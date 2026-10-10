@@ -818,8 +818,20 @@ let properties =
     ; prop "a seed gives the same run" Gen.int same_seed_same_run
     ; test "different seeds give different runs" seeds_differ ]
 
+(* The tests of the public API that each world runs. *)
+let portable_world =
+  let n = ref 0 in
+  { Portable.name= "portable"
+  ; run= (fun f -> run f)
+  ; listen=
+      (fun () ->
+        incr n ;
+        let a = Net.Tcp ("portable", !n) in
+        (Net.listen a, a) ) }
+
 let () =
   exit
     (Windtrap.run "sim"
        ( [time; timers; events; chans; scopes; checks; properties]
-       @ Test_net.tests ) )
+       @ Test_net.tests
+       @ Portable.tests portable_world ) )

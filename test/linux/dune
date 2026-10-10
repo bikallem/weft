@@ -1,9 +1,21 @@
+(executable
+ (name echo_client)
+ (enabled_if
+  (= %{system} linux))
+ (modules echo_client)
+ (libraries unix))
+
 (test
  (name test_linux)
  (enabled_if
   (= %{system} linux))
- (libraries weft weft.linux windtrap)
+ (modules test_linux)
+ (libraries weft weft.linux windtrap portable unix)
+ (deps echo_client.exe)
  (action
-  (progn
-   (run %{test} --corrected)
-   (diff? test_linux.ml test_linux.ml.corrected))))
+  (setenv
+   WEFT_ECHO_CLIENT
+   %{dep:echo_client.exe}
+   (progn
+    (run %{test} --corrected)
+    (diff? test_linux.ml test_linux.ml.corrected)))))

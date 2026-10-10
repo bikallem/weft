@@ -4,7 +4,7 @@
 
 (test
  (name test_sim)
- (libraries weft weft.sim windtrap)
+ (libraries weft weft.sim windtrap portable)
  (action
   (progn
    (run %{test} --corrected)

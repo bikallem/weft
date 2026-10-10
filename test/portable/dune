@@ -1,0 +1,6 @@
+; The tests that use only the public API. Each world runs them (design
+; section 2.14).
+
+(library
+ (name portable)
+ (libraries weft windtrap))

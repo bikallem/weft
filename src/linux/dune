@@ -1,11 +1,17 @@
-; The Linux world: epoll, timerfd and eventfd (design section 2.7).
+; The Linux world: epoll, timerfd and eventfd (design section 2.7). Its own
+; stubs do each OS call, so it does not link unix.
 
 (library
  (name weft_linux)
  (public_name weft.linux)
  (enabled_if
   (= %{system} linux))
- (libraries weft unix)
+ (libraries weft)
+ (foreign_stubs
+  (language c)
+  (flags
+   (:standard -O2 -Wall -Wextra -Wno-unused-parameter))
+  (names weft_linux_stubs))
  (instrumentation
   (backend ppx_windtrap.coverage))
  (instrumentation
