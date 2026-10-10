@@ -206,7 +206,8 @@ Each operation is a constructor of the GADT `'a Op.t`, for example `Read : fd * 
 **Direct calls to `Unix`.** A wrapper does not stop a library that calls `Unix` directly. This call goes past the world with no warning, as in caravan. Thus:
 
 - The core library and the simulator do not depend on the `unix` library. `Op.error` is a type of the library, not `Unix.error`.
-- A simulator test executable uses `(forbidden_libraries unix)` in its dune stanza. The build then gives an error if a dependency links `unix`. This field applies to executables and tests, not to libraries. Eio uses it in `tests/nounix/dune`. The `threads` library needs `unix`, so a simulator test cannot link `threads`.
+- The guard executable `test/nounix` links `weft` and `weft.sim` and has `(forbidden_libraries unix)` in its dune stanza. The build then gives an error if one of these libraries links `unix`. This field applies to executables and tests, not to libraries. Eio uses it in `tests/nounix/dune`. Each library of a layer that must stay on the seam (milestone M2) goes into the guard too. The `threads` library needs `unix`, so these libraries cannot link `threads`.
+- The test suites use windtrap (section 2.17), and windtrap links `unix`. Thus a suite cannot have `(forbidden_libraries unix)`, and the guard is a separate executable with no test library. The code of a simulator test must not call `Unix`. The build does not find such a call.
 - The production executable links `unix` through the Linux or kqueue world. The program code does not link it.
 - The check finds only the `unix` library. It does not find a library with its own C stubs for the time or for random numbers. I think that the clock packages of `mtime` and `ptime` and the entropy of `mirage-crypto-rng` work in this way, but I did not verify it. A test can add them to `forbidden_libraries`.
 - The check does not find the stdlib I/O: `open_in`, `In_channel` and `Out_channel` on files, `Sys.readdir`, `Sys.command`, `Sys.file_exists`, `Filename.temp_file`, `Sys.time` and `Sys.getenv`. These calls go past the world, and in production they block the domain.
@@ -943,13 +944,12 @@ A `Blocking` operation (milestone M2) does not complete at once. The simulator p
 
 ### A test example: the 408 from caravan
 
-The test is in a `test` stanza of dune, because `forbidden_libraries` applies only to `executable` and `test` stanzas:
+The test is a windtrap suite in a `test` stanza of dune (section 2.17). The `server` library is also in the guard `test/nounix` (section 2.3), so the build gives an error if it links `unix`:
 
 ```text
 (test
  (name t408)
- (libraries affect_new affect_new.sim server)
- (forbidden_libraries unix))
+ (libraries weft weft.sim server windtrap))
 ```
 
 ```ocaml
@@ -968,7 +968,7 @@ let () =
   assert (Time.diff Mono (Time.now Mono) t0 = Span.s 10)
 ```
 
-An inline test with `let%test` cannot use `forbidden_libraries`, and its body must be a `bool`.
+The library code of `weft` and `weft.sim` has no inline tests (`let%test`). The runtime libraries of `ppx_windtrap` link `unix`, so an inline test would make each program that links the library link `unix` (section 2.17).
 
 The test reads like production code. The read blocks, the program becomes quiescent, and the simulator jumps to 10 s. The time does not move while the program is not quiescent, and the latency is 0 by default. Thus the server arms its deadline at the same virtual time as `t0`, and the difference is exactly 10 s. From milestone M1, the same test runs with `~domains:4`.
 
@@ -1030,7 +1030,7 @@ The cost of an effect is a perform and a handler call for each world operation. 
 
 ## 2.12 Decisions
 
-Decisions 1 to 6 were made on 2026-10-09, and decisions 7 and 8 on 2026-10-10.
+Decisions 1 to 6 were made on 2026-10-09, and decisions 7 to 9 on 2026-10-10.
 
 | No. | Question | Decision |
 |---|---|---|
@@ -1042,6 +1042,7 @@ Decisions 1 to 6 were made on 2026-10-09, and decisions 7 and 8 on 2026-10-10.
 | 6 | Unix in fiber code | Wrap the full Unix I/O API |
 | 7 | Stealing | Full stealing, as in affect. A fiber that ran can move, but its registrations stay on the domain where it blocked. |
 | 8 | Fd registration | Edge-triggered, with one registration in each domain where a fiber blocks on the fd |
+| 9 | Tests | windtrap 0.2.0: property, stateful and expect tests, coverage and mutation testing (section 2.17) |
 
 Also on 2026-10-10, the user accepted the milestone plan of section 2.14. Decisions 4, 7 and 8 stay, and they come in milestone M1. Milestone M0 has one domain.
 
@@ -1092,7 +1093,8 @@ The sections of this document mark each part that does not come in M0 with its m
 - A `send` and a `recv` that start at the same time on an empty channel meet.
 - A test with a fiber that waits forever gets `Deadlock`, with the name of that fiber. A planted lost wakeup gives `Lost_wakeup`, not an incorrect timeout.
 - 10,000 connections open and close on Linux with no fd leak, and a late `write` after `close` gives `EBADF` and closes nothing.
-- The simulator tests are in `test` stanzas with `(forbidden_libraries unix)`.
+- The guard `test/nounix` with `(forbidden_libraries unix)` builds, and it links `weft` and `weft.sim`.
+- Each module of the core has its windtrap tests: property tests for each law, expect tests for long text, and a mutation run with no survivor that is not dismissed with a reason (section 2.17).
 - The TLA+ models of section 2.16 pass (`spec/tla/check.sh`).
 
 **What M0 proves:** the `WORLD` contract (`Wait`, `Submit`, `Register`, the tokens) works on a real OS and on the simulator. The core API is complete enough for a server with timeouts. The design meets a real OS in the first milestone, not at the end.
@@ -1209,6 +1211,38 @@ Run all of the models with `nix develop -c spec/tla/check.sh`. `MODELS="Ivar Fd"
 - **A Register and a close notice of one domain never interleave** (section 2.7). The model of the fd record needs this rule of the design. Without it, a notice can arrive before the registration is live, and the waiter waits forever.
 
 **The limits.** The models are small: two or three fibers or domains in each scenario, a few work items, and one fd. Each model takes some details as one atomic step, and another model examines them, for example the commit in `Scope.tla` and `Ivar.tla`. The models do not cover the simulator, the OS facts, `Fiber.Mutex`, `Condition`, promises or signals. `dscheck` still examines the OCaml code in milestone M1, because the OCaml code can differ from the model.
+
+## 2.17 Tests with windtrap
+
+The tests use windtrap 0.2.0 (decision 9). The flake builds windtrap and `ppx_windtrap` from the `v0.2.0` tag, because nixpkgs has only 0.1.0. Windtrap gives unit tests, property tests, stateful tests, expect tests, coverage and mutation testing from one library.
+
+**Which test for which part:**
+
+| The part | The test |
+|---|---|
+| A law, for example "a span in nanoseconds and back is the same span", or "a `choose` resumes the fiber one time" | A property (`prop`) over a generator. A `Law` verb when windtrap names the law. |
+| A value with state: `Chan`, `Ivar`, the heap of timers, the fd records | A stateful test against a simple model. In M1, the same commands also run with `stateful ~domains:2`, and windtrap finds a result that no order of the calls explains. |
+| A result that the design gives for chosen inputs | `test` with `equal`, or `cases` for a table |
+| A long text: a trace of the simulator, the message of `Deadlock` | An expect test (`expect`), accepted with `dune promote` |
+| The tests themselves | Coverage, and a mutation run on each module that a change touches |
+
+**The layout:**
+
+- `test/sim` and `test/linux` are windtrap suites. Each suite runs with `--corrected`, so `dune promote` accepts a new baseline. The tests that use only the public API run on each world.
+- `test/nounix` is the guard of section 2.3. It has no test library.
+- The libraries have the backends `ppx_windtrap.coverage` and `ppx_windtrap.mutate`. A backend does nothing until a build asks for it. Its runtime library, `windtrap.runtime`, uses only the stdlib, so the guard stays correct also with the instrumented libraries.
+- The libraries do not use `ppx_windtrap` itself. Its runtime libraries include `windtrap`, which links `unix`. Thus there are no inline tests in `weft` or `weft.sim`, and a test of an inside part goes through a module that the library exports for tests, as `Sched_debug` (section 2.2).
+
+**The commands:**
+
+- `dune runtest`: all suites.
+- `dune runtest --force --instrument-with ppx_windtrap.coverage`, then `dune exec windtrap -- coverage`.
+- `WINDTRAP_MUTATE=1 dune runtest --force --instrument-with ppx_windtrap.mutate`, then `dune exec windtrap -- mutants`.
+
+**Two facts for M1.** I read them in the source of windtrap 0.2.0, but I did not do a test of them with domains:
+
+- The runner of windtrap can run tests on worker domains (`Domain.spawn` in `lib/workers.ml`). A test that calls `run ~domains:n` then has more domains than `n` in the process.
+- Mutation testing forks a child for each mutant. OCaml 5 refuses `Unix.fork` in a process that started a domain, and windtrap tells this in its message (`lib/mutate_loop.ml`). Thus a mutation run of a test with many domains can give an error.
 
 ---
 
