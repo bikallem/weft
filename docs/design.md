@@ -428,9 +428,9 @@ Thus each direction has one path.
 
 - Each fiber has one atomic field, "the current sync word". The fiber sets it when a `sync` starts and clears it when the `sync` ends.
 - Each `sync` has a record with its innermost cancel context. The record does not change, and the fiber publishes it before it sets the current sync word.
-- A cancel of scope S sets the cancelled flag of S. Then it walks the members of S and of its nested scopes, and it stops at each shield node. For each member that is in a `sync`, it reads the context of that `sync`. It commits the `sync` with the cancel only if the chain of contexts from that `sync` reaches S with no shield between them. Thus a cancel cannot reach a `sync` that the fiber started after it left S, or a `sync` inside a shield.
+- A cancel of scope S sets the cancelled flag of S, and only that flag. It does not set the flags of the nested scopes. Then it walks the members of S and of its nested scopes, and it stops at each shield node. For each member that is in a `sync`, it reads the context of that `sync`. It commits the `sync` with the cancel only if the chain of contexts from that `sync` reaches S with no shield between them. Thus a cancel cannot reach a `sync` that the fiber started after it left S, or a `sync` inside a shield.
 - The walk collects the commits under the lock of each scope. It resumes the fibers and calls `wake` only after it releases the lock, because `wake` is a world effect.
-- Before a `sync` parks, it tests the cancelled flags of its contexts, up to the nearest shield.
+- Before a `sync` parks, it tests the cancelled flags of its contexts, up to the nearest shield. Thus a `sync` in a nested scope sees the flag of an outer scope, and the nested scopes need no flag of their own. A chain is short, and its reads have no contention.
 - The cancel writes the flag and then reads the current sync word. The fiber writes its current sync word and then reads the flag. OCaml atomics are sequentially consistent, so at least one of the two sees the other. This is the Dekker pattern again, and `dscheck` must examine it.
 
 **The concurrency of scopes.** The fibers of one scope can run on many domains at the same time. Thus:
@@ -438,7 +438,7 @@ Thus each direction has one path.
 - Each scope has one atomic state word with two counts and a closed bit: the members that are not daemons, and all members. A `fork` adds a member with a CAS that succeeds only if the closed bit is clear. When the first count is 0 and the body returned, the scope cancels its daemons. The end of the last member sets the closed bit with the same CAS. Thus a `fork` and the end of the last member cannot both win.
 - A member that fails stores its exception before it decreases the counts. Thus the join always sees the exception.
 - If `on_error` of `fork_isolated` raises, its exception goes to the outer scope, as an exception of a normal fiber does.
-- Each scope has a short lock for its list of members and of nested scopes. A new nested scope links itself under this lock, under its parent node. Then it reads the cancelled flag of that parent again, and if the flag is set, it marks itself cancelled. Thus a cancel that walks the list at the same time cannot miss it. The parent of a scope inside a shield is the shield node, and a cancel from outside never sets the flag of a shield node. The TLA+ model of this section shows that the `sync` itself does not need this second read: each `sync` reads the flags of its whole chain up to the nearest shield, so it sees a cancel of an outer scope also when the new scope has no flag. The second read only makes a `fork` into the new scope give `Scope_closed` at once.
+- Each scope has a short lock for its list of members and of nested scopes. A new nested scope links itself under this lock, under its parent node. The parent of a scope inside a shield is the shield node. The link has no cancel logic: a cancel that walks the list at the same time can miss the new scope, but each `sync` in it reads the flag of the cancelled scope through its chain. The TLA+ model of section 2.16 examined this.
 - A scope never holds its lock across a world effect. Thus, in the simulator, the lock is never contended.
 
 **Cancellation points.** Only `sync` is a cancellation point. `Fiber.yield`, `Time.sleep` and all I/O functions call `sync`, so they are cancellation points too. A fiber that computes and never calls `sync` cannot be cancelled. This agrees with "The limit of a busy domain" that follows.
@@ -454,7 +454,7 @@ Thus each direction has one path.
 
 **The shield is a one-way barrier:**
 
-- **It stops the cancels from outside.** A cancel of an outer scope does not go into `f`, and it does not go into a scope that `f` makes, because that scope links under the shield node. The cancel is not lost. When `f` returns, the next `sync` of the fiber raises `Cancelled`.
+- **It stops the cancels from outside.** A cancel of an outer scope does not go into `f`, and it does not go into a scope that `f` makes, because that scope links under the shield node. The chain of a `sync` in `f` stops at the shield node, so it does not read the flag of the outer scope. The cancel is not lost. When `f` returns, the next `sync` of the fiber raises `Cancelled`.
 - **The cancels from inside still work.** A scope that `f` makes can cancel its own code, for example with `with_timeout`.
 - **It lets exceptions go out.** An exception in `f` goes out as usual, and it can make the outer scope fail.
 - **It delays the end of the outer scope.** The outer scope waits for the fiber, so it waits until `f` returns.
@@ -470,7 +470,7 @@ Fun.protect f ~finally:(fun () ->
 
 The scope of `with_timeout` links under the shield node. Thus the cancel of the outer scope does not reach it, and its own timer can cancel it.
 
-**Fork into a scope that ends.** Code can give a scope value to another fiber, for example to fork the handler of each connection. If the scope is cancelled or has ended, `fork` raises `Fiber.Scope_closed`. This exception is different from `Cancelled`. The reason: the fiber that called `fork` is not cancelled. If `fork` raised `Cancelled`, the scope of that fiber could take a real failure as a cancel.
+**Fork into a scope that ends.** Code can give a scope value to another fiber, for example to fork the handler of each connection. If the scope has ended, or a flag on its chain of contexts is set, `fork` raises `Fiber.Scope_closed`. The `fork` reads the chain, because a nested scope has no flag of its own. This exception is different from `Cancelled`. The reason: the fiber that called `fork` is not cancelled. If `fork` raised `Cancelled`, the scope of that fiber could take a real failure as a cancel.
 
 **Timeouts.** For one event, CML already has a timeout: `choose [ev; Time.after Mono span]`. For a block of code, `Fiber.with_timeout` runs `f` in a new scope T. In milestone M0, T has one daemon fiber that does `Time.sleep` and then cancels T with `Timeout`. The result:
 
@@ -580,7 +580,7 @@ These parts are shared by all domains:
 
 - The local queues and the next slots, for stealing
 - The global injection queue (M3), for `Ivar.fill_from_outside`. It is lock-free, because a finaliser can push to it (section 2.5, Fiber code with no handler).
-- The `idle` and `searching` values
+- The `idle` set (and in M3, the `searching` count, if it comes)
 - The scopes and the sync words
 - The fd records: the use count, the closed bit, the generation and the set of domains (section 2.7)
 
@@ -609,7 +609,7 @@ The next slot makes a hand-off fast. When F1 sends to F2 and then blocks, F2 run
 
 **A limit on the next slot (M3).** Two fibers that send to each other can keep the next slot full forever. The local queue then never runs. Thus the next slot runs at most 3 times in sequence. After that, the fiber in the slot goes to the tail. Tokio has a similar limit. The value 3 is a start value, and it must be measured.
 
-**A steal of the next slot (M3).** A thief first tries the local queues of all domains. If they are empty, it tries the next slots, and it takes a fiber from a next slot with a CAS. Suppose that F1 wakes F2 and then computes for 50 ms. Then an idle domain takes F2 from the next slot, and F2 does not wait 50 ms. Go also lets a thief take `runnext`. A push to the next slot wakes an idle domain with the normal rule of "Idle and wake", below.
+**A steal of the next slot (M3).** This steal is only for latency: the TLA+ model of `Wake.tla` showed that without it no wakeup is lost. It can stay out until a measurement shows that it is necessary. A thief first tries the local queues of all domains. If they are empty, it tries the next slots, and it takes a fiber from a next slot with a CAS. Suppose that F1 wakes F2 and then computes for 50 ms. Then an idle domain takes F2 from the next slot, and F2 does not wait 50 ms. Go also lets a thief take `runnext`. A push to the next slot wakes an idle domain with the normal rule of "Idle and wake", below.
 
 I changed one point from my earlier answer. A Chase-Lev deque gives the owner LIFO order, and LIFO order is not fair to old fibers. Thus the local queue is FIFO, and only the next slot is LIFO.
 
@@ -634,33 +634,34 @@ Steps 1 and 3 and the next slot come in milestone M3. Before M3, step 2 takes on
 
 ### Idle and wake (M1)
 
-A lost wake-up is the typical bug here: domain A goes to sleep, and at the same time domain B pushes work that A must run. The protocol uses two atomic values that all domains share:
+A lost wake-up is the typical bug here: domain A goes to sleep, and at the same time domain B pushes work that A must run. In M1, the protocol uses one atomic value that all domains share:
 
-- `idle`: the set of domains that sleep in `Wait`.
-- `searching`: the number of domains that look for work in step 4. A domain increases it when it starts step 4. Go also limits the searching domains to half of the domains, and this design does the same.
+- `idle`: the set of domains that sleep in `Wait`, or that are about to sleep.
 
-**A searching domain that finds no work:**
+**A domain that finds no work (step 4 of the loop found nothing):**
 
-1. It decreases `searching`.
-2. It adds itself to `idle`.
-3. It checks again: its next slot, its local queue, its mailbox, the global injection queue, the queues and next slots of the other domains, and on domain 0, the pinned queue.
-4. If it finds work, it removes itself from `idle` and goes to step 1 of the loop. If not, it performs `Wait`.
-
-The decrease must come before the second check. If it comes after, this lost wakeup can occur. Domain S is the last searching domain, and its second check finds nothing. A thread then pushes to the injection queue, reads `searching = 1`, and wakes nobody. Then S decreases `searching` and sleeps, with work in the queue. Go uses the same order.
+1. It adds itself to `idle`.
+2. It checks again: its next slot, its local queue, its mailbox, the global injection queue, the queues and next slots of the other domains, and on domain 0, the pinned queue.
+3. If it finds work, it removes itself from `idle` and goes to step 1 of the loop. If not, it performs `Wait`.
 
 **A domain or thread that pushes work:**
 
 1. It pushes the fiber.
-2. It reads `idle`. If `idle` is not empty and `searching` is 0, it wakes one idle domain with `wake`.
+2. It reads `idle`. If `idle` is not empty, it takes one domain out of `idle` and wakes it with `wake`.
 3. A push to the pinned queue wakes domain 0 directly. A different idle domain cannot run a pinned fiber.
-
-**A searching domain that finds work:** it decreases `searching`. If it was the last searching domain and `idle` is not empty, it wakes one idle domain. Without this rule, work can wait in a queue while other domains sleep. Go has the same rule.
 
 OCaml `Atomic` operations are sequentially consistent. Thus one of the two sides always sees the other: the sleeper sees the work in its second check, or the pusher sees the sleeper in `idle`. This is the Dekker pattern. It needs a model check with `dscheck`, because the simulator does not try the other orders of the atomic operations between two switch points.
 
 A `wake` that comes before the domain is in `Wait` is not lost. The `eventfd` keeps its count, and the next `Wait` returns at once. `EVFILT_USER` in kqueue keeps its trigger in the same way.
 
-The `searching` count prevents a "thundering herd". If one domain already searches for work, a push does not wake a second domain. Go uses "spinning" threads, and Tokio uses "searching" workers, for the same purpose.
+**The cost: more wakes.** A push wakes an idle domain each time that one exists, also when another domain already looks for work. Thus there can be more wakes than necessary, a small "thundering herd". Go and Tokio prevent this with a count of the domains that search for work ("spinning" threads in Go, "searching" workers in Tokio). Open question 8 asks for a measurement of this cost.
+
+**The Go rules (M3, only if a measurement shows that they are necessary).** These rules lower the number of wakes, but the TLA+ model of `Wake.tla` showed that correctness does not need them:
+
+- A `searching` count. A domain increases it when it starts step 4, and a push wakes nobody if it is not 0.
+- At most half of the domains search at one time.
+- The last searching domain that finds work wakes one idle domain.
+- The order of the decrease: a searching domain that finds no work decreases `searching` before its second check. If the decrease comes after, this lost wakeup can occur. Domain S is the last searching domain, and its second check finds nothing. A thread then pushes to the injection queue, reads `searching = 1`, and wakes nobody. Then S decreases `searching` and sleeps, with work in the queue. The model found this race.
 
 ### Timers and domains
 
@@ -784,7 +785,7 @@ Each domain has its own poller (section 2.5). A fiber registers an fd in the pol
 - **One record for each open.** User handles hold the record object, and the library never uses the same object for a new fd. Only the slot in the table is used again, with a new generation. The kernel can give the same fd number to a new file after `close(2)`. Thus `epoll_data` holds the index of the slot and the generation, not the fd number, and a domain drops an event with an old generation.
 - `close` never blocks, so it is not a cancellation point. A cancelled fiber can thus call it in cleanup code.
 - **Registrations hold a user (M1).** Each registration in the poller of a domain holds one user. Register adds a user, then sets its bit in the domain set, then reads the state. If the state is `Closing`, Register undoes its steps and commits its waiter with `EBADF`. `close` sets `Closing` and then reads the domain set. These are Dekker pairs of atomics, so one side always sees the other. Register runs on the thread of the domain that owns the poller, and it does not suspend the fiber. That thread takes its mailbox only between fibers. Thus a domain never takes a close notice between the steps of its own Register.
-- **Close notices (M1).** `close` sends a close notice with the slot index and the generation to the mailbox of each domain in the set, and it wakes these domains. A domain acts on a notice only if it holds a live registration for that pair. The removal of section "An fd in many pollers" also needs a live registration. The two run on the thread of the domain, one after the other, so only the first one finds the registration live. That one clears the domain bit, commits the waiters with `EBADF`, does `EPOLL_CTL_DEL` and removes the user of the registration. Thus a user is removed exactly one time, and `EPOLL_CTL_DEL` never names a reused fd number. The domain bit does not need a CAS. Only the owner clears it, and the closer only reads it to know which domains get a notice. The TLA+ model of section 2.16 showed this: without the CAS, the result and the number of states do not change.
+- **Close notices (M1).** `close` sends a close notice with the slot index and the generation to the mailbox of each domain in the set, and it wakes these domains. A domain acts on a notice only if it holds a live registration for that pair. The removal of section "An fd in many pollers" also needs a live registration. The two run on the thread of the domain, one after the other, so only the first one finds the registration live. That one clears the domain bit, commits the waiters with `EBADF`, does `EPOLL_CTL_DEL` and removes the user of the registration. Thus a user is removed exactly one time, and `EPOLL_CTL_DEL` never names a reused fd number. The domain bit needs no CAS. Only the owner sets and clears it, with one atomic store, and the closer only reads it to know which domains get a notice. The TLA+ model of section 2.16 showed this: without the CAS, the result and the number of states do not change.
 - `close(2)` comes after each `EPOLL_CTL_DEL`. An epoll registration lives until all fds of its open file description close (epoll(7)). A review verified this: with a `dup` alive, the registration gave events after `close(2)`.
 - `close(2)` can block, for example on a socket with `SO_LINGER` and on an NFS or FUSE file. Thus the library gives the `close(2)` of a `File` fd, and of a socket with `SO_LINGER`, to the pool (milestone M2).
 - **Close-on-exec.** The library makes each fd with this flag: `epoll_create1 (EPOLL_CLOEXEC)`, `EFD_CLOEXEC`, `TFD_CLOEXEC`, `SOCK_CLOEXEC` for `socket`, `socketpair` and `accept4`, `O_CLOEXEC` for `File.open`, `pipe2`, `MSG_CMSG_CLOEXEC` for fds that come with `SCM_RIGHTS`, and `F_DUPFD_CLOEXEC` or `dup3` for a copy. Thus a child from `Process.spawn` does not keep a copy.
@@ -1011,13 +1012,13 @@ The cost of an effect is a perform and a handler call for each world operation. 
 | `Sim.settle` (wait until quiescent) | Trio `wait_all_tasks_blocked`, Go `synctest.Wait` |
 | One alarm in the poller (`timerfd`, `EVFILT_TIMER`) | The session's `CLOCK` + `ALARM` design |
 | `Mono` and `Posix` lines with a typed clock | The caravan time seam |
-| A FIFO local queue, a next slot, a global injection queue, stealing half a queue, the `searching` count | Go, Tokio |
+| A FIFO local queue, a next slot, a global injection queue, stealing half a queue | Go, Tokio |
 | A queue for pinned fibers | affect `only_main_queue` |
 | Scopes, daemon fibers and cancellation | Eio switches, Trio nurseries |
 | `Fiber.shield`, and "the cancel wins at a checkpoint" | Trio |
 | The commit protocol of `choose` across domains | Parallel CML (Reppy, Russo and Xiao, 2009) |
 | Full stealing. The `Blocked` state with a retry on `Claimed`. Pinned fibers on the main domain. The atomic state of an `Ivar` (`cell.ml`). The idea of one fd map for each domain, from a comment in `affect_unix__select.ml`. | affect |
-| The order of the `searching` decrease, the wake by the last searching domain, a steal of the next slot | Go |
+| The rules for the `searching` count (M3), a steal of the next slot | Go |
 | A lock for each channel | Parallel CML |
 | A join of a scope that ignores cancels | Eio `Switch.await_idle` |
 | A deadline on a cancel context | Trio |
@@ -1053,6 +1054,7 @@ Also on 2026-10-10, the user accepted the milestone plan of section 2.14. Decisi
 5. **The limit of the next slot (M3).** The start value is 3 runs in sequence (section 2.5). This must be measured.
 6. **The default number of domains (M1).** The start value is 4 (section 2.5). The GC pauses and the throughput must be measured for different numbers of domains.
 7. **The limits of the watchdog (M3) and the slack (M0).** The start values are 10 ms (section 2.5, The limit of a busy domain) and 1 ms (section 2.5, Timers and domains).
+8. **The cost of more wakes (M1).** With no `searching` count, a push wakes an idle domain each time that one exists (section 2.5, Idle and wake). This must be measured on a server with many short fibers. If the cost is too high, M3 adds the Go rules.
 
 **An answer to an earlier question: the cost of `Switch`.** A review measured one perform and continue with one deep handler at 5.6 ns (OCaml 5.5.1, `-O3`, a loop with warm caches). Each more handler level costs about 3 to 5 ns. Thus the `Switch` effect is cheap, and the scheduler does not need to be a functor over the world. The real costs are the syscalls and the wakes between cores. For example, an empty `epoll_wait` costs about 0.26 µs, and `timerfd_settime` about 0.6 µs (measured).
 
@@ -1100,20 +1102,20 @@ The sections of this document mark each part that does not come in M0 with its m
 **Contents:**
 
 - `run ~domains:n`, with full stealing as in decision 7, and the registrations for each domain of decision 8 (sections 2.5 and 2.7).
-- A FIFO ring for each domain, a steal of half a queue, and `idle` and `searching` in the Go order. The step value to the loop, with no DLS.
+- A FIFO ring for each domain, a steal of half a queue, and the `idle` set with the second check. The step value to the loop, with no DLS.
 - The cancel walk across domains, the scope state word and lock, the domain set of an fd record and the close notices.
 - Virtual domains in the simulator (decision 4).
 - `dscheck` for each shared protocol.
 
-**Done when the TLA+ model of section 2.4 passes for the code of M1, and a `dscheck` test passes for each of these parts.** `dscheck` needs each part as a module with no effects, a functor over its traced `Atomic`. Each test also finds a planted bug. For example, put the decrease of `searching` after the second check, and the `idle` test must give a failure.
+**Done when the TLA+ model of section 2.4 passes for the code of M1, and a `dscheck` test passes for each of these parts.** `dscheck` needs each part as a module with no effects, a functor over its traced `Atomic`. Each test also finds a planted bug. For example, remove the second check, and the `idle` test must give a failure.
 
 - The local queue: a push by the owner and a steal by two thieves
-- The `idle` and `searching` protocol: a searching domain that finds nothing while another domain pushes work
+- The `idle` protocol: a domain that goes idle while another domain pushes work
 - The commit of `choose`: a commit during the scan, a one-word partner while a claimer holds the word, two partners and one parked `sync`, and two fibers that sync on each other
 - The atomic register: a `send` and a `recv` on an empty channel at the same time, and a fill of an `Ivar` during a register
 - The self-commit: a yield and a cancel at the same time
 - The cancel: a cancel walk while a fiber starts a `sync`, and a cancel walk while a fiber leaves the scope
-- The scope: a `fork` while the last member ends, a cancel while a nested scope links itself, and a cancel while a shield node links itself
+- The scope: a `fork` while the last member ends
 - The fd record: a `submit` and a `close` at the same time, a late `submit` after `close(2)`, a Register and a `close` at the same time, and a close notice and a removal of section 2.7 at the same time
 
 **Also done when:**
@@ -1123,7 +1125,7 @@ The sections of this document mark each part that does not come in M0 with its m
 - A seed that gives a failure gives the same failure, with the same order of events, when it runs again.
 - A fiber that a thief stole uses the state of the thief at its next effect.
 - A fiber that blocks on one fd from two domains in sequence gets all of its data, on the simulator and on Linux.
-- Open questions 3, 4 and 6 have measurements.
+- Open questions 3, 4, 6 and 8 have measurements.
 
 **What M1 proves:** the protocols are correct with many domains, and the seed replays the order of the virtual domains.
 
@@ -1152,7 +1154,8 @@ The sections of this document mark each part that does not come in M0 with its m
 
 **Contents:**
 
-- The next slot, with its limit and its steal (section 2.5)
+- The next slot, with its limit, and its steal if a measurement shows that it is necessary (section 2.5)
+- The Go rules of section 2.5, Idle and wake, if open question 8 shows that M1 wakes too many domains
 - The pinned queue, `~pinned`, and `Ivar.fill_from_outside` with the injection queue
 - The deadline form of `with_timeout`
 - The watchdog, the report of failed promises and `Livelock`
@@ -1184,23 +1187,24 @@ It has three problems:
 
 ## 2.16 Verification with TLA+
 
-The protocols that run on many domains at the same time have models in PlusCal, in `spec/tla`. The TLC model checker examines each order of their steps. Each model has the protocol of this design, and a set of planted bugs. Each planted bug must give a failure. Thus the model can find the errors that matter, and it is not only a model that always passes.
+The protocols that run on many domains at the same time have models in PlusCal, in `spec/tla`. The TLC model checker examines each order of their steps. Each model has the protocol of this design, and a set of planted bugs. Each planted bug must give a failure. Thus the model can find the errors that matter, and it is not only a model that always passes. Some models also have simplifications (constants with the prefix `Simp`). A simplification must pass, and section 2.5 uses the ones that passed.
 
-Run all of the models with `nix develop -c spec/tla/check.sh`. `MODELS="Ivar Fd"` selects some of them. The full check takes about 20 minutes on a machine with 16 CPUs. The flake of the repository gives the TLA+ tools.
+Run all of the models with `nix develop -c spec/tla/check.sh`. `MODELS="Ivar Fd"` selects some of them. The script runs `JOBS` cases at the same time (default 4), each one with `-lncheck final`, so that TLC checks the liveness property one time at the end. The 40 cases take about 16 minutes on a machine with 16 CPUs. The slowest case, `Wake.tla` with no bug and 15.3 million states, takes about 11 minutes, and it is the lower limit of the run time. The flake of the repository gives the TLA+ tools.
 
 | Model | Protocol (section) | Properties | Planted bugs that fail |
 |---|---|---|---|
 | `Commit.tla` | The commit of `choose` (2.4) | At most one resume, correct rendezvous pairs, no lost rendezvous, a correct end state, termination | No `Parked` state, no id order, a partner that gives up on `Claimed`, no channel lock |
-| `Scope.tla` | Scopes and cancellation (2.5) | No orphan fiber, no lost exception, the shield holds, no cancel of a foreign `sync`, a closed scope is empty, termination | A join that a cancel can end, a scope in a shield under the outer scope, no check of the chain, an exception after the end, no read of the flags |
+| `Scope.tla` | Scopes and cancellation (2.5) | No orphan fiber, no lost exception, the shield holds, no cancel of a foreign `sync`, a closed scope is empty, termination | A join that a cancel can end, a scope in a shield under the outer scope, no check of the chain, an exception after the end, no read of the flags. Simplifications that pass: no flags on nested scopes, no second read at a link, and the two together. |
 | `Ivar.tla` | The atomic register of an `Ivar`, and `Ivar.fill_from_outside` (2.4, 2.5) | At most one resume, one fill, no waiters after the fill, a correct end state, termination | A finaliser that commits the waiters itself, a register that is not atomic |
-| `Wake.tla` | The loop of a domain: idle and wake, steal, next slot, pinned queue, injection queue (2.5) | Each item runs, a pinned item runs only on domain 0, no lost wakeup | The decrease of `searching` after the second check, no second check, a pinned push that wakes any domain |
-| `Fd.tla` | The fd record: `Rcfd`, the registrations, the close notices, the removal (2.7) | One `close(2)`, no `close(2)` of another file, no use after `close(2)`, no `EPOLL_CTL_DEL` of a new file, `EPOLL_CTL_DEL` before `close(2)`, termination | A count and a closed bit, a Register that reads the state first, a registration with no user |
+| `Wake.tla` | The loop of a domain: idle and wake, steal, next slot, pinned queue, injection queue (2.5) | Each item runs, a pinned item runs only on domain 0, no lost wakeup | The decrease of `searching` after the second check, no second check, a pinned push that wakes any domain. Simplifications that pass: no steal of a next slot, no search limit, no last wake, no `searching` count. |
+| `Fd.tla` | The fd record: `Rcfd`, the registrations, the close notices, the removal (2.7) | One `close(2)`, no `close(2)` of another file, no use after `close(2)`, no `EPOLL_CTL_DEL` of a new file, `EPOLL_CTL_DEL` before `close(2)`, termination | A count and a closed bit, a Register that reads the state first, a registration with no user. A simplification that passes: no CAS on the domain bit. |
 
 **What the models showed about the design:**
 
 - **A daemon needs its own cancel context** (section 2.5, Lifetime). The design did not tell how the `sync` of a daemon sees the cancel of the daemons.
-- **The second read of the parent flag is not necessary** for a `sync` (section 2.5, The concurrency of scopes). Each `sync` reads the flags of its whole chain.
+- **A cancel sets only one flag** (section 2.5, How a cancel reaches a fiber). The flags of nested scopes and the second read of the parent flag at a link are not necessary, because each `sync` reads the flags of its whole chain. The combined case passed in the three scenarios.
 - **The domain bit of an fd record needs no CAS** (section 2.7, Close notices). The owner of the registration decides.
+- **M1 needs no `searching` count** (section 2.5, Idle and wake). The count, its limit and the last wake are each only for performance. Without the count, the model also passes.
 - **A thief that cannot take a next slot loses no wakeup** (`Wake.tla`). The steal of the next slot only makes the latency smaller.
 - **A Register and a close notice of one domain never interleave** (section 2.7). The model of the fd record needs this rule of the design. Without it, a notice can arrive before the registration is live, and the waiter waits forever.
 
