@@ -7,4 +7,6 @@
  (action
   (progn
    (run %{test} --corrected)
-   (diff? test_commit.ml test_commit.ml.corrected))))
+   (diff? test_commit.ml test_commit.ml.corrected)
+   (diff? test_world.ml test_world.ml.corrected)
+   (diff? test_heap.ml test_heap.ml.corrected))))

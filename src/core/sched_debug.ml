@@ -1,0 +1,82 @@
+(* A read of the state of the scheduler for the checks of the simulator (design
+   section 2.8, The wait steps). It changes nothing. *)
+
+open Sched
+
+let fibers t =
+  Spin.with_lock t.fibers_lock (fun () ->
+      Hashtbl.fold (fun _ f acc -> f :: acc) t.fibers [] )
+  |> List.sort (fun a b -> compare a.fid b.fid)
+
+(* The fibers that wait in a sync that did not commit. *)
+let blocked t =
+  List.filter_map
+    (fun f ->
+      match Atomic.get f.current with
+      | Some s when not (is_done s) ->
+          Some f.name
+      | _ ->
+          None )
+    (fibers t)
+
+(* The parked syncs, by the name of the fiber. A test of the checks uses them to
+   plant a lost wakeup. *)
+let parked t =
+  List.filter_map
+    (fun f ->
+      match Atomic.get f.current with
+      | Some s when C.state s.word = C.Parked ->
+          Some (f.name, s.word)
+      | _ ->
+          None )
+    (fibers t)
+
+(* The items of the check for lost wakeups. Each one is a problem. *)
+let lost t ~now =
+  let now = Clock.to_ns Mono now in
+  let queues =
+    Array.to_list t.doms
+    |> List.filter_map (fun d ->
+        if Queue.is_empty d.queue then None
+        else Some (Printf.sprintf "the queue of domain %d is not empty" d.index) )
+  in
+  let timers =
+    Array.to_list t.doms
+    |> List.concat_map (fun d ->
+        List.init d.heap.size (fun i -> d.heap.entries.(i))
+        |> List.filter_map (fun e ->
+            if
+              (not (is_done e.esync))
+              && ( Int64.compare e.deadline now
+                 <= 0 )
+                 [@mutate
+                   off
+                     "the scheduler expires each entry up to now before a \
+                      sleep, so an entry at now is a bug in expire, not in \
+                      this check"]
+            then
+              Some (Printf.sprintf "%s has an expired timer" e.esync.owner.name)
+            else None ) )
+  in
+  let done_not_queued =
+    List.filter_map
+      (fun f ->
+        match Atomic.get f.current with
+        | Some s when is_done s && not f.queued ->
+            Some (Printf.sprintf "%s is committed but not in a queue" f.name)
+        | _ ->
+            None )
+      (fibers t)
+  in
+  queues @ timers @ done_not_queued
+
+(* The heap entries whose sync did not commit. *)
+let live_timers t =
+  Array.fold_left
+    (fun n d ->
+      let live = ref 0 in
+      for i = 0 to d.heap.size - 1 do
+        if not (is_done d.heap.entries.(i).esync) then incr live
+      done ;
+      n + !live )
+    0 t.doms
