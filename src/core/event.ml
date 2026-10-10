@@ -24,23 +24,11 @@ let never = Choose []
 let always v =
   Base
     (fun () ->
-      { leaf= {attempt= (fun _ s i -> ignore (C.self_commit s.word i))}
+      { leaf= (fun _ s i -> ignore (C.self_commit s.word i))
       ; result= (fun () -> v) } )
 
 let of_ivar iv =
   Base (fun () -> {leaf= Iv.leaf iv; result= (fun () -> Iv.get iv)})
-
-(* The event of [Fiber.yield]: ready at once, and the fiber goes to the tail of
-   its queue. *)
-let yield =
-  Base
-    (fun () ->
-      { leaf=
-          { attempt=
-              (fun _ s i ->
-                s.requeue <- true ;
-                ignore (C.self_commit s.word i) ) }
-      ; result= ignore } )
 
 (* A nack of [with_nack]: an Ivar, and the range of the branches that it
    covers. *)
@@ -77,17 +65,14 @@ let flatten (type a) (ev : a t) =
   | exception e ->
       (* A guard raised: enable the nacks of the guards that ran before. *)
       let bt = Printexc.get_raw_backtrace () in
-      List.iter
-        (fun nk -> enqueue (Option.value ~default:[] (Iv.fill nk.niv ())))
-        !nacks ;
+      List.iter (fun nk -> ignore (fill_resume nk.niv ())) !nacks ;
       Printexc.raise_with_backtrace e bt
 
 (* Enable each nack whose branches did not commit. *)
 let enable nacks i =
   List.iter
     (fun nk ->
-      if i < nk.first || i >= nk.last then
-        enqueue (Option.value ~default:[] (Iv.fill nk.niv ())) )
+      if i < nk.first || i >= nk.last then ignore (fill_resume nk.niv ()) )
     nacks
 
 let sync_with ~nocancel ev =
@@ -97,3 +82,7 @@ let sync_with ~nocancel ev =
   if i < 0 then raise (Cancelled (reason ())) else results.(i) ()
 
 let sync ev = sync_with ~nocancel:false ev
+
+(* [Fiber.yield]: the fiber goes to the tail of its queue. It is a cancellation
+   point. *)
+let yield () = if prog "Fiber.yield" Yield then raise (Cancelled (reason ()))

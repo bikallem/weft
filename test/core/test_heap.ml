@@ -7,12 +7,7 @@ module S = Weft.Private.Sched
 let dummy_sync () =
   let node = S.new_node (S.Scope_node (S.new_scope_state ())) in
   let fiber = S.new_fiber [node] in
-  { S.word= S.C.make 0
-  ; owner= fiber
-  ; sctx= node
-  ; cancellable= true
-  ; k= None
-  ; requeue= false }
+  {S.word= S.C.make 0; owner= fiber; sctx= node; cancellable= true; k= None}
 
 type op = Push of int | Pop
 

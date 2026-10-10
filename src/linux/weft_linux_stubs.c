@@ -84,7 +84,7 @@ static int ctl(int epfd, int op, int fd, int64_t token) {
 }
 
 value weft_epoll_add(value epfd, value fd, value token) {
-  return Val_int(ctl(Int_val(epfd), EPOLL_CTL_ADD, Int_val(fd), Int64_val(token)));
+  return Val_int(ctl(Int_val(epfd), EPOLL_CTL_ADD, Int_val(fd), Long_val(token)));
 }
 
 value weft_epoll_del(value epfd, value fd) {
@@ -93,7 +93,8 @@ value weft_epoll_del(value epfd, value fd) {
 
 #define MAX_EVENTS 256
 
-/* [weft_epoll_wait epfd sleep] gives an array of (token, read, write). With
+/* [weft_epoll_wait epfd sleep] gives an array of (token, read, write). A
+   token is an OCaml int. With
    [sleep], it waits with no timeout and releases the runtime lock. */
 value weft_epoll_wait(value epfd, value sleep) {
   CAMLparam2(epfd, sleep);
@@ -112,7 +113,7 @@ value weft_epoll_wait(value epfd, value sleep) {
   for (int i = 0; i < n; i++) {
     uint32_t e = evs[i].events;
     item = caml_alloc_tuple(3);
-    Store_field(item, 0, caml_copy_int64((int64_t)evs[i].data.u64));
+    Store_field(item, 0, Val_long((intnat)evs[i].data.u64));
     Store_field(item, 1, Val_bool(e & (EPOLLIN | EPOLLRDHUP | EPOLLHUP | EPOLLERR)));
     Store_field(item, 2, Val_bool(e & (EPOLLOUT | EPOLLHUP | EPOLLERR)));
     Store_field(result, i, item);
@@ -135,6 +136,7 @@ static int make_addr(int kind, value host, int port, struct sockaddr_storage *sa
     *len = sizeof *un;
     return AF_UNIX;
   }
+  if (port < 0 || port > 65535) return -EINVAL;
   if (strcmp(h, "localhost") == 0) h = "127.0.0.1";
   struct sockaddr_in *in4 = (struct sockaddr_in *)sa;
   if (inet_pton(AF_INET, h, &in4->sin_addr) == 1) {
@@ -213,7 +215,8 @@ value weft_connect_result(value fd) {
   return Val_int(errno == ENOTCONN ? -EAGAIN : ERR);
 }
 
-/* [weft_accept fd] gives (fd or -errno, host, port). */
+/* [weft_accept fd] gives (fd or -errno, host, port, unix). [unix] tells that
+   the peer is a Unix socket. */
 value weft_accept(value lfd) {
   CAMLparam1(lfd);
   CAMLlocal2(result, host);
@@ -232,10 +235,11 @@ value weft_accept(value lfd) {
     port = ntohs(((struct sockaddr_in6 *)&sa)->sin6_port);
   }
   host = caml_copy_string(buf);
-  result = caml_alloc_tuple(3);
+  result = caml_alloc_tuple(4);
   Store_field(result, 0, Val_int(fd));
   Store_field(result, 1, host);
   Store_field(result, 2, Val_int(port));
+  Store_field(result, 3, Val_bool(fd >= 0 && sa.ss_family == AF_UNIX));
   CAMLreturn(result);
 }
 

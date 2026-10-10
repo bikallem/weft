@@ -51,7 +51,6 @@
               ocamlPackages.ocaml
               ocamlPackages.dune_3
               ocamlPackages.findlib
-              ocamlPackages.ocaml-lsp
               pkgs.ocamlformat_0_29_0
               # The TLA+ tools (tlc, tla2sany, pcal) for the specs in spec/tla.
               pkgs.tlaplus

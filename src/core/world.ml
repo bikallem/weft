@@ -8,7 +8,7 @@ module Ready = struct
   type t =
     | Alarm
     | Woken
-    | Fd of {token: int64; read: bool; write: bool}
+    | Fd of {token: int; read: bool; write: bool}
     | External of int
 end
 

@@ -123,9 +123,54 @@ let invalid_address () =
       | exception Net.Error (Net.Other _, "Net.connect") ->
           () )
 
+(* C3: a Register that fails gives its error to the waiter. Two records for one
+   fd make the second EPOLL_CTL_ADD fail with EEXIST. *)
+let register_failure () =
+  Weft_linux.run (fun () ->
+      let l : Private.Net.t = Net.listen (Net.Tcp ("127.0.0.1", 0)) in
+      ignore (sync (choose [Net.readable l; Time.after Mono (Span.ms 1)])) ;
+      let clone = Private.Sched.Fdtab.alloc l.Private.Sched.os in
+      ( match Net.accept clone with
+      | _ ->
+          failwith "no error"
+      | exception Net.Error (Net.Other _, _) ->
+          () ) ;
+      Net.close l )
+
+(* L2: the peer of a Unix socket has a Unix address. *)
+let unix_peer_addr () =
+  let path = Filename.temp_file "weft" ".sock" in
+  Sys.remove path ;
+  Fun.protect
+    ~finally:(fun () -> if Sys.file_exists path then Sys.remove path)
+    (fun () ->
+      Weft_linux.run (fun () ->
+          let l = Net.listen (Net.Unix path) in
+          let c = Net.connect (Net.Unix path) in
+          let s, peer = Net.accept l in
+          is_true (peer = Net.Unix "") ;
+          (* A Unix socket has no port. *)
+          equal int 0 (Weft_linux.local_port l) ;
+          Net.close s ;
+          Net.close c ;
+          Net.close l ) )
+
+(* L3: a port out of range is an error, not a truncated port. *)
+let port_range () =
+  Weft_linux.run (fun () ->
+      match Net.listen (Net.Tcp ("127.0.0.1", 70000)) with
+      | _ ->
+          failwith "no error"
+      | exception Net.Error (Net.Other _, _) ->
+          () )
+
 let linux =
   group "linux"
     [ test "a Unix domain socket echoes" unix_socket
+    ; test ~timeout:5. "C3: a Register that fails raises in the waiter"
+        register_failure
+    ; test "L2: the peer of a Unix socket has a Unix address" unix_peer_addr
+    ; test "L3: a port out of range gives an error" port_range
     ; test "Time.now Posix is the time of the system" posix_time
     ; test "an address that is not an IP address gives an error" invalid_address
     ; test "a 10 ms sleep ends between 10 ms and 12 ms" sleep_10ms

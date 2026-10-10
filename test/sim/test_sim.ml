@@ -476,6 +476,118 @@ let live_timer_count () =
           Fiber.yield () ;
           equal int 1 (Private.Sched_debug.live_timers (Sim.sched sim)) ) )
 
+(* Regression tests of the review of M0. *)
+
+(* C1: with_timeout in a cancelled context raises the Cancelled of that context,
+   not Scope_closed. *)
+let with_timeout_in_cancelled_scope () =
+  run (fun () ->
+      let r = ref "" in
+      Fiber.scope (fun s ->
+          Fiber.cancel s (Boom "x") ;
+          try Fiber.with_timeout Mono (Span.s 1) (fun () -> r := "ran")
+          with Fiber.Cancelled (Boom m) -> r := m ) ;
+      equal string "x" !r )
+
+(* C1: the failure of one member is not Multiple with a Scope_closed of another
+   member that called with_timeout. *)
+let with_timeout_after_failure () =
+  run (fun () ->
+      let c = Chan.create () in
+      raises (Boom "b") (fun () ->
+          Fiber.scope (fun s ->
+              Fiber.fork s (fun () ->
+                  while true do
+                    Fiber.with_timeout Mono (Span.s 1) (fun () ->
+                        ignore (sync (Chan.recv c)) )
+                  done ) ;
+              Fiber.fork s (fun () ->
+                  sync (Chan.send c 1) ;
+                  raise (Boom "b") ) ) ) )
+
+(* T5: an outer cancel at the same time as the deadline gives the Cancelled of
+   the outer scope. *)
+let with_timeout_outer_at_deadline () =
+  run (fun () ->
+      let r = ref "" in
+      Fiber.scope (fun s ->
+          Fiber.fork s (fun () ->
+              try
+                Fiber.with_timeout Mono (Span.s 1) (fun () ->
+                    Time.sleep Mono (Span.s 10) )
+              with
+              | Fiber.Timeout ->
+                  r := "timeout"
+              | Fiber.Cancelled (Boom m) ->
+                  r := m ) ;
+          Time.sleep Mono (Span.s 1) ;
+          Fiber.cancel s (Boom "outer") ) ;
+      equal string "outer" !r )
+
+(* C2: a daemon removes its node when it ends. *)
+let daemon_nodes_removed () =
+  run (fun () ->
+      Fiber.scope (fun s ->
+          for _ = 1 to 100 do
+            Fiber.fork_daemon s ignore
+          done ;
+          Fiber.yield () ;
+          let ctx = Private.scope_ctx s in
+          equal int 0 (Hashtbl.length ctx.Private.Sched.children) ;
+          match ctx.Private.Sched.kind with
+          | Private.Sched.Scope_node st ->
+              equal int 0 (Hashtbl.length st.Private.Sched.daemons)
+          | _ ->
+              failwith "not a scope" ) )
+
+let yield_in_cancelled_scope () =
+  run (fun () ->
+      let r = ref "" in
+      Fiber.scope (fun s ->
+          Fiber.cancel s (Boom "y") ;
+          try Fiber.yield () with Fiber.Cancelled (Boom m) -> r := m ) ;
+      equal string "y" !r )
+
+(* T6: a fill outside a fiber raises Not_in_fiber and changes nothing. *)
+let fill_outside_fiber () =
+  let iv = Ivar.create () in
+  raises_match
+    (function Fiber.Not_in_fiber _ -> true | _ -> false)
+    (fun () -> Ivar.fill iv 1) ;
+  equal (option int) None (Ivar.peek iv)
+
+(* K4: the waiters of an Ivar stay bounded in a loop with a timeout. *)
+let ivar_waiters_bounded () =
+  run (fun () ->
+      let iv : int Ivar.t = Ivar.create () in
+      for _ = 1 to 100 do
+        ignore
+          (sync
+             (choose
+                [ wrap (Ivar.read iv) Option.some
+                ; wrap (Time.after Mono (Span.ms 1)) (fun () -> None) ] ) )
+      done ;
+      match Private.ivar_state iv with
+      | Private.Sched.Empty w ->
+          less int ~than:16 (List.length w.Private.Sched.ws)
+      | Private.Sched.Full _ ->
+          failwith "full" )
+
+let reviews =
+  group "review of M0"
+    [ test "C1: with_timeout in a cancelled scope gives its Cancelled"
+        with_timeout_in_cancelled_scope
+    ; test "C1: with_timeout after a failure does not add Scope_closed"
+        with_timeout_after_failure
+    ; test "T5: an outer cancel at the deadline is not a Timeout"
+        with_timeout_outer_at_deadline
+    ; test "C2: a daemon removes its node when it ends" daemon_nodes_removed
+    ; test "a yield in a cancelled scope raises Cancelled"
+        yield_in_cancelled_scope
+    ; test "T6: a fill outside a fiber raises Not_in_fiber and fills nothing"
+        fill_outside_fiber
+    ; test "K4: the waiters of an Ivar stay bounded" ivar_waiters_bounded ]
+
 let scopes =
   group "scopes"
     [ test "an error in a child cancels the body" child_error_cancels_body
@@ -538,8 +650,8 @@ let planted_lost_wakeup () =
             (* Commit the parked sync of the victim, but do not put it in a
                queue: a lost wakeup. *)
             List.iter
-              (fun (name, word) ->
-                if name = "victim" then ignore (Private.Sched.C.notify word 0) )
+              (fun (name, (s : Private.Sched.sync)) ->
+                if name = "victim" then ignore (Private.Sched.C.notify s.word 0) )
               (Private.Sched_debug.parked (Sim.sched sim)) ;
             Time.sleep Mono (Span.s 1) ) )
   with
@@ -622,8 +734,10 @@ let timers =
 let live_offers c =
   let module C = Private.Chan in
   let live o = not (Private.Sched.is_done o) in
-  List.length (List.filter (fun o -> live o.C.ssync) c.C.senders)
-  + List.length (List.filter (fun o -> live o.C.rsync) c.C.receivers)
+  let count side =
+    List.length (List.filter (fun o -> live o.C.osync) (C.offers side))
+  in
+  count c.C.senders + count c.C.receivers
 
 let send_recv_meet () =
   run (fun () ->
@@ -734,7 +848,9 @@ let timeout_loop_bounded () =
                 ; wrap (Time.after Mono (Span.ms 1)) (fun () -> None) ] ) )
       done ;
       let module C = Private.Chan in
-      at_most int ~than:1 (List.length c.C.receivers) )
+      (* The stale offers are dropped when the side doubles its size, from at
+         least 8 offers. *)
+      less int ~than:8 (List.length (C.offers c.C.receivers)) )
 
 (* Each sent value arrives exactly one time. *)
 let values_conserved (seed, n) =
@@ -832,6 +948,6 @@ let portable_world =
 let () =
   exit
     (Windtrap.run "sim"
-       ( [time; timers; events; chans; scopes; checks; properties]
+       ( [time; timers; events; chans; scopes; reviews; checks; properties]
        @ Test_net.tests
        @ Portable.tests portable_world ) )

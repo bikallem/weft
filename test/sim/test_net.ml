@@ -474,10 +474,10 @@ let planted_fd_lost_wakeup () =
             Time.sleep Mono (Span.ms 1) ;
             let sched = Sim.sched sim in
             let victim =
-              List.assoc "victim" (Private.Sched_debug.parked_syncs sched)
+              List.assoc "victim" (Private.Sched_debug.parked sched)
             in
             let reg = Hashtbl.find sched.doms.(0).regs l.slot in
-            reg.rwait <- (victim, 0) :: reg.rwait ;
+            reg.rwait <- Private.Sched.Waiters.add victim 0 reg.rwait ;
             reg.rflag <- false ;
             Time.sleep Mono (Span.s 1) ) )
   with
@@ -488,6 +488,29 @@ let planted_fd_lost_wakeup () =
         (List.exists
            (fun p -> String.starts_with ~prefix:"victim waits to read fd" p)
            problems )
+
+(* L5: a cancel of advance_until ends the advance. *)
+let advance_cancelled () =
+  Sim.run ~auto:false (fun sim ->
+      let t0 = Time.now Mono in
+      let at n = Option.get (Time.add Mono t0 (Span.s n)) in
+      Fiber.scope (fun s ->
+          Fiber.fork s (fun () -> Sim.advance_until sim (at 5)) ;
+          Fiber.yield () ;
+          Fiber.cancel s Exit ) ;
+      Sim.advance_until sim (at 1) ;
+      equal int 1000 (ms_since t0) )
+
+(* L6: the connections in flight count against the backlog. *)
+let backlog_counts_in_flight () =
+  Sim.run (fun sim ->
+      Sim.set_latency sim (Span.ms 5) ;
+      let a = Sim.addr sim "server:22" in
+      let _l = Net.listen ~backlog:1 a in
+      Fiber.scope (fun s ->
+          Fiber.fork s (fun () -> ignore (Net.connect a)) ;
+          Fiber.yield () ;
+          equal string "ECONNREFUSED" (error_of (fun () -> Net.connect a)) ) )
 
 let tests =
   [ group "net"
@@ -529,5 +552,8 @@ let tests =
       ; test "a read that never ends gives Deadlock" read_deadlock
       ; test "close(2) before Deregister gives Model_error"
           close_before_deregister
+      ; test "L5: a cancel ends advance_until" advance_cancelled
+      ; test "L6: the connections in flight count against the backlog"
+          backlog_counts_in_flight
       ; test "a planted lost wakeup on an fd gives Lost_wakeup"
           planted_fd_lost_wakeup ] ]

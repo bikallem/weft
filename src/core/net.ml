@@ -55,11 +55,16 @@ let attempt fd name op =
   | exception e ->
       release fd ; raise e
 
-let await ~write fd =
-  Event.sync
-    (Event.Base
-       (fun () -> {Event.leaf= fd_leaf ~write ~clear:true fd; result= ignore})
-    )
+(* The event of a wait for an fd. If the Register of the fd fails, the event
+   raises the error. *)
+let fd_event ~write ~clear fd =
+  Event.Base
+    (fun () ->
+      let err = ref None in
+      { Event.leaf= fd_leaf ~write ~clear ~err fd
+      ; result=
+          (fun () ->
+            match !err with Some e -> raise (Error (e, "Net")) | None -> () ) } )
 
 (* Try until the operation does not give [EAGAIN]. *)
 let rec retry ~write fd name op =
@@ -67,39 +72,39 @@ let rec retry ~write fd name op =
   | Ok v ->
       v
   | Error Op.Would_block ->
-      await ~write fd ; retry ~write fd name op
+      Event.sync (fd_event ~write ~clear:true fd) ;
+      retry ~write fd name op
   | Error e ->
       raise (Error (e, name))
 
-let readable fd =
-  Event.Base
-    (fun () ->
-      {Event.leaf= fd_leaf ~write:false ~clear:false fd; result= ignore} )
+(* A ready event after a close: the next operation gives [EBADF]. *)
+let readable fd = fd_event ~write:false ~clear:false fd
 
-let writable fd =
-  Event.Base
-    (fun () -> {Event.leaf= fd_leaf ~write:true ~clear:false fd; result= ignore})
+let writable fd = fd_event ~write:true ~clear:false fd
 
 let ok name = function Ok v -> v | Error e -> raise (Error (e, name))
 
 (* [close] holds a user while it removes the registration, so close(2) comes
    after the Deregister (design section 2.7). A second [close] does nothing. *)
 let close fd =
+  (* [Self] first: outside a fiber, [close] raises [Not_in_fiber] before it
+     changes the state. *)
+  ignore (self ()) ;
   match acquire fd "Net.close" with
   | exception Error _ ->
       ()
   | () ->
+      (* If another close came first, this one only releases its user. *)
       let rec closing () =
         match Atomic.get fd.rc with
         | Open n as old ->
-            if not (Atomic.compare_and_set fd.rc old (Closing n)) then
-              closing ()
+            Atomic.compare_and_set fd.rc old (Closing n) || closing ()
         | Closing _ | Closed ->
-            assert false
+            false
       in
-      closing () ;
+      let first = closing () in
       (* Milestone M0 has one domain, so the registration is on this domain. *)
-      prog "Net.close" (Close_regs fd) ;
+      if first then prog "Net.close" (Close_regs fd) ;
       release fd
 
 let listen ?(backlog = 128) addr =

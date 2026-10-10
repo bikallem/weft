@@ -19,8 +19,6 @@ val run : ?seed:int -> ?auto:bool -> (t -> 'a) -> 'a
       if the program breaks the order of the OS, for example a close(2) before a
       Deregister. *)
 
-val seed : t -> int
-
 val settle : t -> unit
 (** [settle t] waits until the program is quiescent. *)
 

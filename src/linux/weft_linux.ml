@@ -16,11 +16,11 @@ external drain : int -> int = "weft_drain"
 
 external eventfd_signal : int -> int = "weft_eventfd_signal"
 
-external epoll_add : int -> int -> int64 -> int = "weft_epoll_add"
+external epoll_add : int -> int -> int -> int = "weft_epoll_add"
 
 external epoll_del : int -> int -> int = "weft_epoll_del"
 
-external epoll_wait : int -> bool -> (int64 * bool * bool) array
+external epoll_wait : int -> bool -> (int * bool * bool) array
   = "weft_epoll_wait"
 
 external listen : int -> string -> int -> int -> int = "weft_listen"
@@ -31,7 +31,7 @@ external connect : int -> string -> int -> int = "weft_connect"
 
 external connect_result : int -> int = "weft_connect_result"
 
-external accept : int -> int * string * int = "weft_accept"
+external accept : int -> int * string * int * bool = "weft_accept"
 
 external recv : int -> bytes -> int -> int -> int = "weft_recv"
 
@@ -69,9 +69,9 @@ let unit r = Result.map ignore (result r)
 
 (* The tokens of the alarm and of the wake fd. A slot of an fd is never so
    large. *)
-let timer_token = -1L
+let timer_token = -1
 
-let wake_token = -2L
+let wake_token = -2
 
 type dom =
   { epfd: int
@@ -93,7 +93,7 @@ let make_dom () =
 
 let create () =
   let seed = Bytes.create 8 in
-  ignore (getrandom seed) ;
+  ignore (check "getrandom" (getrandom seed)) ;
   { doms= [|make_dom ()|]
   ; rng= Random.State.make [|Int64.to_int (Bytes.get_int64_le seed 0)|] }
 
@@ -125,11 +125,17 @@ module World = struct
         let kind, h, p = host_port addr in
         result (listen kind h p backlog)
     | Op.Accept fd ->
-        let r, host, port = accept fd in
-        Result.map (fun fd -> (fd, Op.Tcp (host, port))) (result r)
+        let r, host, port, unix = accept fd in
+        Result.map
+          (fun fd -> (fd, if unix then Op.Unix "" else Op.Tcp (host, port)))
+          (result r)
     | Op.Connect addr ->
         let kind, h, p = host_port addr in
-        result (connect kind h p)
+        let r = connect kind h p in
+        (* A Unix socket gives EAGAIN when the backlog of the listener is full.
+           This is not a connect that continues. *)
+        if r = -eagain then Error (Op.Other "EAGAIN: the backlog is full")
+        else result r
     | Op.Connect_result fd ->
         unit (connect_result fd)
     | Op.Read (fd, buf, off, len) ->
@@ -164,12 +170,12 @@ module World = struct
     let events = epoll_wait d.epfd (w.timeout = World.Wait.Sleep) in
     Array.to_list events
     |> List.map (fun (token, read, write) ->
-        if Int64.equal token timer_token then (
+        if token = timer_token then (
           ignore (drain d.tfd) ;
           (* A timerfd that fired is not armed. *)
           d.armed <- 0L ;
           World.Ready.Alarm )
-        else if Int64.equal token wake_token then (
+        else if token = wake_token then (
           ignore (drain d.evfd) ;
           World.Ready.Woken )
         else World.Ready.Fd {token; read; write} )
@@ -187,4 +193,9 @@ let run ?slack main =
     ~finally:(fun () -> close t)
     (fun () -> Weft.run ?slack (module World) t main)
 
-let local_port (fd : Weft.Net.t) = local_port_of fd.Sched.os
+let local_port (fd : Weft.Net.t) =
+  Net.acquire fd "Weft_linux.local_port" ;
+  let p = local_port_of fd.Sched.os in
+  Net.release fd ;
+  if p < 0 then raise (Net.Error (error_of (-p), "Weft_linux.local_port")) ;
+  p

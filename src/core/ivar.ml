@@ -4,12 +4,11 @@ type 'a t = 'a Sched.ivar
 
 let create () = Sched.Iv.make ()
 
+(* [Self] first: outside a fiber, the fill raises [Not_in_fiber] before it
+   commits waiters that nobody would then resume. *)
 let try_fill t v =
-  match Sched.Iv.fill t v with
-  | None ->
-      false
-  | Some resumed ->
-      Sched.enqueue resumed ; true
+  ignore (Sched.self ()) ;
+  Sched.fill_resume t v
 
 let fill t v =
   if not (try_fill t v) then invalid_arg "Ivar.fill: the Ivar is full"

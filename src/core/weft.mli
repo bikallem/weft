@@ -148,20 +148,30 @@ val run :
 (** The parts inside the library. They are for the tests and for the worlds of
     the library, not for programs. They can change in each version. *)
 module Private : sig
+  val run_world :
+       ?slack:Span.t
+    -> ?on_create:(Sched.t -> unit)
+    -> (module WORLD with type t = 'w)
+    -> 'w
+    -> (unit -> 'a)
+    -> 'a
+  (** [run] with a function that gets the scheduler when it starts. The
+      simulator uses it. *)
+
+  val scope_ctx : Fiber.scope -> Sched.ctx
+  (** The node of a scope, for the tests. *)
+
+  val ivar_state : 'a Ivar.t -> 'a Sched.ivar_state
+  (** The state of an Ivar, for the tests. *)
+
   module Commit = Commit
   module World = World
   module Op = Op
   module Sched = Sched
   module Sched_debug = Sched_debug
   module Event = Event
-
-  module Net : module type of struct
-    include Net
-  end
-
-  module Chan : module type of struct
-    include Chan
-  end
+  module Net = Net
+  module Chan = Chan
 end
 
 module Chan : sig
@@ -226,6 +236,9 @@ module Net : sig
       blocks, so a cancelled fiber can call it. *)
 
   val readable : t -> unit event
+  (** Ready when the socket can be read. It is also ready after a [close]: the
+      next operation then raises [Error (Bad_fd, _)]. *)
 
   val writable : t -> unit event
+  (** As [readable], for a write. *)
 end

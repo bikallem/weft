@@ -55,16 +55,18 @@ and sync =
   ; owner: fiber
   ; sctx: ctx  (** The innermost context when the sync started. *)
   ; cancellable: bool
-  ; mutable k: (int, step) Effect.Deep.continuation option
-  ; mutable requeue: bool  (** A yield: the fiber goes to the tail. *) }
+  ; mutable k: (int, step) Effect.Deep.continuation option }
 
 and ctx =
-  { kind: kind
+  { nid: int
+  ; kind: kind
   ; parent: ctx option
   ; flag: exn option Atomic.t  (** The cancel of this node. *)
   ; lock: Spin.t
-  ; mutable members: fiber list  (** The newest first. *)
-  ; mutable children: ctx list  (** The nested nodes, the newest first. *) }
+  ; members: (int, fiber) Hashtbl.t  (** By fiber id, under [lock]. *)
+  ; children: (int, ctx) Hashtbl.t
+        (** The nested nodes that are not shields, by node id, under [lock]. *)
+  }
 
 and kind = Scope_node of scope_state | Shield_node | Daemon_node
 
@@ -75,11 +77,17 @@ and scope_state =
   ; failures: (exn * Printexc.raw_backtrace) list Atomic.t
         (** The newest first. *)
   ; join: unit ivar
-  ; mutable daemons: ctx list  (** Under the lock of the scope node. *) }
+  ; daemons: (int, ctx) Hashtbl.t  (** Under the lock of the scope node. *) }
 
 and 'a ivar = 'a ivar_state Atomic.t
 
-and 'a ivar_state = Empty of (sync * int) list | Full of 'a
+and 'a ivar_state = Empty of waiters | Full of 'a
+
+(* A list of waiters, the newest first. It drops the waiters whose sync is Done
+   only when it has grown to twice its size after the last drop. Thus an add
+   costs O(1) on average, and the list holds at most twice its live waiters
+   (design section 2.7, The waiters). *)
+and waiters = {ws: (sync * int) list; len: int; drop_at: int}
 
 (* The record of one open fd (design section 2.7, close). All domains share
    it. *)
@@ -90,7 +98,8 @@ and fdrec =
   ; rc: rc Atomic.t
   ; doms: int Atomic.t
         (** The bit of each domain with a registration. Only the owner of a bit
-            changes it. *) }
+            changes it, with [fetch_and_add], because the bits of all domains
+            share the word. *) }
 
 (* The state machine of Eio's [Rcfd]. *)
 and rc = Open of int | Closing of int | Closed
@@ -101,8 +110,8 @@ and reg =
   { fdr: fdrec
   ; mutable rflag: bool
   ; mutable wflag: bool
-  ; mutable rwait: (sync * int) list
-  ; mutable wwait: (sync * int) list }
+  ; mutable rwait: waiters
+  ; mutable wwait: waiters }
 
 and step =
   | Finished
@@ -110,6 +119,7 @@ and step =
 
 and _ req =
   | Sync : sync_req -> int req
+  | Yield : bool req  (** Gives [true] if the context is cancelled. *)
   | Fork : fiber * (unit -> unit) -> unit req
   | Self : fiber req
   | Enqueue : sync list -> unit req
@@ -117,9 +127,10 @@ and _ req =
 
 and sync_req = {leaves: leaf array; nocancel: bool}
 
-(** The part of a base event that the scheduler runs in the scan. It commits the
-    branch if it is ready, or it registers an offer. *)
-and leaf = {attempt: dom -> sync -> int -> unit}
+(** The part of a base event that the scheduler runs in the scan, with the
+    branch index. It commits the branch if it is ready, or it registers an
+    offer. *)
+and leaf = dom -> sync -> int -> unit
 
 and dom =
   { index: int
@@ -155,6 +166,25 @@ type _ Effect.t += Prog : 'a req -> 'a Effect.t
 let prog name r = World.perform name (Prog r)
 
 let is_done s = match C.state s.word with C.Done _ -> true | _ -> false
+
+module Waiters = struct
+  let empty = {ws= []; len= 0; drop_at= 8}
+
+  let add s i w =
+    let w = {w with ws= (s, i) :: w.ws; len= w.len + 1} in
+    if
+      ( w.len < w.drop_at )
+      [@mutate
+        off "one more waiter before a drop: only the time of the drop changes"]
+    then w
+    else
+      let ws = List.filter (fun (s, _) -> not (is_done s)) w.ws in
+      let len = List.length ws in
+      {ws; len; drop_at= Int.max 8 (2 * len)}
+
+  (* The waiters, the oldest first. *)
+  let to_list w = List.rev w.ws
+end
 
 (* The deadline heap. The order is the deadline, then the order of the adds, so
    the result does not depend on the heap layout. *)
@@ -193,7 +223,17 @@ module Heap = struct
       then l
       else i
     in
-    let m = if r < h.size && lt h.entries.(r) h.entries.(m) then r else m in
+    let m =
+      if
+        ( r < h.size )
+        [@mutate
+          off
+            "at r = size, the slot holds the element that moves down, or an \
+             entry that the rebuild compacted past the size"]
+        && lt h.entries.(r) h.entries.(m)
+      then r
+      else m
+    in
     if m <> i then (swap h i m ; down h m)
 
   let top h = if h.size = 0 then None else Some h.entries.(0)
@@ -204,16 +244,17 @@ module Heap = struct
       h.entries.(0) <- h.entries.(h.size) ;
       down h 0 )
 
-  (* Remove the stale entries: their sync committed to another branch. *)
+  (* Remove the stale entries in place: their sync committed to another
+     branch. *)
   let rebuild h =
-    let live =
-      Array.of_list
-        (List.filter
-           (fun e -> not (is_done e.esync))
-           (Array.to_list (Array.sub h.entries 0 h.size)) )
-    in
-    h.entries <- live ;
-    h.size <- Array.length live ;
+    let n = ref 0 in
+    for i = 0 to h.size - 1 do
+      let e = h.entries.(i) in
+      if not (is_done e.esync) then (
+        h.entries.(!n) <- e ;
+        incr n )
+    done ;
+    h.size <- !n ;
     for
       i = ((h.size / 2) - 1) [@mutate off "down does nothing on a leaf"]
       downto 0
@@ -221,19 +262,6 @@ module Heap = struct
       down h i
     done ;
     h.rebuild_at <- Int.max 64 (2 * h.size)
-
-  let push h ~deadline esync branch =
-    let e = {deadline; seq= h.next_seq; esync; branch} in
-    h.next_seq <- h.next_seq + 1 ;
-    if (h.size >= h.rebuild_at) [@mutate off "one more entry before a rebuild"]
-    then rebuild h ;
-    if h.size = Array.length h.entries then (
-      let a = Array.make (Int.max 16 (2 * h.size)) e in
-      Array.blit h.entries 0 a 0 h.size ;
-      h.entries <- a ) ;
-    h.entries.(h.size) <- e ;
-    h.size <- h.size + 1 ;
-    up h (h.size - 1)
 
   let drop_stale h =
     let rec loop () =
@@ -244,21 +272,37 @@ module Heap = struct
           ()
     in
     loop ()
+
+  (* An add drops the stale entries at the head, and rebuilds the heap when it
+     has grown to twice its size after the last rebuild (design section 2.5,
+     Timers and domains). *)
+  let push h ~deadline esync branch =
+    let e = {deadline; seq= h.next_seq; esync; branch} in
+    h.next_seq <- h.next_seq + 1 ;
+    drop_stale h ;
+    if (h.size >= h.rebuild_at) [@mutate off "one more entry before a rebuild"]
+    then rebuild h ;
+    if h.size = Array.length h.entries then (
+      let a = Array.make (Int.max 16 (2 * h.size)) e in
+      Array.blit h.entries 0 a 0 h.size ;
+      h.entries <- a ) ;
+    h.entries.(h.size) <- e ;
+    h.size <- h.size + 1 ;
+    up h (h.size - 1)
 end
 
 (* The atomic register of an Ivar (design section 2.4, spec/tla/Ivar.tla). *)
 module Iv = struct
-  let make () : 'a ivar = Atomic.make (Empty [])
+  let make () : 'a ivar = Atomic.make (Empty Waiters.empty)
 
-  (* The scan of a reader: a poll, then a register with a CAS on Empty. A
-     register also drops the waiters whose sync is Done. *)
+  (* The scan of a reader: a poll, then a register with a CAS on Empty. *)
   let rec register (iv : 'a ivar) s i =
     match Atomic.get iv with
     | Full _ ->
         ignore (C.self_commit s.word i)
-    | Empty ws as old ->
-        let ws' = (s, i) :: List.filter (fun (w, _) -> not (is_done w)) ws in
-        if not (Atomic.compare_and_set iv old (Empty ws')) then register iv s i
+    | Empty w as old ->
+        if not (Atomic.compare_and_set iv old (Empty (Waiters.add s i w))) then
+          register iv s i
 
   (* [fill iv v] gives [Some resumed] with the syncs to resume, or [None] if the
      Ivar is full. *)
@@ -266,13 +310,13 @@ module Iv = struct
     match Atomic.get iv with
     | Full _ ->
         None
-    | Empty ws as old ->
+    | Empty w as old ->
         if Atomic.compare_and_set iv old (Full v) then
           Some
             (List.filter_map
                (fun (s, i) ->
                  match C.notify s.word i with C.Resume -> Some s | _ -> None )
-               (List.rev ws) )
+               (Waiters.to_list w) )
         else fill iv v
 
   let get (iv : 'a ivar) =
@@ -282,7 +326,7 @@ module Iv = struct
     | Empty _ ->
         invalid_arg "Ivar: the value is not set"
 
-  let leaf iv = {attempt= (fun _ s i -> register iv s i)}
+  let leaf iv : leaf = fun _ s i -> register iv s i
 end
 
 (* The table of fd slots. A slot is used again with a new generation, so a token
@@ -321,12 +365,10 @@ module Fdtab = struct
 
   let release r = Spin.with_lock lock (fun () -> free := r.slot :: !free)
 
-  let token r =
-    Int64.logor (Int64.shift_left (Int64.of_int r.slot) 32) (Int64.of_int r.gen)
+  (* The slot and the generation in one [int]. A slot is less than 2^30. *)
+  let token r = (r.slot lsl 32) lor r.gen
 
-  let of_token t =
-    ( Int64.to_int (Int64.shift_right_logical t 32)
-    , Int64.to_int (Int64.logand t 0xffff_ffffL) )
+  let of_token t = (t lsr 32, t land 0xffff_ffff)
 end
 
 (* The fibers. *)
@@ -377,57 +419,59 @@ let resume dom s =
       Atomic.set s.owner.current None ;
       Effect.Deep.continue k i )
 
-(* Commit each waiter. *)
+(* Commit each waiter, the oldest first. *)
 let wake_all dom waiters =
   List.iter
     (fun (s, i) ->
       match C.notify s.word i with C.Resume -> resume dom s | _ -> () )
-    (List.rev waiters)
-
-(* Add a waiter, and drop the waiters whose sync is Done (design section 2.7,
-   The waiters). *)
-let add_waiter s i l = (s, i) :: List.filter (fun (w, _) -> not (is_done w)) l
+    (Waiters.to_list waiters)
 
 (* The registration of [fdr] on [dom]. The first block on a domain adds the fd
-   to its poller. [None] tells that the fd is closing: the waiter retries and
-   gets [EBADF]. *)
+   to its poller. *)
 let ensure_reg dom fdr =
   match Hashtbl.find_opt dom.regs fdr.slot with
   | Some reg when reg.fdr == fdr ->
-      Some reg
+      Ok reg
   | _ -> (
     match Atomic.get fdr.rc with
     | Closing _ | Closed ->
-        None
+        (* The waiter retries, and the retry gets [EBADF]. *)
+        Error None
     | Open _ -> (
         let token = Fdtab.token fdr in
         match
           World.perform "Net"
             (World.Submit (Op.Register (dom.index, fdr.os, token)))
         with
-        | Error _ ->
-            None
+        | Error e ->
+            Error (Some e)
         | Ok () ->
-            let reg = {fdr; rflag= false; wflag= false; rwait= []; wwait= []} in
+            let reg =
+              { fdr
+              ; rflag= false
+              ; wflag= false
+              ; rwait= Waiters.empty
+              ; wwait= Waiters.empty }
+            in
             Hashtbl.replace dom.regs fdr.slot reg ;
-            Atomic.set fdr.doms (Atomic.get fdr.doms lor (1 lsl dom.index)) ;
-            Some reg ) )
+            ignore (Atomic.fetch_and_add fdr.doms (1 lsl dom.index)) ;
+            Ok reg ) )
 
 (* The wait for an fd. With [~clear], the fiber got [EAGAIN], so the flag of
-   this domain is stale. *)
-let fd_leaf ~write ~clear fdr =
-  { attempt=
-      (fun dom s i ->
-        match ensure_reg dom fdr with
-        | None ->
-            ignore (C.self_commit s.word i)
-        | Some reg ->
-            if clear then
-              if write then reg.wflag <- false else reg.rflag <- false ;
-            if if write then reg.wflag else reg.rflag then
-              ignore (C.self_commit s.word i)
-            else if write then reg.wwait <- add_waiter s i reg.wwait
-            else reg.rwait <- add_waiter s i reg.rwait ) }
+   this domain is stale. If the Register fails, [err] gets the error, and the
+   branch commits, so that the fiber raises it. *)
+let fd_leaf ~write ~clear ~err fdr : leaf =
+ fun dom s i ->
+  match ensure_reg dom fdr with
+  | Error e ->
+      err := e ;
+      ignore (C.self_commit s.word i)
+  | Ok reg ->
+      if clear then if write then reg.wflag <- false else reg.rflag <- false ;
+      if if write then reg.wflag else reg.rflag then
+        ignore (C.self_commit s.word i)
+      else if write then reg.wwait <- Waiters.add s i reg.wwait
+      else reg.rwait <- Waiters.add s i reg.rwait
 
 (* The close of [fdr] on [dom]: remove the registration, commit its waiters, and
    remove the fd from the poller. *)
@@ -435,7 +479,7 @@ let close_reg dom fdr =
   match Hashtbl.find_opt dom.regs fdr.slot with
   | Some reg when reg.fdr == fdr ->
       Hashtbl.remove dom.regs fdr.slot ;
-      Atomic.set fdr.doms (Atomic.get fdr.doms land lnot (1 lsl dom.index)) ;
+      ignore (Atomic.fetch_and_add fdr.doms (-(1 lsl dom.index))) ;
       wake_all dom reg.rwait ;
       wake_all dom reg.wwait ;
       ignore
@@ -444,8 +488,8 @@ let close_reg dom fdr =
   | _ ->
       ()
 
-let external_leaf id =
-  {attempt= (fun dom s i -> Hashtbl.replace dom.externals id (s, i))}
+let external_leaf id : leaf =
+ fun dom s i -> Hashtbl.replace dom.externals id (s, i)
 
 let on_ready dom = function
   | World.Ready.Fd {token; read; write} -> (
@@ -455,20 +499,20 @@ let on_ready dom = function
           if read then (
             reg.rflag <- true ;
             let w = reg.rwait in
-            reg.rwait <- [] ;
+            reg.rwait <- Waiters.empty ;
             wake_all dom w ) ;
           if write then (
             reg.wflag <- true ;
             let w = reg.wwait in
-            reg.wwait <- [] ;
+            reg.wwait <- Waiters.empty ;
             wake_all dom w )
       | _ ->
           () )
   | World.Ready.External id -> (
     match Hashtbl.find_opt dom.externals id with
-    | Some w ->
+    | Some (s, i) -> (
         Hashtbl.remove dom.externals id ;
-        wake_all dom [w]
+        match C.notify s.word i with C.Resume -> resume dom s | _ -> () )
     | None ->
         () )
   | World.Ready.Alarm | World.Ready.Woken ->
@@ -477,13 +521,27 @@ let on_ready dom = function
 (* The cancel contexts (design section 2.5, How a cancel reaches a fiber, and
    spec/tla/Scope.tla). *)
 
+let next_nid = Atomic.make 0
+
 let new_node ?parent kind =
-  { kind
+  { nid= Atomic.fetch_and_add next_nid 1
+  ; kind
   ; parent
   ; flag= Atomic.make None
   ; lock= Spin.make ()
-  ; members= []
-  ; children= [] }
+  ; members= Hashtbl.create ~random:false 4
+  ; children= Hashtbl.create ~random:false 4 }
+
+let add_member_to n f =
+  Spin.with_lock n.lock (fun () -> Hashtbl.replace n.members f.fid f)
+
+let remove_member n f =
+  Spin.with_lock n.lock (fun () -> Hashtbl.remove n.members f.fid)
+
+(* The values of a table, in the order of their ids: the fork order. *)
+let by_id tbl =
+  Hashtbl.fold (fun id v acc -> (id, v) :: acc) tbl []
+  |> List.sort compare |> List.map snd
 
 (* The first cancelled context on the chain from [c], up to a shield. *)
 let rec first_flag c =
@@ -515,7 +573,7 @@ let cancel_node x reason =
   let found = ref [] in
   let rec visit n =
     let members, children =
-      Spin.with_lock n.lock (fun () -> (n.members, n.children))
+      Spin.with_lock n.lock (fun () -> (by_id n.members, by_id n.children))
     in
     List.iter
       (fun f ->
@@ -524,9 +582,9 @@ let cancel_node x reason =
             found := s :: !found
         | None ->
             () )
-      (List.rev members) ;
+      members ;
     (* A shield is never in [children], so the walk does not go into it. *)
-    List.iter visit (List.rev children)
+    List.iter visit children
   in
   visit x ;
   List.filter_map
@@ -538,6 +596,7 @@ let cancel_node x reason =
 
 (* The sync of a fiber, in the scheduler (design section 2.4). *)
 
+(* The order of the scan. It performs no [Random] when [n <= 1]. *)
 let shuffle n =
   let a = Array.init n Fun.id in
   for i = n - 1 downto 1 do
@@ -565,6 +624,12 @@ let rec run_fiber : dom -> fiber -> step -> unit =
   | Suspended (Enqueue l, k) ->
       List.iter (resume dom) l ;
       run_fiber dom fiber (Effect.Deep.continue k ())
+  | Suspended (Yield, k) ->
+      (* The fiber reads the flags of its chain when it runs again, so a yield
+         is a cancellation point. *)
+      push dom fiber (fun () ->
+          Effect.Deep.continue k
+            (Option.is_some (first_flag (List.hd fiber.ctxs))) )
   | Suspended (Sync r, k) ->
       sync dom fiber r k
 
@@ -574,19 +639,17 @@ and sync dom fiber (r : sync_req) (k : (int, step) Effect.Deep.continuation) =
     ; owner= fiber
     ; sctx= List.hd fiber.ctxs
     ; cancellable= not r.nocancel
-    ; k= None
-    ; requeue= false }
+    ; k= None }
   in
   (* Publish the sync, then read the flags (the Dekker pair with the walk). *)
   Atomic.set fiber.current (Some s) ;
-  if s.cancellable && first_flag s.sctx <> None then
+  if s.cancellable && Option.is_some (first_flag s.sctx) then
     ignore (C.self_commit s.word (-1)) ;
   let n = Array.length r.leaves in
-  (* [shuffle] performs no [Random] when [n <= 1]. *)
   let order = shuffle n in
   let rec scan j =
     if j < n && not (is_done s) then (
-      r.leaves.(order.(j)).attempt dom s order.(j) ;
+      r.leaves.(order.(j)) dom s order.(j) ;
       scan (j + 1) )
   in
   scan 0 ;
@@ -597,8 +660,7 @@ and sync dom fiber (r : sync_req) (k : (int, step) Effect.Deep.continuation) =
   | `Done i ->
       s.k <- None ;
       Atomic.set fiber.current None ;
-      if s.requeue then push dom fiber (fun () -> Effect.Deep.continue k i)
-      else run_fiber dom fiber (Effect.Deep.continue k i)
+      run_fiber dom fiber (Effect.Deep.continue k i)
 
 (* The loop of one domain (design section 2.5). *)
 
@@ -627,6 +689,8 @@ let expire dom =
   in
   loop ()
 
+(* The alarm: the earliest live deadline, rounded up to the slack. The rounding
+   saturates at the largest time. *)
 let alarm dom =
   Heap.drop_stale dom.heap ;
   match Heap.top dom.heap with
@@ -634,17 +698,28 @@ let alarm dom =
       None
   | Some e ->
       let slack = dom.sched.slack in
+      let d = e.deadline in
       let d =
-        if Int64.compare slack 0L <= 0 then e.deadline
+        if Int64.compare slack 0L <= 0 then d
         else
-          let r = Int64.rem e.deadline slack in
-          if Int64.equal r 0L then e.deadline
-          else Int64.add e.deadline (Int64.sub slack r)
+          let r = Int64.rem d slack in
+          if Int64.equal r 0L then d
+          else
+            let up = Int64.sub slack r in
+            if
+              ( Int64.compare d (Int64.sub Int64.max_int up)
+              > 0 )
+              [@mutate off "at the limit, the sum is max_int, the same value"]
+            then Int64.max_int
+            else Int64.add d up
       in
       Some (Clock.of_ns Mono d)
 
 let wait dom timeout =
   expire dom ;
+  (* The time can pass after the last poll: if an entry expired, the domain
+     polls instead of a sleep. *)
+  let timeout = if Queue.is_empty dom.queue then timeout else World.Wait.Poll in
   let w = {World.Wait.timeout; deadline= alarm dom} in
   List.iter (on_ready dom) (World.perform "sched" (World.Wait (dom.index, w))) ;
   expire dom
@@ -664,9 +739,9 @@ let rec loop dom =
         World.perform "sched" (World.Switch dom.index) ;
         run_fiber dom r.rfiber (r.run ())
     | None ->
+        (* [wait] polls instead of a sleep if the poll made a fiber ready. *)
         wait dom World.Wait.Poll ;
-        if Queue.is_empty dom.queue && not dom.sched.finished then
-          wait dom World.Wait.Sleep ) ;
+        if not dom.sched.finished then wait dom World.Wait.Sleep ) ;
     loop dom )
 
 (* The scopes (design section 2.5, Fibers, scopes and cancellation). *)
@@ -685,12 +760,20 @@ let self () = prog "Fiber.self" Self
 
 let enqueue = function [] -> () | l -> prog "Fiber" (Enqueue l)
 
+(* Fill an Ivar and resume its waiters. *)
+let fill_resume iv v =
+  match Iv.fill iv v with
+  | None ->
+      false
+  | Some resumed ->
+      enqueue resumed ; true
+
 let state_of node =
   match node.kind with
   | Scope_node st ->
       st
   | Shield_node | Daemon_node ->
-      invalid_arg "not a scope"
+      assert false (* Only a scope node has members that end. *)
 
 (* A failed member stores its exception before it ends, then it cancels the
    scope. A [Cancelled] is not a failure. *)
@@ -708,10 +791,6 @@ let fail node e bt =
       store () ;
       enqueue (cancel_node node e)
 
-let remove_member n f =
-  Spin.with_lock n.lock (fun () ->
-      n.members <- List.filter (fun g -> g != f) n.members )
-
 (* The end of a member: one CAS on the counts. The end of the last member sets
    the closed bit and fills the join. When the last member that is not a daemon
    ends, the scope cancels its daemons. *)
@@ -724,18 +803,17 @@ let member_end node ~daemon =
     if Atomic.compare_and_set st.counts c c' then c' else dec ()
   in
   let c = dec () in
-  if all_count c = 0 then
-    enqueue (Option.value ~default:[] (Iv.fill st.join ()))
+  if all_count c = 0 then ignore (fill_resume st.join ())
   else if (not daemon) && nd_count c = 0 then
-    let ds = Spin.with_lock node.lock (fun () -> st.daemons) in
-    List.iter (fun d -> enqueue (cancel_node d Daemons_end)) (List.rev ds)
+    let ds = Spin.with_lock node.lock (fun () -> by_id st.daemons) in
+    List.iter (fun d -> enqueue (cancel_node d Daemons_end)) ds
 
 (* Add a member with a CAS that succeeds only if the closed bit is clear. A fork
    also reads the flags of the chain (design section 2.5, Fork into a scope that
    ends). *)
 let add_member node ~daemon =
   let st = state_of node in
-  if first_flag node <> None then raise Scope_closed ;
+  if Option.is_some (first_flag node) then raise Scope_closed ;
   let rec inc () =
     let c = Atomic.get st.counts in
     if c land closed_bit <> 0 || (daemon && nd_count c = 0) then
@@ -745,33 +823,48 @@ let add_member node ~daemon =
   in
   inc ()
 
-let fiber_body ~scope ~member_of ~daemon f body () =
-  ( match body () with
+let run_body scope body =
+  match body () with
   | () ->
       ()
   | exception e ->
       let bt = Printexc.get_raw_backtrace () in
-      fail scope e bt ) ;
-  remove_member member_of f ; member_end scope ~daemon
+      fail scope e bt
 
 let fork ?name scope body =
   add_member scope ~daemon:false ;
   let f = new_fiber ?name [scope] in
-  Spin.with_lock scope.lock (fun () -> scope.members <- f :: scope.members) ;
+  add_member_to scope f ;
   prog "Fiber.fork"
-    (Fork (f, fiber_body ~scope ~member_of:scope ~daemon:false f body))
+    (Fork
+       ( f
+       , fun () ->
+           run_body scope body ;
+           remove_member scope f ;
+           member_end scope ~daemon:false ) )
 
+(* A daemon has its own node under the scope. The count and the link of the node
+   are one step under the lock of the scope, so the end of the last member that
+   is not a daemon sees the node (it reads the daemons under the same lock). The
+   daemon removes its node when it ends. *)
 let fork_daemon ?name scope body =
-  add_member scope ~daemon:true ;
+  let st = state_of scope in
   let d = new_node ~parent:scope Daemon_node in
   let f = new_fiber ?name [d] in
-  d.members <- [f] ;
-  let st = state_of scope in
+  Hashtbl.replace d.members f.fid f ;
   Spin.with_lock scope.lock (fun () ->
-      scope.children <- d :: scope.children ;
-      st.daemons <- d :: st.daemons ) ;
+      add_member scope ~daemon:true ;
+      Hashtbl.replace scope.children d.nid d ;
+      Hashtbl.replace st.daemons d.nid d ) ;
   prog "Fiber.fork_daemon"
-    (Fork (f, fiber_body ~scope ~member_of:d ~daemon:true f body))
+    (Fork
+       ( f
+       , fun () ->
+           run_body scope body ;
+           Spin.with_lock scope.lock (fun () ->
+               Hashtbl.remove scope.children d.nid ;
+               Hashtbl.remove st.daemons d.nid ) ;
+           member_end scope ~daemon:true ) )
 
 let sync_req ~nocancel leaves = prog "sync" (Sync {leaves; nocancel})
 
@@ -779,23 +872,23 @@ let new_scope_state () =
   { counts= Atomic.make (all_one + nd_one)
   ; failures= Atomic.make []
   ; join= Iv.make ()
-  ; daemons= [] }
+  ; daemons= Hashtbl.create ~random:false 4 }
 
 let reraise (e, bt) = Printexc.raise_with_backtrace e bt
 
 (* The end of the body of a scope: store a failure, end the body as a member,
-   then join. The join ignores cancels. *)
+   then join. The join ignores cancels. If the body gave a value, the scope
+   gives it, also if the scope was cancelled: [with_timeout] never drops a
+   value. *)
 let finish_scope fiber node result =
   (match result with Error (e, bt) -> fail node e bt | Ok _ -> ()) ;
-  fiber.ctxs <- List.tl fiber.ctxs ;
   remove_member node fiber ;
   member_end node ~daemon:false ;
   let st = state_of node in
   ignore (sync_req ~nocancel:true [|Iv.leaf st.join|]) ;
   ( match node.parent with
   | Some p ->
-      Spin.with_lock p.lock (fun () ->
-          p.children <- List.filter (fun c -> c != node) p.children )
+      Spin.with_lock p.lock (fun () -> Hashtbl.remove p.children node.nid)
   | None ->
       () ) ;
   match List.rev (Atomic.get st.failures) with
@@ -810,9 +903,9 @@ let scope f =
   let fiber = self () in
   let parent = List.hd fiber.ctxs in
   let node = new_node ~parent (Scope_node (new_scope_state ())) in
-  node.members <- [fiber] ;
+  Hashtbl.replace node.members fiber.fid fiber ;
   Spin.with_lock parent.lock (fun () ->
-      parent.children <- node :: parent.children ) ;
+      Hashtbl.replace parent.children node.nid node ) ;
   fiber.ctxs <- node :: fiber.ctxs ;
   let result =
     match f node with
@@ -821,6 +914,7 @@ let scope f =
     | exception e ->
         Error (e, Printexc.get_raw_backtrace ())
   in
+  fiber.ctxs <- List.tl fiber.ctxs ;
   finish_scope fiber node result
 
 let shield f =
@@ -836,8 +930,10 @@ let shield f =
       pop () ;
       Printexc.raise_with_backtrace e bt
 
+(* [Self] first: outside a fiber, the cancel raises [Not_in_fiber] before it
+   changes a word that nobody would then resume. *)
 let cancel scope reason =
-  ignore (state_of scope) ;
+  ignore (self ()) ;
   enqueue (cancel_node scope reason)
 
 (* The reason of the cancel that ended a sync of this fiber. *)
@@ -873,7 +969,7 @@ let run ?(slack = Span.ms 1) ?on_create main =
   Option.iter (fun f -> f t) on_create ;
   let root = new_node (Scope_node (new_scope_state ())) in
   let fiber = new_fiber ~name:"main" [root] in
-  root.members <- [fiber] ;
+  Hashtbl.replace root.members fiber.fid fiber ;
   let result = ref None in
   let body () =
     let r =
@@ -883,7 +979,6 @@ let run ?(slack = Span.ms 1) ?on_create main =
       | exception e ->
           Error (e, Printexc.get_raw_backtrace ())
     in
-    fiber.ctxs <- root :: fiber.ctxs ;
     result :=
       Some
         ( match finish_scope fiber root r with

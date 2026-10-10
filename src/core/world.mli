@@ -18,7 +18,7 @@ module Ready : sig
   type t =
     | Alarm  (** The alarm of the domain went off. *)
     | Woken  (** A [wake] occurred. *)
-    | Fd of {token: int64; read: bool; write: bool}
+    | Fd of {token: int; read: bool; write: bool}
         (** An edge of a registered fd. [token] is the token of [Register]. *)
     | External of int
         (** A completion that the world gives, for example the end of

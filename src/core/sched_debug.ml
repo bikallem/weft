@@ -26,7 +26,7 @@ let parked t =
     (fun f ->
       match Atomic.get f.current with
       | Some s when C.state s.word = C.Parked ->
-          Some (f.name, s.word)
+          Some (f.name, s)
       | _ ->
           None )
     (fibers t)
@@ -84,27 +84,14 @@ let live_timers t =
 (* The live waiters of each registered fd: the fd of the world, and the names of
    the fibers that wait to read and to write. *)
 let fd_waiters t =
+  let names w =
+    List.filter_map
+      (fun (s, _) -> if is_done s then None else Some s.owner.name)
+      (Waiters.to_list w)
+  in
   Array.to_list t.doms
   |> List.concat_map (fun d ->
       Hashtbl.fold
-        (fun _ reg acc ->
-          let names l =
-            List.filter_map
-              (fun (s, _) -> if is_done s then None else Some s.owner.name)
-              l
-          in
-          (reg.fdr.os, names reg.rwait, names reg.wwait) :: acc )
+        (fun _ reg acc -> (reg.fdr.os, names reg.rwait, names reg.wwait) :: acc)
         d.regs [] )
   |> List.sort compare
-
-(* The parked syncs, by the name of the fiber. A test of the checks uses them to
-   plant a lost wakeup. *)
-let parked_syncs t =
-  List.filter_map
-    (fun f ->
-      match Atomic.get f.current with
-      | Some s when C.state s.word = C.Parked ->
-          Some (f.name, s)
-      | _ ->
-          None )
-    (fibers t)

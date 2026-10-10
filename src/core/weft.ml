@@ -27,26 +27,22 @@ module Fiber = struct
   let fork_promise = Promise.fork
 end
 
-module Promise = struct
-  type 'a t = 'a Promise.t
-
-  let await = Promise.await
-
-  let ready = Promise.ready
-end
-
+module Promise = Promise
 module Ivar = Ivar
-module Net_internal = Net
-module Net = Net_internal
-module Chan_internal = Chan
-module Chan = Chan_internal
+module Net = Net
+module Chan = Chan
 
 module type WORLD = World.WORLD
 
-let run (type w) ?slack (module W : WORLD with type t = w) (w : w) main =
+(* The world handler: it gives each world effect to the module of the world
+   (design section 2.3). The simulator uses it too. *)
+let run_world (type w) ?slack ?on_create (module W : WORLD with type t = w)
+    (w : w) main =
   let open Effect.Deep in
+  (* Not [try_with]: it raises the exception again with [raise], and the
+     backtrace of the fiber is lost. *)
   match_with
-    (fun () -> Sched.run ?slack main)
+    (fun () -> Sched.run ?slack ?on_create main)
     ()
     { retc= Fun.id
     ; exnc=
@@ -72,13 +68,21 @@ let run (type w) ?slack (module W : WORLD with type t = w) (w : w) main =
           | _ ->
               None ) }
 
+let run ?slack m w main = run_world ?slack m w main
+
 module Private = struct
+  let run_world = run_world
+
+  let scope_ctx (s : Fiber.scope) : Sched.ctx = s
+
+  let ivar_state (iv : 'a Ivar.t) = Atomic.get iv
+
   module Commit = Commit
   module World = World
   module Op = Op
   module Sched = Sched
   module Sched_debug = Sched_debug
   module Event = Event
-  module Net = Net_internal
-  module Chan = Chan_internal
+  module Net = Net
+  module Chan = Chan
 end

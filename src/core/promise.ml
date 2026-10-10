@@ -1,4 +1,5 @@
-(* Promises (design section 2.5, Promises). *)
+(* Promises (design section 2.5, Promises). The fiber of a promise gets its own
+   scope with [Promise.cancel] in milestone M2. *)
 
 type 'a t = ('a, exn * Printexc.raw_backtrace) result Ivar.t
 
@@ -6,7 +7,7 @@ let fork ?name scope f =
   let p = Ivar.create () in
   Fiber.fork ?name scope (fun () ->
       let r =
-        match Fiber.scope (fun _ -> f ()) with
+        match f () with
         | v ->
             Ok v
         | exception e ->

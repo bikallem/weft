@@ -31,7 +31,7 @@ type _ t =
   | Write : fd * bytes * int * int -> int t
   | Shutdown : fd -> unit t  (** Ends the send side. *)
   | Close : fd -> unit t
-  | Register : int * fd * int64 -> unit t
+  | Register : int * fd * int -> unit t
       (** [Register (domain, fd, token)] adds the fd to the poller of the
           domain, edge-triggered, for read and write. *)
   | Deregister : int * fd -> unit t

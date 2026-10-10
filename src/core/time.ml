@@ -20,21 +20,16 @@ let diff line a b =
 
 let at (_ : Clock.mono Clock.line) t =
   let deadline = Clock.to_ns Mono t in
-  Event.Base
-    (fun () ->
-      { Event.leaf=
-          { Sched.attempt=
-              (fun dom s i ->
-                if
-                  ( Int64.compare (Sched.now_ns ()) deadline
-                  >= 0 )
-                  [@mutate
-                    off
-                      "an entry at now expires in the next poll, at the same \
-                       time"]
-                then ignore (Sched.C.self_commit s.word i)
-                else Sched.Heap.push dom.heap ~deadline s i ) }
-      ; result= ignore } )
+  let leaf : Sched.leaf =
+   fun dom s i ->
+    if
+      ( Int64.compare (Sched.now_ns ()) deadline
+      >= 0 )
+      [@mutate off "an entry at now expires in the next poll, at the same time"]
+    then ignore (Sched.C.self_commit s.word i)
+    else Sched.Heap.push dom.heap ~deadline s i
+  in
+  Event.Base (fun () -> {Event.leaf; result= ignore})
 
 let after (_ : Clock.mono Clock.line) span =
   Event.Guard

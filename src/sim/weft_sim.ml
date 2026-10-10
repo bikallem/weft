@@ -70,7 +70,12 @@ type conn =
   ; mutable cfd: int  (** [-1] until the server side is accepted. *)
   ; remote: Op.addr }
 
-type listener = {key: string; backlog: conn Queue.t; limit: int}
+(* [pending] counts the connections that the latency still holds, so that they
+   count against the limit of the backlog. A full backlog refuses the connect at
+   once. On Linux, a TCP connect retries the SYN instead, and a Unix connect
+   gives EAGAIN. *)
+type listener =
+  {key: string; backlog: conn Queue.t; limit: int; mutable pending: int}
 
 type sfd = Lsn of listener | Conn of conn
 
@@ -78,7 +83,7 @@ type net =
   { fds: (int, sfd) Hashtbl.t
   ; mutable next_fd: int
   ; names: (string, int) Hashtbl.t  (** The listeners, by address. *)
-  ; regs: (int, (int * int64) list) Hashtbl.t
+  ; regs: (int, (int * int) list) Hashtbl.t
         (** The registrations of each fd: the domain and the token. *)
   ; mutable edges: (int * World.Ready.t) list
         (** The edges to give, by domain, the newest first. *)
@@ -86,8 +91,7 @@ type net =
   ; mutable next_port: int }
 
 type t =
-  { seed: int
-  ; prng: Prng.t
+  { prng: Prng.t
   ; auto: bool
   ; mutable now: int64  (** The virtual [Mono] time, in nanoseconds. *)
   ; posix0: int64  (** [Posix] at [Mono] 0. *)
@@ -100,8 +104,6 @@ type t =
   ; mutable next_id: int
   ; mutable settles: int list
   ; mutable advance: (int64 * int) option }
-
-let seed t = t.seed
 
 let sched t = Option.get t.sched
 
@@ -198,7 +200,7 @@ let submit : type a. t -> a Op.t -> (a, Op.error) result =
       else
         let fd = new_fd n in
         Hashtbl.replace n.fds fd
-          (Lsn {key= k; backlog= Queue.create (); limit= backlog}) ;
+          (Lsn {key= k; backlog= Queue.create (); limit= backlog; pending= 0}) ;
         Hashtbl.replace n.names k fd ;
         Ok fd
   | Op.Connect addr -> (
@@ -208,7 +210,8 @@ let submit : type a. t -> a Op.t -> (a, Op.error) result =
           refused ()
       | Some lfd -> (
         match Hashtbl.find_opt n.fds lfd with
-        | Some (Lsn l) when Queue.length l.backlog < l.limit ->
+        | Some (Lsn l) when Queue.length l.backlog + l.pending < l.limit ->
+            l.pending <- l.pending + 1 ;
             let port = n.next_port in
             n.next_port <-
               (port + 1) [@mutate off "a counter that goes down is unique too"] ;
@@ -231,6 +234,7 @@ let submit : type a. t -> a Op.t -> (a, Op.error) result =
             c.cfd <- new_fd n ;
             Hashtbl.replace n.fds c.cfd (Conn c) ;
             later t (fun () ->
+                l.pending <- l.pending - 1 ;
                 match Hashtbl.find_opt n.fds lfd with
                 | Some (Lsn l') when l' == l ->
                     Queue.push s l.backlog ;
@@ -443,24 +447,54 @@ let quiescent t (w : World.Wait.t) =
             raise (Deadlock (Sched_debug.blocked s))
       else
         match t.advance with
-        | Some (target, id) -> (
-          match earliest (earliest deadline next_agenda) (Some target) with
-          | Some at ->
-              let reached = Int64.compare at target >= 0 in
-              if reached then t.advance <- None ;
-              move at (if reached then [World.Ready.External id] else [])
-          | None ->
-              assert false )
+        | Some (target, id) ->
+            let at =
+              match earliest deadline next_agenda with
+              | Some at ->
+                  Int64.min at target
+              | None ->
+                  target
+            in
+            let reached = Int64.compare at target >= 0 in
+            if reached then t.advance <- None ;
+            move at (if reached then [World.Ready.External id] else [])
         | None ->
             raise
               (Deadlock
                  ( "manual mode: only advance_until moves the time"
                  :: Sched_debug.blocked s ) ) )
 
+(* The simulator as a world (design section 2.3). *)
+module World = struct
+  type nonrec t = t
+
+  let now (type time) t (line : time Weft.Clock.line) : time =
+    Weft.Clock.of_ns line
+      (match line with Mono -> t.now | Posix -> Int64.add t.posix0 t.now)
+
+  let submit = submit
+
+  let wait t ~domain (w : World.Wait.t) =
+    let woken = if t.woken then [World.Ready.Woken] else [] in
+    t.woken <- false ;
+    match (woken @ take_edges t domain, w.timeout) with
+    | (_ :: _ as ready), _ ->
+        ready
+    | [], World.Wait.Poll ->
+        []
+    | [], World.Wait.Sleep ->
+        quiescent t w
+
+  let wake t ~domain:_ = t.woken <- true
+
+  let random t n = Prng.int t.prng n
+
+  let random_bytes t b = Prng.bytes t.prng b
+end
+
 let run ?(seed = 0) ?(auto = true) main =
   let t =
-    { seed
-    ; prng= Prng.make seed
+    { prng= Prng.make seed
     ; auto
     ; now= 0L
     ; posix0= 1_700_000_000_000_000_000L
@@ -479,58 +513,11 @@ let run ?(seed = 0) ?(auto = true) main =
     ; settles= []
     ; advance= None }
   in
-  let open Effect.Deep in
-  match_with
-    (fun () ->
-      Sched.run ~slack:Weft.Span.zero
-        ~on_create:(fun s -> t.sched <- Some s)
-        (fun () -> main t) )
-    ()
-    { retc= Fun.id
-    ; exnc=
-        (fun e ->
-          Printexc.raise_with_backtrace e (Printexc.get_raw_backtrace ()) )
-    ; effc=
-        (fun (type a) (e : a Effect.t) ->
-          match e with
-          | World.Now line ->
-              Some
-                (fun (k : (a, _) continuation) ->
-                  let ns =
-                    match line with
-                    | Weft.Clock.Mono ->
-                        t.now
-                    | Weft.Clock.Posix ->
-                        Int64.add t.posix0 t.now
-                  in
-                  continue k (Weft.Clock.of_ns line ns) )
-          | World.Submit op ->
-              Some (fun k -> continue k (submit t op))
-          | World.Random n ->
-              Some (fun k -> continue k (Prng.int t.prng n))
-          | World.Random_bytes b ->
-              Some (fun k -> continue k (Prng.bytes t.prng b))
-          | World.Switch _ ->
-              Some (fun k -> continue k ())
-          | World.Wake _ ->
-              Some
-                (fun k ->
-                  t.woken <- true ;
-                  continue k () )
-          | World.Wait (d, w) ->
-              Some
-                (fun k ->
-                  let woken = if t.woken then [World.Ready.Woken] else [] in
-                  t.woken <- false ;
-                  match (woken @ take_edges t d, w.timeout) with
-                  | (_ :: _ as ready), _ ->
-                      continue k ready
-                  | [], World.Wait.Poll ->
-                      continue k []
-                  | [], World.Wait.Sleep ->
-                      continue k (quiescent t w) )
-          | _ ->
-              None ) }
+  Weft.Private.run_world ~slack:Weft.Span.zero
+    ~on_create:(fun s -> t.sched <- Some s)
+    (module World)
+    t
+    (fun () -> main t)
 
 let fresh t =
   let id = t.next_id in
@@ -552,7 +539,18 @@ let advance_until t target =
     invalid_arg "Sim.advance_until: an advance is already active" ;
   let id = fresh t in
   t.advance <- Some (Weft.Clock.to_ns Mono target, id) ;
-  wait_external id
+  (* A cancel ends the advance. *)
+  match wait_external id with
+  | () ->
+      ()
+  | exception e ->
+      let bt = Printexc.get_raw_backtrace () in
+      ( match t.advance with
+      | Some (_, id') when id' = id ->
+          t.advance <- None
+      | _ ->
+          () ) ;
+      Printexc.raise_with_backtrace e bt
 
 let set_latency t span = t.net.latency <- Weft.Span.to_ns span
 

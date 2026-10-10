@@ -175,6 +175,19 @@ let one_branch_no_random () =
   ignore (run w (fun () -> sync (always ()))) ;
   equal int 0 w.randoms
 
+(* K1: a deadline that passes between the poll and the sleep. The domain must
+   not sleep with the fiber in its queue. *)
+let expire_before_sleep () =
+  let w = Manual.make ~tick:(us 400) () in
+  run ~slack:Span.zero w (fun () -> Time.sleep Mono (Span.us 1300))
+
+(* C4: the slack rounding of a deadline near the largest time saturates. *)
+let alarm_saturates () =
+  let w = Manual.make () in
+  run ~slack:(Span.ms 1) w (fun () ->
+      sync (Time.at Mono (Clock.of_ns Mono (Int64.sub Int64.max_int 10L))) ) ;
+  equal (list int64) [Int64.max_int] w.alarms
+
 let world =
   group "Weft.run"
     [ test "run gives the value of main" run_gives_value
@@ -192,7 +205,11 @@ let world =
     ; test "an idle poll that makes a timer ready does not sleep"
         idle_poll_finds_timer
     ; test "choose takes its order from the world" choose_uses_world_random
-    ; test "a sync with one branch does not use random" one_branch_no_random ]
+    ; test "a sync with one branch does not use random" one_branch_no_random
+    ; test ~timeout:5. "K1: a deadline between the poll and the sleep fires"
+        expire_before_sleep
+    ; test ~timeout:5. "C4: the alarm near the largest time saturates"
+        alarm_saturates ]
 
 (* Span *)
 

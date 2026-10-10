@@ -24,10 +24,22 @@ let cancel = Sched.cancel
 
 let shield = Sched.shield
 
-let yield () = Event.sync Event.yield
+let yield = Event.yield
 
+(* A new scope T with a daemon that cancels T at the deadline (design section
+   2.5, Timeouts). [Timeout] only for the own deadline. If an outer context is
+   cancelled, the call raises its [Cancelled], also when it is cancelled before
+   the start. *)
 let with_timeout (_ : Clock.mono Clock.line) span f =
   let outer = List.hd (Sched.self ()).ctxs in
+  let outer_cancel () =
+    match Sched.first_flag outer with
+    | Some r ->
+        raise (Cancelled r)
+    | None ->
+        ()
+  in
+  outer_cancel () ;
   let fired = ref false in
   match
     scope (fun t ->
@@ -40,8 +52,6 @@ let with_timeout (_ : Clock.mono Clock.line) span f =
   | v ->
       v
   | exception (Cancelled _ as e) ->
-      (* Timeout only for the own deadline, and only if no outer context is
-         cancelled. *)
       let bt = Printexc.get_raw_backtrace () in
-      if !fired && Option.is_none (Sched.first_flag outer) then raise Timeout
-      else Printexc.raise_with_backtrace e bt
+      outer_cancel () ;
+      if !fired then raise Timeout else Printexc.raise_with_backtrace e bt

@@ -20,7 +20,7 @@ type _ t =
   | Write : fd * bytes * int * int -> int t
   | Shutdown : fd -> unit t
   | Close : fd -> unit t
-  | Register : int * fd * int64 -> unit t
+  | Register : int * fd * int -> unit t
   | Deregister : int * fd -> unit t
 
 let pp_addr ppf = function
