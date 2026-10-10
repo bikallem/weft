@@ -13,21 +13,27 @@
 # Each line runs one case. A "pass" case uses the protocol of the design.
 # A "fail" case plants one bug, and TLC must find a violation or a deadlock.
 # The script gives exit status 1 if a result is not the expected one.
+# JOBS (default 4), WORKERS and HEAP (default 2g) control the parallel runs.
 set -u
 cd "$(dirname "$0")"
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 status=0
 n=0
+# JOBS cases run at the same time, each with WORKERS threads of TLC. The
+# liveness check of TLC uses one thread, so parallel cases save the most.
+JOBS=${JOBS:-4}
+WORKERS=${WORKERS:-$(( $(nproc) / JOBS > 0 ? $(nproc) / JOBS : 1 ))}
+export JAVA_TOOL_OPTIONS="-Xmx${HEAP:-2g}"
 MODELS=${MODELS:-"Commit Scope Ivar Wake Fd"}
 want() { case " $MODELS " in *" $1 "*) return 0 ;; *) return 1 ;; esac; }
 
 # run MODULE EXPECT "INVARIANTS" NAME=VALUE...
+# This only writes the case. The cases run at the end, JOBS at a time.
 run() {
   local module=$1 expect=$2 invariants=$3
   shift 3
   n=$((n + 1))
-  local cfg="$work/case$n.cfg"
   {
     echo "SPECIFICATION Spec"
     echo "CONSTANTS"
@@ -35,24 +41,36 @@ run() {
     echo "INVARIANTS $invariants"
     echo "PROPERTIES ${PROPS:-Termination}"
     echo "CHECK_DEADLOCK ${DEADLOCK:-TRUE}"
-  } > "$cfg"
-  local out="$work/out$n.txt"
-  tlc -workers auto -metadir "$work/states$n" -config "$cfg" "$module.tla" > "$out" 2>&1
-  local result=fail
-  grep -q "No error has been found" "$out" && result=pass
-  local why states
-  why=$(grep -m1 -E "^Error: (Invariant [A-Za-z]+ is violated|Deadlock reached|Temporal properties were violated)" "$out" | sed 's/^Error: //')
-  states=$(grep -oE "[0-9]+ distinct states found" "$out" | tail -1)
-  local bugs
-  bugs=$(printf '%s\n' "$@" | grep '=TRUE' | sed 's/=TRUE//' | paste -sd, -)
-  local scen
+  } > "$work/case$n.cfg"
+  local bugs scen
+  bugs=$(printf '%s\n' "$@" | grep '=TRUE' | sed 's/=TRUE//; s/^Simp/+/' | paste -sd, -)
   scen=$(printf '%s\n' "$@" | grep '^Scenario=' | sed 's/^Scenario="\(.*\)"$/\1/')
-  printf '%-6s %-6s %-6s %-20s -> %s %s (%s)\n' "$module" "$expect" "$scen" "${bugs:-no bug}" \
-    "$result" "${why:-}" "${states:-?}"
-  if [ "$result" != "$expect" ]; then
-    status=1
-    echo "---- unexpected result, the end of the TLC output:"; tail -40 "$out"
-  fi
+  printf '%s\n' "$module" "$expect" "$scen" "${bugs:-no bug}" > "$work/case$n.meta"
+}
+
+# One case: run TLC and write one result line.
+runone() {
+  local i=$1 module expect scen bugs
+  { read -r module; read -r expect; read -r scen; read -r bugs; } < "$work/case$i.meta"
+  local out="$work/out$i.txt"
+  local t0=$SECONDS try
+  for try in 1 2; do
+    rm -rf "$work/states$i"
+    tlc -workers "$WORKERS" -lncheck final -metadir "$work/states$i" \
+      -config "$work/case$i.cfg" "$module.tla" > "$out" 2>&1
+    # TLC gave a result: a pass, a violation or a deadlock.
+    grep -qE "No error has been found|^Error: (Invariant|Deadlock|Temporal)" "$out" && break
+  done
+  local result=error why states
+  why=$(grep -m1 -E "^Error: (Invariant [A-Za-z]+ is violated|Deadlock reached|Temporal properties were violated)" "$out" | sed 's/^Error: //')
+  if grep -q "No error has been found" "$out"; then result=pass
+  elif [ -n "$why" ]; then result=fail; fi
+  states=$(grep -oE "[0-9]+ distinct states found" "$out" | tail -1)
+  printf '%-6s %-6s %-6s %-20s -> %s %s (%s, %ss)\n' "$module" "$expect" "$scen" "$bugs" \
+    "$result" "${why:-}" "${states:-?}" "$((SECONDS - t0))" > "$work/res$i"
+  [ "$result" = "$expect" ] || echo "unexpected" >> "$work/res$i"
+  [ "$result" = error ] && head -20 "$out" >> "$work/res$i"
+  rm -rf "$work/states$i"
 }
 
 commit() { want Commit || return 0 # expect scenario noParked noIdOrder dropOnClaimed noLock
@@ -72,9 +90,9 @@ commit fail   cross    FALSE    FALSE     FALSE TRUE
 scope() { want Scope || return 0 # expect scenario joinCancellable shieldNotNode noRecheck noChainCheck exnAfterEnd noFlagCheck
   run Scope "$1" \
     "NoOrphan ExnNotLost ExnSeen ShieldHolds TimeoutOK NoForeignCancel ClosedEmpty" \
-    "Scenario=\"$2\"" BugJoinCancellable="$3" BugShieldNotNode="$4" BugNoRecheck="$5" \
+    "Scenario=\"$2\"" BugJoinCancellable="$3" BugShieldNotNode="$4" SimpNoRecheck="$5" \
     BugNoChainCheck="$6" BugExnAfterEnd="$7" BugNoFlagCheck="$8" \
-    defaultInitValue=defaultInitValue
+    SimpNoChildFlags="${9:-FALSE}" defaultInitValue=defaultInitValue
 }
 #     expect scenario join  shield recheck chain exn   flag
 scope pass   error    FALSE FALSE  FALSE   FALSE FALSE FALSE
@@ -87,6 +105,14 @@ scope pass   fork     FALSE FALSE  TRUE    FALSE FALSE FALSE
 scope fail   error    FALSE FALSE  FALSE   TRUE  FALSE FALSE
 scope fail   error    FALSE FALSE  FALSE   FALSE TRUE  FALSE
 scope fail   fork     FALSE FALSE  FALSE   FALSE FALSE TRUE
+# A simplification: the walk sets only the flag of the cancelled scope.
+scope pass   error    FALSE FALSE  FALSE   FALSE FALSE FALSE TRUE
+scope pass   shield   FALSE FALSE  FALSE   FALSE FALSE FALSE TRUE
+scope pass   fork     FALSE FALSE  FALSE   FALSE FALSE FALSE TRUE
+# The two together: no second read at link, and no flags on nested scopes.
+scope pass   error    FALSE FALSE  TRUE    FALSE FALSE FALSE TRUE
+scope pass   shield   FALSE FALSE  TRUE    FALSE FALSE FALSE TRUE
+scope pass   fork     FALSE FALSE  TRUE    FALSE FALSE FALSE TRUE
 
 ivar() { want Ivar || return 0 # expect directFill nonAtomicRegister
   run Ivar "$1" "AtMostOneResume FullNoWaiters OneFill EndState" \
@@ -101,7 +127,8 @@ ivar fail   FALSE  TRUE
 # liveness property is AllRun: each item runs.
 wake() { want Wake || return 0 # expect decAfterCheck noRecheck pinnedGeneric noNextSteal
   PROPS=AllRun DEADLOCK=FALSE run Wake "$1" "PinnedOnZero SearchingOK NoLostWakeup" \
-    BugDecAfterCheck="$2" BugNoRecheck="$3" BugPinnedGeneric="$4" BugNoNextSteal="$5"
+    BugDecAfterCheck="$2" BugNoRecheck="$3" BugPinnedGeneric="$4" BugNoNextSteal="$5" \
+    SimpNoSearchLimit="${6:-FALSE}" SimpNoLastWake="${7:-FALSE}" SimpNoSearching="${8:-FALSE}"
 }
 #    expect decAfter noRecheck pinned noNext
 wake pass   FALSE    FALSE     FALSE  FALSE
@@ -109,6 +136,11 @@ wake fail   TRUE     FALSE     FALSE  FALSE
 wake fail   FALSE    TRUE      FALSE  FALSE
 wake fail   FALSE    FALSE     TRUE   FALSE
 wake pass   FALSE    FALSE     FALSE  TRUE
+# Simplifications: no limit on the searching domains, and no last wake.
+wake pass   FALSE    FALSE     FALSE  FALSE  TRUE  FALSE
+wake pass   FALSE    FALSE     FALSE  FALSE  FALSE TRUE
+# A simplification: no `searching` count. A push wakes an idle domain each time.
+wake pass   FALSE    FALSE     FALSE  FALSE  FALSE FALSE TRUE
 
 fd() { want Fd || return 0 # expect dupAlive countOnly noBitCas registerOrder regNoUser
   run Fd "$1" "CloseOnce NoWrongClose NoUseAfterClose NoWrongDel UsersOK DelBeforeClose" \
@@ -121,4 +153,21 @@ fd fail   TRUE  TRUE  FALSE  FALSE    FALSE
 fd pass   TRUE  FALSE TRUE   FALSE    FALSE
 fd fail   TRUE  FALSE FALSE  TRUE     FALSE
 fd fail   TRUE  FALSE FALSE  FALSE    TRUE
+
+# Run the cases. The slow cases come first, so that they start early.
+export -f runone
+export work WORKERS
+t0=$SECONDS
+for i in $(seq 1 "$n"); do
+  # Wake cases have the largest state space.
+  if grep -qx Wake "$work/case$i.meta" 2>/dev/null; then echo "0 $i"; else echo "1 $i"; fi
+done | sort -n | cut -d' ' -f2 | xargs -P "$JOBS" -I{} bash -c 'runone "$@"' _ {}
+for i in $(seq 1 "$n"); do
+  head -1 "$work/res$i"
+  if grep -qx unexpected "$work/res$i"; then
+    status=1
+    echo "---- unexpected result, the end of the TLC output:"; tail -40 "$work/out$i.txt"
+  fi
+done
+echo "$n cases in $((SECONDS - t0)) s, $JOBS at a time with $WORKERS workers each"
 exit $status

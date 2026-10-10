@@ -24,11 +24,14 @@ CONSTANTS
   BugDecAfterCheck,   \* a searching domain decreases `searching` after its second check
   BugNoRecheck,       \* a domain that goes idle does not check the queues again
   BugPinnedGeneric,   \* a push to the pinned queue wakes any idle domain
-  BugNoNextSteal      \* a thief cannot take a next slot
+  BugNoNextSteal,     \* a thief cannot take a next slot
+  SimpNoSearchLimit,  \* a simplification: all domains can search
+  SimpNoLastWake,     \* a simplification: the last searching domain wakes nobody
+  SimpNoSearching     \* a simplification: no `searching` count, a push wakes each time
 
 Doms  == {0, 1, 2}
 Items == {1, 2, 3, 4}
-Limit == 1                       \* at most half of the domains search
+Limit == IF SimpNoSearchLimit THEN 3 ELSE 1   \* at most half of the domains search
 
 (* --algorithm Wake {
 variables
@@ -54,7 +57,7 @@ define {
 
 \* Wake one idle domain, by the normal rule of a push.
 macro wakeOne() {
-  if (idle # {} /\ searching = 0) {
+  if (idle # {} /\ (SimpNoSearching \/ searching = 0)) {
     with (v \in idle) { idle := idle \ {v}; wakeCnt[v] := wakeCnt[v] + 1; };
   };
 }
@@ -74,7 +77,8 @@ take:
     if (cur # 0) { goto run; };
 st0:
     \* Step 4: steal. Only `Limit` domains search at one time.
-    if (searching < Limit) { searching := searching + 1; isSearch := TRUE; }
+    if (SimpNoSearching) { isSearch := FALSE; }
+    else if (searching < Limit) { searching := searching + 1; isSearch := TRUE; }
     else { isSearch := FALSE; goto id1; };
 st1:
     victims := Doms \ {self};
@@ -97,10 +101,9 @@ st2:
 st3:
     if (cur # 0) {
       \* A searching domain that finds work.
-      searching := searching - 1;
-      isSearch := FALSE;
+      if (isSearch) { searching := searching - 1; isSearch := FALSE; };
 st4:
-      if (searching = 0 /\ idle # {}) {        \* the last searching domain
+      if (~SimpNoLastWake /\ searching = 0 /\ idle # {}) {   \* the last searching domain
         with (v \in idle) { idle := idle \ {v}; wakeCnt[v] := wakeCnt[v] + 1; };
       };
       goto run;
@@ -218,13 +221,17 @@ take(self) == /\ pc[self] = "take"
                               victims >>
 
 st0(self) == /\ pc[self] = "st0"
-             /\ IF searching < Limit
-                   THEN /\ searching' = searching + 1
-                        /\ isSearch' = [isSearch EXCEPT ![self] = TRUE]
+             /\ IF SimpNoSearching
+                   THEN /\ isSearch' = [isSearch EXCEPT ![self] = FALSE]
                         /\ pc' = [pc EXCEPT ![self] = "st1"]
-                   ELSE /\ isSearch' = [isSearch EXCEPT ![self] = FALSE]
-                        /\ pc' = [pc EXCEPT ![self] = "id1"]
                         /\ UNCHANGED searching
+                   ELSE /\ IF searching < Limit
+                              THEN /\ searching' = searching + 1
+                                   /\ isSearch' = [isSearch EXCEPT ![self] = TRUE]
+                                   /\ pc' = [pc EXCEPT ![self] = "st1"]
+                              ELSE /\ isSearch' = [isSearch EXCEPT ![self] = FALSE]
+                                   /\ pc' = [pc EXCEPT ![self] = "id1"]
+                                   /\ UNCHANGED searching
              /\ UNCHANGED << local, next, pinned, inj, idle, wakeCnt, ran, 
                              ranOn, cur, victims >>
 
@@ -258,8 +265,11 @@ st2(self) == /\ pc[self] = "st2"
 
 st3(self) == /\ pc[self] = "st3"
              /\ IF cur[self] # 0
-                   THEN /\ searching' = searching - 1
-                        /\ isSearch' = [isSearch EXCEPT ![self] = FALSE]
+                   THEN /\ IF isSearch[self]
+                              THEN /\ searching' = searching - 1
+                                   /\ isSearch' = [isSearch EXCEPT ![self] = FALSE]
+                              ELSE /\ TRUE
+                                   /\ UNCHANGED << searching, isSearch >>
                         /\ pc' = [pc EXCEPT ![self] = "st4"]
                    ELSE /\ pc' = [pc EXCEPT ![self] = "id0"]
                         /\ UNCHANGED << searching, isSearch >>
@@ -267,7 +277,7 @@ st3(self) == /\ pc[self] = "st3"
                              ranOn, cur, victims >>
 
 st4(self) == /\ pc[self] = "st4"
-             /\ IF searching = 0 /\ idle # {}
+             /\ IF ~SimpNoLastWake /\ searching = 0 /\ idle # {}
                    THEN /\ \E v \in idle:
                              /\ idle' = idle \ {v}
                              /\ wakeCnt' = [wakeCnt EXCEPT ![v] = wakeCnt[v] + 1]
@@ -341,7 +351,7 @@ run(self) == /\ pc[self] = "run"
                              isSearch, victims >>
 
 r2(self) == /\ pc[self] = "r2"
-            /\ IF idle # {} /\ searching = 0
+            /\ IF idle # {} /\ (SimpNoSearching \/ searching = 0)
                   THEN /\ \E v \in idle:
                             /\ idle' = idle \ {v}
                             /\ wakeCnt' = [wakeCnt EXCEPT ![v] = wakeCnt[v] + 1]
@@ -359,7 +369,7 @@ r3(self) == /\ pc[self] = "r3"
 
 r4(self) == /\ pc[self] = "r4"
             /\ IF BugPinnedGeneric
-                  THEN /\ IF idle # {} /\ searching = 0
+                  THEN /\ IF idle # {} /\ (SimpNoSearching \/ searching = 0)
                              THEN /\ \E v \in idle:
                                        /\ idle' = idle \ {v}
                                        /\ wakeCnt' = [wakeCnt EXCEPT ![v] = wakeCnt[v] + 1]
@@ -389,7 +399,7 @@ x1 == /\ pc[10] = "x1"
                       ranOn, cur, isSearch, victims >>
 
 x2 == /\ pc[10] = "x2"
-      /\ IF idle # {} /\ searching = 0
+      /\ IF idle # {} /\ (SimpNoSearching \/ searching = 0)
             THEN /\ \E v \in idle:
                       /\ idle' = idle \ {v}
                       /\ wakeCnt' = [wakeCnt EXCEPT ![v] = wakeCnt[v] + 1]

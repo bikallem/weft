@@ -49,10 +49,11 @@ CONSTANTS
   Scenario,           \* "error", "shield" or "fork": the fibers that run
   BugJoinCancellable, \* the join of a scope is a normal sync
   BugShieldNotNode,   \* a scope inside a shield links under the outer scope
-  BugNoRecheck,       \* a new nested scope does not read its parent again
+  SimpNoRecheck,      \* a simplification: a new nested scope does not read its parent again
   BugNoChainCheck,    \* the walk commits any sync of a member
   BugExnAfterEnd,     \* a failed member ends before it stores its exception
-  BugNoFlagCheck      \* a sync parks without a read of the flags
+  BugNoFlagCheck,     \* a sync parks without a read of the flags
+  SimpNoChildFlags    \* a simplification: the walk sets only the flag of x
 
 Fibers == {"F0", "G1", "G2", "G3", "K", "TT"}
 Nodes  == {"R", "S", "D2", "H", "T"}
@@ -119,8 +120,10 @@ w2:
     with (n \in wt) {
       wf := wf \cup members[n];
       wt := (wt \ {n}) \cup {z \in Nodes : linked[z] /\ Parent(z) = n /\ ~IsShield(z)};
-      cancelled := [z \in Nodes |->
-        IF linked[z] /\ Parent(z) = n /\ ~IsShield(z) THEN TRUE ELSE cancelled[z]];
+      if (~SimpNoChildFlags) {
+        cancelled := [z \in Nodes |->
+          IF linked[z] /\ Parent(z) = n /\ ~IsShield(z) THEN TRUE ELSE cancelled[z]];
+      };
     };
   };
 w3:
@@ -142,7 +145,7 @@ a1:
   \* under R. Only after this step can another fiber hold the value S.
   linked["S"] := TRUE || members["S"] := {"F0"};
 a2:
-  if (~BugNoRecheck /\ cancelled["R"]) { cancelled["S"] := TRUE; };
+  if (~SimpNoRecheck /\ cancelled["R"]) { cancelled["S"] := TRUE; };
 a3:
   linked["D2"] := TRUE
     || members["S"] := members["S"] \cup (IF Scenario = "fork" THEN {} ELSE {"G1"})
@@ -205,7 +208,7 @@ c1:
 c2:
     linked["T"] := TRUE || members["T"] := {"G1", "TT"};  \* with_timeout
 c3:
-    if (~BugNoRecheck /\ cancelled[Parent("T")]) { cancelled["T"] := TRUE; };
+    if (~SimpNoRecheck /\ cancelled[Parent("T")]) { cancelled["T"] := TRUE; };
 c4:
     publish("G1", "T");                                       \* Ws.send_close waits
 c5:
@@ -357,8 +360,11 @@ w2(self) == /\ pc[self] = "w2"
                   THEN /\ \E n \in wt[self]:
                             /\ wf' = [wf EXCEPT ![self] = wf[self] \cup members[n]]
                             /\ wt' = [wt EXCEPT ![self] = (wt[self] \ {n}) \cup {z \in Nodes : linked[z] /\ Parent(z) = n /\ ~IsShield(z)}]
-                            /\ cancelled' =            [z \in Nodes |->
-                                            IF linked[z] /\ Parent(z) = n /\ ~IsShield(z) THEN TRUE ELSE cancelled[z]]
+                            /\ IF ~SimpNoChildFlags
+                                  THEN /\ cancelled' =            [z \in Nodes |->
+                                                       IF linked[z] /\ Parent(z) = n /\ ~IsShield(z) THEN TRUE ELSE cancelled[z]]
+                                  ELSE /\ TRUE
+                                       /\ UNCHANGED cancelled
                        /\ pc' = [pc EXCEPT ![self] = "w2"]
                   ELSE /\ pc' = [pc EXCEPT ![self] = "w3"]
                        /\ UNCHANGED << cancelled, wt, wf >>
@@ -400,7 +406,7 @@ a1 == /\ pc["F0"] = "a1"
                       toRes, stack, x, wt, wf, fx >>
 
 a2 == /\ pc["F0"] = "a2"
-      /\ IF ~BugNoRecheck /\ cancelled["R"]
+      /\ IF ~SimpNoRecheck /\ cancelled["R"]
             THEN /\ cancelled' = [cancelled EXCEPT !["S"] = TRUE]
             ELSE /\ TRUE
                  /\ UNCHANGED cancelled
@@ -597,7 +603,7 @@ c2 == /\ pc["G1"] = "c2"
                       toRes, stack, x, wt, wf, fx >>
 
 c3 == /\ pc["G1"] = "c3"
-      /\ IF ~BugNoRecheck /\ cancelled[Parent("T")]
+      /\ IF ~SimpNoRecheck /\ cancelled[Parent("T")]
             THEN /\ cancelled' = [cancelled EXCEPT !["T"] = TRUE]
             ELSE /\ TRUE
                  /\ UNCHANGED cancelled
