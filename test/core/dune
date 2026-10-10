@@ -1,0 +1,10 @@
+; The tests of the parts of the core that need no world, for example the
+; commit protocol.
+
+(test
+ (name test_core)
+ (libraries weft windtrap)
+ (action
+  (progn
+   (run %{test} --corrected)
+   (diff? test_commit.ml test_commit.ml.corrected))))
