@@ -104,7 +104,7 @@ The main idea: the effects are in two layers. The seam for the outside world is 
 
 This order solves lesson 6. The scheduler runs inside the world handler. Thus a world effect from any place in a fiber or in the scheduler reaches the world handler. In affect, an effect in a guard raises `Effect.Unhandled`.
 
-`Fiber.yield` has no effect of its own. It is a `sync` on a special event: the scheduler puts the fiber at the tail of its queue, and the event is ready when the fiber runs again. Thus a yield is also a cancellation point (section 2.5).
+`Fiber.yield` is a program effect of its own. The scheduler puts the fiber at the tail of its queue. When the fiber runs again, it reads the flags of its chain of cancel contexts, so a yield is also a cancellation point (section 2.5). The fiber has no sync while it is in the queue, so a cancel cannot resume it a second time. An earlier version made a yield a `sync` on a special event. The review of M0 showed that this form puts one more field in each sync record for the yield alone.
 
 `Wait` is the only world effect that blocks. It has two forms:
 
@@ -404,7 +404,7 @@ end
 - The body `f` of `Fiber.scope f` is a member of the scope, as a fiber is. `Fiber.scope` returns when `f` and all of the fibers end.
 - `run` and `Sim.run` give `main` a root scope. When `main` returns, the root scope cancels the remaining fibers and waits for them. Then `run` gives the result of `main`.
 - The scope cancels a daemon fiber when the body and all other fibers end. Each daemon runs in its own cancel context, a node under its scope, and this cancel sets the flag of that node. Thus a daemon that starts a `sync` after the cancel reads the flag and raises. Without its own node, such a daemon has no flag to read.
-- **The join ignores cancels.** After the body returns, `Fiber.scope` waits for the other members. This wait is a `sync` with no hidden cancel branch, from this scope or from an outer scope. If a cancel could end the join, `Fiber.scope` would return while children still run, and an exception could be lost. After the join, `Fiber.scope` raises the stored exception, or `Cancelled` if its context is cancelled. Eio's `Switch.await_idle` uses `await_protect` in the same way (`lib_eio/core/switch.ml`).
+- **The join ignores cancels.** After the body returns, `Fiber.scope` waits for the other members. This wait is a `sync` with no hidden cancel branch, from this scope or from an outer scope. If a cancel could end the join, `Fiber.scope` would return while children still run, and an exception could be lost. After the join, `Fiber.scope` raises the stored exception, or `Multiple`. If no member failed, it gives the result of the body: the value, or the exception of the body, for example `Cancelled`. A body that gave a value keeps it also when the scope was cancelled after it, so that `with_timeout` never drops a value. The next `sync` of the fiber then raises the sticky cancel. Eio's `Switch.await_idle` uses `await_protect` in the same way (`lib_eio/core/switch.ml`).
 
 **Errors:**
 
@@ -445,7 +445,7 @@ Thus each direction has one path.
 - Each scope has a short lock for its list of members and of nested scopes. A new nested scope links itself under this lock, under its parent node. The parent of a scope inside a shield is the shield node. The link has no cancel logic: a cancel that walks the list at the same time can miss the new scope, but each `sync` in it reads the flag of the cancelled scope through its chain. The TLA+ model of section 2.16 examined this.
 - A scope never holds its lock across a world effect. Thus, in the simulator, the lock is never contended.
 
-**Cancellation points.** Only `sync` is a cancellation point. `Fiber.yield`, `Time.sleep` and all I/O functions call `sync`, so they are cancellation points too. A fiber that computes and never calls `sync` cannot be cancelled. This agrees with "The limit of a busy domain" that follows.
+**Cancellation points.** Only `sync` and `Fiber.yield` are cancellation points. `Time.sleep` calls `sync`. An I/O function calls `sync` only when it must wait for its fd (after `EAGAIN`), so it is a cancellation point only then. A write to a socket with space, or a read of a socket with data, completes also in a cancelled fiber. `with_timeout` reads the flags of its chain when it starts, so in a cancelled context it raises that `Cancelled` at once. A fiber that computes and never calls `sync` cannot be cancelled. This agrees with "The limit of a busy domain" that follows.
 
 **Blocking operations.** A `Blocking` operation on the thread pool cannot stop, but its fiber does not wait for it. On a cancel, the fiber detaches from the operation and raises `Cancelled` at once. Thus `with_timeout` around `Dns.resolve` ends at the deadline, also if `getaddrinfo` takes 30 s. The rules for a detached operation:
 
@@ -672,7 +672,7 @@ A `wake` that comes before the domain is in `Wait` is not lost. The `eventfd` ke
 - A fiber that blocks with a timer puts its entry in the heap of the domain where it blocks. Only that domain pops the entry.
 - When the deadline comes, the owner does the one-word commit on the sync word of the entry. If the commit succeeds, the fiber goes to the tail of the owner.
 - A commit or a nack on another domain does not change the heap. It changes only the sync word. The owner drops an entry with a `Done` word when it pops it.
-- **Stale entries.** The owner drops the stale entries at the head of the heap when it adds an entry and before it sets the alarm. Without this rule, a cancelled timeout still makes the alarm go off. When more than half of the entries are stale, the owner builds the heap again.
+- **Stale entries.** The owner drops the stale entries at the head of the heap when it adds an entry and before it sets the alarm. Without this rule, a cancelled timeout still makes the alarm go off. When the heap has grown to twice its size after the last rebuild, the owner removes the stale entries in place and builds the heap again. Thus an add costs O(log n) on average.
 - **Slack.** The owner rounds the alarm up to a multiple of the slack. Thus the deadlines in one slot of the slack share one alarm. The owner expires only the entries up to `now`, so a timer never fires before its deadline. An earlier version of this rule expired the entries up to `now + slack`. A test in M0 showed that this rule ends a sleep of 1 ms at once, against the M0 limit "a 10 ms sleep ends between 10 ms and 12 ms". The slack is 1 ms by default, and 0 in the simulator. The value can be changed.
 - Each domain sets its own alarm from its own heap.
 
@@ -777,7 +777,7 @@ Each domain has its own poller (section 2.5). A fiber registers an fd in the pol
 - A later block on X on domain B needs no syscall.
 - The read flag, the write flag and the waiters are in the registration of B, and only B uses them. B sets a flag at an event and commits each waiter. A fiber on B that gets `EAGAIN` clears the flag of B. Thus no atomic readiness word is necessary.
 - A fiber reads or writes until the call gives `EAGAIN`. The I/O modules do this loop, so fiber code does not see it.
-- One busy socket can keep its fiber ready for a long time. Thus the I/O modules yield after a fixed number of bytes, so that other fibers get time.
+- One busy socket can keep its fiber ready for a long time (M3). A read loop of the user can then run without a switch, because each read finds data. A write blocks when the buffer is full, so it cannot keep the fiber busy in the same way. M0 has no yield in the I/O modules. M3 adds a yield after a fixed number of bytes, in the place that a measurement shows.
 
 **An fd in many pollers (M1).** A fiber can block on X on domain A, move, and block on X on domain B later. Then X is in the two epoll sets, and A gets edges that nobody waits for. Linux gives a new edge for each arrival of data, also when the only fiber of the fd is busy and not blocked. Thus an edge with no live waiter is normal, also with one domain. A removes X from its set only when the last fiber that blocked on X on A now blocks on X on another domain. The removal is an `EPOLL_CTL_DEL` and a change of the domain bit (see `close`, below). Open question 4 asks how often it occurs.
 
@@ -789,7 +789,7 @@ Each domain has its own poller (section 2.5). A fiber registers an fd in the pol
 - **One record for each open.** User handles hold the record object, and the library never uses the same object for a new fd. Only the slot in the table is used again, with a new generation. The kernel can give the same fd number to a new file after `close(2)`. Thus `epoll_data` holds the index of the slot and the generation, not the fd number, and a domain drops an event with an old generation.
 - `close` never blocks, so it is not a cancellation point. A cancelled fiber can thus call it in cleanup code.
 - **Registrations hold a user (M1).** Each registration in the poller of a domain holds one user. Register adds a user, then sets its bit in the domain set, then reads the state. If the state is `Closing`, Register undoes its steps and commits its waiter with `EBADF`. `close` sets `Closing` and then reads the domain set. These are Dekker pairs of atomics, so one side always sees the other. Register runs on the thread of the domain that owns the poller, and it does not suspend the fiber. That thread takes its mailbox only between fibers. Thus a domain never takes a close notice between the steps of its own Register.
-- **Close notices (M1).** `close` sends a close notice with the slot index and the generation to the mailbox of each domain in the set, and it wakes these domains. A domain acts on a notice only if it holds a live registration for that pair. The removal of section "An fd in many pollers" also needs a live registration. The two run on the thread of the domain, one after the other, so only the first one finds the registration live. That one clears the domain bit, commits the waiters with `EBADF`, does `EPOLL_CTL_DEL` and removes the user of the registration. Thus a user is removed exactly one time, and `EPOLL_CTL_DEL` never names a reused fd number. The domain bit needs no CAS. Only the owner sets and clears it, with one atomic store, and the closer only reads it to know which domains get a notice. The TLA+ model of section 2.16 showed this: without the CAS, the result and the number of states do not change.
+- **Close notices (M1).** `close` sends a close notice with the slot index and the generation to the mailbox of each domain in the set, and it wakes these domains. A domain acts on a notice only if it holds a live registration for that pair. The removal of section "An fd in many pollers" also needs a live registration. The two run on the thread of the domain, one after the other, so only the first one finds the registration live. That one clears the domain bit, commits the waiters with `EBADF`, does `EPOLL_CTL_DEL` and removes the user of the registration. Thus a user is removed exactly one time, and `EPOLL_CTL_DEL` never names a reused fd number. The domain bit needs no CAS: only the owner sets and clears its bit, and the closer only reads the word to know which domains get a notice. But the bits of all domains share one word. Thus the owner changes its bit with `fetch_and_add` of plus or minus the bit, not with a read and a store. With a read and a store, two domains that register at the same time can lose the bit of one of them, and `close` then sends no notice to that domain. The TLA+ model of section 2.16 has a set that changes one element in one step, so it did not find this race. The review of M0 found it.
 - `close(2)` comes after each `EPOLL_CTL_DEL`. An epoll registration lives until all fds of its open file description close (epoll(7)). A review verified this: with a `dup` alive, the registration gave events after `close(2)`.
 - `close(2)` can block, for example on a socket with `SO_LINGER` and on an NFS or FUSE file. Thus the library gives the `close(2)` of a `File` fd, and of a socket with `SO_LINGER`, to the pool (milestone M2).
 - **Close-on-exec.** The library makes each fd with this flag: `epoll_create1 (EPOLL_CLOEXEC)`, `EFD_CLOEXEC`, `TFD_CLOEXEC`, `SOCK_CLOEXEC` for `socket`, `socketpair` and `accept4`, `O_CLOEXEC` for `File.open`, `pipe2`, `MSG_CMSG_CLOEXEC` for fds that come with `SCM_RIGHTS`, and `F_DUPFD_CLOEXEC` or `dup3` for a copy. Thus a child from `Process.spawn` does not keep a copy.
@@ -883,13 +883,17 @@ module Sim : sig
   (** Moves the time one deadline at a time, and settles at each one. *)
 
   val addr : t -> string -> Net.addr
-  val net_faults : t -> Net_faults.t -> unit
+  val set_latency : t -> Span.t -> unit       (* M0: the only fault *)
+  val net_faults : t -> Net_faults.t -> unit  (* milestone M2 *)
   val set_posix : t -> Clock.posix -> unit
   val signal : t -> Signal.t -> unit          (* milestone M2 *)
 
   exception Deadlock of string list           (* the blocked fibers *)
   exception Lost_wakeup of string list
   exception Livelock of string list           (* milestone M3 *)
+  exception Model_error of string
+  (** The program broke the order of the OS, for example a close(2)
+      before a Deregister. *)
 end
 ```
 
@@ -1100,6 +1104,23 @@ The sections of this document mark each part that does not come in M0 with its m
 - Each module of the core has its windtrap tests: property tests for each law, expect tests for long text, and a mutation run with no survivor that is not dismissed with a reason (section 2.17).
 - The TLA+ models of section 2.16 pass (`spec/tla/check.sh`).
 
+**The state of M0 (2026-10-10).** The code is in `src/core`, `src/sim` and `src/linux`, and each item of the "done" list has a test. The code settled these points of the design:
+
+- **The slack.** A timer never fires before its deadline (section 2.5, Timers and domains). A test of M0 found that the old rule ended a sleep of 1 ms at once.
+- **`Net.read`** needs at least one byte. A read of 0 bytes gives 0, the same result as the end of the stream.
+- **No yield in the I/O modules** in M0 (section 2.7).
+- **`close` in M0** holds a user of the record while it removes the registration of its own domain and commits its waiters. Then it releases the user, and the side that makes the state `Closed` calls close(2). Thus close(2) comes after the Deregister. The close notices of section 2.7 come in M1.
+- **The external completions.** `Ready.External id` lets the simulator end `Sim.settle` and `Sim.advance_until`. The completed `Blocking` operations of M2 can use the same form.
+- **The fiber record.** Fiber code reaches the record of its own fiber with a program effect, `Self`. Only `Fiber.scope`, `Fiber.shield`, `with_timeout` and the reason of a cancel use it.
+- **The faults of the simulator.** M0 has only the latency (`Sim.set_latency`). Loss, reordering and partitions come with `Sim.net_faults` in M2.
+- **The tests.** The tests of the public API are in `test/portable`, and the simulator and Linux run the same tests. The exact virtual times are only in the simulator suite. A test of the spin lock with two domains skips itself in a mutation run, because a mutation run forks after the test started a domain.
+- **The review of M0** (section 3.6) found 7 bugs, and each one now has a regression test that fails on the old code. It also found these risks for M1, which M1 must solve:
+  - A Register holds no user, and its order is not the order of `Fd.tla` (user, then bit, then state, then ADD). On one domain this is safe, because no other fiber runs between the steps.
+  - `push` does not read `idle` and calls no `wake`, and the loop has no second check before a sleep (section 2.5, Idle and wake).
+  - The table of live fibers for `Sched_debug` costs a lock and a table change at each fork. M3 makes it a part of the simulator only.
+  - A sync allocates about 130 words. M3 adds a fast path for one base event.
+- **The world effects.** `Wake` and `Random_bytes` have no producer in M0, and the worlds ignore `Switch`. They stay in the contract, because M1 (`Wake`, `Switch`) and M2 (`Random_bytes` for keys) need them.
+
 **What M0 proves:** the `WORLD` contract (`Wait`, `Submit`, `Register`, the tokens) works on a real OS and on the simulator. The core API is complete enough for a server with timeouts. The design meets a real OS in the first milestone, not at the end.
 
 ### M1: many domains
@@ -1212,6 +1233,8 @@ Run all of the models with `nix develop -c spec/tla/check.sh`. `MODELS="Ivar Fd"
 - **M1 needs no `searching` count** (section 2.5, Idle and wake). The count, its limit and the last wake are each only for performance. Without the count, the model also passes.
 - **A thief that cannot take a next slot loses no wakeup** (`Wake.tla`). The steal of the next slot only makes the latency smaller.
 - **A Register and a close notice of one domain never interleave** (section 2.7). The model of the fd record needs this rule of the design. Without it, a notice can arrive before the registration is live, and the waiter waits forever.
+
+**A correction from the review of M0.** In `Scope.tla`, the fork of K checked only the flag of S. The design and the code read the flags of the whole chain of S, because the nested scopes have no flags of their own. The fork step now reads `FirstFlag("S")`, and the 16 cases of `Scope.tla` give the expected results.
 
 **The limits.** The models are small: two or three fibers or domains in each scenario, a few work items, and one fd. Each model takes some details as one atomic step, and another model examines them, for example the commit in `Scope.tla` and `Ivar.tla`. The models do not cover the simulator, the OS facts, `Fiber.Mutex`, `Condition`, promises or signals. `dscheck` still examines the OCaml code in milestone M1, because the OCaml code can differ from the model.
 
@@ -1434,3 +1457,30 @@ Three subagents reviewed the design at the same time: one for the concurrency pr
 | Document | 18 contradictions and old texts | Corrected, and the history moved to Part 3 |
 
 **A claim of mine that was incorrect:** I wrote that affect keeps the fd registrations on the domain where a fiber blocks. affect keeps one shared map for all domains (`affect_unix__select.ml`). Section 2.5 now tells this.
+
+## 3.6 The review of M0, 2026-10-11
+
+Three subagents reviewed the code of M0 (correctness, conformance to the TLA+ models, and complexity). Each finding of this table is fixed. Each bug has a regression test, and each test fails when the old code is put back.
+
+| No. | Finding | Fix |
+|---|---|---|
+| C1 | In a cancelled context, `with_timeout` raises `Scope_closed`, and the scope records it as a failure | `with_timeout` reads the flags of its chain first and raises that `Cancelled` (2.5) |
+| K1 | A deadline that passes between the poll and the sleep: the domain sleeps with the fiber in its queue | `wait` polls instead of a sleep when the queue is not empty |
+| C3, T7 | A failed Register makes the waiter retry with no switch, and the domain stops | The waiter raises the error of the Register |
+| C2, K3 | The node of a daemon stays in its scope after the daemon ends | The daemon removes its node when it ends |
+| C4 | The slack rounding of a deadline near the largest time overflows, and the alarm fires at each sleep | The rounding saturates |
+| T5 | An outer cancel at the deadline of `with_timeout` gives `Cancelled Timeout` | `with_timeout` raises the `Cancelled` of the outer context first (2.5) |
+| T6 | `Ivar.fill`, `Fiber.cancel` and `Net.close` outside a fiber change the state and then raise | They perform `Self` first |
+| T1 | M1: a `fork_daemon` and the end of the last member can miss the new daemon | The count and the link of the daemon are one step under the lock of the scope |
+| T2 | M1: a read and a store of the shared domain word can lose a bit | `fetch_and_add` (2.7) |
+| T4 | The text said that `Fiber.scope` raises `Cancelled` when its body gave a value | The text now agrees with the code (2.5) |
+| T8 | The fork step of `Scope.tla` read only one flag | The step reads the chain (2.16) |
+| K2 | The removal of a member is O(N) | The members and the nested nodes are hash tables. The walk sorts them by id, so the fork order stays. |
+| K4 | Each register of a waiter or an offer filters the whole list | The lists drop stale entries only when they have grown to twice their live size |
+| K5 | `fork_promise` makes a scope that nothing uses in M0 | No scope until `Promise.cancel` (M2) |
+| K6, K10 | The simulator copies the world handler, and the aliases of `weft.ml` are not necessary | The simulator is a `WORLD` with one shared handler |
+| K8, K9, K14, K15, K16, K17, K20 | Copies in `chan.ml`, a field for `yield` in each sync, the `leaf` record, `int64` tokens, defensive code, three copies of one expression, a rebuild with four copies | Each one is simpler |
+| L1 to L6 | Small errors of the Linux world and of the simulator: the Unix connect, the address of a Unix peer, the port range, the seed, a cancelled `advance_until`, the backlog under latency | Each one is fixed |
+| L7 | The text said that each I/O function is a cancellation point | The text now agrees with the code (2.5) |
+
+These findings stay open, with their milestone: the Register order of `Fd.tla` and idle and wake (M1), the table of live fibers and the allocations of a sync (M3). The state of M0 in section 2.14 lists them.
