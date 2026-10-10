@@ -344,11 +344,14 @@ module Fiber : sig
       Each fiber of the scope and of its nested scopes runs inside
       [handler]. [~handler] is in milestone M2. *)
 
-  val fork : ?pinned:bool -> scope -> (unit -> unit) -> unit
+  val fork : ?name:string -> ?pinned:bool -> scope -> (unit -> unit) -> unit
   (** [~pinned:true] puts the fiber on domain 0, the main domain.
       [~pinned] is in milestone M3. *)
-  val fork_promise : ?pinned:bool -> scope -> (unit -> 'a) -> 'a Promise.t
-  val fork_daemon : scope -> (unit -> unit) -> unit
+  val fork_promise :
+    ?name:string -> ?pinned:bool -> scope -> (unit -> 'a) -> 'a Promise.t
+  val fork_daemon : ?name:string -> scope -> (unit -> unit) -> unit
+  (** [~name] names the fiber in the reports of the simulator, for
+      example in [Deadlock]. *)
   (** The scope cancels a daemon fiber when all other fibers end. *)
 
   val fork_isolated :
@@ -670,7 +673,7 @@ A `wake` that comes before the domain is in `Wait` is not lost. The `eventfd` ke
 - When the deadline comes, the owner does the one-word commit on the sync word of the entry. If the commit succeeds, the fiber goes to the tail of the owner.
 - A commit or a nack on another domain does not change the heap. It changes only the sync word. The owner drops an entry with a `Done` word when it pops it.
 - **Stale entries.** The owner drops the stale entries at the head of the heap when it adds an entry and before it sets the alarm. Without this rule, a cancelled timeout still makes the alarm go off. When more than half of the entries are stale, the owner builds the heap again.
-- **Slack.** The owner expires all entries up to `now + slack`, and it rounds the alarm up to the slack. Thus one alarm serves many deadlines that are near each other. The slack is 1 ms by default, and 0 in the simulator. The value can be changed.
+- **Slack.** The owner rounds the alarm up to a multiple of the slack. Thus the deadlines in one slot of the slack share one alarm. The owner expires only the entries up to `now`, so a timer never fires before its deadline. An earlier version of this rule expired the entries up to `now + slack`. A test in M0 showed that this rule ends a sleep of 1 ms at once, against the M0 limit "a 10 ms sleep ends between 10 ms and 12 ms". The slack is 1 ms by default, and 0 in the simulator. The value can be changed.
 - Each domain sets its own alarm from its own heap.
 
 ### Fibers that must stay on one domain (M3)
