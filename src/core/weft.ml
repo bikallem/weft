@@ -36,6 +36,17 @@ module Promise = struct
 end
 
 module Ivar = Ivar
+module Chan_internal = Chan
+
+module Chan = struct
+  type 'a t = 'a Chan.t
+
+  let create = Chan.create
+
+  let send = Chan.send
+
+  let recv = Chan.recv
+end
 
 module type WORLD = World.WORLD
 
@@ -74,4 +85,5 @@ module Private = struct
   module Op = Op
   module Sched = Sched
   module Sched_debug = Sched_debug
+  module Chan = Chan_internal
 end

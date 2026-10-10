@@ -617,6 +617,160 @@ let timers =
     ; test "a fill skips a waiter that committed to another branch"
         ivar_stale_waiter ]
 
+(* Channels *)
+
+let live_offers c =
+  let module C = Private.Chan in
+  let live o = not (Private.Sched.is_done o) in
+  List.length (List.filter (fun o -> live o.C.ssync) c.C.senders)
+  + List.length (List.filter (fun o -> live o.C.rsync) c.C.receivers)
+
+let send_recv_meet () =
+  run (fun () ->
+      let c = Chan.create () in
+      let got =
+        Fiber.scope (fun s ->
+            let r = Fiber.fork_promise s (fun () -> sync (Chan.recv c)) in
+            Fiber.fork s (fun () -> sync (Chan.send c "hello")) ;
+            Promise.await r )
+      in
+      equal string "hello" got )
+
+(* The cross scenario of spec/tla/Commit.tla: X syncs on [send c1; recv c2] and
+   Y on [send c2; recv c1]. Exactly one pair commits for each. *)
+let cross seed =
+  let x, y =
+    run ~seed (fun () ->
+        let c1 = Chan.create () and c2 = Chan.create () in
+        Fiber.scope (fun s ->
+            let x =
+              Fiber.fork_promise s (fun () ->
+                  sync
+                    (choose
+                       [ wrap (Chan.send c1 "x") (fun () -> "x sent on c1")
+                       ; wrap (Chan.recv c2) (fun v -> "x got " ^ v ^ " on c2")
+                       ] ) )
+            in
+            let y =
+              Fiber.fork_promise s (fun () ->
+                  sync
+                    (choose
+                       [ wrap (Chan.send c2 "y") (fun () -> "y sent on c2")
+                       ; wrap (Chan.recv c1) (fun v -> "y got " ^ v ^ " on c1")
+                       ] ) )
+            in
+            (Promise.await x, Promise.await y) ) )
+  in
+  is_true
+    ( (x, y) = ("x sent on c1", "y got x on c1")
+    || (x, y) = ("x got y on c2", "y sent on c2") )
+
+let own_offer_never_meets () =
+  run (fun () ->
+      let c = Chan.create () in
+      let r =
+        sync
+          (choose
+             [ wrap (Chan.send c 1) (fun () -> "met")
+             ; wrap (Chan.recv c) (fun _ -> "met")
+             ; wrap (Time.after Mono (Span.s 1)) (fun () -> "timeout") ] )
+      in
+      equal string "timeout" r )
+
+let stale_offer_skipped () =
+  run (fun () ->
+      let c = Chan.create () in
+      let r =
+        sync
+          (choose
+             [ wrap (Chan.recv c) (fun v -> v)
+             ; wrap (Time.after Mono (Span.ms 10)) (fun () -> "timeout") ] )
+      in
+      equal string "timeout" r ;
+      (* The offer of the first recv is stale. The send must wait for the second
+         receiver. *)
+      let t0 = Time.now Mono in
+      Fiber.scope (fun s ->
+          Fiber.fork s (fun () ->
+              Time.sleep Mono (Span.s 1) ;
+              equal string "late" (sync (Chan.recv c)) ) ;
+          sync (Chan.send c "late") ;
+          equal int 1000 (ms_since t0) ) )
+
+let cancel_in_recv () =
+  run (fun () ->
+      let c = Chan.create () in
+      let r = ref "" in
+      Fiber.scope (fun s ->
+          Fiber.fork s (fun () ->
+              try ignore (sync (Chan.recv c))
+              with Fiber.Cancelled (Boom m) -> r := m ) ;
+          Fiber.yield () ;
+          Fiber.cancel s (Boom "stop") ) ;
+      equal string "stop" !r ;
+      equal int 0 (live_offers c) )
+
+let no_offers_after_cancel () =
+  run (fun () ->
+      let c = Chan.create () in
+      Fiber.scope (fun s ->
+          for i = 1 to 3 do
+            Fiber.fork s (fun () -> sync (Chan.send c i))
+          done ;
+          Fiber.fork s (fun () -> ignore (sync (Chan.recv (Chan.create ())))) ;
+          Fiber.yield () ;
+          equal int 3 (live_offers c) ;
+          Fiber.cancel s (Boom "stop") ) ;
+      equal int 0 (live_offers c) )
+
+let timeout_loop_bounded () =
+  run (fun () ->
+      let c : int Chan.t = Chan.create () in
+      for _ = 1 to 100 do
+        ignore
+          (sync
+             (choose
+                [ wrap (Chan.recv c) Option.some
+                ; wrap (Time.after Mono (Span.ms 1)) (fun () -> None) ] ) )
+      done ;
+      let module C = Private.Chan in
+      at_most int ~than:1 (List.length c.C.receivers) )
+
+(* Each sent value arrives exactly one time. *)
+let values_conserved (seed, n) =
+  let got =
+    run ~seed (fun () ->
+        let c = Chan.create () in
+        let got = ref [] in
+        Fiber.scope (fun s ->
+            for i = 1 to n do
+              Fiber.fork s (fun () ->
+                  if i mod 2 = 0 then Fiber.yield () ;
+                  sync (Chan.send c i) ) ;
+              Fiber.fork s (fun () ->
+                  if i mod 3 = 0 then Fiber.yield () ;
+                  (* Read [!got] after the sync, not before it. *)
+                  let v = sync (Chan.recv c) in
+                  got := v :: !got )
+            done ) ;
+        !got )
+  in
+  equal (list int) (List.init n (fun i -> i + 1)) (List.sort compare got)
+
+let chans =
+  group "channels"
+    [ test "a send and a recv that start at the same time meet" send_recv_meet
+    ; prop "cross: each sync commits exactly one pair" Gen.int cross
+    ; test "a sync never meets its own offer" own_offer_never_meets
+    ; test "a stale offer does not meet a later send" stale_offer_skipped
+    ; test "a cancel ends a recv and leaves no offer" cancel_in_recv
+    ; test "a cancelled scope leaves no live offers" no_offers_after_cancel
+    ; test "a loop of recv with a timeout keeps the offers bounded"
+        timeout_loop_bounded
+    ; prop "each sent value arrives exactly one time"
+        (Gen.pair Gen.int (Gen.int_range 0 12))
+        values_conserved ]
+
 (* Properties *)
 
 let spans = Gen.list ~size:(Gen.int_range 1 8) (Gen.int_range (-3) 5000)
@@ -665,4 +819,6 @@ let properties =
     ; test "different seeds give different runs" seeds_differ ]
 
 let () =
-  exit (Windtrap.run "sim" [time; timers; events; scopes; checks; properties])
+  exit
+    (Windtrap.run "sim"
+       [time; timers; events; chans; scopes; checks; properties] )

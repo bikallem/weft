@@ -153,4 +153,19 @@ module Private : sig
   module Op = Op
   module Sched = Sched
   module Sched_debug = Sched_debug
+
+  module Chan : module type of struct
+    include Chan
+  end
+end
+
+module Chan : sig
+  (** A synchronous channel: a [send] and a [recv] commit together. *)
+  type 'a t = 'a Private.Chan.t
+
+  val create : unit -> 'a t
+
+  val send : 'a t -> 'a -> unit event
+
+  val recv : 'a t -> 'a event
 end
