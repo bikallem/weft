@@ -3,3 +3,4 @@ _windtrap/
 *.install
 .direnv/
 .vscode/
+spec/tla/*.old
