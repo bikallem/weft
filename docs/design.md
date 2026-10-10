@@ -298,7 +298,7 @@ At the end of the scan, the fiber changes its word from `Waiting` to `Parked` wi
 
 **Own offers.** A partner skips an offer of its own `sync`, for example in `choose [send c v; recv c]`.
 
-**In the simulator.** A claim holds a word for a short time, with no world effect inside. Thus a virtual domain never sees a `Claimed` word of another virtual domain, and the retry paths on `Claimed` never run in a simulator test. The simulator cannot find a race here, so `dscheck` must examine this protocol (section 2.14, milestone M1).
+**In the simulator.** A claim holds a word for a short time, with no world effect inside. Thus a virtual domain never sees a `Claimed` word of another virtual domain, and the retry paths on `Claimed` never run in a simulator test. The simulator cannot find a race here, so `dscheck` must examine this protocol (section 2.14, milestone M1). The unit tests run each retry path with a test instance of `ATOMIC`. Before each read or CAS, it can change the word, for example to `Claimed` and then to `Parked` (`test/core/test_commit.ml`). These tests find a path that does not retry, but not a race.
 
 **A TLA+ model.** `spec/tla/Commit.tla` is a model of this protocol in PlusCal, and the TLC model checker examines it. Each CAS on a word is one atomic step. The model has the scan, the atomic register with a lock for each channel, the claim of two words in id order, the `Parked` state, the one-word partners (a cancel and a timer) and the self-commit. TLC checks these properties for each order of the steps:
 
@@ -1232,6 +1232,8 @@ The tests use windtrap 0.2.0 (decision 9). The flake builds windtrap and `ppx_wi
 - `test/nounix` is the guard of section 2.3. It has no test library.
 - The libraries have the backends `ppx_windtrap.coverage` and `ppx_windtrap.mutate`. A backend does nothing until a build asks for it. Its runtime library, `windtrap.runtime`, uses only the stdlib, so the guard stays correct also with the instrumented libraries.
 - The libraries do not use `ppx_windtrap` itself. Its runtime libraries include `windtrap`, which links `unix`. Thus there are no inline tests in `weft` or `weft.sim`, and a test of an inside part goes through a module that the library exports for tests, as `Sched_debug` (section 2.2).
+
+**The commit protocol (M0).** `Commit.Make (A : ATOMIC)` in `src/core/commit.ml` has no effects, and it does not resume a fiber. Each function gives the caller its part of the resume: `claim` gives `Committed { resume_partner }`, `notify` gives `Resume`, `In_scan` or `Lost`, and `park` gives `` `Parked `` or `` `Done ``. The stateful test of `test/core` compares the protocol with a sequential model. Its invariant on each sync is the property of `Commit.tla`: at most one resume, and a suspended fiber always has a `Parked` word. Thus a lost wakeup fails the test at the call that caused it. In M1, the same commands run with `stateful ~domains:2`.
 
 **The commands:**
 
