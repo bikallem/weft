@@ -2,3 +2,4 @@ _build/
 _windtrap/
 *.install
 .direnv/
+.vscode/
