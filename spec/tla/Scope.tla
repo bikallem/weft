@@ -257,7 +257,8 @@ k0:
   if (Scenario # "fork") { goto Done; };
 k1:
   \* One CAS on the state word of S: fork only if S is open.
-  if (linked["S"] /\ ~closed /\ ~cancelled["S"]) {
+  \* The code reads the flags of the whole chain of S, as a sync does.
+  if (linked["S"] /\ ~closed /\ FirstFlag("S") = "none") {
     members["S"] := members["S"] \cup {"G3"};
     g3 := "forked";
   } else {
@@ -738,7 +739,7 @@ k0 == /\ pc["K"] = "k0"
                       g3, sRes, tRes, toRes, stack, x, wt, wf, fx >>
 
 k1 == /\ pc["K"] = "k1"
-      /\ IF linked["S"] /\ ~closed /\ ~cancelled["S"]
+      /\ IF linked["S"] /\ ~closed /\ FirstFlag("S") = "none"
             THEN /\ members' = [members EXCEPT !["S"] = members["S"] \cup {"G3"}]
                  /\ g3' = "forked"
             ELSE /\ g3' = "closed"
