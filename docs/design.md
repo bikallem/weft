@@ -307,7 +307,7 @@ At the end of the scan, the fiber changes its word from `Waiting` to `Parked` wi
 - At the end, each sync with `Done` had one resume, and the cancel took effect.
 - With weak fairness, each process ends: no deadlock and no loop that runs forever.
 
-Three scenarios pass: two fibers that sync on each other, a stale offer with a timer, and a ready branch with a cancel. To show that the model is useful, four planted bugs each give a failure: no `Parked` state (two resumes), no id order (the deadlock of "Why there is no deadlock"), a one-word partner that gives up on `Claimed` (a cancel that is lost), and no channel lock (a lost rendezvous). Run `nix develop -c spec/tla/check.sh`. The model is small: two or three fibers, one `sync` for each fiber, and two channels. Thus it does not cover a word that is used again, nacks, or more than three fibers. `dscheck` still examines the OCaml code in M1.
+Three scenarios pass: two fibers that sync on each other, a stale offer with a timer, and a ready branch with a cancel. To show that the model is useful, four planted bugs each give a failure: no `Parked` state (two resumes), no id order (the deadlock of "Why there is no deadlock"), a one-word partner that gives up on `Claimed` (a cancel that is lost), and no channel lock (a lost rendezvous). Section 2.16 lists all of the TLA+ models. The model is small: two or three fibers, one `sync` for each fiber, and two channels. Thus it does not cover a word that is used again, nacks, or more than three fibers. `dscheck` still examines the OCaml code in M1.
 
 When more than one branch is ready, `choose` uses `Random` from the world to select a branch. In production this prevents starvation. In the simulator, the seed controls it, so a failed run can run again with the same result.
 
@@ -495,7 +495,7 @@ TLC checks these properties in each scenario:
 - A closed scope has no members (`ClosedEmpty`).
 - With weak fairness, each process ends. Thus each cancel reaches each fiber that it must reach, and each join ends.
 
-All three scenarios pass. Five planted bugs each give a failure: a join that a cancel can end, a scope in a shield that links under the outer scope, a walk with no check of the chain, a member that ends before it stores its exception, and a `sync` that parks with no read of the flags. Run `nix develop -c spec/tla/check.sh`. The model makes each commit one atomic step, and `Commit.tla` examines the commit itself. The model does not cover promises, `fork_isolated`, `Fiber.Mutex`, more than one nested scope in each scenario, or the deadline form of `with_timeout`.
+All three scenarios pass. Five planted bugs each give a failure: a join that a cancel can end, a scope in a shield that links under the outer scope, a walk with no check of the chain, a member that ends before it stores its exception, and a `sync` that parks with no read of the flags. Section 2.16 lists all of the TLA+ models. The model makes each commit one atomic step, and `Commit.tla` examines the commit itself. The model does not cover promises, `fork_isolated`, `Fiber.Mutex`, more than one nested scope in each scenario, or the deadline form of `with_timeout`.
 
 **In the simulator.** The scope cancels its members in the fork order, so the seed sets the full result. After a scope ends, the simulator examines its state. It must find no fibers of that scope, and no live offers or heap entries. An offer or an entry is live if its sync word is not `Done`. Stale entries can stay until their owner drops them.
 
@@ -783,8 +783,8 @@ Each domain has its own poller (section 2.5). A fiber registers an fd in the pol
 - **The state machine of Eio's `Rcfd`.** The record has one atomic state: `Open of users`, `Closing of users` and `Closed`. A `submit` adds a user with a CAS only in `Open`. In `Closing` or `Closed`, it gets `EBADF` and adds no user. Thus a late `submit` after `close` cannot take a count from 0 to 1 and back to 0. `close` changes `Open n` to `Closing n`. The side that changes `Closing 0` to `Closed` with a CAS calls `close(2)`, and only that side. Thus `close(2)` occurs exactly one time (`lib_eio/unix/rcfd.ml`).
 - **One record for each open.** User handles hold the record object, and the library never uses the same object for a new fd. Only the slot in the table is used again, with a new generation. The kernel can give the same fd number to a new file after `close(2)`. Thus `epoll_data` holds the index of the slot and the generation, not the fd number, and a domain drops an event with an old generation.
 - `close` never blocks, so it is not a cancellation point. A cancelled fiber can thus call it in cleanup code.
-- **Registrations hold a user (M1).** Each registration in the poller of a domain holds one user. Register adds a user, then sets its bit in the domain set, then reads the state. If the state is `Closing`, Register undoes its steps and commits its waiter with `EBADF`. `close` sets `Closing` and then reads the domain set. These are Dekker pairs of atomics, so one side always sees the other.
-- **Close notices (M1).** `close` sends a close notice with the slot index and the generation to the mailbox of each domain in the set, and it wakes these domains. A domain acts on a notice only if it holds a live registration for that pair. The side that clears the domain bit with a CAS owns the removal: a close notice or the removal of section "An fd in many pollers". That side commits the waiters with `EBADF`, does `EPOLL_CTL_DEL` and removes the user of the registration. Thus a user is removed exactly one time, and `EPOLL_CTL_DEL` never names a reused fd number.
+- **Registrations hold a user (M1).** Each registration in the poller of a domain holds one user. Register adds a user, then sets its bit in the domain set, then reads the state. If the state is `Closing`, Register undoes its steps and commits its waiter with `EBADF`. `close` sets `Closing` and then reads the domain set. These are Dekker pairs of atomics, so one side always sees the other. Register runs on the thread of the domain that owns the poller, and it does not suspend the fiber. That thread takes its mailbox only between fibers. Thus a domain never takes a close notice between the steps of its own Register.
+- **Close notices (M1).** `close` sends a close notice with the slot index and the generation to the mailbox of each domain in the set, and it wakes these domains. A domain acts on a notice only if it holds a live registration for that pair. The removal of section "An fd in many pollers" also needs a live registration. The two run on the thread of the domain, one after the other, so only the first one finds the registration live. That one clears the domain bit, commits the waiters with `EBADF`, does `EPOLL_CTL_DEL` and removes the user of the registration. Thus a user is removed exactly one time, and `EPOLL_CTL_DEL` never names a reused fd number. The domain bit does not need a CAS. Only the owner clears it, and the closer only reads it to know which domains get a notice. The TLA+ model of section 2.16 showed this: without the CAS, the result and the number of states do not change.
 - `close(2)` comes after each `EPOLL_CTL_DEL`. An epoll registration lives until all fds of its open file description close (epoll(7)). A review verified this: with a `dup` alive, the registration gave events after `close(2)`.
 - `close(2)` can block, for example on a socket with `SO_LINGER` and on an NFS or FUSE file. Thus the library gives the `close(2)` of a `File` fd, and of a socket with `SO_LINGER`, to the pool (milestone M2).
 - **Close-on-exec.** The library makes each fd with this flag: `epoll_create1 (EPOLL_CLOEXEC)`, `EFD_CLOEXEC`, `TFD_CLOEXEC`, `SOCK_CLOEXEC` for `socket`, `socketpair` and `accept4`, `O_CLOEXEC` for `File.open`, `pipe2`, `MSG_CMSG_CLOEXEC` for fds that come with `SCM_RIGHTS`, and `F_DUPFD_CLOEXEC` or `dup3` for a copy. Thus a child from `Process.spawn` does not keep a copy.
@@ -1091,7 +1091,7 @@ The sections of this document mark each part that does not come in M0 with its m
 - A test with a fiber that waits forever gets `Deadlock`, with the name of that fiber. A planted lost wakeup gives `Lost_wakeup`, not an incorrect timeout.
 - 10,000 connections open and close on Linux with no fd leak, and a late `write` after `close` gives `EBADF` and closes nothing.
 - The simulator tests are in `test` stanzas with `(forbidden_libraries unix)`.
-- The TLA+ models of sections 2.4 and 2.5 pass (`spec/tla/check.sh`).
+- The TLA+ models of section 2.16 pass (`spec/tla/check.sh`).
 
 **What M0 proves:** the `WORLD` contract (`Wait`, `Submit`, `Register`, the tokens) works on a real OS and on the simulator. The core API is complete enough for a server with timeouts. The design meets a real OS in the first milestone, not at the end.
 
@@ -1181,6 +1181,30 @@ It has three problems:
 1. **Many domains.** A replay is exact only if the fibers run in the same order. With one domain, the world effects set the order. With many real domains, steals, channel operations and atomics between domains are not world effects, so the log does not record their order. Thus Record works fully only with `~domains:1`.
 2. **Log size.** Each read writes its data to the log, and each `Now` adds an entry. A busy server makes a very large log.
 3. **Privacy.** The log holds all of the request data, for example passwords and tokens.
+
+## 2.16 Verification with TLA+
+
+The protocols that run on many domains at the same time have models in PlusCal, in `spec/tla`. The TLC model checker examines each order of their steps. Each model has the protocol of this design, and a set of planted bugs. Each planted bug must give a failure. Thus the model can find the errors that matter, and it is not only a model that always passes.
+
+Run all of the models with `nix develop -c spec/tla/check.sh`. `MODELS="Ivar Fd"` selects some of them. The full check takes about 20 minutes on a machine with 16 CPUs. The flake of the repository gives the TLA+ tools.
+
+| Model | Protocol (section) | Properties | Planted bugs that fail |
+|---|---|---|---|
+| `Commit.tla` | The commit of `choose` (2.4) | At most one resume, correct rendezvous pairs, no lost rendezvous, a correct end state, termination | No `Parked` state, no id order, a partner that gives up on `Claimed`, no channel lock |
+| `Scope.tla` | Scopes and cancellation (2.5) | No orphan fiber, no lost exception, the shield holds, no cancel of a foreign `sync`, a closed scope is empty, termination | A join that a cancel can end, a scope in a shield under the outer scope, no check of the chain, an exception after the end, no read of the flags |
+| `Ivar.tla` | The atomic register of an `Ivar`, and `Ivar.fill_from_outside` (2.4, 2.5) | At most one resume, one fill, no waiters after the fill, a correct end state, termination | A finaliser that commits the waiters itself, a register that is not atomic |
+| `Wake.tla` | The loop of a domain: idle and wake, steal, next slot, pinned queue, injection queue (2.5) | Each item runs, a pinned item runs only on domain 0, no lost wakeup | The decrease of `searching` after the second check, no second check, a pinned push that wakes any domain |
+| `Fd.tla` | The fd record: `Rcfd`, the registrations, the close notices, the removal (2.7) | One `close(2)`, no `close(2)` of another file, no use after `close(2)`, no `EPOLL_CTL_DEL` of a new file, `EPOLL_CTL_DEL` before `close(2)`, termination | A count and a closed bit, a Register that reads the state first, a registration with no user |
+
+**What the models showed about the design:**
+
+- **A daemon needs its own cancel context** (section 2.5, Lifetime). The design did not tell how the `sync` of a daemon sees the cancel of the daemons.
+- **The second read of the parent flag is not necessary** for a `sync` (section 2.5, The concurrency of scopes). Each `sync` reads the flags of its whole chain.
+- **The domain bit of an fd record needs no CAS** (section 2.7, Close notices). The owner of the registration decides.
+- **A thief that cannot take a next slot loses no wakeup** (`Wake.tla`). The steal of the next slot only makes the latency smaller.
+- **A Register and a close notice of one domain never interleave** (section 2.7). The model of the fd record needs this rule of the design. Without it, a notice can arrive before the registration is live, and the waiter waits forever.
+
+**The limits.** The models are small: two or three fibers or domains in each scenario, a few work items, and one fd. Each model takes some details as one atomic step, and another model examines them, for example the commit in `Scope.tla` and `Ivar.tla`. The models do not cover the simulator, the OS facts, `Fiber.Mutex`, `Condition`, promises or signals. `dscheck` still examines the OCaml code in milestone M1, because the OCaml code can differ from the model.
 
 ---
 
