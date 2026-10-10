@@ -1,0 +1,10 @@
+; The simulator world. It has no dependency on unix (design section 2.8).
+
+(library
+ (name weft_sim)
+ (public_name weft.sim)
+ (libraries weft)
+ (instrumentation
+  (backend ppx_windtrap.coverage))
+ (instrumentation
+  (backend ppx_windtrap.mutate)))

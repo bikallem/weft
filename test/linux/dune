@@ -1,0 +1,9 @@
+(test
+ (name test_linux)
+ (enabled_if
+  (= %{system} linux))
+ (libraries weft weft.linux windtrap)
+ (action
+  (progn
+   (run %{test} --corrected)
+   (diff? test_linux.ml test_linux.ml.corrected))))

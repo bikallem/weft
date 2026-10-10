@@ -1,0 +1,11 @@
+; The suites on the simulator world. Windtrap links unix, so these suites
+; cannot use (forbidden_libraries unix); test/nounix is the guard. The test
+; code itself must not call Unix.
+
+(test
+ (name test_sim)
+ (libraries weft weft.sim windtrap)
+ (action
+  (progn
+   (run %{test} --corrected)
+   (diff? test_sim.ml test_sim.ml.corrected))))

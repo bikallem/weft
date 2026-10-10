@@ -1,0 +1,12 @@
+; The Linux world: epoll, timerfd and eventfd (design section 2.7).
+
+(library
+ (name weft_linux)
+ (public_name weft.linux)
+ (enabled_if
+  (= %{system} linux))
+ (libraries weft unix)
+ (instrumentation
+  (backend ppx_windtrap.coverage))
+ (instrumentation
+  (backend ppx_windtrap.mutate)))

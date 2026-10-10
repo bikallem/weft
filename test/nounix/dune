@@ -1,0 +1,8 @@
+; The guard: the build gives an error if weft or weft.sim links unix
+; (design section 2.3). The windtrap suites link unix, so the guard is a
+; separate executable with no test library.
+
+(test
+ (name nounix)
+ (libraries weft weft.sim)
+ (forbidden_libraries unix))

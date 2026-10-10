@@ -1,0 +1,11 @@
+; The core library. It has no dependency on unix (design section 2.3), and
+; it does not use ppx_windtrap, because its runtime libraries link unix.
+; test/nounix makes sure of it.
+
+(library
+ (name weft)
+ (public_name weft)
+ (instrumentation
+  (backend ppx_windtrap.coverage))
+ (instrumentation
+  (backend ppx_windtrap.mutate)))
