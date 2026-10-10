@@ -153,6 +153,11 @@ module Private : sig
   module Op = Op
   module Sched = Sched
   module Sched_debug = Sched_debug
+  module Event = Event
+
+  module Net : module type of struct
+    include Net
+  end
 
   module Chan : module type of struct
     include Chan
@@ -168,4 +173,59 @@ module Chan : sig
   val send : 'a t -> 'a -> unit event
 
   val recv : 'a t -> 'a event
+end
+
+(** {1 Sockets} (design sections 2.3 and 2.7) *)
+
+module Net : sig
+  type addr = Private.Net.addr =
+    | Tcp of string * int
+    | Unix of string
+        (** In the simulator, the host of [Tcp] is a name, for example
+            ["server"]. *)
+
+  (** A socket. *)
+  type t = Private.Net.t
+
+  type error = Private.Op.error =
+    | Would_block
+    | Bad_fd  (** [EBADF]: the socket is closed. *)
+    | Refused
+    | Reset
+    | Broken_pipe
+    | In_use
+    | Other of string
+
+  (** The error, and the name of the function. It is [Private.Net.Error]. *)
+  exception Error of error * string
+
+  val listen : ?backlog:int -> addr -> t
+
+  val accept : t -> t * addr
+
+  val connect : addr -> t
+
+  val read : t -> bytes -> int -> int -> int
+  (** [read t buf off len] reads at least one byte, or gives 0 at the end of the
+      stream.
+
+      @raise Invalid_argument if [len < 1] or the range is not in [buf]. *)
+
+  val write : t -> string -> unit
+  (** Writes all of the string. *)
+
+  val write_sub : t -> bytes -> int -> int -> int
+  (** Writes at least one byte, and gives the number. *)
+
+  val shutdown : t -> unit
+  (** Ends the send side. The peer reads the end of the stream. *)
+
+  val close : t -> unit
+  (** Closes the socket. A fiber that waits on it, and each later operation,
+      gets [Error (Bad_fd, _)]. A second [close] does nothing. [close] never
+      blocks, so a cancelled fiber can call it. *)
+
+  val readable : t -> unit event
+
+  val writable : t -> unit event
 end

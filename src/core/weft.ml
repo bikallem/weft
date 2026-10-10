@@ -36,17 +36,10 @@ module Promise = struct
 end
 
 module Ivar = Ivar
+module Net_internal = Net
+module Net = Net_internal
 module Chan_internal = Chan
-
-module Chan = struct
-  type 'a t = 'a Chan.t
-
-  let create = Chan.create
-
-  let send = Chan.send
-
-  let recv = Chan.recv
-end
+module Chan = Chan_internal
 
 module type WORLD = World.WORLD
 
@@ -64,8 +57,8 @@ let run (type w) ?slack (module W : WORLD with type t = w) (w : w) main =
           match e with
           | World.Now line ->
               Some (fun (k : (a, _) continuation) -> continue k (W.now w line))
-          | World.Submit _ ->
-              . (* Op.t has no operations before Net. *)
+          | World.Submit op ->
+              Some (fun k -> continue k (W.submit w op))
           | World.Wait (domain, wt) ->
               Some (fun k -> continue k (W.wait w ~domain wt))
           | World.Wake domain ->
@@ -85,5 +78,7 @@ module Private = struct
   module Op = Op
   module Sched = Sched
   module Sched_debug = Sched_debug
+  module Event = Event
+  module Net = Net_internal
   module Chan = Chan_internal
 end

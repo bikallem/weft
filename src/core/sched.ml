@@ -81,6 +81,29 @@ and 'a ivar = 'a ivar_state Atomic.t
 
 and 'a ivar_state = Empty of (sync * int) list | Full of 'a
 
+(* The record of one open fd (design section 2.7, close). All domains share
+   it. *)
+and fdrec =
+  { slot: int
+  ; gen: int
+  ; os: Op.fd
+  ; rc: rc Atomic.t
+  ; doms: int Atomic.t
+        (** The bit of each domain with a registration. Only the owner of a bit
+            changes it. *) }
+
+(* The state machine of Eio's [Rcfd]. *)
+and rc = Open of int | Closing of int | Closed
+
+(* The registration of an fd in the poller of one domain. Only that domain uses
+   it. *)
+and reg =
+  { fdr: fdrec
+  ; mutable rflag: bool
+  ; mutable wflag: bool
+  ; mutable rwait: (sync * int) list
+  ; mutable wwait: (sync * int) list }
+
 and step =
   | Finished
   | Suspended : 'a req * ('a, step) Effect.Deep.continuation -> step
@@ -90,6 +113,7 @@ and _ req =
   | Fork : fiber * (unit -> unit) -> unit req
   | Self : fiber req
   | Enqueue : sync list -> unit req
+  | Close_regs : fdrec -> unit req
 
 and sync_req = {leaves: leaf array; nocancel: bool}
 
@@ -103,7 +127,10 @@ and dom =
   ; heap: heap
   ; ids: Commit.Id.gen
   ; sched: t
-  ; mutable switches: int }
+  ; mutable switches: int
+  ; regs: (int, reg) Hashtbl.t  (** The registrations, by slot. *)
+  ; externals: (int, sync * int) Hashtbl.t
+        (** The waiters of [Ready.External], by id. *) }
 
 and ready = {rfiber: fiber; run: unit -> step}
 
@@ -258,6 +285,50 @@ module Iv = struct
   let leaf iv = {attempt= (fun _ s i -> register iv s i)}
 end
 
+(* The table of fd slots. A slot is used again with a new generation, so a token
+   of an old open never names the new one. *)
+module Fdtab = struct
+  let lock = Spin.make ()
+
+  let gens = ref (Array.make 64 0)
+
+  let free = ref []
+
+  let next = ref 0
+
+  let alloc os =
+    Spin.with_lock lock (fun () ->
+        let slot =
+          match !free with
+          | s :: rest ->
+              free := rest ;
+              s
+          | [] ->
+              let s = !next in
+              incr next ;
+              if s >= Array.length !gens then (
+                let a = Array.make (2 * s) 0 in
+                Array.blit !gens 0 a 0 s ;
+                gens := a ) ;
+              s
+        in
+        let gen =
+          (!gens.(slot) + 1) [@mutate off "any change gives a new generation"]
+          land 0xffff_ffff
+        in
+        !gens.(slot) <- gen ;
+        {slot; gen; os; rc= Atomic.make (Open 0); doms= Atomic.make 0} )
+
+  let release r = Spin.with_lock lock (fun () -> free := r.slot :: !free)
+
+  let token r =
+    Int64.logor (Int64.shift_left (Int64.of_int r.slot) 32) (Int64.of_int r.gen)
+
+  let of_token t =
+    ( Int64.to_int (Int64.shift_right_logical t 32)
+    , Int64.to_int (Int64.logand t 0xffff_ffffL) )
+end
+
 (* The fibers. *)
 
 let next_fid = Atomic.make 0
@@ -305,6 +376,103 @@ let resume dom s =
   push dom s.owner (fun () ->
       Atomic.set s.owner.current None ;
       Effect.Deep.continue k i )
+
+(* Commit each waiter. *)
+let wake_all dom waiters =
+  List.iter
+    (fun (s, i) ->
+      match C.notify s.word i with C.Resume -> resume dom s | _ -> () )
+    (List.rev waiters)
+
+(* Add a waiter, and drop the waiters whose sync is Done (design section 2.7,
+   The waiters). *)
+let add_waiter s i l = (s, i) :: List.filter (fun (w, _) -> not (is_done w)) l
+
+(* The registration of [fdr] on [dom]. The first block on a domain adds the fd
+   to its poller. [None] tells that the fd is closing: the waiter retries and
+   gets [EBADF]. *)
+let ensure_reg dom fdr =
+  match Hashtbl.find_opt dom.regs fdr.slot with
+  | Some reg when reg.fdr == fdr ->
+      Some reg
+  | _ -> (
+    match Atomic.get fdr.rc with
+    | Closing _ | Closed ->
+        None
+    | Open _ -> (
+        let token = Fdtab.token fdr in
+        match
+          World.perform "Net"
+            (World.Submit (Op.Register (dom.index, fdr.os, token)))
+        with
+        | Error _ ->
+            None
+        | Ok () ->
+            let reg = {fdr; rflag= false; wflag= false; rwait= []; wwait= []} in
+            Hashtbl.replace dom.regs fdr.slot reg ;
+            Atomic.set fdr.doms (Atomic.get fdr.doms lor (1 lsl dom.index)) ;
+            Some reg ) )
+
+(* The wait for an fd. With [~clear], the fiber got [EAGAIN], so the flag of
+   this domain is stale. *)
+let fd_leaf ~write ~clear fdr =
+  { attempt=
+      (fun dom s i ->
+        match ensure_reg dom fdr with
+        | None ->
+            ignore (C.self_commit s.word i)
+        | Some reg ->
+            if clear then
+              if write then reg.wflag <- false else reg.rflag <- false ;
+            if if write then reg.wflag else reg.rflag then
+              ignore (C.self_commit s.word i)
+            else if write then reg.wwait <- add_waiter s i reg.wwait
+            else reg.rwait <- add_waiter s i reg.rwait ) }
+
+(* The close of [fdr] on [dom]: remove the registration, commit its waiters, and
+   remove the fd from the poller. *)
+let close_reg dom fdr =
+  match Hashtbl.find_opt dom.regs fdr.slot with
+  | Some reg when reg.fdr == fdr ->
+      Hashtbl.remove dom.regs fdr.slot ;
+      Atomic.set fdr.doms (Atomic.get fdr.doms land lnot (1 lsl dom.index)) ;
+      wake_all dom reg.rwait ;
+      wake_all dom reg.wwait ;
+      ignore
+        (World.perform "Net.close"
+           (World.Submit (Op.Deregister (dom.index, fdr.os))) )
+  | _ ->
+      ()
+
+let external_leaf id =
+  {attempt= (fun dom s i -> Hashtbl.replace dom.externals id (s, i))}
+
+let on_ready dom = function
+  | World.Ready.Fd {token; read; write} -> (
+      let slot, gen = Fdtab.of_token token in
+      match Hashtbl.find_opt dom.regs slot with
+      | Some reg when reg.fdr.gen = gen ->
+          if read then (
+            reg.rflag <- true ;
+            let w = reg.rwait in
+            reg.rwait <- [] ;
+            wake_all dom w ) ;
+          if write then (
+            reg.wflag <- true ;
+            let w = reg.wwait in
+            reg.wwait <- [] ;
+            wake_all dom w )
+      | _ ->
+          () )
+  | World.Ready.External id -> (
+    match Hashtbl.find_opt dom.externals id with
+    | Some w ->
+        Hashtbl.remove dom.externals id ;
+        wake_all dom [w]
+    | None ->
+        () )
+  | World.Ready.Alarm | World.Ready.Woken ->
+      ()
 
 (* The cancel contexts (design section 2.5, How a cancel reaches a fiber, and
    spec/tla/Scope.tla). *)
@@ -391,6 +559,9 @@ let rec run_fiber : dom -> fiber -> step -> unit =
       register dom.sched f ;
       push dom f (start body) ;
       run_fiber dom fiber (Effect.Deep.continue k ())
+  | Suspended (Close_regs fdr, k) ->
+      close_reg dom fdr ;
+      run_fiber dom fiber (Effect.Deep.continue k ())
   | Suspended (Enqueue l, k) ->
       List.iter (resume dom) l ;
       run_fiber dom fiber (Effect.Deep.continue k ())
@@ -475,7 +646,7 @@ let alarm dom =
 let wait dom timeout =
   expire dom ;
   let w = {World.Wait.timeout; deadline= alarm dom} in
-  ignore (World.perform "sched" (World.Wait (dom.index, w))) ;
+  List.iter (on_ready dom) (World.perform "sched" (World.Wait (dom.index, w))) ;
   expire dom
 
 let rec loop dom =
@@ -694,7 +865,9 @@ let run ?(slack = Span.ms 1) ?on_create main =
     ; heap= Heap.create ()
     ; ids= Commit.Id.gen ~domain:0 ~max_domains:1
     ; sched= t
-    ; switches= 0 }
+    ; switches= 0
+    ; regs= Hashtbl.create ~random:false 64
+    ; externals= Hashtbl.create ~random:false 8 }
   in
   t.doms <- [|dom|] ;
   Option.iter (fun f -> f t) on_create ;

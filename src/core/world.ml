@@ -5,7 +5,11 @@ module Wait = struct
 end
 
 module Ready = struct
-  type t = Alarm | Woken
+  type t =
+    | Alarm
+    | Woken
+    | Fd of {token: int64; read: bool; write: bool}
+    | External of int
 end
 
 type _ Effect.t +=

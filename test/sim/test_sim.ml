@@ -821,4 +821,5 @@ let properties =
 let () =
   exit
     (Windtrap.run "sim"
-       [time; timers; events; chans; scopes; checks; properties] )
+       ( [time; timers; events; chans; scopes; checks; properties]
+       @ Test_net.tests ) )

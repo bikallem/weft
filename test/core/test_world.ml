@@ -22,7 +22,7 @@ module Manual = struct
     t.now <- Int64.add t.now t.tick ;
     Clock.of_ns line n
 
-  let submit _ (op : _ Private.Op.t) = match op with _ -> .
+  let submit _ (_ : _ Private.Op.t) = Error (Private.Op.Other "no network")
 
   let wait t ~domain:_ (w : Private.World.Wait.t) =
     match w.timeout with
