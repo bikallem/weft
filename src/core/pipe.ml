@@ -11,8 +11,9 @@ let create () =
 
 let read fd buf off len =
   Net.check_range ~read:true "Pipe.read" buf off len ;
-  Net.retry ~write:false fd "Pipe.read" (fun os ->
-      Op.Fd_read (os, buf, off, len) )
+  Net.after_read fd
+    (Net.retry ~write:false fd "Pipe.read" (fun os ->
+         Op.Fd_read (os, buf, off, len) ) )
 
 let write_sub fd buf off len =
   Net.check_range ~read:false "Pipe.write_sub" buf off len ;

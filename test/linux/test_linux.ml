@@ -415,6 +415,41 @@ let posix_sleep () =
       less int64 ~than:30_000_000L
         (Span.to_ns (Time.diff Mono (Time.now Mono) t0)) )
 
+(* M3: a reader whose reads always find data yields after 64 KiB, so a timer on
+   the same domain is not late by much. The reader of a full pipe works 20 us on
+   each chunk, and a fiber sleeps 1 ms 20 times. *)
+let busy_reader () =
+  let worst =
+    Weft_linux.run ~domains:1 ~watchdog:None (fun () ->
+        let p = Process.spawn ~stdout:Piped "cat" ["/dev/zero"] in
+        let out = Option.get (Process.stdout p) in
+        let stop = Atomic.make false and worst = ref 0L in
+        Fiber.scope (fun s ->
+            Fiber.fork s (fun () ->
+                let buf = Bytes.create 65536 in
+                while not (Atomic.get stop) do
+                  ignore (Pipe.read out buf 0 65536) ;
+                  let t1 = Unix.gettimeofday () in
+                  while Unix.gettimeofday () -. t1 < 20e-6 do
+                    ()
+                  done
+                done ) ;
+            Fiber.fork s (fun () ->
+                for _ = 1 to 20 do
+                  let t = Time.now Mono in
+                  Time.sleep Mono (Span.ms 1) ;
+                  worst :=
+                    Int64.max !worst
+                      (Span.to_ns (Time.diff Mono (Time.now Mono) t))
+                done ;
+                Atomic.set stop true ) ) ;
+        Process.kill p SIGKILL ;
+        ignore (Process.wait p) ;
+        Pipe.close out ;
+        !worst )
+  in
+  less int64 ~than:20_000_000L worst
+
 let unwatched () =
   Weft_linux.run ~domains:1 (fun () ->
       raises
@@ -448,6 +483,7 @@ let linux =
     ; test "a failed promise that nobody awaits gives a report" promise_report
     ; test "the watchdog reports a fiber that computes 200 ms" watchdog
     ; test "a Posix sleep ends after its deadline" posix_sleep
+    ; test "a reader that never waits yields after 64 KiB" busy_reader
     ; test "a signal that run does not watch is not an event" unwatched ]
 
 let () = exit (Windtrap.run "linux" (Portable.tests world @ [linux]))

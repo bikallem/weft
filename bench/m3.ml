@@ -128,8 +128,63 @@ let q7 () =
   done ;
   Printf.printf "  reports: %d\n%!" (Weft_linux.watchdog_reports () - r0)
 
+(* The yield in the I/O modules: a reader of a pipe that is always full never
+   gets EAGAIN, so it never switches. A timer fiber on the same domain sleeps 1
+   ms 50 times. It gives the mean and the max lateness, and the MiB/s. *)
+let busy_reader () =
+  Weft_linux.run ~domains:1 (fun () ->
+      let p = Process.spawn ~stdout:Piped "cat" ["/dev/zero"] in
+      let out = Option.get (Process.stdout p) in
+      let stop = Atomic.make false and bytes = ref 0 in
+      let late = ref [] in
+      let t0 = now_s () in
+      Fiber.scope (fun s ->
+          Fiber.fork s (fun () ->
+              let buf = Bytes.create 65536 in
+              while (not (Atomic.get stop)) && now_s () -. t0 < 1.0 do
+                let n = Pipe.read out buf 0 65536 in
+                bytes := !bytes + n ;
+                (* The work on each chunk: about 20 us. *)
+                let t1 = now_s () in
+                while now_s () -. t1 < 20e-6 do
+                  ()
+                done
+              done ) ;
+          Fiber.fork s (fun () ->
+              for _ = 1 to 50 do
+                if now_s () -. t0 > 1.0 then Atomic.set stop true ;
+                let t = Time.now Mono in
+                Time.sleep Mono (Span.ms 1) ;
+                late :=
+                  Int64.to_float (Span.to_ns (Time.diff Mono (Time.now Mono) t))
+                  /. 1e3
+                  -. 1000.
+                  :: !late
+              done ;
+              Atomic.set stop true ) ) ;
+      let dt = now_s () -. t0 in
+      Process.kill p SIGKILL ;
+      ignore (Process.wait p) ;
+      Pipe.close out ;
+      let l = !late in
+      ( List.fold_left ( +. ) 0. l /. float (List.length l)
+      , List.fold_left Float.max 0. l
+      , float !bytes /. dt /. 1048576. ) )
+
 let () =
   Printf.printf "CPUs: %d\n" (Domain.recommended_domain_count ()) ;
+  print_endline
+    "The yield of a read: a reader of a full pipe that works 20 us on each 64 \
+     KiB, and a 1 ms timer, on 1 domain" ;
+  Printf.printf "  %10s %14s %14s %10s\n" "yield KiB" "late mean us"
+    "late max us" "MiB/s" ;
+  List.iter
+    (fun kib ->
+      Private.Net.yield_bytes := kib * 1024 ;
+      let mean, max, mibs = busy_reader () in
+      Printf.printf "  %10d %14.0f %14.0f %10.0f\n%!" kib mean max mibs )
+    [64; 256; 1024; 4096; max_int / 1024] ;
+  Private.Net.yield_bytes := 64 * 1024 ;
   q7 () ;
   Printf.printf "with_timeout around a call that ends at once: %.0f/s\n%!"
     (timeouts ()) ;

@@ -112,7 +112,10 @@ and fdrec =
   ; doms: int Atomic.t
         (** The bit of each domain with a registration. Only the owner of a bit
             changes it, with [fetch_and_add], because the bits of all domains
-            share the word. *) }
+            share the word. *)
+  ; mutable streak: int
+        (** The bytes of the reads with no wait in sequence (M3). Only a hint,
+            so a race between two domains does no harm. *) }
 
 (* The state machine of Eio's [Rcfd]. A registration holds a user. *)
 and rc = Open of int | Closing of int | Closed
@@ -468,7 +471,7 @@ module Fdtab = struct
           land 0xffff_ffff
         in
         !gens.(slot) <- gen ;
-        {slot; gen; os; rc= Atomic.make (Open 0); doms= Atomic.make 0} )
+        {slot; gen; os; rc= Atomic.make (Open 0); doms= Atomic.make 0; streak= 0} )
 
   let release r = Mutex.protect lock (fun () -> free := r.slot :: !free)
 

@@ -233,7 +233,12 @@ let queued (t : S.t) s =
 
 (* An fd record that the setup makes, with no use of the global table. *)
 let new_fdrec () =
-  {S.slot= 0; gen= 1; os= 7; rc= Atomic.make (S.Open 0); doms= Atomic.make 0}
+  { S.slot= 0
+  ; gen= 1
+  ; os= 7
+  ; rc= Atomic.make (S.Open 0)
+  ; doms= Atomic.make 0
+  ; streak= 0 }
 
 (* The ring: a push by the owner, and a steal by two thieves. Each item is taken
    exactly one time. *)

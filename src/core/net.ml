@@ -56,6 +56,7 @@ let rec retry ~write fd name op =
   | Ok v ->
       v
   | Error Op.Would_block ->
+      fd.streak <- 0 ;
       Event.sync (fd_event ~write ~clear:true fd) ;
       retry ~write fd name op
   | Error e ->
@@ -111,9 +112,22 @@ let write_all write_sub fd s =
   in
   loop 0
 
+(* A reader whose reads always find data never switches (design section 2.7).
+   After [yield_bytes] bytes with no wait, a read yields. The yield is not a
+   cancellation point: the read already took the bytes. *)
+let yield_bytes = ref (64 * 1024)
+
+let after_read fd n =
+  fd.streak <- fd.streak + n ;
+  if fd.streak >= !yield_bytes then (
+    fd.streak <- 0 ;
+    ignore (prog "Net.read" Yield) ) ;
+  n
+
 let read fd buf off len =
   check_range ~read:true "Net.read" buf off len ;
-  retry ~write:false fd "Net.read" (fun os -> Op.Read (os, buf, off, len))
+  after_read fd
+    (retry ~write:false fd "Net.read" (fun os -> Op.Read (os, buf, off, len)))
 
 let write_sub fd buf off len =
   check_range ~read:false "Net.write_sub" buf off len ;
