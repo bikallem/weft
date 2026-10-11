@@ -154,6 +154,10 @@ and leaf = dom -> sync -> int -> unit
 and dom =
   { index: int
   ; ring: ready Ring.t  (** The local queue. *)
+  ; next: ready option Atomic.t
+        (** The next slot: a fiber that a fiber of this domain woke. The owner
+            puts and takes, and a thief takes with a CAS (M3). *)
+  ; mutable next_runs: int  (** The runs from the next slot in sequence. *)
   ; heap: heap
   ; ids: Commit.Id.gen
   ; sched: t
@@ -554,9 +558,8 @@ end
    to the overflow queue, as Go does, so the order stays FIFO. If a domain is
    idle, the push marks a wake: the scheduler does it at the next safe point,
    because a wake is a world effect, and a lock can be held here. *)
-let push dom f run =
-  f.queued <- true ;
-  let r = {rfiber= f; run} in
+let push_ready dom r =
+  r.rfiber.queued <- true ;
   let t = dom.sched in
   if not (Ring.push dom.ring r) then
     Spin.with_lock t.overflow_lock (fun () ->
@@ -571,6 +574,22 @@ let push dom f run =
   (* A domain that searches finds the fiber: no wake (the Go rules). *)
   if Atomic.get t.idle <> 0 && Atomic.get t.searching = 0 then dom.wake <- true
 
+let push dom f run = push_ready dom {rfiber= f; run}
+
+(* A fiber that a fiber of [dom] woke goes to the next slot, and the fiber that
+   was in the slot goes to the tail (design section 2.5, Where a woken fiber
+   goes). A thief can take the slot, so the push wakes an idle domain by the
+   normal rule. *)
+let wake_on_next = ref true
+
+let push_next dom f run =
+  f.queued <- true ;
+  Option.iter (push_ready dom)
+    (Atomic.exchange dom.next (Some {rfiber= f; run})) ;
+  let t = dom.sched in
+  if !wake_on_next && Atomic.get t.idle <> 0 && Atomic.get t.searching = 0 then
+    dom.wake <- true
+
 (* Wake one idle domain if a push marked it. No lock is held here. *)
 let flush_wake dom =
   if dom.wake then (
@@ -584,11 +603,11 @@ let flush_wake dom =
 
 (* Resume a parked sync. The caller got [Resume] or a claim with
    [resume_partner], so it is the one owner of this resume. *)
-let resume dom s =
+let resume ?(next = false) dom s =
   let i = match C.state s.word with C.Done i -> i | _ -> assert false in
   let k = match s.k with Some k -> k | None -> assert false in
   s.k <- None ;
-  push dom s.owner (fun () ->
+  (if next then push_next else push) dom s.owner (fun () ->
       Atomic.set s.owner.current None ;
       Effect.Deep.continue k i )
 
@@ -1017,7 +1036,13 @@ let rec run_fiber : dom -> fiber -> step -> unit =
       flush_wake dom ;
       run_fiber dom fiber (Effect.Deep.continue k ())
   | Suspended (Enqueue l, k) ->
-      List.iter (resume dom) l ;
+      (* One fiber that this fiber woke goes to the next slot, many go to the
+         tail. *)
+      ( match l with
+      | [s] ->
+          resume ~next:true dom s
+      | l ->
+          List.iter (resume dom) l ) ;
       flush_wake dom ;
       run_fiber dom fiber (Effect.Deep.continue k ())
   | Suspended (Yield, k) ->
@@ -1117,7 +1142,11 @@ let wait dom timeout =
   take_mail dom ;
   expire dom ;
   flush_wake dom ;
-  let timeout = if Ring.is_empty dom.ring then timeout else World.Wait.Poll in
+  let timeout =
+    if Ring.is_empty dom.ring && Option.is_none (Atomic.get dom.next) then
+      timeout
+    else World.Wait.Poll
+  in
   let w = {World.Wait.timeout; deadline= alarm dom} in
   List.iter (on_ready dom) (World.perform "sched" (World.Wait (dom.index, w))) ;
   take_mail dom ;
@@ -1163,10 +1192,42 @@ let steal dom =
           | None ->
               try_ (i + 1)
     in
-    let r = try_ 0 in
+    (* Then the next slots, with a CAS: a fiber that waits behind a long
+       computation of the fiber that woke it can go on. *)
+    let rec next_of i =
+      if i = n then None
+      else
+        let v = doms.((start + i) mod n) in
+        match Atomic.get v.next with
+        | Some r as cur when v != dom && Atomic.compare_and_set v.next cur None
+          ->
+            Some r
+        | _ ->
+            next_of (i + 1)
+    in
+    let r = match try_ 0 with Some r -> Some r | None -> next_of 0 in
     if Atomic.fetch_and_add t.searching (-1) = 1 && Option.is_some r then
       if Atomic.get t.idle <> 0 then dom.wake <- true ;
     r
+
+(* The next slot runs at most [next_limit] times in sequence. Then its fiber
+   goes to the tail, so that two fibers that wake each other do not starve the
+   local queue (open question 5). *)
+let next_limit = ref 3
+
+let take_next dom =
+  match Atomic.exchange dom.next None with
+  | None ->
+      dom.next_runs <- 0 ;
+      None
+  | Some r ->
+      if dom.next_runs < !next_limit then (
+        dom.next_runs <- dom.next_runs + 1 ;
+        Some r )
+      else (
+        dom.next_runs <- 0 ;
+        push_ready dom r ;
+        None )
 
 (* Steps 2 to 4 of the loop: the local queue, the overflow queue, then a steal.
    Each 61st take tries the overflow queue first, so that its fibers do not
@@ -1186,12 +1247,19 @@ let take dom =
   | Some r ->
       Some r
   | None -> (
-    match Ring.pop dom.ring with
+    match take_next dom with
     | Some r ->
         Some r
     | None -> (
-      match take_overflow dom.sched with Some r -> Some r | None -> steal dom )
-    )
+      match Ring.pop dom.ring with
+      | Some r ->
+          Some r
+      | None -> (
+        match take_overflow dom.sched with
+        | Some r ->
+            Some r
+        | None ->
+            steal dom ) ) )
 
 (* The second check of a domain that is in [idle]: did [main] end, or is there a
    fiber in a queue that it can take? The check needs [finished]: a poll in the
@@ -1200,14 +1268,16 @@ let take dom =
 let work_for dom =
   let t = dom.sched in
   Atomic.get t.finished
-  ||
-  if Array.exists (fun d -> not (Ring.is_empty d.ring)) t.doms then true
-  else
-    Spin.with_lock t.overflow_lock (fun () -> not (Queue.is_empty t.overflow))
-    [@mutate
-      off
-        "a lost steal of the overflow queue costs only parallelism: the domain \
-         that filled it takes it when its ring is empty"]
+  || Array.exists
+       (fun d ->
+         (not (Ring.is_empty d.ring)) || Option.is_some (Atomic.get d.next) )
+       t.doms
+  || (Spin.with_lock t.overflow_lock (fun () ->
+          not (Queue.is_empty t.overflow) )
+  [@mutate
+    off
+      "a lost steal of the overflow queue costs only parallelism: the domain \
+       that filled it takes it when its ring is empty"] )
 
 let run_ready dom r =
   r.rfiber.queued <- false ;
@@ -1501,6 +1571,8 @@ let create ?(slack = Span.ms 1) ?(simulated = false) ~domains () =
     Array.init domains (fun index ->
         { index
         ; ring= Ring.create ()
+        ; next= Atomic.make None
+        ; next_runs= 0
         ; heap= Heap.create ()
         ; ids= Commit.Id.gen ~domain:index ~max_domains:domains
         ; sched= t

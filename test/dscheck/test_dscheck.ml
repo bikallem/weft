@@ -313,6 +313,28 @@ let search_push () =
       fun () ->
         Atomic.get found || (not (Atomic.get slept)) || Atomic.get w.wakes = 1 )
 
+(* The next slot (M3): the owner puts a fiber and takes it, while a thief takes
+   the slot with a CAS. The fiber runs exactly one time. *)
+let next_steal () =
+  trace (fun () ->
+      let t = S.create ~domains:2 () in
+      let w = world () in
+      let d0 = t.S.doms.(0) and d1 = t.S.doms.(1) in
+      let f = S.new_fiber [scope_node ()] in
+      let runs = Atomic.make 0 in
+      let run () = Atomic.incr runs ; S.Finished in
+      spawn_in w (fun () ->
+          S.push_next d0 f run ;
+          match S.take_next d0 with Some r -> ignore (r.S.run ()) | None -> () ) ;
+      spawn_in w (fun () ->
+          match S.steal d1 with Some r -> ignore (r.S.run ()) | None -> () ) ;
+      fun () ->
+        (* A fiber that nobody took is still in a queue. *)
+        ( Atomic.get runs
+        + (if Option.is_some (Atomic.get d0.S.next) then 1 else 0)
+        + if Ring.is_empty d0.S.ring && Ring.is_empty d1.S.ring then 0 else 1 )
+        = 1 )
+
 (* The atomic register of a channel: a send and a recv on an empty channel at
    the same time. They meet. *)
 let chan_meet () =
@@ -605,6 +627,7 @@ let () =
   case "idle: a domain goes idle while another domain pushes work" idle_push ;
   case "idle: a searching domain goes idle while another domain pushes"
     search_push ;
+  case "next slot: a take by the owner and a steal at the same time" next_steal ;
   case "register: a send and a recv on an empty channel at the same time"
     chan_meet ;
   case "register: a fill of an Ivar during a register" ivar_fill_register ;

@@ -587,6 +587,28 @@ let layers w =
                   raises Promise.Cancelled (fun () -> Promise.await p)
               | None ->
                   failwith "no promise" ) )
+    ; test "two fibers that wake each other do not starve the queue" (fun () ->
+          w.run (fun () ->
+              let a = Chan.create () and b = Chan.create () in
+              let flag = Atomic.make false in
+              Fiber.scope (fun s ->
+                  (* The first fiber decides when the two stop, and the second
+                     one always answers. *)
+                  Fiber.fork s (fun () ->
+                      let n = ref 0 in
+                      while not (Atomic.get flag) do
+                        incr n ;
+                        if !n > 100_000 then failwith "starved" ;
+                        sync (Chan.send a true) ;
+                        sync (Chan.recv b)
+                      done ;
+                      sync (Chan.send a false) ) ;
+                  Fiber.fork s (fun () ->
+                      while sync (Chan.recv a) do
+                        sync (Chan.send b ())
+                      done ) ;
+                  (* The fiber in the queue behind the two. *)
+                  Fiber.fork s (fun () -> Atomic.set flag true) ) ) )
     ; test "a mutex keeps the counter correct" (fun () ->
           w.run (fun () ->
               let m = Fiber.Mutex.create () and n = ref 0 in

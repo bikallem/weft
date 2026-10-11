@@ -61,11 +61,36 @@ let no_fd_leak () =
       Net.close l ) ;
   equal int before (open_fds ())
 
+(* M3: F1 wakes F2 into its next slot, then computes 100 ms with no switch.
+   Another domain takes F2 from the next slot. *)
+let next_slot_steal () =
+  Weft_linux.run ~domains (fun () ->
+      let c = Chan.create () in
+      Fiber.scope (fun s ->
+          let got =
+            Fiber.fork_promise s (fun () ->
+                ignore (sync (Chan.recv c)) ;
+                Time.now Mono )
+          in
+          Fiber.yield () ;
+          let t0 = Time.now Mono in
+          Fiber.fork s (fun () ->
+              sync (Chan.send c ()) ;
+              let rec spin () =
+                if Span.to_ns (Time.diff Mono (Time.now Mono) t0) < 100_000_000L
+                then spin ()
+              in
+              spin () ) ;
+          less int64 ~than:50_000_000L
+            (Span.to_ns (Time.diff Mono (Promise.await got) t0)) ) )
+
 let () =
   exit
     (Windtrap.run "linux_md"
        ( Portable.tests world
        @ [ group "linux"
              [ test "timers on many domains end after their deadlines" timers
+             ; test "a thief takes the next slot of a busy domain"
+                 next_slot_steal
              ; test "2,000 connections on 4 domains with no fd leak" no_fd_leak
              ] ] ) )

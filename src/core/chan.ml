@@ -63,7 +63,7 @@ let rec meet dom s l ~commit =
   | o :: rest -> (
     match commit o with
     | C.Committed {resume_partner} ->
-        if resume_partner then resume dom o.osync ;
+        if resume_partner then resume ~next:true dom o.osync ;
         (rest, true)
     | C.Stale ->
         meet dom s rest ~commit

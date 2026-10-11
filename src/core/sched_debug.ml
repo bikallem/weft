@@ -40,7 +40,7 @@ let lost t ~now =
   let queues =
     Array.to_list t.doms
     |> List.concat_map (fun d ->
-        ( if Ring.is_empty d.ring then []
+        ( if Ring.is_empty d.ring && Option.is_none (Atomic.get d.next) then []
           else [Printf.sprintf "the queue of domain %d is not empty" d.index] )
         @
         match Atomic.get d.mailbox with
