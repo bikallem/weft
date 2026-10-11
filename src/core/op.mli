@@ -77,6 +77,12 @@ type _ t =
   | Read : fd * bytes * int * int -> int t  (** 0 at the end of the stream. *)
   | Write : fd * bytes * int * int -> int t
   | Shutdown : fd -> unit t  (** Ends the send side. *)
+  | Pipe : (fd * fd) t
+      (** A pipe: the read end and the write end. The two are non-blocking. *)
+  | Fd_read : fd * bytes * int * int -> int t
+      (** read(2) on a non-blocking fd that the library made, for example a
+          pipe. 0 at the end of the stream. *)
+  | Fd_write : fd * bytes * int * int -> int t  (** write(2), as [Fd_read]. *)
   | Close : fd -> unit t
   | Register : int * fd * int -> unit t
       (** [Register (domain, fd, token)] adds the fd to the poller of the

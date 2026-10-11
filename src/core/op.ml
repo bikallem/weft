@@ -52,6 +52,9 @@ type _ t =
   | Read : fd * bytes * int * int -> int t
   | Write : fd * bytes * int * int -> int t
   | Shutdown : fd -> unit t
+  | Pipe : (fd * fd) t
+  | Fd_read : fd * bytes * int * int -> int t
+  | Fd_write : fd * bytes * int * int -> int t
   | Close : fd -> unit t
   | Register : int * fd * int -> unit t
   | Deregister : int * fd -> unit t

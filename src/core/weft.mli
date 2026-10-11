@@ -421,6 +421,33 @@ module Dir : sig
   (** @raise Error with [No_entry], [Not_dir] or [Not_empty]. *)
 end
 
+(** {1 Pipes} *)
+
+module Pipe : sig
+  (** The same exception as [Net.Error]. *)
+  exception Error of Net.error * string
+
+  (** One end of a pipe. *)
+  type t
+
+  val create : unit -> t * t
+  (** [create ()] gives the read end and the write end. *)
+
+  val read : t -> bytes -> int -> int -> int
+  (** As [Net.read]. It gives 0 when the write end is closed and the pipe is
+      empty. *)
+
+  val write : t -> string -> unit
+  (** Writes all of the string.
+
+      @raise Error with [Broken_pipe] if the read end is closed. *)
+
+  val write_sub : t -> bytes -> int -> int -> int
+
+  val close : t -> unit
+  (** As [Net.close]. *)
+end
+
 (** {1 Names} *)
 
 module Dns : sig

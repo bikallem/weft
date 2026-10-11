@@ -833,7 +833,64 @@ let files w =
                   done ) ;
               equal int 20 (List.length (Dir.readdir d)) ) ) ]
 
+(* Pipes (milestone M2). *)
+
+let pipe_error f =
+  match f () with
+  | _ ->
+      "no error"
+  | exception Pipe.Error (e, _) ->
+      Format.asprintf "%a" Private.Op.pp_error e
+
+let pipe_read_all r =
+  let b = Buffer.create 64 and buf = Bytes.create 4096 in
+  let rec loop () =
+    match Pipe.read r buf 0 4096 with
+    | 0 ->
+        Buffer.contents b
+    | k ->
+        Buffer.add_subbytes b buf 0 k ;
+        loop ()
+  in
+  loop ()
+
+let pipes w =
+  group "pipes"
+    [ test "1 MiB goes through a pipe, then the end of the stream" (fun () ->
+          w.run (fun () ->
+              let r, wr = Pipe.create () in
+              let data =
+                String.init (1 lsl 20) (fun i -> Char.chr (i * 7 land 0xff))
+              in
+              Fiber.scope (fun s ->
+                  let got = Fiber.fork_promise s (fun () -> pipe_read_all r) in
+                  Pipe.write wr data ;
+                  Pipe.close wr ;
+                  is_true (String.equal data (Promise.await got)) ) ;
+              Pipe.close r ) )
+    ; test "a write after the reader closed gives EPIPE" (fun () ->
+          w.run (fun () ->
+              let r, wr = Pipe.create () in
+              Pipe.close r ;
+              equal string "EPIPE" (pipe_error (fun () -> Pipe.write wr "x")) ;
+              Pipe.close wr ) )
+    ; test "each end has one direction" (fun () ->
+          w.run (fun () ->
+              let r, wr = Pipe.create () in
+              equal string "EBADF" (pipe_error (fun () -> Pipe.write r "x")) ;
+              equal string "EBADF"
+                (pipe_error (fun () -> Pipe.read wr (Bytes.create 1) 0 1)) ;
+              Pipe.close r ;
+              Pipe.close wr ) ) ]
+
 let tests w =
   [ group w.name
-      ( [events w; chans w; scopes w; net w; overflow_runs w; layers w; files w]
+      ( [ events w
+        ; chans w
+        ; scopes w
+        ; net w
+        ; overflow_runs w
+        ; layers w
+        ; files w
+        ; pipes w ]
       @ many w ) ]

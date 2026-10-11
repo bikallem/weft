@@ -5,6 +5,7 @@
 #define _GNU_SOURCE
 #include <arpa/inet.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <string.h>
@@ -269,6 +270,35 @@ value weft_recv(value fd, value buf, value off, value len) {
 value weft_send(value fd, value buf, value off, value len) {
   ssize_t n = send(Int_val(fd), Bytes_val(buf) + Long_val(off), Long_val(len),
                    MSG_DONTWAIT | MSG_NOSIGNAL);
+  return Val_long(n < 0 ? ERR : n);
+}
+
+/* A pipe that the library made: both ends have O_NONBLOCK. (r, w), or
+   (-errno, -1). */
+value weft_pipe(value unit) {
+  CAMLparam0();
+  CAMLlocal1(r);
+  int fds[2];
+  r = caml_alloc_tuple(2);
+  if (pipe2(fds, O_NONBLOCK | O_CLOEXEC) < 0) {
+    Store_field(r, 0, Val_int(ERR));
+    Store_field(r, 1, Val_int(-1));
+  } else {
+    Store_field(r, 0, Val_int(fds[0]));
+    Store_field(r, 1, Val_int(fds[1]));
+  }
+  CAMLreturn(r);
+}
+
+/* read and write on a non-blocking fd that the library made. A write to a
+   pipe with no reader gives EPIPE: the world ignores SIGPIPE. */
+value weft_read(value fd, value buf, value off, value len) {
+  ssize_t n = read(Int_val(fd), Bytes_val(buf) + Long_val(off), Long_val(len));
+  return Val_long(n < 0 ? ERR : n);
+}
+
+value weft_write(value fd, value buf, value off, value len) {
+  ssize_t n = write(Int_val(fd), Bytes_val(buf) + Long_val(off), Long_val(len));
   return Val_long(n < 0 ? ERR : n);
 }
 

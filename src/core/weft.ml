@@ -34,6 +34,7 @@ module Chan = Chan
 module File = Fs.File
 module Dir = Fs.Dir
 module Dns = Fs.Dns
+module Pipe = Pipe
 
 module type WORLD = World.WORLD
 

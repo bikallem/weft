@@ -57,8 +57,12 @@ exception Model_error of string
 (* The capacity of the receive buffer of a connection. *)
 let capacity = 65536
 
+(* A socket, or one end of a pipe. *)
+type role = Sock | Rd_end | Wr_end
+
 type conn =
-  { inbox: Buffer.t  (** The bytes to read, from [rpos]. *)
+  { role: role
+  ; inbox: Buffer.t  (** The bytes to read, from [rpos]. *)
   ; mutable rpos: int
   ; mutable inflight: int  (** Bytes that the latency still holds. *)
   ; mutable peer: conn option  (** [None] after the peer closed. *)
@@ -148,6 +152,8 @@ let readable n fd =
 
 let writable n fd =
   match Hashtbl.find_opt n.fds fd with
+  | Some (Conn {role= Rd_end; _}) ->
+      false
   | Some (Conn c) -> (
       c.refused
       ||
@@ -372,11 +378,56 @@ let start_job : type a. t -> int -> a Op.blocking -> int =
       schedule t (Int64.of_int (Prng.int t.prng (limit + 1))) complete ) ;
   id
 
+(* A read of a socket or of the read end of a pipe. *)
+let read_conn n c buf off len =
+  let a = avail c in
+  if a > 0 then (
+    let k = Int.min a len in
+    Buffer.blit c.inbox c.rpos buf off k ;
+    c.rpos <- c.rpos + k ;
+    if c.rpos = Buffer.length c.inbox then (
+      Buffer.clear c.inbox ;
+      c.rpos <- 0 ) ;
+    (* The space is free again: the peer can write. *)
+    ( match c.peer with
+    | Some p ->
+        edge n p.cfd ~read:false ~write:true
+    | None ->
+        () ) ;
+    Ok k )
+  else if c.eof then Ok 0
+  else if c.refused then Error Op.Reset
+  else Error Op.Would_block
+
+(* A write of a socket or of the write end of a pipe. The data of a pipe arrives
+   at once, and the data of a socket after the latency. *)
+let write_conn t c buf off len =
+  let n = t.net in
+  if c.shut then Error Op.Broken_pipe
+  else
+    match c.peer with
+    | None ->
+        Error Op.Broken_pipe
+    | Some p ->
+        let space = capacity - avail p - p.inflight in
+        if space <= 0 then Error Op.Would_block
+        else
+          let k = Int.min len space in
+          let data = Bytes.sub_string buf off k in
+          p.inflight <- p.inflight + k ;
+          (if c.role = Sock then later t else fun f -> f ()) (fun () ->
+              p.inflight <- p.inflight - k ;
+              Buffer.add_string p.inbox data ;
+              edge n p.cfd ~read:true ~write:false ) ;
+          Ok k
+
 let submit : type a. t -> a Op.t -> (a, Op.error) result =
  fun t op ->
   let n = t.net in
   let conn fd k =
     match Hashtbl.find_opt n.fds fd with
+    | Some (Conn {role= Rd_end | Wr_end; _}) ->
+        Error (Op.Other "ENOTSOCK")
     | Some (Conn c) ->
         k c
     | Some (Lsn _) ->
@@ -409,7 +460,8 @@ let submit : type a. t -> a Op.t -> (a, Op.error) result =
             n.next_port <-
               (port + 1) [@mutate off "a counter that goes down is unique too"] ;
             let mk remote =
-              { inbox= Buffer.create 64
+              { role= Sock
+              ; inbox= Buffer.create 64
               ; rpos= 0
               ; inflight= 0
               ; peer= None
@@ -461,44 +513,45 @@ let submit : type a. t -> a Op.t -> (a, Op.error) result =
     | None ->
         Error Op.Bad_fd )
   | Op.Read (fd, buf, off, len) ->
-      conn fd (fun c ->
-          let a = avail c in
-          if a > 0 then (
-            let k = Int.min a len in
-            Buffer.blit c.inbox c.rpos buf off k ;
-            c.rpos <- c.rpos + k ;
-            if c.rpos = Buffer.length c.inbox then (
-              Buffer.clear c.inbox ;
-              c.rpos <- 0 ) ;
-            (* The space is free again: the peer can write. *)
-            ( match c.peer with
-            | Some p ->
-                edge n p.cfd ~read:false ~write:true
-            | None ->
-                () ) ;
-            Ok k )
-          else if c.eof then Ok 0
-          else if c.refused then Error Op.Reset
-          else Error Op.Would_block )
+      conn fd (fun c -> read_conn n c buf off len)
   | Op.Write (fd, buf, off, len) ->
-      conn fd (fun c ->
-          if c.shut then Error Op.Broken_pipe
-          else
-            match c.peer with
-            | None ->
-                Error Op.Broken_pipe
-            | Some p ->
-                let space = capacity - avail p - p.inflight in
-                if space <= 0 then Error Op.Would_block
-                else
-                  let k = Int.min len space in
-                  let data = Bytes.sub_string buf off k in
-                  p.inflight <- p.inflight + k ;
-                  later t (fun () ->
-                      p.inflight <- p.inflight - k ;
-                      Buffer.add_string p.inbox data ;
-                      edge n p.cfd ~read:true ~write:false ) ;
-                  Ok k )
+      conn fd (fun c -> write_conn t c buf off len)
+  | Op.Pipe ->
+      let mk role =
+        { role
+        ; inbox= Buffer.create 64
+        ; rpos= 0
+        ; inflight= 0
+        ; peer= None
+        ; eof= false
+        ; shut= false
+        ; established= true
+        ; refused= false
+        ; cfd= new_fd n
+        ; remote= Op.Unix "" }
+      in
+      let r = mk Rd_end and w = mk Wr_end in
+      r.peer <- Some w ;
+      w.peer <- Some r ;
+      Hashtbl.replace n.fds r.cfd (Conn r) ;
+      Hashtbl.replace n.fds w.cfd (Conn w) ;
+      Ok (r.cfd, w.cfd)
+  | Op.Fd_read (fd, buf, off, len) -> (
+    match Hashtbl.find_opt n.fds fd with
+    | Some (Conn ({role= Rd_end | Sock; _} as c)) ->
+        read_conn n c buf off len
+    | Some (Conn {role= Wr_end; _}) | None ->
+        Error Op.Bad_fd
+    | Some (Lsn _ | Fil _) ->
+        Error (Op.Other "EINVAL") )
+  | Op.Fd_write (fd, buf, off, len) -> (
+    match Hashtbl.find_opt n.fds fd with
+    | Some (Conn ({role= Wr_end | Sock; _} as c)) ->
+        write_conn t c buf off len
+    | Some (Conn {role= Rd_end; _}) | None ->
+        Error Op.Bad_fd
+    | Some (Lsn _ | Fil _) ->
+        Error (Op.Other "EINVAL") )
   | Op.Shutdown fd ->
       conn fd (fun c ->
           c.shut <- true ;
@@ -529,7 +582,7 @@ let submit : type a. t -> a Op.t -> (a, Op.error) result =
             match c.peer with
             | Some p ->
                 c.peer <- None ;
-                later t (fun () ->
+                (if c.role = Sock then later t else fun f -> f ()) (fun () ->
                     p.eof <- true ;
                     p.peer <- None ;
                     edge n p.cfd ~read:true ~write:true )

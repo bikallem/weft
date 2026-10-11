@@ -41,6 +41,12 @@ external send : int -> bytes -> int -> int -> int = "weft_send"
 
 external shutdown_send : int -> int = "weft_shutdown_send"
 
+external pipe : unit -> int * int = "weft_pipe"
+
+external fd_read : int -> bytes -> int -> int -> int = "weft_read"
+
+external fd_write : int -> bytes -> int -> int -> int = "weft_write"
+
 external close_fd : int -> int = "weft_close"
 
 external getrandom : bytes -> int = "weft_getrandom"
@@ -147,7 +153,10 @@ let make_dom () =
   ignore (check "epoll_ctl" (epoll_add_in epfd tfd timer_token)) ;
   {epfd; evfd; tfd; armed= 0L}
 
+(* A write to a pipe with no reader then gives EPIPE (design section 2.7,
+   Signals). *)
 let create ?(domains = 1) () =
+  Sys.set_signal Sys.sigpipe Sys.Signal_ignore ;
   let seed = Bytes.create 8 in
   ignore (check "getrandom" (getrandom seed)) ;
   let doms = Array.init domains (fun _ -> make_dom ()) in
@@ -367,6 +376,13 @@ module World = struct
         result (send fd buf off len)
     | Op.Shutdown fd ->
         unit (shutdown_send fd)
+    | Op.Pipe ->
+        let r, w = pipe () in
+        Result.map (fun r -> (r, w)) (result r)
+    | Op.Fd_read (fd, buf, off, len) ->
+        result (fd_read fd buf off len)
+    | Op.Fd_write (fd, buf, off, len) ->
+        result (fd_write fd buf off len)
     | Op.Close fd ->
         (* close(2) of a file can block: the pool does it (design section
            2.7). *)
