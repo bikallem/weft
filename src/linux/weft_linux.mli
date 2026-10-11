@@ -24,16 +24,28 @@ val run :
      ?slack:Weft.Span.t
   -> ?domains:int
   -> ?signals:Weft.Signal.t list
+  -> ?watchdog:Weft.Span.t option
   -> (unit -> 'a)
   -> 'a
 (** [run main] runs [main] with a new Linux world, and closes the world at the
     end. [~domains] is [min 4 (Domain.recommended_domain_count ())] by default
-    (open question 6). *)
+    (open question 6).
+
+    [~watchdog] is the limit of the watchdog, 10 ms by default (open question
+    7): if a fiber runs on a domain for more than the limit with no switch, a C
+    thread writes a warning to [stderr] with the index of the domain. [None]
+    stops the watchdog. *)
 
 val local_port : Weft.Net.t -> int
 (** The port of a TCP socket, for example after a listen on port 0. *)
 
 (**/**)
+
+val alarm_sets : unit -> int
+(** The calls of [timerfd_settime], for the measurements. *)
+
+val watchdog_reports : unit -> int
+(** The number of warnings of all watchdogs, for the tests. *)
 
 val unblocked_threads : Weft.Signal.t list -> string list
 (** The threads of the process that do not block each of these signals. For the

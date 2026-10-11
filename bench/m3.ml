@@ -79,8 +79,58 @@ let timeouts () =
       done ;
       float n /. (now_s () -. t0) )
 
+(* Q7, the slack: 1,000 fibers sleep 10 times each, a random time of 1 to 20 ms.
+   It gives the mean and p99 lateness and the calls of timerfd_settime. *)
+let slack_run slack =
+  let late = Atomic.make [] in
+  let rec add x =
+    let l = Atomic.get late in
+    if not (Atomic.compare_and_set late l (x :: l)) then add x
+  in
+  let sets0 = Weft_linux.alarm_sets () in
+  Weft_linux.run ~slack ~domains:4 (fun () ->
+      Fiber.scope (fun s ->
+          for i = 1 to 1000 do
+            Fiber.fork s (fun () ->
+                for j = 1 to 10 do
+                  let ms = 1 + (((i * 7) + (j * 13)) mod 20) in
+                  let t0 = Time.now Mono in
+                  Time.sleep Mono (Span.ms ms) ;
+                  let d = Span.to_ns (Time.diff Mono (Time.now Mono) t0) in
+                  add ((Int64.to_float d /. 1e3) -. float (ms * 1000))
+                done )
+          done ) ) ;
+  let l = List.sort compare (Atomic.get late) in
+  let a = Array.of_list l in
+  let mean = List.fold_left ( +. ) 0. l /. float (Array.length a) in
+  (mean, a.(Array.length a * 99 / 100), Weft_linux.alarm_sets () - sets0)
+
+let q7 () =
+  print_endline
+    "Q7, the slack (4 domains, 1,000 fibers, 10 sleeps of 1 to 20 ms each)" ;
+  Printf.printf "  %8s %14s %14s %16s\n" "slack" "late mean us" "late p99 us"
+    "timerfd sets" ;
+  List.iter
+    (fun us ->
+      let mean, p99, sets = slack_run (Span.us us) in
+      Printf.printf "  %6dus %14.1f %14.1f %16d\n%!" us mean p99 sets )
+    [0; 100; 1000; 10_000] ;
+  print_endline "Q7, the watchdog (10 ms): the reports on normal loads" ;
+  let r0 = Weft_linux.watchdog_reports () in
+  ignore (slack_run (Span.ms 1)) ;
+  Weft_linux.run ~domains:8 (fun () ->
+      Fiber.scope (fun s ->
+          for _ = 1 to 100_000 do
+            Fiber.fork s ignore
+          done ) ) ;
+  for _ = 1 to 5 do
+    ignore (ping_pong ~domains:4 ~n:100_000)
+  done ;
+  Printf.printf "  reports: %d\n%!" (Weft_linux.watchdog_reports () - r0)
+
 let () =
   Printf.printf "CPUs: %d\n" (Domain.recommended_domain_count ()) ;
+  q7 () ;
   Printf.printf "with_timeout around a call that ends at once: %.0f/s\n%!"
     (timeouts ()) ;
   q5 () ;

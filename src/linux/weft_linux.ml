@@ -467,6 +467,9 @@ let take_job t id =
       let j = Hashtbl.find_opt t.jobs id in
       Hashtbl.remove t.jobs id ; j )
 
+(* The calls of timerfd_settime, for the measurements. *)
+let alarm_sets = Atomic.make 0
+
 module World = struct
   type nonrec t = t
 
@@ -620,6 +623,7 @@ module World = struct
           Int64.max 1L (Weft.Clock.to_ns Mono m)
     in
     if not (Int64.equal target d.armed) then (
+      Atomic.incr alarm_sets ;
       ignore (timerfd_set d.tfd target) ;
       d.armed <- target )
 
@@ -663,12 +667,35 @@ end
 (* The default number of domains is a start value (open question 6). *)
 let default_domains () = Int.min 4 (Domain.recommended_domain_count ())
 
-let run ?slack ?domains ?signals main =
+external watchdog_start :
+     (int, Bigarray.int_elt, Bigarray.c_layout) Bigarray.Array1.t
+  -> int64
+  -> nativeint = "weft_watchdog_start"
+
+external watchdog_stop : nativeint -> unit = "weft_watchdog_stop"
+
+external watchdog_reports : unit -> int = "weft_watchdog_reports"
+
+(* The watchdog reads the beats of the scheduler. The pair keeps the Bigarray
+   alive until the stop. *)
+let run ?slack ?domains ?signals ?(watchdog = Some (Weft.Span.ms 10)) main =
   let domains = match domains with Some n -> n | None -> default_domains () in
   let t = create ~domains ?signals () in
+  let dog = ref None in
+  let start (s : Sched.t) =
+    Option.iter
+      (fun limit ->
+        dog := Some (watchdog_start s.beats (Weft.Span.to_ns limit), s.beats) )
+      watchdog
+  in
   Fun.protect
-    ~finally:(fun () -> close t)
-    (fun () -> Weft.run ?slack ~domains (module World) t main)
+    ~finally:(fun () ->
+      Option.iter (fun (w, _) -> watchdog_stop w) !dog ;
+      close t )
+    (fun () ->
+      Weft.Private.run_world ?slack ~domains ~on_create:start
+        (module World)
+        t main )
 
 let local_port (fd : Weft.Net.t) =
   Net.acquire fd "Weft_linux.local_port" ;
@@ -676,3 +703,5 @@ let local_port (fd : Weft.Net.t) =
   Net.release fd ;
   if p < 0 then raise (Net.Error (error_of (-p), "Weft_linux.local_port")) ;
   p
+
+let alarm_sets () = Atomic.get alarm_sets

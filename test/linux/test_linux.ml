@@ -384,6 +384,27 @@ let promise_report () =
       Gc.full_major () ;
       is_true (List.mem Lost_exn !got) )
 
+(* M3: the watchdog reports a fiber that computes for 200 ms with no switch, one
+   time. A fiber that sleeps or yields gives no report. *)
+let watchdog () =
+  let busy_ms ms =
+    let t0 = Unix.gettimeofday () in
+    while Unix.gettimeofday () -. t0 < Float.of_int ms /. 1000. do
+      ()
+    done
+  in
+  let before = Weft_linux.watchdog_reports () in
+  Weft_linux.run ~domains:1 (fun () ->
+      Time.sleep Mono (Span.ms 50) ;
+      for _ = 1 to 50 do
+        busy_ms 1 ; Fiber.yield ()
+      done ) ;
+  equal int before (Weft_linux.watchdog_reports ()) ;
+  Weft_linux.run ~domains:1 (fun () -> busy_ms 200) ;
+  equal int (before + 1) (Weft_linux.watchdog_reports ()) ;
+  Weft_linux.run ~domains:1 ~watchdog:None (fun () -> busy_ms 50) ;
+  equal int (before + 1) (Weft_linux.watchdog_reports ())
+
 let unwatched () =
   Weft_linux.run ~domains:1 (fun () ->
       raises
@@ -415,6 +436,7 @@ let linux =
     ; test "each thread of run ~signals blocks the signals" blocked_threads
     ; test "a finaliser fills an Ivar from outside a fiber" finaliser_fill
     ; test "a failed promise that nobody awaits gives a report" promise_report
+    ; test "the watchdog reports a fiber that computes 200 ms" watchdog
     ; test "a signal that run does not watch is not an event" unwatched ]
 
 let () = exit (Windtrap.run "linux" (Portable.tests world @ [linux]))

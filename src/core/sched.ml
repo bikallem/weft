@@ -193,6 +193,10 @@ and stats =
 
 and t =
   { run_id: int  (** The id of the run. *)
+  ; beats: (int, Bigarray.int_elt, Bigarray.c_layout) Bigarray.Array1.t
+        (** The beat of each domain, out of the OCaml heap: one more at the
+            start of a fiber and one more at its end, so an odd value tells that
+            a fiber runs. The watchdog of a world reads it (M3). *)
   ; mutable doms: dom array
   ; slack: int64
   ; fibers: (int, fiber) Hashtbl.t  (** The live fibers, for the debug. *)
@@ -1362,6 +1366,12 @@ let work_for dom =
       "a lost steal of the overflow queue costs only parallelism: the domain \
        that filled it takes it when its ring is empty"] )
 
+(* Only the domain writes its beat. *)
+let beat dom =
+  let b = dom.sched.beats in
+  Bigarray.Array1.unsafe_set b dom.index
+    (Bigarray.Array1.unsafe_get b dom.index + 1)
+
 let run_ready dom r =
   r.rfiber.queued <- false ;
   dom.switches <- dom.switches + 1 ;
@@ -1381,7 +1391,9 @@ let run_ready dom r =
            switch point more or less changes only the order that the seed \
            selects"]
   then World.perform "sched" World.Switch ;
+  beat dom ;
   run_fiber dom r.rfiber (r.run ()) ;
+  beat dom ;
   flush_wake dom
 
 (* The loop of one domain. It ends when [main] ended. Each close came before the
@@ -1638,6 +1650,11 @@ let create ?(slack = Span.ms 1) ?(simulated = false) ~domains () =
     invalid_arg "run: the number of domains is not in the range 1 to 62" ;
   let t =
     { run_id= Atomic.fetch_and_add next_run 1
+    ; beats=
+        (let b =
+           Bigarray.Array1.create Bigarray.int Bigarray.c_layout domains
+         in
+         Bigarray.Array1.fill b 0 ; b )
     ; doms= [||]
     ; slack= Span.to_ns slack
     ; fibers= Hashtbl.create ~random:false 64
