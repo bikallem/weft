@@ -47,12 +47,15 @@ module Time : sig
   val diff : 'time Clock.line -> 'time -> 'time -> Span.t
   (** [diff line a b] is [a - b]. It saturates on overflow. *)
 
-  val at : Clock.mono Clock.line -> Clock.mono -> unit event
+  val at : 'time Clock.line -> 'time -> unit event
+  (** [at line t] is ready when the time of [line] is [t] or later. A [Posix]
+      deadline follows a step of the wall clock: the wait ends when the clock
+      reaches [t], also after a step. *)
 
-  val after : Clock.mono Clock.line -> Span.t -> unit event
+  val after : 'time Clock.line -> Span.t -> unit event
   (** If the deadline overflows, the event is [never]. *)
 
-  val sleep : Clock.mono Clock.line -> Span.t -> unit
+  val sleep : 'time Clock.line -> Span.t -> unit
 
   val posix_of_unix_s : float -> Clock.posix
 

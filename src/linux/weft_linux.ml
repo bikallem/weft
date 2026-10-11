@@ -12,6 +12,10 @@ external timerfd : unit -> int = "weft_timerfd"
 
 external timerfd_set : int -> int64 -> int = "weft_timerfd_set"
 
+external timerfd_realtime : unit -> int = "weft_timerfd_realtime"
+
+external timerfd_set_posix : int -> int64 -> int = "weft_timerfd_set_posix"
+
 external drain : int -> int = "weft_drain"
 
 external eventfd_signal : int -> int = "weft_eventfd_signal"
@@ -185,11 +189,15 @@ let wake_token = -2
 
 let signal_token = -3
 
+let posix_token = -4
+
 type dom =
   { epfd: int
   ; evfd: int
   ; tfd: int
-  ; mutable armed: int64  (** The time of the alarm, or 0. *) }
+  ; mutable armed: int64  (** The time of the alarm, or 0. *)
+  ; ptfd: int  (** The [Posix] alarm, on [CLOCK_REALTIME] (M3). *)
+  ; mutable parmed: int64 }
 
 (* [rng] is the state of SplitMix64. Each domain can call [random], so the state
    is one atomic counter. [jobs] and [files] are under [lock]: each domain can
@@ -213,9 +221,11 @@ let make_dom () =
   let epfd = check "epoll_create1" (epoll_create ()) in
   let evfd = check "eventfd" (eventfd ()) in
   let tfd = check "timerfd_create" (timerfd ()) in
+  let ptfd = check "timerfd_create" (timerfd_realtime ()) in
   ignore (check "epoll_ctl" (epoll_add_in epfd evfd wake_token)) ;
   ignore (check "epoll_ctl" (epoll_add_in epfd tfd timer_token)) ;
-  {epfd; evfd; tfd; armed= 0L}
+  ignore (check "epoll_ctl" (epoll_add_in epfd ptfd posix_token)) ;
+  {epfd; evfd; tfd; armed= 0L; ptfd; parmed= 0L}
 
 (* The threads that do not block each signal of [sigs], from the [SigBlk] line
    of /proc/self/task/*/status (design section 2.7, Not sure). *)
@@ -313,6 +323,7 @@ let close t =
   Array.iter
     (fun d ->
       ignore (close_fd d.tfd) ;
+      ignore (close_fd d.ptfd) ;
       ignore (close_fd d.evfd) ;
       ignore (close_fd d.epfd) )
     t.doms
@@ -613,23 +624,24 @@ module World = struct
     | Op.Deregister (d, fd) ->
         unit (epoll_del t.doms.(d).epfd fd)
 
-  (* Set the alarm only when the earliest deadline changed. *)
-  let arm d (deadline : Weft.Clock.mono option) =
-    let target =
-      match deadline with
-      | None ->
-          0L
-      | Some m ->
-          Int64.max 1L (Weft.Clock.to_ns Mono m)
-    in
-    if not (Int64.equal target d.armed) then (
+  (* Set an alarm only when its earliest deadline changed. *)
+  let target to_ns = function None -> 0L | Some x -> Int64.max 1L (to_ns x)
+
+  let arm d (w : World.Wait.t) =
+    let t = target (Weft.Clock.to_ns Mono) w.deadline in
+    if not (Int64.equal t d.armed) then (
       Atomic.incr alarm_sets ;
-      ignore (timerfd_set d.tfd target) ;
-      d.armed <- target )
+      ignore (timerfd_set d.tfd t) ;
+      d.armed <- t ) ;
+    let p = target (Weft.Clock.to_ns Posix) w.posix_deadline in
+    if not (Int64.equal p d.parmed) then (
+      Atomic.incr alarm_sets ;
+      ignore (timerfd_set_posix d.ptfd p) ;
+      d.parmed <- p )
 
   let wait t ~domain (w : World.Wait.t) =
     let d = t.doms.(domain) in
-    arm d w.deadline ;
+    arm d w ;
     let events = epoll_wait d.epfd (w.timeout = World.Wait.Sleep) in
     Array.fold_right
       (fun (token, read, write) acc ->
@@ -638,6 +650,12 @@ module World = struct
           (* A timerfd that fired is not armed. *)
           d.armed <- 0L ;
           World.Ready.Alarm :: acc )
+        else if token = posix_token then (
+          (* After a step of the clock, the read gives ECANCELED, and the alarm
+             must be set again. *)
+          ignore (drain d.ptfd) ;
+          d.parmed <- 0L ;
+          World.Ready.Posix_alarm :: acc )
         else if token = signal_token then (
           let counts = signalfd_read t.sigfd in
           let acc = ref acc in

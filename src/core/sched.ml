@@ -163,6 +163,7 @@ and dom =
             puts and takes, and a thief takes with a CAS (M3). *)
   ; mutable next_runs: int  (** The runs from the next slot in sequence. *)
   ; heap: heap
+  ; pheap: heap  (** The [Posix] deadlines (M3). *)
   ; ids: Commit.Id.gen
   ; sched: t
   ; mutable switches: int
@@ -941,7 +942,7 @@ let on_ready dom = function
               () )
       | None ->
           () )
-  | World.Ready.Alarm | World.Ready.Woken ->
+  | World.Ready.Alarm | World.Ready.Posix_alarm | World.Ready.Woken ->
       ()
 
 (* The cancel contexts (design section 2.5, How a cancel reaches a fiber, and
@@ -1152,15 +1153,16 @@ let k_poll = ref 61
 
 let now_ns () = Clock.to_ns Mono (World.perform "sched" (World.Now Mono))
 
+let posix_ns () = Clock.to_ns Posix (World.perform "sched" (World.Now Posix))
+
 (* Expire the entries up to now. A timer never fires before its deadline: the
    slack only rounds the alarm up, so the deadlines in one slot of the slack
    share one alarm. *)
-let expire dom =
-  let limit = now_ns () in
+let expire_heap dom heap limit =
   let rec loop () =
-    match Heap.top dom.heap with
+    match Heap.top heap with
     | Some e when Int64.compare e.deadline limit <= 0 ->
-        Heap.pop dom.heap ;
+        Heap.pop heap ;
         ( match (C.notify e.esync.word e.branch, e.cancels) with
         | C.Resume, _ ->
             resume dom e.esync
@@ -1177,9 +1179,14 @@ let expire dom =
 
 (* The alarm: the earliest live deadline, rounded up to the slack. The rounding
    saturates at the largest time. *)
-let alarm dom =
-  Heap.drop_stale dom.heap ;
-  match Heap.top dom.heap with
+(* The [Posix] heap reads [Now Posix] only when it holds an entry. *)
+let expire dom =
+  expire_heap dom dom.heap (now_ns ()) ;
+  if dom.pheap.size > 0 then expire_heap dom dom.pheap (posix_ns ())
+
+let alarm_of dom heap =
+  Heap.drop_stale heap ;
+  match Heap.top heap with
   | None ->
       None
   | Some e ->
@@ -1199,7 +1206,11 @@ let alarm dom =
             then Int64.max_int
             else Int64.add d up
       in
-      Some (Clock.of_ns Mono d)
+      Some d
+
+let alarm dom = Option.map (Clock.of_ns Mono) (alarm_of dom dom.heap)
+
+let posix_alarm dom = Option.map (Clock.of_ns Posix) (alarm_of dom dom.pheap)
 
 (* A poll or a sleep. The time can pass after the last poll: if the mailbox or
    an expired entry made a fiber ready, the domain polls instead of a sleep. *)
@@ -1212,7 +1223,9 @@ let wait dom timeout =
       timeout
     else World.Wait.Poll
   in
-  let w = {World.Wait.timeout; deadline= alarm dom} in
+  let w =
+    {World.Wait.timeout; deadline= alarm dom; posix_deadline= posix_alarm dom}
+  in
   List.iter (on_ready dom) (World.perform "sched" (World.Wait (dom.index, w))) ;
   take_mail dom ;
   expire dom ;
@@ -1681,6 +1694,7 @@ let create ?(slack = Span.ms 1) ?(simulated = false) ~domains () =
         ; next= Atomic.make None
         ; next_runs= 0
         ; heap= Heap.create ()
+        ; pheap= Heap.create ()
         ; ids= Commit.Id.gen ~domain:index ~max_domains:domains
         ; sched= t
         ; switches= 0

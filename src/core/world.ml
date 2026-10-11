@@ -1,12 +1,16 @@
 module Wait = struct
   type timeout = Poll | Sleep
 
-  type t = {timeout: timeout; deadline: Clock.mono option}
+  type t =
+    { timeout: timeout
+    ; deadline: Clock.mono option
+    ; posix_deadline: Clock.posix option }
 end
 
 module Ready = struct
   type t =
     | Alarm
+    | Posix_alarm
     | Woken
     | Fd of {token: int; read: bool; write: bool}
     | External of int

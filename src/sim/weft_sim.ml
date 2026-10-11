@@ -141,7 +141,7 @@ type t =
   { prng: Prng.t
   ; auto: bool
   ; mutable now: int64  (** The virtual [Mono] time, in nanoseconds. *)
-  ; posix0: int64  (** [Posix] at [Mono] 0. *)
+  ; mutable posix0: int64  (** [Posix] at [Mono] 0. [set_posix] changes it. *)
   ; woken: bool array  (** A [wake] of each domain that it did not take. *)
   ; mutable sched: Sched.t option
   ; net: net
@@ -1051,24 +1051,39 @@ let quiescent t st =
   progress t ;
   let s = sched t in
   ( match
-      Sched_debug.lost s ~now:(Weft.Clock.of_ns Mono t.now) @ fd_problems t
+      Sched_debug.lost s
+        ~now:(Weft.Clock.of_ns Mono t.now)
+        ~posix:(Weft.Clock.of_ns Posix (Int64.add t.posix0 t.now))
+      @ fd_problems t
     with
   | [] ->
       ()
   | l ->
       raise (Lost_wakeup l) ) ;
+  (* A [Posix] deadline comes at the [Mono] time where [posix0 + now] reaches
+     it. The alarm of each line goes to its domain. *)
   let deadlines =
-    List.filter_map
+    List.concat_map
       (fun d ->
         match st.(d) with
         | Sleeping (w, _) ->
-            Option.map (fun m -> (d, Weft.Clock.to_ns Mono m)) w.deadline
+            Option.to_list
+              (Option.map
+                 (fun m -> (d, Weft.Clock.to_ns Mono m, World.Ready.Alarm))
+                 w.deadline )
+            @ Option.to_list
+                (Option.map
+                   (fun p ->
+                     ( d
+                     , Int64.sub (Weft.Clock.to_ns Posix p) t.posix0
+                     , World.Ready.Posix_alarm ) )
+                   w.posix_deadline )
         | _ ->
-            None )
+            [] )
       (List.init (Array.length st) Fun.id)
   in
   let deadline =
-    List.fold_left (fun acc (_, at) -> earliest acc (Some at)) None deadlines
+    List.fold_left (fun acc (_, at, _) -> earliest acc (Some at)) None deadlines
   in
   let next_agenda =
     match t.agenda with (at, _) :: _ -> Some at | [] -> None
@@ -1091,8 +1106,7 @@ let quiescent t st =
     t.now <- Int64.max t.now at ;
     run_agenda t ;
     List.iter
-      (fun (d, dl) ->
-        if Int64.compare dl t.now <= 0 then give d World.Ready.Alarm )
+      (fun (d, dl, alarm) -> if Int64.compare dl t.now <= 0 then give d alarm)
       deadlines
   in
   if Atomic.get t.refused_fills > 0 then
@@ -1261,6 +1275,15 @@ let advance_until t target =
       Printexc.raise_with_backtrace e bt
 
 let set_latency t span = t.net.latency <- Weft.Span.to_ns span
+
+(* A step of the wall clock. As TFD_TIMER_CANCEL_ON_SET does on Linux, the step
+   ends the wait of each domain for its [Posix] alarm. The [Mono] line does not
+   change. *)
+let set_posix t p =
+  t.posix0 <- Int64.sub (Weft.Clock.to_ns Posix p) t.now ;
+  Array.iteri
+    (fun d _ -> t.net.edges <- (d, World.Ready.Posix_alarm) :: t.net.edges)
+    (sched t).doms
 
 type net_faults = {jitter: Weft.Span.t; short_io: bool; extra_edges: bool}
 

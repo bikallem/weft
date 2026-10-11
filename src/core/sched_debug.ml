@@ -46,8 +46,9 @@ let parked t =
     (fibers t)
 
 (* The items of the check for lost wakeups. Each one is a problem. *)
-let lost t ~now =
+let lost ?posix t ~now =
   let now = Clock.to_ns Mono now in
+  let posix = Option.map (Clock.to_ns Posix) posix in
   let queues =
     Array.to_list t.doms
     |> List.concat_map (fun d ->
@@ -74,24 +75,23 @@ let lost t ~now =
     if Atomic.get t.inject = [] then queues
     else "the injection queue is not empty" :: queues
   in
+  (* The scheduler expires each entry up to now before a sleep, so an entry at
+     now is a bug in expire. *)
+  let expired heap now =
+    List.init heap.size (fun i -> heap.entries.(i))
+    |> List.filter (fun e ->
+        (not (is_done e.esync))
+        && ( Int64.compare e.deadline now
+           <= 0 )
+           [@mutate off "an entry at now is a bug in expire, not in this check"] )
+  in
   let timers =
     Array.to_list t.doms
     |> List.concat_map (fun d ->
-        List.init d.heap.size (fun i -> d.heap.entries.(i))
-        |> List.filter_map (fun e ->
-            if
-              (not (is_done e.esync))
-              && ( Int64.compare e.deadline now
-                 <= 0 )
-                 [@mutate
-                   off
-                     "the scheduler expires each entry up to now before a \
-                      sleep, so an entry at now is a bug in expire, not in \
-                      this check"]
-            then
-              Some
-                (Printf.sprintf "%s has an expired timer" (name e.esync.owner))
-            else None ) )
+        expired d.heap now
+        @ match posix with Some p -> expired d.pheap p | None -> [] )
+    |> List.map (fun e ->
+        Printf.sprintf "%s has an expired timer" (name e.esync.owner) )
   in
   let done_not_queued =
     List.filter_map

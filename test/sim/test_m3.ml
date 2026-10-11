@@ -147,6 +147,49 @@ let unawaited () =
           let q = Fiber.fork_promise s (fun () -> Time.sleep Mono (Span.s 1)) in
           Promise.cancel q ) )
 
+let mono_ms t0 =
+  Int64.to_int
+    (Int64.div (Span.to_ns (Time.diff Mono (Time.now Mono) t0)) 1_000_000L)
+
+(* Real Posix timers: a step of the wall clock moves a Posix deadline, and not a
+   Mono deadline. *)
+let posix_timers () =
+  Sim.run (fun sim ->
+      let t0 = Time.now Mono in
+      Time.sleep Posix (Span.s 10) ;
+      equal int 10_000 (mono_ms t0) ;
+      (* A step forward: the Posix deadline is due at once. *)
+      let p0 = Time.now Posix in
+      let at = Option.get (Time.add Posix p0 (Span.s 10)) in
+      Fiber.scope (fun s ->
+          let posix =
+            Fiber.fork_promise s (fun () ->
+                sync (Time.at Posix at) ;
+                mono_ms t0 )
+          in
+          let mono =
+            Fiber.fork_promise s (fun () ->
+                Time.sleep Mono (Span.s 5) ;
+                mono_ms t0 )
+          in
+          Time.sleep Mono (Span.s 1) ;
+          Sim.set_posix sim (Option.get (Time.add Posix p0 (Span.s 20))) ;
+          equal int 11_000 (Promise.await posix) ;
+          equal int 15_000 (Promise.await mono) ) ;
+      (* A step back: the deadline is later in Mono time. *)
+      let t1 = Time.now Mono in
+      let p1 = Time.now Posix in
+      Fiber.scope (fun s ->
+          let posix =
+            Fiber.fork_promise s (fun () ->
+                sync
+                  (Time.at Posix (Option.get (Time.add Posix p1 (Span.s 10)))) ;
+                mono_ms t1 )
+          in
+          Time.sleep Mono (Span.s 1) ;
+          Sim.set_posix sim (Option.get (Time.add Posix p1 (Span.s (-99)))) ;
+          equal int (1_000 + 109_000) (Promise.await posix) ) )
+
 let tests =
   [ group "m3"
       [ test "pinned fibers run only on domain 0, with 200 seeds" (fun () ->
@@ -159,6 +202,7 @@ let tests =
       ; test "a yield loop that waits for the time gives Livelock" livelock
       ; test "a stream of 4 MiB is not a livelock" stream
       ; test "a failed promise that nobody awaits gives Unawaited" unawaited
+      ; test "a step of the wall clock moves a Posix timer only" posix_timers
       ; test "a finaliser fills an Ivar" finaliser
       ; test "a fill from outside needs ~outside_fills" refused
       ; test "no run: fill_from_outside gives false" (fun () ->

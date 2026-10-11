@@ -18,27 +18,35 @@ let diff line a b =
   else if a < 0L then Span.of_ns Int64.min_int
   else Span.of_ns Int64.max_int
 
-let at (_ : Clock.mono Clock.line) t =
-  let deadline = Clock.to_ns Mono t in
+(* A [Posix] deadline goes to the [Posix] heap of the domain. Its alarm follows
+   a step of the clock (M3). *)
+let at (type time) (line : time Clock.line) (t : time) =
+  let deadline = Clock.to_ns line t in
   let leaf : Sched.leaf =
    fun dom s i ->
+    let now, heap =
+      match line with
+      | Mono ->
+          (Sched.now_ns (), dom.heap)
+      | Posix ->
+          (Sched.posix_ns (), dom.pheap)
+    in
     if
-      ( Int64.compare (Sched.now_ns ()) deadline
-      >= 0 )
+      ( Int64.compare now deadline >= 0 )
       [@mutate off "an entry at now expires in the next poll, at the same time"]
     then ignore (Sched.C.self_commit s.word i)
-    else Sched.Heap.push dom.heap ~deadline s i
+    else Sched.Heap.push heap ~deadline s i
   in
   Event.Base (fun () -> {Event.leaf; result= ignore})
 
-let after (_ : Clock.mono Clock.line) span =
+let after line span =
   Event.Guard
     (fun () ->
-      match add Mono (now Mono) span with
+      match add line (now line) span with
       | None ->
           Event.never
       | Some t ->
-          at Mono t )
+          at line t )
 
 let sleep line span = Event.sync (after line span)
 

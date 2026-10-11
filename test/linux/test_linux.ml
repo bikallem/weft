@@ -405,6 +405,16 @@ let watchdog () =
   Weft_linux.run ~domains:1 ~watchdog:None (fun () -> busy_ms 50) ;
   equal int (before + 1) (Weft_linux.watchdog_reports ())
 
+(* M3: a Posix sleep ends after its deadline on the wall clock. *)
+let posix_sleep () =
+  Weft_linux.run ~domains:1 (fun () ->
+      let p0 = Time.now Posix and t0 = Time.now Mono in
+      Time.sleep Posix (Span.ms 20) ;
+      at_least int64 ~than:20_000_000L
+        (Span.to_ns (Time.diff Posix (Time.now Posix) p0)) ;
+      less int64 ~than:30_000_000L
+        (Span.to_ns (Time.diff Mono (Time.now Mono) t0)) )
+
 let unwatched () =
   Weft_linux.run ~domains:1 (fun () ->
       raises
@@ -437,6 +447,7 @@ let linux =
     ; test "a finaliser fills an Ivar from outside a fiber" finaliser_fill
     ; test "a failed promise that nobody awaits gives a report" promise_report
     ; test "the watchdog reports a fiber that computes 200 ms" watchdog
+    ; test "a Posix sleep ends after its deadline" posix_sleep
     ; test "a signal that run does not watch is not an event" unwatched ]
 
 let () = exit (Windtrap.run "linux" (Portable.tests world @ [linux]))

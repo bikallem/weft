@@ -61,6 +61,12 @@ val addr : t -> string -> Weft.Net.addr
 val set_latency : t -> Weft.Span.t -> unit
 (** The latency of each packet. It is 0 by default. *)
 
+val set_posix : t -> Weft.Clock.posix -> unit
+(** [set_posix t p] makes the wall clock jump to [p]. Only [Now Posix] changes.
+    A [Posix] timer follows the step: it ends when the new time reaches its
+    deadline, as with [TFD_TIMER_CANCEL_ON_SET] on Linux. A [Mono] timer does
+    not move. *)
+
 (** The faults of the network. They come from the seed, and they are off by
     default. A TCP stream keeps its order and loses no data, so the loss and the
     reordering of packets show only as delays: [jitter]. *)

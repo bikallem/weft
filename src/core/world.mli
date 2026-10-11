@@ -9,14 +9,21 @@ module Wait : sig
     | Poll  (** Timeout 0. *)
     | Sleep  (** No timeout: the alarm of the domain ends the wait. *)
 
-  (** [deadline] is the earliest deadline of the domain, for its alarm. *)
-  type t = {timeout: timeout; deadline: Clock.mono option}
+  (** [deadline] is the earliest deadline of the domain, for its alarm.
+      [posix_deadline] is the earliest [Posix] deadline, for its [Posix] alarm
+      (M3): a step of the clock must also end the wait. *)
+  type t =
+    { timeout: timeout
+    ; deadline: Clock.mono option
+    ; posix_deadline: Clock.posix option }
 end
 
 (** The result of [Wait]. *)
 module Ready : sig
   type t =
     | Alarm  (** The alarm of the domain went off. *)
+    | Posix_alarm
+        (** The [Posix] alarm went off, or the clock made a step (M3). *)
     | Woken  (** A [wake] occurred. *)
     | Fd of {token: int; read: bool; write: bool}
         (** An edge of a registered fd. [token] is the token of [Register]. *)
