@@ -1235,6 +1235,20 @@ The sections of this document mark each part that does not come in M0 with its m
 - A yield loop that waits for the time gives `Livelock`, and a long stream with no timer does not.
 - Open questions 5 and 7 have measurements.
 
+**The state of M3 (2026-10-11).** Each item of the "done" list has a test, and open questions 5, 7 and 8 have measurements (section 2.13). The code settled these points:
+
+- **The Go rules** (section 2.5, Idle and wake) follow `Wake.tla`: a `searching` count with a limit of half of the domains, no wake at a push while a domain searches, the decrease before the second check, and a wake by the last searching domain that finds work. They replace the wake chain of M1. On 8 domains, they halve the wakes of 100,000 short fibers and double the throughput.
+- **The next slot** gets one fiber that a fiber of the domain wakes: the partner of a channel, or the one fiber of an `Enqueue`. A list of more fibers goes to the tail. The limit is 3 runs in sequence. A thief takes a next slot with a CAS after the local queues, and a push to the next slot wakes an idle domain (open question 5).
+- **Pinned fibers.** `~pinned:true` is on `fork`, `fork_promise` and `fork_isolated`. A push of a pinned fiber goes to the pinned queue and wakes domain 0 only if domain 0 is in `idle`: domain 0 checks the pinned queue in its second check, so the pair is a Dekker pair.
+- **`Ivar.fill_from_outside`** gives `false` if no `run` is active. One `run` at a time takes these fills: `run` keeps its scheduler and the wake of its world in one global slot. A domain applies the requests of the injection queue each 61st take and before a steal.
+- **The deadline form of `with_timeout`** uses a sync word as the state of its heap entry, so the heap drops an ended entry as a stale one. A call that ends at once costs 4.6 times less than with a daemon fiber.
+- **The report of failed promises.** The closure of the finaliser holds the id of the run, not the scheduler: the scheduler can hold the promise in an old slot of a ring. A ring now clears the slot of each pop. The simulator forces a full GC at its end only if a promise of the run failed and no fiber awaited it.
+- **The watchdog** reads a beat of each domain in a Bigarray: one more at the start and at the end of each fiber. It is in the Linux world (`Weft_linux.run ~watchdog`).
+- **`Livelock`.** A switch point with only `Now`, `Switch`, `Random` or a `Wait` that gives nothing is not progress.
+- **A yield in a read** after 64 KiB with no wait (section 2.7).
+- **A sync on one base event** has a fast path: 60 words instead of 123.
+- **Not done:** the slack stays 1 ms (open question 7 gives the data for a choice), and `Scope.tla` does not cover the deadline form of `with_timeout`.
+
 ### Why `dscheck` is in M1
 
 The virtual domains run on one OS thread and change only at switch points. Thus the simulator never tries the other orders of the atomic operations between two switch points. `dscheck` tries all of these orders. An error in the shared protocols can make the simulator tests give incorrect results, so `dscheck` comes in the same milestone as the domains.
