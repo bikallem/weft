@@ -65,6 +65,9 @@ type conn =
   ; inbox: Buffer.t  (** The bytes to read, from [rpos]. *)
   ; mutable rpos: int
   ; mutable inflight: int  (** Bytes that the latency still holds. *)
+  ; mutable last_at: int64
+        (** The time of the last delivery to this side: a later one never comes
+            before it. *)
   ; mutable peer: conn option  (** [None] after the peer closed. *)
   ; mutable eof: bool  (** The peer ended its send side. *)
   ; mutable shut: bool  (** This side ended its send side. *)
@@ -105,6 +108,9 @@ type net =
   ; mutable edges: (int * World.Ready.t) list
         (** The edges to give, by domain, the newest first. *)
   ; mutable latency: int64
+  ; mutable jitter: int64  (** The limit of a random delay more. *)
+  ; mutable short_io: bool
+  ; mutable extra_edges: bool
   ; mutable next_port: int }
 
 (* The result of a job, before [Finish] gives it with its type. *)
@@ -220,9 +226,28 @@ let run_agenda t =
   in
   loop ()
 
-(* After the latency, or at once. *)
+(* The latency, and a random delay up to the jitter. *)
+let delay t =
+  let j = t.net.jitter in
+  Int64.add t.net.latency
+    ( if Int64.equal j 0L then 0L
+      else Int64.of_int (Prng.int t.prng (Int64.to_int j + 1)) )
+
+(* After the delay, or at once. *)
 let later t f =
-  if Int64.equal t.net.latency 0L then f () else schedule t t.net.latency f
+  let d = delay t in
+  if Int64.equal d 0L then f () else schedule t d f
+
+(* A delivery to [p] after the delay, but never before the last delivery to [p]:
+   a stream keeps its order (TCP). *)
+let later_to t p f =
+  let at = Int64.max (Int64.add t.now (delay t)) p.last_at in
+  p.last_at <- at ;
+  if Int64.compare at t.now <= 0 then f ()
+  else schedule t (Int64.sub at t.now) f
+
+(* With [short_io], a read or a write moves a random part of [k] bytes. *)
+let part t k = if t.net.short_io && k > 1 then 1 + Prng.int t.prng k else k
 
 let new_fd n =
   let fd = n.next_fd in
@@ -397,10 +422,11 @@ let start_job : type a. t -> int -> a Op.blocking -> int =
   id
 
 (* A read of a socket or of the read end of a pipe. *)
-let read_conn n c buf off len =
+let read_conn t c buf off len =
+  let n = t.net in
   let a = avail c in
   if a > 0 then (
-    let k = Int.min a len in
+    let k = part t (Int.min a len) in
     Buffer.blit c.inbox c.rpos buf off k ;
     c.rpos <- c.rpos + k ;
     if c.rpos = Buffer.length c.inbox then (
@@ -430,10 +456,10 @@ let write_conn t c buf off len =
         let space = capacity - avail p - p.inflight in
         if space <= 0 then Error Op.Would_block
         else
-          let k = Int.min len space in
+          let k = part t (Int.min len space) in
           let data = Bytes.sub_string buf off k in
           p.inflight <- p.inflight + k ;
-          (if c.role = Sock then later t else fun f -> f ()) (fun () ->
+          (if c.role = Sock then later_to t p else fun f -> f ()) (fun () ->
               p.inflight <- p.inflight - k ;
               Buffer.add_string p.inbox data ;
               edge n p.cfd ~read:true ~write:false ) ;
@@ -445,7 +471,7 @@ let close_conn t c =
   match c.peer with
   | Some p ->
       c.peer <- None ;
-      (if c.role = Sock then later t else fun f -> f ()) (fun () ->
+      (if c.role = Sock then later_to t p else fun f -> f ()) (fun () ->
           p.eof <- true ;
           p.peer <- None ;
           edge t.net p.cfd ~read:true ~write:true )
@@ -458,6 +484,7 @@ let new_pipe n =
     ; inbox= Buffer.create 64
     ; rpos= 0
     ; inflight= 0
+    ; last_at= 0L
     ; peer= None
     ; eof= false
     ; shut= false
@@ -577,6 +604,7 @@ let submit : type a. t -> a Op.t -> (a, Op.error) result =
               ; inbox= Buffer.create 64
               ; rpos= 0
               ; inflight= 0
+              ; last_at= 0L
               ; peer= None
               ; eof= false
               ; shut= false
@@ -626,7 +654,7 @@ let submit : type a. t -> a Op.t -> (a, Op.error) result =
     | None ->
         Error Op.Bad_fd )
   | Op.Read (fd, buf, off, len) ->
-      conn fd (fun c -> read_conn n c buf off len)
+      conn fd (fun c -> read_conn t c buf off len)
   | Op.Write (fd, buf, off, len) ->
       conn fd (fun c -> write_conn t c buf off len)
   | Op.Pipe ->
@@ -673,7 +701,7 @@ let submit : type a. t -> a Op.t -> (a, Op.error) result =
   | Op.Fd_read (fd, buf, off, len) -> (
     match Hashtbl.find_opt n.fds fd with
     | Some (Conn ({role= Rd_end | Sock; _} as c)) ->
-        read_conn n c buf off len
+        read_conn t c buf off len
     | Some (Conn {role= Wr_end; _}) | None ->
         Error Op.Bad_fd
     | Some (Lsn _ | Fil _ | Pfd _) ->
@@ -691,7 +719,7 @@ let submit : type a. t -> a Op.t -> (a, Op.error) result =
           c.shut <- true ;
           ( match c.peer with
           | Some p ->
-              later t (fun () ->
+              later_to t p (fun () ->
                   p.eof <- true ;
                   edge n p.cfd ~read:true ~write:false )
           | None ->
@@ -871,6 +899,28 @@ let runnable t st d =
   | Ended_dom ->
       false
 
+(* With [extra_edges], a wait of a domain gets an edge with no change, for a
+   registration of that domain, one time in 8 (design section 2.8, The model of
+   the fds). *)
+let extra_edge t d =
+  if Prng.int t.prng 8 = 0 then
+    let mine =
+      Hashtbl.fold
+        (fun _ l acc ->
+          List.filter_map
+            (fun (d', token) -> if d' = d then Some token else None)
+            l
+          @ acc )
+        t.net.regs []
+    in
+    match mine with
+    | [] ->
+        ()
+    | l ->
+        let token = List.nth l (Prng.int t.prng (List.length l)) in
+        t.net.edges <-
+          (d, World.Ready.Fd {token; read= true; write= true}) :: t.net.edges
+
 (* Answer the effect of domain [d], continue it, and keep its next state. *)
 let step t st d =
   let next = function Ended -> Ended_dom | Paused (e, k) -> Pending (e, k) in
@@ -898,14 +948,15 @@ let step t st d =
           t.woken.(d') <- true ;
           go ()
       | World.Wait (_, w) -> (
-        (* A domain waits only on its own poller. *)
-        match (take_ready t d, w.timeout) with
-        | (_ :: _ as ready), _ ->
-            go ready
-        | [], World.Wait.Poll ->
-            go []
-        | [], World.Wait.Sleep ->
-            st.(d) <- Sleeping (w, k) )
+          if t.net.extra_edges then extra_edge t d ;
+          (* A domain waits only on its own poller. *)
+          match (take_ready t d, w.timeout) with
+          | (_ :: _ as ready), _ ->
+              go ready
+          | [], World.Wait.Poll ->
+              go []
+          | [], World.Wait.Sleep ->
+              st.(d) <- Sleeping (w, k) )
       | _ ->
           assert false (* The handler stops only at world effects. *) )
 
@@ -1006,6 +1057,9 @@ let run ?(seed = 0) ?(domains = 1) ?(auto = true) main =
         ; regs= Hashtbl.create ~random:false 16
         ; edges= []
         ; latency= 0L
+        ; jitter= 0L
+        ; short_io= false
+        ; extra_edges= false
         ; next_port= 40000 }
     ; agenda= []
     ; next_id= 0
@@ -1066,6 +1120,17 @@ let advance_until t target =
       Printexc.raise_with_backtrace e bt
 
 let set_latency t span = t.net.latency <- Weft.Span.to_ns span
+
+type net_faults = {jitter: Weft.Span.t; short_io: bool; extra_edges: bool}
+
+let no_faults = {jitter= Weft.Span.zero; short_io= false; extra_edges= false}
+
+let net_faults t (f : net_faults) =
+  if Int64.compare (Weft.Span.to_ns f.jitter) 0L < 0 then
+    invalid_arg "Sim.net_faults: the jitter is negative" ;
+  t.net.jitter <- Weft.Span.to_ns f.jitter ;
+  t.net.short_io <- f.short_io ;
+  t.net.extra_edges <- f.extra_edges
 
 let set_blocking_cost t span =
   if Int64.compare (Weft.Span.to_ns span) 0L < 0 then

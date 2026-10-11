@@ -283,10 +283,42 @@ let shutdown_test () =
     equal int64 20_000_000L (Clock.to_ns Mono (shutdown seed))
   done
 
+(* The tests of the public API with all faults, 20 seeds each, on 4 virtual
+   domains. *)
+let faults_world =
+  let n = ref 0 in
+  { Portable.name= "faults"
+  ; domains= 4
+  ; run=
+      (fun f ->
+        let rec go seed =
+          let v =
+            Sim.run ~seed ~domains:4 (fun sim ->
+                Sim.net_faults sim
+                  {jitter= Span.ms 2; short_io= true; extra_edges= true} ;
+                Sim.set_blocking_cost sim (Span.ms 1) ;
+                f () )
+          in
+          if seed = 20 then v else go (seed + 1)
+        in
+        go 1 )
+  ; listen=
+      (fun () ->
+        incr n ;
+        let a = Net.Tcp ("faults", !n) in
+        (Net.listen a, a) )
+  ; tmp=
+      (let n = ref 0 in
+       fun () ->
+         incr n ;
+         let d = Printf.sprintf "/tmp%d" !n in
+         Dir.mkdir d ; d ) }
+
 let tests =
   [ Windtrap.group "200 seeds"
       [Portable.layers seeds_200; Portable.files seeds_200]
   ; jobs
   ; processes
+  ; group "with faults" (Portable.tests faults_world)
   ; group "signals"
       [test "SIGTERM gives a graceful shutdown with 100 seeds" shutdown_test] ]

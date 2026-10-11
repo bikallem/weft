@@ -37,6 +37,24 @@ val addr : t -> string -> Weft.Net.addr
 val set_latency : t -> Weft.Span.t -> unit
 (** The latency of each packet. It is 0 by default. *)
 
+(** The faults of the network. They come from the seed, and they are off by
+    default. A TCP stream keeps its order and loses no data, so the loss and the
+    reordering of packets show only as delays: [jitter]. *)
+type net_faults =
+  { jitter: Weft.Span.t
+        (** Each delivery takes a random delay more, from 0 to [jitter]. The
+            data of a stream keeps its order. *)
+  ; short_io: bool
+        (** A read or a write of a socket or a pipe moves a random part of the
+            bytes, at least one. *)
+  ; extra_edges: bool
+        (** A wait of a domain gets an edge with no change, one time in 8, for
+            one of its registrations. *) }
+
+val no_faults : net_faults
+
+val net_faults : t -> net_faults -> unit
+
 val set_blocking_cost : t -> Weft.Span.t -> unit
 (** [set_blocking_cost t limit]: each [Blocking] operation (a [File], [Dir] or
     [Dns] operation) takes a time cost from the seed, in the range 0 to [limit].

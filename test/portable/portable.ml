@@ -57,8 +57,12 @@ let echo_server l =
                   | 0 ->
                       ()
                   | k ->
-                      ignore (Net.write_sub c buf 0 k) ;
-                      loop ()
+                      (* A write can move only a part of the bytes. *)
+                      let rec send off =
+                        if off < k then
+                          send (off + Net.write_sub c buf off (k - off))
+                      in
+                      send 0 ; loop ()
                 in
                 loop () ) )
       done )
@@ -102,8 +106,8 @@ let events w =
     ; test "two fibers that yield keep their own order" (fun () ->
           (* On many domains, the two fibers can run at the same time: only the
              order of each fiber is sure. *)
-          let l = Log.create () in
           w.run (fun () ->
+              let l = Log.create () in
               Fiber.scope (fun s ->
                   List.iter
                     (fun name ->
@@ -112,11 +116,10 @@ let events w =
                             Log.add l (Printf.sprintf "%s%d" name i) ;
                             Fiber.yield ()
                           done ) )
-                    ["a"; "b"] ) ) ;
-          let all = Log.get l in
-          let only p = List.filter (fun x -> x.[0] = p) all in
-          equal (list string) ["a1"; "a2"] (only 'a') ;
-          equal (list string) ["b1"; "b2"] (only 'b') )
+                    ["a"; "b"] ) ;
+              let only p = List.filter (fun x -> x.[0] = p) (Log.get l) in
+              equal (list string) ["a1"; "a2"] (only 'a') ;
+              equal (list string) ["b1"; "b2"] (only 'b') ) )
     ; test "a sleep ends after its deadline" (fun () ->
           w.run (fun () ->
               let t0 = Time.now Mono in
