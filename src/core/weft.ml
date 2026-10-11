@@ -35,15 +35,12 @@ module Chan = Chan
 module type WORLD = World.WORLD
 
 (* The world handler: it gives each world effect to the module of the world
-   (design section 2.3). The simulator uses it too. *)
-let run_world (type w) ?slack ?on_create (module W : WORLD with type t = w)
-    (w : w) main =
+   (design section 2.3). Each OCaml domain runs its own instance. *)
+let handle (type w) (module W : WORLD with type t = w) (w : w) f =
   let open Effect.Deep in
   (* Not [try_with]: it raises the exception again with [raise], and the
      backtrace of the fiber is lost. *)
-  match_with
-    (fun () -> Sched.run ?slack ?on_create main)
-    ()
+  match_with f ()
     { retc= Fun.id
     ; exnc=
         (fun e ->
@@ -68,7 +65,36 @@ let run_world (type w) ?slack ?on_create (module W : WORLD with type t = w)
           | _ ->
               None ) }
 
-let run ?slack m w main = run_world ?slack m w main
+(* Domain 0 runs on the calling thread, and each other domain on an OCaml domain
+   of its own. If a loop fails, the others stop. *)
+let run_world (type w) ?slack ?(domains = 1) ?on_create
+    (module W : WORLD with type t = w) (w : w) main =
+  let t = Sched.create ?slack ~domains () in
+  Option.iter (fun f -> f t) on_create ;
+  let result = Sched.start t main in
+  let run_dom d () =
+    match handle (module W) w (fun () -> Sched.run_domain d) with
+    | () ->
+        Ok ()
+    | exception e ->
+        let bt = Printexc.get_raw_backtrace () in
+        Atomic.set t.finished true ;
+        Array.iter (fun d -> W.wake w ~domain:d.Sched.index) t.doms ;
+        Error (e, bt)
+  in
+  let others =
+    Array.to_list (Array.sub t.doms 1 (domains - 1))
+    |> List.map (fun d -> Domain.spawn (run_dom d))
+  in
+  let first = run_dom t.doms.(0) () in
+  let rest = List.map Domain.join others in
+  match List.find_opt Result.is_error (first :: rest) with
+  | Some (Error (e, bt)) ->
+      Printexc.raise_with_backtrace e bt
+  | _ ->
+      result ()
+
+let run ?slack ?domains m w main = run_world ?slack ?domains m w main
 
 module Private = struct
   let run_world = run_world
@@ -85,4 +111,5 @@ module Private = struct
   module Event = Event
   module Net = Net
   module Chan = Chan
+  module Ring = Ring
 end

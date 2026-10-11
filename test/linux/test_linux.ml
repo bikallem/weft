@@ -6,14 +6,14 @@ open Weft
 
 let world =
   { Portable.name= "linux"
-  ; run= (fun f -> Weft_linux.run f)
+  ; run= (fun f -> Weft_linux.run ~domains:1 f)
   ; listen=
       (fun () ->
         let l = Net.listen (Net.Tcp ("127.0.0.1", 0)) in
         (l, Net.Tcp ("127.0.0.1", Weft_linux.local_port l)) ) }
 
 let elapsed_ns f =
-  Weft_linux.run (fun () ->
+  Weft_linux.run ~domains:1 (fun () ->
       let t0 = Time.now Mono in
       f () ;
       Int64.to_int (Span.to_ns (Time.diff Mono (Time.now Mono) t0)) )
@@ -46,7 +46,7 @@ let other_process () =
   in
   let out_r, out_w = Unix.pipe ~cloexec:true () in
   let pid =
-    Weft_linux.run (fun () ->
+    Weft_linux.run ~domains:1 (fun () ->
         let l = Net.listen (Net.Tcp ("127.0.0.1", 0)) in
         let port = Weft_linux.local_port l in
         let pid =
@@ -82,7 +82,7 @@ let open_fds () = Array.length (Sys.readdir "/proc/self/fd")
 (* 10,000 connections open and close, and no fd stays open. *)
 let no_fd_leak () =
   let before = open_fds () in
-  Weft_linux.run (fun () ->
+  Weft_linux.run ~domains:1 (fun () ->
       let l, a = world.listen () in
       Fiber.scope (fun s ->
           Fiber.fork_daemon s (fun () -> Portable.echo_server l) ;
@@ -101,7 +101,7 @@ let unix_socket () =
   Fun.protect
     ~finally:(fun () -> if Sys.file_exists path then Sys.remove path)
     (fun () ->
-      Weft_linux.run (fun () ->
+      Weft_linux.run ~domains:1 (fun () ->
           let l = Net.listen (Net.Unix path) in
           Fiber.scope (fun s ->
               Fiber.fork_daemon s (fun () -> Portable.echo_server l) ;
@@ -112,11 +112,13 @@ let unix_socket () =
           Net.close l ) )
 
 let posix_time () =
-  let p = Weft_linux.run (fun () -> Time.posix_to_unix_s (Time.now Posix)) in
+  let p =
+    Weft_linux.run ~domains:1 (fun () -> Time.posix_to_unix_s (Time.now Posix))
+  in
   less (float 1e-9) ~than:1.0 (Float.abs (p -. Unix.gettimeofday ()))
 
 let invalid_address () =
-  Weft_linux.run (fun () ->
+  Weft_linux.run ~domains:1 (fun () ->
       match Net.connect (Net.Tcp ("999.1.1.1", 80)) with
       | _ ->
           failwith "no error"
@@ -126,7 +128,7 @@ let invalid_address () =
 (* C3: a Register that fails gives its error to the waiter. Two records for one
    fd make the second EPOLL_CTL_ADD fail with EEXIST. *)
 let register_failure () =
-  Weft_linux.run (fun () ->
+  Weft_linux.run ~domains:1 (fun () ->
       let l : Private.Net.t = Net.listen (Net.Tcp ("127.0.0.1", 0)) in
       ignore (sync (choose [Net.readable l; Time.after Mono (Span.ms 1)])) ;
       let clone = Private.Sched.Fdtab.alloc l.Private.Sched.os in
@@ -144,7 +146,7 @@ let unix_peer_addr () =
   Fun.protect
     ~finally:(fun () -> if Sys.file_exists path then Sys.remove path)
     (fun () ->
-      Weft_linux.run (fun () ->
+      Weft_linux.run ~domains:1 (fun () ->
           let l = Net.listen (Net.Unix path) in
           let c = Net.connect (Net.Unix path) in
           let s, peer = Net.accept l in
@@ -157,7 +159,7 @@ let unix_peer_addr () =
 
 (* L3: a port out of range is an error, not a truncated port. *)
 let port_range () =
-  Weft_linux.run (fun () ->
+  Weft_linux.run ~domains:1 (fun () ->
       match Net.listen (Net.Tcp ("127.0.0.1", 70000)) with
       | _ ->
           failwith "no error"

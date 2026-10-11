@@ -48,6 +48,7 @@
               # OCaml 5.5, dune and the test library.
               windtrap
               ppx_windtrap
+              ocamlPackages.dscheck
               ocamlPackages.ocaml
               ocamlPackages.dune_3
               ocamlPackages.findlib

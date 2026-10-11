@@ -6,6 +6,18 @@ type world =
 
 exception Boom of string
 
+(* A log that fibers on many domains can add to. *)
+module Log = struct
+  let create () = Atomic.make []
+
+  let rec add l x =
+    let old = Atomic.get l in
+    if not (Atomic.compare_and_set l old (x :: old)) then add l x
+
+  (* The entries, the oldest first. *)
+  let get l = List.rev (Atomic.get l)
+end
+
 let read_n c n =
   let buf = Bytes.create n in
   let rec loop off =
@@ -83,19 +95,24 @@ let events w =
                   in
                   Fiber.fork s (fun () -> Ivar.fill iv 42) ;
                   equal int 42 (Promise.await p) ) ) )
-    ; test "two fibers that yield alternate" (fun () ->
-          let l = ref [] in
+    ; test "two fibers that yield keep their own order" (fun () ->
+          (* On many domains, the two fibers can run at the same time: only the
+             order of each fiber is sure. *)
+          let l = Log.create () in
           w.run (fun () ->
               Fiber.scope (fun s ->
                   List.iter
                     (fun name ->
                       Fiber.fork s (fun () ->
                           for i = 1 to 2 do
-                            l := Printf.sprintf "%s%d" name i :: !l ;
+                            Log.add l (Printf.sprintf "%s%d" name i) ;
                             Fiber.yield ()
                           done ) )
                     ["a"; "b"] ) ) ;
-          equal (list string) ["a1"; "b1"; "a2"; "b2"] (List.rev !l) )
+          let all = Log.get l in
+          let only p = List.filter (fun x -> x.[0] = p) all in
+          equal (list string) ["a1"; "a2"] (only 'a') ;
+          equal (list string) ["b1"; "b2"] (only 'b') )
     ; test "a sleep ends after its deadline" (fun () ->
           w.run (fun () ->
               let t0 = Time.now Mono in
@@ -123,15 +140,13 @@ let chans w =
     ; test "each sent value arrives one time" (fun () ->
           let got =
             w.run (fun () ->
-                let c = Chan.create () and got = ref [] in
+                let c = Chan.create () and got = Log.create () in
                 Fiber.scope (fun s ->
                     for i = 1 to 20 do
                       Fiber.fork s (fun () -> sync (Chan.send c i)) ;
-                      Fiber.fork s (fun () ->
-                          let v = sync (Chan.recv c) in
-                          got := v :: !got )
+                      Fiber.fork s (fun () -> Log.add got (sync (Chan.recv c)))
                     done ) ;
-                !got )
+                Log.get got )
           in
           equal (list int) (List.init 20 succ) (List.sort compare got) )
     ; test "a sync never meets its own offer" (fun () ->

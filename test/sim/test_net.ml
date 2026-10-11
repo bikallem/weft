@@ -49,8 +49,8 @@ let echo_server l =
             loop () )
       done )
 
-let echo_once seed =
-  Sim.run ~seed (fun sim ->
+let echo_once ?(domains = 1) seed =
+  Sim.run ~seed ~domains (fun sim ->
       let addr = Sim.addr sim "server:7" in
       let l = Net.listen addr in
       Fiber.scope (fun s ->
@@ -96,8 +96,8 @@ let http_server l =
 
 let status_of response = String.sub response 9 3
 
-let t408 seed =
-  Sim.run ~seed (fun sim ->
+let t408 ?(domains = 1) seed =
+  Sim.run ~seed ~domains (fun sim ->
       Fiber.scope (fun s ->
           let addr = Sim.addr sim "server:80" in
           let l = Net.listen addr in

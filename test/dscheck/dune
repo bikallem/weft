@@ -1,0 +1,13 @@
+; The dscheck tests of the shared protocols (design section 2.14, M1). The
+; test copies the sources of the core, and its own module Atomic (the traced
+; atomics of dscheck) shadows Stdlib.Atomic in these copies. Thus dscheck
+; examines the real code, and production keeps the stdlib atomics.
+
+(copy_files#
+ (files ../../src/core/*.{ml,mli}))
+
+(test
+ (name test_dscheck)
+ (libraries dscheck)
+ (flags
+  (:standard -w -32-69)))

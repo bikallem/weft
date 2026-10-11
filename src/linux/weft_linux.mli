@@ -7,15 +7,16 @@ type t
 
 module World : Weft.WORLD with type t = t
 
-val create : unit -> t
-(** [create ()] makes the poller of domain 0. *)
+val create : ?domains:int -> unit -> t
+(** [create ~domains ()] makes the poller of each domain, 1 by default. *)
 
 val close : t -> unit
 (** [close t] closes the fds of the pollers. *)
 
-val run : ?slack:Weft.Span.t -> (unit -> 'a) -> 'a
+val run : ?slack:Weft.Span.t -> ?domains:int -> (unit -> 'a) -> 'a
 (** [run main] runs [main] with a new Linux world, and closes the world at the
-    end. *)
+    end. [~domains] is [min 4 (Domain.recommended_domain_count ())] by default
+    (open question 6). *)
 
 val local_port : Weft.Net.t -> int
 (** The port of a TCP socket, for example after a listen on port 0. *)

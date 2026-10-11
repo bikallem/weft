@@ -36,9 +36,20 @@ let lost t ~now =
   let now = Clock.to_ns Mono now in
   let queues =
     Array.to_list t.doms
-    |> List.filter_map (fun d ->
-        if Queue.is_empty d.queue then None
-        else Some (Printf.sprintf "the queue of domain %d is not empty" d.index) )
+    |> List.concat_map (fun d ->
+        ( if Ring.is_empty d.ring then []
+          else [Printf.sprintf "the queue of domain %d is not empty" d.index] )
+        @
+        match Atomic.get d.mailbox with
+        | [] ->
+            []
+        | _ :: _ ->
+            [Printf.sprintf "domain %d has close notices" d.index] )
+  in
+  let queues =
+    if Spin.with_lock t.overflow_lock (fun () -> Queue.is_empty t.overflow) then
+      queues
+    else "the overflow queue is not empty" :: queues
   in
   let timers =
     Array.to_list t.doms

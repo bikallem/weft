@@ -22,30 +22,9 @@ let submit name op = World.perform name (World.Submit op)
 
 (* A [submit] holds a user of the record. In [Closing] or [Closed], it gets
    [EBADF] and adds no user (Eio's [Rcfd]). *)
-let rec acquire fd name =
-  match Atomic.get fd.rc with
-  | Open n as old ->
-      if not (Atomic.compare_and_set fd.rc old (Open (n + 1))) then
-        acquire fd name
-  | Closing _ | Closed ->
-      raise (Error (Op.Bad_fd, name))
+let acquire fd name = if not (Rc.acquire fd) then raise (Error (Op.Bad_fd, name))
 
-(* The side that changes [Closing 0] to [Closed] calls close(2), and only that
-   side. *)
-let rec release fd =
-  match Atomic.get fd.rc with
-  | Open n as old ->
-      if not (Atomic.compare_and_set fd.rc old (Open (n - 1))) then release fd
-  | Closing 1 as old ->
-      if Atomic.compare_and_set fd.rc old Closed then (
-        ignore (submit "Net.close" (Op.Close fd.os)) ;
-        Fdtab.release fd )
-      else release fd
-  | Closing n as old ->
-      if not (Atomic.compare_and_set fd.rc old (Closing (n - 1))) then
-        release fd
-  | Closed ->
-      assert false
+let release = Rc.release
 
 let attempt fd name op =
   acquire fd name ;
@@ -86,26 +65,13 @@ let ok name = function Ok v -> v | Error e -> raise (Error (e, name))
 
 (* [close] holds a user while it removes the registration, so close(2) comes
    after the Deregister (design section 2.7). A second [close] does nothing. *)
+(* [close] never blocks. If users remain, each domain with a registration
+   gets a close notice, and the last user calls close(2) (design section 2.7,
+   spec/tla/Fd.tla). A second close does nothing. [Self] first: outside a
+   fiber, [close] raises [Not_in_fiber] before it changes the state. *)
 let close fd =
-  (* [Self] first: outside a fiber, [close] raises [Not_in_fiber] before it
-     changes the state. *)
   ignore (self ()) ;
-  match acquire fd "Net.close" with
-  | exception Error _ ->
-      ()
-  | () ->
-      (* If another close came first, this one only releases its user. *)
-      let rec closing () =
-        match Atomic.get fd.rc with
-        | Open n as old ->
-            Atomic.compare_and_set fd.rc old (Closing n) || closing ()
-        | Closing _ | Closed ->
-            false
-      in
-      let first = closing () in
-      (* Milestone M0 has one domain, so the registration is on this domain. *)
-      if first then prog "Net.close" (Close_regs fd) ;
-      release fd
+  if Rc.close fd then prog "Net.close" (Close_notices fd)
 
 let listen ?(backlog = 128) addr =
   Fdtab.alloc

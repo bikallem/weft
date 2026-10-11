@@ -945,9 +945,24 @@ let portable_world =
         let a = Net.Tcp ("portable", !n) in
         (Net.listen a, a) ) }
 
+(* The same tests on four virtual domains, with a seed for each run. *)
+let portable_world_4 =
+  let n = ref 0 and seed = ref 0 in
+  { Portable.name= "portable on 4 domains"
+  ; run=
+      (fun f ->
+        incr seed ;
+        Sim.run ~seed:!seed ~domains:4 (fun _ -> f ()) )
+  ; listen=
+      (fun () ->
+        incr n ;
+        let a = Net.Tcp ("portable4", !n) in
+        (Net.listen a, a) ) }
+
 let () =
   exit
     (Windtrap.run "sim"
        ( [time; timers; events; chans; scopes; reviews; checks; properties]
-       @ Test_net.tests
-       @ Portable.tests portable_world ) )
+       @ Test_net.tests @ Test_m1.tests
+       @ Portable.tests portable_world
+       @ Portable.tests portable_world_4 ) )

@@ -1,6 +1,7 @@
-(* The scheduler of one domain, the events, the fibers and the scopes (design
-   sections 2.4 and 2.5). Milestone M0 has one domain, but each part of the
-   shared state uses atomics or a short lock, as milestone M1 needs. *)
+(* The scheduler, the events, the fibers and the scopes (design sections 2.4 and
+   2.5). Each domain runs [loop] on its own state. The domains share the scopes,
+   the sync words, the fd records, the rings for the steal, the overflow queue
+   and the idle set. *)
 
 module C = Commit.Make (Atomic)
 
@@ -101,7 +102,7 @@ and fdrec =
             changes it, with [fetch_and_add], because the bits of all domains
             share the word. *) }
 
-(* The state machine of Eio's [Rcfd]. *)
+(* The state machine of Eio's [Rcfd]. A registration holds a user. *)
 and rc = Open of int | Closing of int | Closed
 
 (* The registration of an fd in the poller of one domain. Only that domain uses
@@ -122,8 +123,10 @@ and _ req =
   | Yield : bool req  (** Gives [true] if the context is cancelled. *)
   | Fork : fiber * (unit -> unit) -> unit req
   | Self : fiber req
+  | Dom_index : int req  (** The domain that runs the fiber, for the tests. *)
   | Enqueue : sync list -> unit req
-  | Close_regs : fdrec -> unit req
+  | Close_notices : fdrec -> unit req
+      (** Send a close notice to each domain with a registration. *)
 
 and sync_req = {leaves: leaf array; nocancel: bool}
 
@@ -134,14 +137,15 @@ and leaf = dom -> sync -> int -> unit
 
 and dom =
   { index: int
-  ; queue: ready Queue.t
+  ; ring: ready Ring.t  (** The local queue. *)
   ; heap: heap
   ; ids: Commit.Id.gen
   ; sched: t
   ; mutable switches: int
+  ; mutable rng: int  (** The PRNG of the steal. *)
+  ; mutable wake: bool  (** A push to do a wake at the next safe point. *)
   ; regs: (int, reg) Hashtbl.t  (** The registrations, by slot. *)
-  ; externals: (int, sync * int) Hashtbl.t
-        (** The waiters of [Ready.External], by id. *) }
+  ; mailbox: fdrec list Atomic.t  (** The close notices, the newest first. *) }
 
 and ready = {rfiber: fiber; run: unit -> step}
 
@@ -150,7 +154,14 @@ and t =
   ; slack: int64
   ; fibers: (int, fiber) Hashtbl.t  (** The live fibers, for the debug. *)
   ; fibers_lock: Spin.t
-  ; mutable finished: bool }
+  ; finished: bool Atomic.t
+  ; idle: int Atomic.t
+        (** The bit of each domain that sleeps, or is about to. *)
+  ; overflow: ready Queue.t  (** The fibers of full rings, under its lock. *)
+  ; overflow_lock: Spin.t
+  ; externals: (int, sync * int) Hashtbl.t
+        (** The waiters of [Ready.External], by id, under its lock. *)
+  ; externals_lock: Spin.t }
 
 (* The heap of deadlines of one domain. Only its owner uses it. *)
 and heap =
@@ -332,7 +343,9 @@ end
 (* The table of fd slots. A slot is used again with a new generation, so a token
    of an old open never names the new one. *)
 module Fdtab = struct
-  let lock = Spin.make ()
+  (* A mutex, not a spin lock: the table is global, and its critical sections
+     have no atomic operation and no effect. *)
+  let lock = Mutex.create ()
 
   let gens = ref (Array.make 64 0)
 
@@ -341,7 +354,7 @@ module Fdtab = struct
   let next = ref 0
 
   let alloc os =
-    Spin.with_lock lock (fun () ->
+    Mutex.protect lock (fun () ->
         let slot =
           match !free with
           | s :: rest ->
@@ -363,12 +376,58 @@ module Fdtab = struct
         !gens.(slot) <- gen ;
         {slot; gen; os; rc= Atomic.make (Open 0); doms= Atomic.make 0} )
 
-  let release r = Spin.with_lock lock (fun () -> free := r.slot :: !free)
+  let release r = Mutex.protect lock (fun () -> free := r.slot :: !free)
 
   (* The slot and the generation in one [int]. A slot is less than 2^30. *)
   let token r = (r.slot lsl 32) lor r.gen
 
   let of_token t = (t lsr 32, t land 0xffff_ffff)
+end
+
+(* The users of an fd record (Eio's [Rcfd], design section 2.7, close, and
+   spec/tla/Fd.tla). *)
+module Rc = struct
+  (* Add a user. Only in [Open]. *)
+  let rec acquire fdr =
+    match Atomic.get fdr.rc with
+    | Open n as old ->
+        Atomic.compare_and_set fdr.rc old (Open (n + 1)) || acquire fdr
+    | Closing _ | Closed ->
+        false
+
+  (* The side that changes [Closing 0] to [Closed] calls close(2), and only that
+     side. *)
+  let rec release fdr =
+    match Atomic.get fdr.rc with
+    | Open n as old ->
+        if not (Atomic.compare_and_set fdr.rc old (Open (n - 1))) then
+          release fdr
+    | Closing 1 as old ->
+        if Atomic.compare_and_set fdr.rc old Closed then (
+          ignore (World.perform "Net.close" (World.Submit (Op.Close fdr.os))) ;
+          Fdtab.release fdr )
+        else release fdr
+    | Closing n as old ->
+        if not (Atomic.compare_and_set fdr.rc old (Closing (n - 1))) then
+          release fdr
+    | Closed ->
+        assert false
+
+  (* The start of a close: [Open 0] is the last use, so it closes the fd at
+     once, and [Open n] gives [Closing n]. It gives [true] if users remain: then
+     the domains in the set get a close notice. A second close does nothing. *)
+  let rec close fdr =
+    match Atomic.get fdr.rc with
+    | Open 0 as old ->
+        if Atomic.compare_and_set fdr.rc old Closed then (
+          ignore (World.perform "Net.close" (World.Submit (Op.Close fdr.os))) ;
+          Fdtab.release fdr ;
+          false )
+        else close fdr
+    | Open n as old ->
+        Atomic.compare_and_set fdr.rc old (Closing n) || close fdr
+    | Closing _ | Closed ->
+        false
 end
 
 (* The fibers. *)
@@ -403,11 +462,54 @@ let handler : (unit, step) Effect.Deep.handler =
         | _ ->
             None ) }
 
-let start body () = Effect.Deep.match_with body () handler
+let start_fiber body () = Effect.Deep.match_with body () handler
 
+(* The idle set (design section 2.5, Idle and wake, and spec/tla/Wake.tla). *)
+module Idle = struct
+  let bit d = 1 lsl d
+
+  let rec add t d =
+    let v = Atomic.get t.idle in
+    if not (Atomic.compare_and_set t.idle v (v lor bit d)) then add t d
+
+  (* Take [d] out of the set. It gives [true] if [d] was in it. *)
+  let rec remove t d =
+    let v = Atomic.get t.idle in
+    if v land bit d = 0 then false
+    else Atomic.compare_and_set t.idle v (v land lnot (bit d)) || remove t d
+
+  (* Take one domain out of the set, the lowest, and give it. *)
+  let rec take t =
+    let v = Atomic.get t.idle in
+    if v = 0 then None
+    else
+      let d =
+        let rec low i = if v land bit i <> 0 then i else low (i + 1) in
+        low 0
+      in
+      if remove t d then Some d else take t
+end
+
+(* A push to the local queue. A full ring spills into the overflow queue. If a
+   domain is idle, the push marks a wake: the scheduler does it at the next safe
+   point, because a wake is a world effect, and a lock can be held here. *)
 let push dom f run =
   f.queued <- true ;
-  Queue.push {rfiber= f; run} dom.queue
+  let r = {rfiber= f; run} in
+  let t = dom.sched in
+  if not (Ring.push dom.ring r) then
+    Spin.with_lock t.overflow_lock (fun () -> Queue.push r t.overflow) ;
+  if Atomic.get t.idle <> 0 then dom.wake <- true
+
+(* Wake one idle domain if a push marked it. No lock is held here. *)
+let flush_wake dom =
+  if dom.wake then (
+    dom.wake <- false ;
+    match Idle.take dom.sched with
+    | Some d ->
+        World.perform "sched" (World.Wake d)
+    | None ->
+        () )
 
 (* Resume a parked sync. The caller got [Resume] or a claim with
    [resume_partner], so it is the one owner of this resume. *)
@@ -426,36 +528,44 @@ let wake_all dom waiters =
       match C.notify s.word i with C.Resume -> resume dom s | _ -> () )
     (Waiters.to_list waiters)
 
-(* The registration of [fdr] on [dom]. The first block on a domain adds the fd
-   to its poller. *)
+(* The registration of [fdr] on [dom], in the order of spec/tla/Fd.tla: add a
+   user, set the domain bit, read the state, then add the fd to the poller.
+   [Error None] tells that the fd is closing: the waiter retries and gets
+   [EBADF]. *)
 let ensure_reg dom fdr =
   match Hashtbl.find_opt dom.regs fdr.slot with
   | Some reg when reg.fdr == fdr ->
       Ok reg
   | _ -> (
-    match Atomic.get fdr.rc with
-    | Closing _ | Closed ->
-        (* The waiter retries, and the retry gets [EBADF]. *)
-        Error None
-    | Open _ -> (
-        let token = Fdtab.token fdr in
-        match
-          World.perform "Net"
-            (World.Submit (Op.Register (dom.index, fdr.os, token)))
-        with
-        | Error e ->
-            Error (Some e)
-        | Ok () ->
-            let reg =
-              { fdr
-              ; rflag= false
-              ; wflag= false
-              ; rwait= Waiters.empty
-              ; wwait= Waiters.empty }
-            in
-            Hashtbl.replace dom.regs fdr.slot reg ;
-            ignore (Atomic.fetch_and_add fdr.doms (1 lsl dom.index)) ;
-            Ok reg ) )
+      if not (Rc.acquire fdr) then Error None
+      else
+        let bit = 1 lsl dom.index in
+        ignore (Atomic.fetch_and_add fdr.doms bit) ;
+        let undo () =
+          ignore (Atomic.fetch_and_add fdr.doms (-bit)) ;
+          Rc.release fdr
+        in
+        match Atomic.get fdr.rc with
+        | Closing _ | Closed ->
+            undo () ; Error None
+        | Open _ -> (
+            let token = Fdtab.token fdr in
+            match
+              World.perform "Net"
+                (World.Submit (Op.Register (dom.index, fdr.os, token)))
+            with
+            | Error e ->
+                undo () ; Error (Some e)
+            | Ok () ->
+                let reg =
+                  { fdr
+                  ; rflag= false
+                  ; wflag= false
+                  ; rwait= Waiters.empty
+                  ; wwait= Waiters.empty }
+                in
+                Hashtbl.replace dom.regs fdr.slot reg ;
+                Ok reg ) )
 
 (* The wait for an fd. With [~clear], the fiber got [EAGAIN], so the flag of
    this domain is stale. If the Register fails, [err] gets the error, and the
@@ -473,9 +583,10 @@ let fd_leaf ~write ~clear ~err fdr : leaf =
       else if write then reg.wwait <- Waiters.add s i reg.wwait
       else reg.rwait <- Waiters.add s i reg.rwait
 
-(* The close of [fdr] on [dom]: remove the registration, commit its waiters, and
-   remove the fd from the poller. *)
-let close_reg dom fdr =
+(* A close notice on [dom]: if the registration is live, remove it, clear the
+   bit, commit its waiters (they retry and get [EBADF]), remove the fd from the
+   poller, and release the user of the registration. *)
+let close_notice dom fdr =
   match Hashtbl.find_opt dom.regs fdr.slot with
   | Some reg when reg.fdr == fdr ->
       Hashtbl.remove dom.regs fdr.slot ;
@@ -484,12 +595,37 @@ let close_reg dom fdr =
       wake_all dom reg.wwait ;
       ignore
         (World.perform "Net.close"
-           (World.Submit (Op.Deregister (dom.index, fdr.os))) )
+           (World.Submit (Op.Deregister (dom.index, fdr.os))) ) ;
+      Rc.release fdr
   | _ ->
       ()
 
+let rec post dom fdr =
+  let l = Atomic.get dom.mailbox in
+  if not (Atomic.compare_and_set dom.mailbox l (fdr :: l)) then post dom fdr
+
+(* Take the close notices of [dom], the oldest first. *)
+let take_mail dom =
+  List.iter (close_notice dom) (List.rev (Atomic.exchange dom.mailbox []))
+
+(* Send a close notice to each domain in the set of [fdr], and wake it. The
+   closer acts on its own notice at once. *)
+let close_notices dom fdr =
+  let set = Atomic.get fdr.doms in
+  Array.iter
+    (fun d ->
+      if set land (1 lsl d.index) <> 0 then
+        if d == dom then close_notice dom fdr
+        else (
+          post d fdr ;
+          World.perform "Net.close" (World.Wake d.index) ) )
+    dom.sched.doms
+
 let external_leaf id : leaf =
- fun dom s i -> Hashtbl.replace dom.externals id (s, i)
+ fun dom s i ->
+  let t = dom.sched in
+  Spin.with_lock t.externals_lock (fun () ->
+      Hashtbl.replace t.externals id (s, i) )
 
 let on_ready dom = function
   | World.Ready.Fd {token; read; write} -> (
@@ -509,12 +645,18 @@ let on_ready dom = function
       | _ ->
           () )
   | World.Ready.External id -> (
-    match Hashtbl.find_opt dom.externals id with
-    | Some (s, i) -> (
-        Hashtbl.remove dom.externals id ;
+      let t = dom.sched in
+      let w =
+        Spin.with_lock t.externals_lock (fun () ->
+            let w = Hashtbl.find_opt t.externals id in
+            Hashtbl.remove t.externals id ;
+            w )
+      in
+      match w with
+      | Some (s, i) -> (
         match C.notify s.word i with C.Resume -> resume dom s | _ -> () )
-    | None ->
-        () )
+      | None ->
+          () )
   | World.Ready.Alarm | World.Ready.Woken ->
       ()
 
@@ -541,7 +683,8 @@ let remove_member n f =
 (* The values of a table, in the order of their ids: the fork order. *)
 let by_id tbl =
   Hashtbl.fold (fun id v acc -> (id, v) :: acc) tbl []
-  |> List.sort compare |> List.map snd
+  |> List.sort (fun (a, _) (b, _) -> Int.compare a b)
+  |> List.map snd
 
 (* The first cancelled context on the chain from [c], up to a shield. *)
 let rec first_flag c =
@@ -609,17 +752,20 @@ let shuffle n =
 
 let rec run_fiber : dom -> fiber -> step -> unit =
  fun dom fiber step ->
+  flush_wake dom ;
   match step with
   | Finished ->
       unregister dom.sched fiber
   | Suspended (Self, k) ->
       run_fiber dom fiber (Effect.Deep.continue k fiber)
+  | Suspended (Dom_index, k) ->
+      run_fiber dom fiber (Effect.Deep.continue k dom.index)
   | Suspended (Fork (f, body), k) ->
       register dom.sched f ;
-      push dom f (start body) ;
+      push dom f (start_fiber body) ;
       run_fiber dom fiber (Effect.Deep.continue k ())
-  | Suspended (Close_regs fdr, k) ->
-      close_reg dom fdr ;
+  | Suspended (Close_notices fdr, k) ->
+      close_notices dom fdr ;
       run_fiber dom fiber (Effect.Deep.continue k ())
   | Suspended (Enqueue l, k) ->
       List.iter (resume dom) l ;
@@ -715,33 +861,102 @@ let alarm dom =
       in
       Some (Clock.of_ns Mono d)
 
+(* A poll or a sleep. The time can pass after the last poll: if the mailbox or
+   an expired entry made a fiber ready, the domain polls instead of a sleep. *)
 let wait dom timeout =
+  take_mail dom ;
   expire dom ;
-  (* The time can pass after the last poll: if an entry expired, the domain
-     polls instead of a sleep. *)
-  let timeout = if Queue.is_empty dom.queue then timeout else World.Wait.Poll in
+  flush_wake dom ;
+  let timeout = if Ring.is_empty dom.ring then timeout else World.Wait.Poll in
   let w = {World.Wait.timeout; deadline= alarm dom} in
   List.iter (on_ready dom) (World.perform "sched" (World.Wait (dom.index, w))) ;
-  expire dom
+  take_mail dom ;
+  expire dom ;
+  flush_wake dom
 
+let take_overflow t =
+  Spin.with_lock t.overflow_lock (fun () -> Queue.take_opt t.overflow)
+
+(* A steal: try each other domain one time, from a start that the PRNG of the
+   domain selects. *)
+let steal dom =
+  let doms = dom.sched.doms in
+  let n = Array.length doms in
+  if n = 1 then None
+  else (
+    dom.rng <-
+      ((dom.rng * 1103515245) + 12345) [@mutate off "a constant of the PRNG"] ;
+    let start = (dom.rng lsr 16) mod n in
+    let rec try_ i =
+      if i = n then None
+      else
+        let v = doms.((start + i) mod n) in
+        if v == dom then try_ (i + 1)
+        else
+          match Ring.steal ~from:v.ring ~into:dom.ring with
+          | Some r ->
+              Some r
+          | None ->
+              try_ (i + 1)
+    in
+    try_ 0 )
+
+(* Steps 2 and 4 of the loop: the local queue, the overflow queue, then a
+   steal. *)
+let take dom =
+  match Ring.pop dom.ring with
+  | Some r ->
+      Some r
+  | None -> (
+    match take_overflow dom.sched with Some r -> Some r | None -> steal dom )
+
+(* The second check of a domain that is in [idle]: did [main] end, or is there a
+   fiber in a queue that it can take? The check needs [finished]: a poll in the
+   same turn of the loop can take the wake of the end. It needs no check of the
+   mailbox: [wait] takes the mailbox after each poll. *)
+let work_for dom =
+  let t = dom.sched in
+  Atomic.get t.finished
+  ||
+  if Array.exists (fun d -> not (Ring.is_empty d.ring)) t.doms then true
+  else
+    Spin.with_lock t.overflow_lock (fun () -> not (Queue.is_empty t.overflow))
+    [@mutate
+      off
+        "a lost steal of the overflow queue costs only parallelism: the domain \
+         that filled it takes it when its ring is empty"]
+
+let run_ready dom r =
+  r.rfiber.queued <- false ;
+  dom.switches <- dom.switches + 1 ;
+  if
+    ( dom.switches >= k_poll )
+    [@mutate off "61 or 62 switches: k_poll is a start value"]
+  then (
+    dom.switches <- 0 ;
+    wait dom World.Wait.Poll ) ;
+  World.perform "sched" (World.Switch dom.index) ;
+  run_fiber dom r.rfiber (r.run ()) ;
+  flush_wake dom
+
+(* The loop of one domain. It ends when [main] ended. Each close came before the
+   end of [main], because the root scope waited for each fiber. Thus the domain
+   takes its last close notices when it leaves the loop, and each registration
+   releases its user. *)
 let rec loop dom =
-  if not dom.sched.finished then (
-    ( match Queue.take_opt dom.queue with
+  let t = dom.sched in
+  if Atomic.get t.finished then take_mail dom
+  else (
+    ( match take dom with
     | Some r ->
-        r.rfiber.queued <- false ;
-        dom.switches <- dom.switches + 1 ;
-        if
-          ( dom.switches >= k_poll )
-          [@mutate off "61 or 62 switches: k_poll is a start value"]
-        then (
-          dom.switches <- 0 ;
-          wait dom World.Wait.Poll ) ;
-        World.perform "sched" (World.Switch dom.index) ;
-        run_fiber dom r.rfiber (r.run ())
+        run_ready dom r
     | None ->
-        (* [wait] polls instead of a sleep if the poll made a fiber ready. *)
         wait dom World.Wait.Poll ;
-        if not dom.sched.finished then wait dom World.Wait.Sleep ) ;
+        (* Idle: add the domain to [idle], then check again (Wake.tla). The
+           check sees a fiber that the poll made ready, and the end. *)
+        Idle.add t dom.index ;
+        if not (work_for dom) then wait dom World.Wait.Sleep ;
+        ignore (Idle.remove t dom.index) ) ;
     loop dom )
 
 (* The scopes (design section 2.5, Fibers, scopes and cancellation). *)
@@ -776,11 +991,11 @@ let state_of node =
       assert false (* Only a scope node has members that end. *)
 
 (* A failed member stores its exception before it ends, then it cancels the
-   scope. A [Cancelled] is not a failure. *)
+   scope. A [Cancelled] is not a failure. It gives the syncs to resume. *)
 let fail node e bt =
   match e with
   | Cancelled _ ->
-      ()
+      []
   | _ ->
       let st = state_of node in
       let rec store () =
@@ -788,12 +1003,11 @@ let fail node e bt =
         if not (Atomic.compare_and_set st.failures l ((e, bt) :: l)) then
           store ()
       in
-      store () ;
-      enqueue (cancel_node node e)
+      store () ; cancel_node node e
 
 (* The end of a member: one CAS on the counts. The end of the last member sets
    the closed bit and fills the join. When the last member that is not a daemon
-   ends, the scope cancels its daemons. *)
+   ends, the scope cancels its daemons. It gives the syncs to resume. *)
 let member_end node ~daemon =
   let st = state_of node in
   let rec dec () =
@@ -803,10 +1017,11 @@ let member_end node ~daemon =
     if Atomic.compare_and_set st.counts c c' then c' else dec ()
   in
   let c = dec () in
-  if all_count c = 0 then ignore (fill_resume st.join ())
+  if all_count c = 0 then Option.value ~default:[] (Iv.fill st.join ())
   else if (not daemon) && nd_count c = 0 then
     let ds = Spin.with_lock node.lock (fun () -> by_id st.daemons) in
-    List.iter (fun d -> enqueue (cancel_node d Daemons_end)) ds
+    List.concat_map (fun d -> cancel_node d Daemons_end) ds
+  else []
 
 (* Add a member with a CAS that succeeds only if the closed bit is clear. A fork
    also reads the flags of the chain (design section 2.5, Fork into a scope that
@@ -829,7 +1044,7 @@ let run_body scope body =
       ()
   | exception e ->
       let bt = Printexc.get_raw_backtrace () in
-      fail scope e bt
+      enqueue (fail scope e bt)
 
 let fork ?name scope body =
   add_member scope ~daemon:false ;
@@ -841,7 +1056,7 @@ let fork ?name scope body =
        , fun () ->
            run_body scope body ;
            remove_member scope f ;
-           member_end scope ~daemon:false ) )
+           enqueue (member_end scope ~daemon:false) ) )
 
 (* A daemon has its own node under the scope. The count and the link of the node
    are one step under the lock of the scope, so the end of the last member that
@@ -864,7 +1079,7 @@ let fork_daemon ?name scope body =
            Spin.with_lock scope.lock (fun () ->
                Hashtbl.remove scope.children d.nid ;
                Hashtbl.remove st.daemons d.nid ) ;
-           member_end scope ~daemon:true ) )
+           enqueue (member_end scope ~daemon:true) ) )
 
 let sync_req ~nocancel leaves = prog "sync" (Sync {leaves; nocancel})
 
@@ -881,9 +1096,9 @@ let reraise (e, bt) = Printexc.raise_with_backtrace e bt
    gives it, also if the scope was cancelled: [with_timeout] never drops a
    value. *)
 let finish_scope fiber node result =
-  (match result with Error (e, bt) -> fail node e bt | Ok _ -> ()) ;
+  (match result with Error (e, bt) -> enqueue (fail node e bt) | Ok _ -> ()) ;
   remove_member node fiber ;
-  member_end node ~daemon:false ;
+  enqueue (member_end node ~daemon:false) ;
   let st = state_of node in
   ignore (sync_req ~nocancel:true [|Iv.leaf st.join|]) ;
   ( match node.parent with
@@ -945,28 +1160,40 @@ let reason () =
   | None ->
       assert false (* A sync commits with -1 only after a flag. *)
 
-(* Run [main] as the first fiber, in the root scope. When [main] returns, the
-   root scope cancels the other fibers and waits for them. *)
-let run ?(slack = Span.ms 1) ?on_create main =
+(* The scheduler of [domains] domains. *)
+let create ?(slack = Span.ms 1) ~domains () =
+  if domains < 1 || domains > 62 then
+    invalid_arg "run: the number of domains is not in the range 1 to 62" ;
   let t =
     { doms= [||]
     ; slack= Span.to_ns slack
     ; fibers= Hashtbl.create ~random:false 64
     ; fibers_lock= Spin.make ()
-    ; finished= false }
+    ; finished= Atomic.make false
+    ; idle= Atomic.make 0
+    ; overflow= Queue.create ()
+    ; overflow_lock= Spin.make ()
+    ; externals= Hashtbl.create ~random:false 8
+    ; externals_lock= Spin.make () }
   in
-  let dom =
-    { index= 0
-    ; queue= Queue.create ()
-    ; heap= Heap.create ()
-    ; ids= Commit.Id.gen ~domain:0 ~max_domains:1
-    ; sched= t
-    ; switches= 0
-    ; regs= Hashtbl.create ~random:false 64
-    ; externals= Hashtbl.create ~random:false 8 }
-  in
-  t.doms <- [|dom|] ;
-  Option.iter (fun f -> f t) on_create ;
+  t.doms <-
+    Array.init domains (fun index ->
+        { index
+        ; ring= Ring.create ()
+        ; heap= Heap.create ()
+        ; ids= Commit.Id.gen ~domain:index ~max_domains:domains
+        ; sched= t
+        ; switches= 0
+        ; rng= (index + 1) [@mutate off "a seed of the PRNG"]
+        ; wake= false
+        ; regs= Hashtbl.create ~random:false 64
+        ; mailbox= Atomic.make [] } ) ;
+  t
+
+(* Put [main] as the first fiber on domain 0, in the root scope. When [main]
+   returns, the root scope cancels the other fibers and waits for them. Then the
+   end of [main] wakes each domain, so that each loop ends. *)
+let start t main =
   let root = new_node (Scope_node (new_scope_state ())) in
   let fiber = new_fiber ~name:"main" [root] in
   Hashtbl.replace root.members fiber.fid fiber ;
@@ -979,25 +1206,27 @@ let run ?(slack = Span.ms 1) ?on_create main =
       | exception e ->
           Error (e, Printexc.get_raw_backtrace ())
     in
-    result :=
-      Some
-        ( match finish_scope fiber root r with
-        | v ->
-            Ok v
-        | exception e ->
-            Error (e, Printexc.get_raw_backtrace ()) ) ;
-    t.finished <- true
+    let r =
+      match finish_scope fiber root r with
+      | v ->
+          fun () -> v
+      | exception e ->
+          let bt = Printexc.get_raw_backtrace () in
+          fun () -> Printexc.raise_with_backtrace e bt
+    in
+    result := Some r ;
+    Atomic.set t.finished true ;
+    Array.iter (fun d -> World.perform "sched" (World.Wake d.index)) t.doms
   in
   register t fiber ;
-  push dom fiber (start body) ;
-  ( try loop dom
-    with e ->
-      let bt = Printexc.get_raw_backtrace () in
-      raise (Internal_error (e, bt)) ) ;
-  match !result with
-  | Some (Ok v) ->
-      v
-  | Some (Error e) ->
-      reraise e
-  | None ->
-      assert false
+  push t.doms.(0) fiber (start_fiber body) ;
+  (* The value of [main], or its exception. *)
+  fun () -> match !result with Some r -> r () | None -> assert false
+
+(* Run the loop of a domain. A bug in the scheduler stops the program. *)
+let run_domain dom =
+  try loop dom
+  with e ->
+    let bt = Printexc.get_raw_backtrace () in
+    Atomic.set dom.sched.finished true ;
+    raise (Internal_error (e, bt))

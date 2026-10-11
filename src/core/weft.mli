@@ -140,16 +140,26 @@ end
 module type WORLD = World.WORLD
 
 val run :
-  ?slack:Span.t -> (module WORLD with type t = 'w) -> 'w -> (unit -> 'a) -> 'a
+     ?slack:Span.t
+  -> ?domains:int
+  -> (module WORLD with type t = 'w)
+  -> 'w
+  -> (unit -> 'a)
+  -> 'a
 (** [run (module W) w main] runs [main] as the first fiber, with the world [W].
     When [main] returns, the root scope cancels the other fibers and waits for
-    them. *)
+    them. [~domains] (1 by default) is the number of domains: domain 0 runs on
+    the calling thread, and each other domain on an OCaml domain of its own. The
+    world must have a poller for each domain.
+
+    @raise Invalid_argument if [domains] is not in the range 1 to 62. *)
 
 (** The parts inside the library. They are for the tests and for the worlds of
     the library, not for programs. They can change in each version. *)
 module Private : sig
   val run_world :
        ?slack:Span.t
+    -> ?domains:int
     -> ?on_create:(Sched.t -> unit)
     -> (module WORLD with type t = 'w)
     -> 'w
@@ -172,6 +182,7 @@ module Private : sig
   module Event = Event
   module Net = Net
   module Chan = Chan
+  module Ring = Ring
 end
 
 module Chan : sig

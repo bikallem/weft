@@ -5,10 +5,12 @@
 (** The state of one simulation. *)
 type t
 
-val run : ?seed:int -> ?auto:bool -> (t -> 'a) -> 'a
-(** [run main] runs [main] in the simulator. [~seed] is 0 by default. With
-    [~auto:true] (the default), the time moves to the next deadline at each
-    quiescence. With [~auto:false], only {!advance_until} moves the time.
+val run : ?seed:int -> ?domains:int -> ?auto:bool -> (t -> 'a) -> 'a
+(** [run main] runs [main] in the simulator. [~seed] is 0 by default. [~domains]
+    is the number of virtual domains, 1 by default: the seed selects the domain
+    that continues at each world effect. With [~auto:true] (the default), the
+    time moves to the next deadline at each quiescence. With [~auto:false], only
+    {!advance_until} moves the time.
 
     @raise Deadlock
       if the program is quiescent, no deadline exists, and no event can come.

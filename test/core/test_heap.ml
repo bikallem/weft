@@ -82,4 +82,50 @@ let spin =
     [ test "two domains do not enter the lock at the same time" spin_excludes
     ; test "the lock is free after a raise" spin_unlocks_on_raise ]
 
-let tests = [heap; spin]
+module Ring = Weft.Private.Ring
+
+(* The ring of a domain, on one thread. *)
+let ring_full () =
+  let r = Ring.create () in
+  for i = 1 to Ring.size do
+    is_true (Ring.push r i)
+  done ;
+  is_false (Ring.push r 0) ;
+  equal (option int) (Some 1) (Ring.pop r) ;
+  is_true (Ring.push r (Ring.size + 1)) ;
+  let rec all acc =
+    match Ring.pop r with Some x -> all (x :: acc) | None -> List.rev acc
+  in
+  equal (list int) (List.init Ring.size (fun i -> i + 2)) (all [])
+
+let ring_steal_full () =
+  let r = Ring.create () and into = Ring.create () in
+  for i = 1 to Ring.size do
+    ignore (Ring.push r i)
+  done ;
+  (* A thief takes half: it keeps the first and puts the others in its ring. *)
+  equal (option int) (Some 1) (Ring.steal ~from:r ~into) ;
+  let rec count r n =
+    match Ring.pop r with Some _ -> count r (n + 1) | None -> n
+  in
+  equal int ((Ring.size / 2) - 1) (count into 0) ;
+  equal int (Ring.size / 2) (count r 0) ;
+  equal (option int) None (Ring.steal ~from:r ~into)
+
+let ring =
+  group "ring"
+    [ test "a full ring refuses a push and keeps the FIFO order" ring_full
+    ; test "a steal takes half of a full ring" ring_steal_full ]
+
+let domains_range () =
+  let invalid = function Invalid_argument _ -> true | _ -> false in
+  raises_match invalid (fun () -> S.create ~domains:0 ()) ;
+  raises_match invalid (fun () -> S.create ~domains:63 ()) ;
+  equal int 1 (Array.length (S.create ~domains:1 ()).S.doms) ;
+  equal int 62 (Array.length (S.create ~domains:62 ()).S.doms)
+
+let tests =
+  [ heap
+  ; spin
+  ; ring
+  ; group "domains" [test "the number of domains is 1 to 62" domains_range] ]

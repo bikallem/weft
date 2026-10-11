@@ -79,7 +79,9 @@ type dom =
   ; tfd: int
   ; mutable armed: int64  (** The time of the alarm, or 0. *) }
 
-type t = {doms: dom array; rng: Random.State.t}
+(* [rng] is the state of SplitMix64. Each domain can call [random], so the state
+   is one atomic counter. *)
+type t = {doms: dom array; rng: int Atomic.t}
 
 let check name r = if r < 0 then failwith (name ^ ": " ^ strerror (-r)) else r
 
@@ -91,11 +93,22 @@ let make_dom () =
   ignore (check "epoll_ctl" (epoll_add epfd tfd timer_token)) ;
   {epfd; evfd; tfd; armed= 0L}
 
-let create () =
+let create ?(domains = 1) () =
   let seed = Bytes.create 8 in
   ignore (check "getrandom" (getrandom seed)) ;
-  { doms= [|make_dom ()|]
-  ; rng= Random.State.make [|Int64.to_int (Bytes.get_int64_le seed 0)|] }
+  { doms= Array.init domains (fun _ -> make_dom ())
+  ; rng= Atomic.make (Int64.to_int (Bytes.get_int64_le seed 0)) }
+
+(* SplitMix64, on 63 bits. *)
+let next t =
+  let z =
+    ( Atomic.fetch_and_add t.rng 0x1E3779B97F4A7C15
+    + 0x1E3779B97F4A7C15 )
+    [@mutate off "a constant of the PRNG"]
+  in
+  let z = z lxor (z lsr 30) * 0x3F58476D1CE4E5B9 in
+  let z = z lxor (z lsr 27) * 0x14D049BB133111EB in
+  z lxor (z lsr 31) land max_int
 
 let close t =
   Array.iter
@@ -182,16 +195,20 @@ module World = struct
 
   let wake t ~domain = ignore (eventfd_signal t.doms.(domain).evfd)
 
-  let random t n = Random.State.int t.rng n
+  let random t n = next t mod n
 
   let random_bytes _ b = ignore (getrandom b)
 end
 
-let run ?slack main =
-  let t = create () in
+(* The default number of domains is a start value (open question 6). *)
+let default_domains () = Int.min 4 (Domain.recommended_domain_count ())
+
+let run ?slack ?domains main =
+  let domains = match domains with Some n -> n | None -> default_domains () in
+  let t = create ~domains () in
   Fun.protect
     ~finally:(fun () -> close t)
-    (fun () -> Weft.run ?slack (module World) t main)
+    (fun () -> Weft.run ?slack ~domains (module World) t main)
 
 let local_port (fd : Weft.Net.t) =
   Net.acquire fd "Weft_linux.local_port" ;

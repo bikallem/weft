@@ -95,7 +95,7 @@ type t =
   ; auto: bool
   ; mutable now: int64  (** The virtual [Mono] time, in nanoseconds. *)
   ; posix0: int64  (** [Posix] at [Mono] 0. *)
-  ; mutable woken: bool
+  ; woken: bool array  (** A [wake] of each domain that it did not take. *)
   ; mutable sched: Sched.t option
   ; net: net
   ; mutable agenda: (int64 * (unit -> unit)) list
@@ -411,9 +411,106 @@ let earliest a b =
   | Some a, Some b ->
       Some (Int64.min a b)
 
-(* The program is quiescent: the domain sleeps, and nothing is ready (design
-   section 2.8, The wait steps). *)
-let quiescent t (w : World.Wait.t) =
+(* The virtual domains (design section 2.8, Virtual domains). Each domain runs
+   its loop under a handler that stops at each world effect: each world effect
+   is a switch point. One top-level loop keeps the continuation of each domain,
+   and the PRNG selects the domain that continues. *)
+
+type dstep =
+  | Ended
+  | Paused : 'a Effect.t * ('a, dstep) Effect.Deep.continuation -> dstep
+
+type vstate =
+  | Start of Sched.dom
+  | Pending : 'a Effect.t * ('a, dstep) Effect.Deep.continuation -> vstate
+  | Sleeping of
+      World.Wait.t * (World.Ready.t list, dstep) Effect.Deep.continuation
+  | Ended_dom
+
+let start_dom d =
+  Effect.Deep.match_with Sched.run_domain d
+    { retc= (fun () -> Ended)
+    ; exnc=
+        (fun e ->
+          Printexc.raise_with_backtrace e (Printexc.get_raw_backtrace ()) )
+    ; effc=
+        (fun (type a) (e : a Effect.t) ->
+          match e with
+          | World.Now _
+          | World.Submit _
+          | World.Wait _
+          | World.Wake _
+          | World.Random _
+          | World.Random_bytes _
+          | World.Switch _ ->
+              Some
+                (fun (k : (a, dstep) Effect.Deep.continuation) -> Paused (e, k))
+          | _ ->
+              None ) }
+
+let now_of (type time) t (line : time Weft.Clock.line) : time =
+  Weft.Clock.of_ns line
+    (match line with Mono -> t.now | Posix -> Int64.add t.posix0 t.now)
+
+(* What a [Wait] of domain [d] gets now: a wake, and the edges, alarms and
+   completions of [d]. *)
+let take_ready t d =
+  let woken = if t.woken.(d) then [World.Ready.Woken] else [] in
+  t.woken.(d) <- false ;
+  woken @ take_edges t d
+
+let has_ready t d =
+  t.woken.(d) || List.exists (fun (d', _) -> d' = d) t.net.edges
+
+let runnable t st d =
+  match st.(d) with
+  | Start _ | Pending _ ->
+      true
+  | Sleeping _ ->
+      has_ready t d
+  | Ended_dom ->
+      false
+
+(* Answer the effect of domain [d], continue it, and keep its next state. *)
+let step t st d =
+  let next = function Ended -> Ended_dom | Paused (e, k) -> Pending (e, k) in
+  match st.(d) with
+  | Start dom ->
+      st.(d) <- next (start_dom dom)
+  | Sleeping (_, k) ->
+      st.(d) <- next (Effect.Deep.continue k (take_ready t d))
+  | Ended_dom ->
+      ()
+  | Pending (e, k) -> (
+      let go v = st.(d) <- next (Effect.Deep.continue k v) in
+      match e with
+      | World.Now line ->
+          go (now_of t line)
+      | World.Submit op ->
+          go (submit t op)
+      | World.Random n ->
+          go (Prng.int t.prng n)
+      | World.Random_bytes b ->
+          go (Prng.bytes t.prng b)
+      | World.Switch _ ->
+          go ()
+      | World.Wake d' ->
+          t.woken.(d') <- true ;
+          go ()
+      | World.Wait (dd, w) -> (
+        match (take_ready t dd, w.timeout) with
+        | (_ :: _ as ready), _ ->
+            go ready
+        | [], World.Wait.Poll ->
+            go []
+        | [], World.Wait.Sleep ->
+            st.(d) <- Sleeping (w, k) )
+      | _ ->
+          assert false (* The handler stops only at world effects. *) )
+
+(* The program is quiescent: each domain sleeps, or ended, and nothing is ready
+   (design section 2.8, The wait steps). *)
+let quiescent t st =
   let s = sched t in
   ( match
       Sched_debug.lost s ~now:(Weft.Clock.of_ns Mono t.now) @ fd_problems t
@@ -422,27 +519,55 @@ let quiescent t (w : World.Wait.t) =
       ()
   | l ->
       raise (Lost_wakeup l) ) ;
-  let deadline = Option.map (Weft.Clock.to_ns Mono) w.deadline in
+  let deadlines =
+    List.filter_map
+      (fun d ->
+        match st.(d) with
+        | Sleeping (w, _) ->
+            Option.map (fun m -> (d, Weft.Clock.to_ns Mono m)) w.deadline
+        | _ ->
+            None )
+      (List.init (Array.length st) Fun.id)
+  in
+  let deadline =
+    List.fold_left (fun acc (_, at) -> earliest acc (Some at)) None deadlines
+  in
   let next_agenda =
     match t.agenda with (at, _) :: _ -> Some at | [] -> None
   in
-  (* Move the time to [at] and run the agenda. The scheduler reads the clock to
-     expire its timers, so the alarm tells only that the time moved. *)
-  let move at extra =
+  (* The first domain that did not end gets the completions. *)
+  let first =
+    let rec find d =
+      if
+        ( d >= Array.length st )
+        [@mutate off "a domain did not end, so the search stops before"]
+      then 0
+      else match st.(d) with Ended_dom -> find (d + 1) | _ -> d
+    in
+    find 0
+  in
+  let give d r = t.net.edges <- (d, r) :: t.net.edges in
+  (* Move the time to [at], run the agenda, and give the alarm to each domain
+     whose deadline is due. *)
+  let move at =
     t.now <- Int64.max t.now at ;
     run_agenda t ;
-    (World.Ready.Alarm :: extra) @ take_edges t 0
+    List.iter
+      (fun (d, dl) ->
+        if Int64.compare dl t.now <= 0 then give d World.Ready.Alarm )
+      deadlines
   in
   match t.settles with
   | _ :: _ ->
-      let ids = List.rev t.settles in
-      t.settles <- [] ;
-      List.map (fun id -> World.Ready.External id) ids
+      List.iter
+        (fun id -> give first (World.Ready.External id))
+        (List.rev t.settles) ;
+      t.settles <- []
   | [] -> (
       if t.auto then
         match earliest deadline next_agenda with
         | Some at ->
-            move at []
+            move at
         | None ->
             raise (Deadlock (Sched_debug.blocked s))
       else
@@ -455,50 +580,23 @@ let quiescent t (w : World.Wait.t) =
               | None ->
                   target
             in
-            let reached = Int64.compare at target >= 0 in
-            if reached then t.advance <- None ;
-            move at (if reached then [World.Ready.External id] else [])
+            move at ;
+            if Int64.compare at target >= 0 then (
+              t.advance <- None ;
+              give first (World.Ready.External id) )
         | None ->
             raise
               (Deadlock
                  ( "manual mode: only advance_until moves the time"
                  :: Sched_debug.blocked s ) ) )
 
-(* The simulator as a world (design section 2.3). *)
-module World = struct
-  type nonrec t = t
-
-  let now (type time) t (line : time Weft.Clock.line) : time =
-    Weft.Clock.of_ns line
-      (match line with Mono -> t.now | Posix -> Int64.add t.posix0 t.now)
-
-  let submit = submit
-
-  let wait t ~domain (w : World.Wait.t) =
-    let woken = if t.woken then [World.Ready.Woken] else [] in
-    t.woken <- false ;
-    match (woken @ take_edges t domain, w.timeout) with
-    | (_ :: _ as ready), _ ->
-        ready
-    | [], World.Wait.Poll ->
-        []
-    | [], World.Wait.Sleep ->
-        quiescent t w
-
-  let wake t ~domain:_ = t.woken <- true
-
-  let random t n = Prng.int t.prng n
-
-  let random_bytes t b = Prng.bytes t.prng b
-end
-
-let run ?(seed = 0) ?(auto = true) main =
+let run ?(seed = 0) ?(domains = 1) ?(auto = true) main =
   let t =
     { prng= Prng.make seed
     ; auto
     ; now= 0L
     ; posix0= 1_700_000_000_000_000_000L
-    ; woken= false
+    ; woken= Array.make domains false
     ; sched= None
     ; net=
         { fds= Hashtbl.create ~random:false 16
@@ -513,11 +611,24 @@ let run ?(seed = 0) ?(auto = true) main =
     ; settles= []
     ; advance= None }
   in
-  Weft.Private.run_world ~slack:Weft.Span.zero
-    ~on_create:(fun s -> t.sched <- Some s)
-    (module World)
-    t
-    (fun () -> main t)
+  let s = Sched.create ~slack:Weft.Span.zero ~domains () in
+  t.sched <- Some s ;
+  let result = Sched.start s (fun () -> main t) in
+  let st = Array.map (fun d -> Start d) s.doms in
+  let all = List.init domains Fun.id in
+  let rec loop () =
+    match List.filter (runnable t st) all with
+    | [] ->
+        if
+          List.exists
+            (fun d -> match st.(d) with Ended_dom -> false | _ -> true)
+            all
+        then ( quiescent t st ; loop () )
+    | ds ->
+        step t st (List.nth ds (Prng.int t.prng (List.length ds))) ;
+        loop ()
+  in
+  loop () ; result ()
 
 let fresh t =
   let id = t.next_id in

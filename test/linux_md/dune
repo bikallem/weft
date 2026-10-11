@@ -1,0 +1,9 @@
+; The tests of many domains on Linux (design section 2.14, M1). They are a
+; suite of their own: a mutation run forks for each mutant, and OCaml refuses
+; a fork after a domain started.
+
+(test
+ (name test_linux_md)
+ (enabled_if
+  (= %{system} linux))
+ (libraries weft weft.linux windtrap portable))

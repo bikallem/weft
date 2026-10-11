@@ -14,29 +14,31 @@ type 'a offer = {osync: sync; obranch: int; cell: 'a option ref}
    the stale offers, and the adds since then. The side drops the stale offers
    when [len] comes to [drop_at], twice the live offers of the last drop. *)
 type 'a side =
-  { mutable front: 'a offer list
-  ; mutable back: 'a offer list
+  { front: 'a offer list Atomic.t
+  ; back: 'a offer list Atomic.t
   ; mutable len: int
   ; mutable drop_at: int }
 
 type 'a t = {lock: Spin.t; senders: 'a side; receivers: 'a side}
 
-let side () = {front= []; back= []; len= 0; drop_at= 8}
+(* The lock of the channel guards [front] and [back]. They are atomic locations
+   only so that dscheck sees each access. *)
+let side () = {front= Atomic.make []; back= Atomic.make []; len= 0; drop_at= 8}
 
 let create () = {lock= Spin.make (); senders= side (); receivers= side ()}
 
 (* All offers, the oldest first. *)
 let offers side =
-  ( match side.back with
+  ( match Atomic.get side.back with
   | [] ->
       ()
   | back ->
-      side.front <- side.front @ List.rev back ;
-      side.back <- [] ) ;
-  side.front
+      Atomic.set side.front (Atomic.get side.front @ List.rev back) ;
+      Atomic.set side.back [] ) ;
+  Atomic.get side.front
 
 let add side o =
-  side.back <- o :: side.back ;
+  Atomic.set side.back (o :: Atomic.get side.back) ;
   side.len <- side.len + 1 ;
   if
     ( side.len >= side.drop_at )
@@ -44,7 +46,7 @@ let add side o =
       off "one more offer before a drop: only the time of the drop changes"]
   then (
     let live = List.filter (fun o -> not (is_done o.osync)) (offers side) in
-    side.front <- live ;
+    Atomic.set side.front live ;
     side.len <- List.length live ;
     side.drop_at <- Int.max 8 (2 * side.len) )
 
@@ -78,7 +80,7 @@ let leaf c ~mine ~other ~cell ~move : leaf =
             C.claim s.word i o.osync.word o.obranch ~on_commit:(fun () ->
                 move o ) )
       in
-      other.front <- rest ;
+      Atomic.set other.front rest ;
       if not stop then add mine {osync= s; obranch= i; cell} )
 
 let send c v =
