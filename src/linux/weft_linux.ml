@@ -92,6 +92,66 @@ external job_detach : nativeint -> unit = "weft_job_detach"
 
 external close_async : int -> unit = "weft_close_async"
 
+(* Child processes and signals (weft_proc.c). *)
+
+external signal_numbers : unit -> int array = "weft_signal_numbers"
+
+external spawn :
+     string * string array * string array * bool * string * int array * int array
+  -> int * int * int * int * int = "weft_spawn"
+
+external wait_child : int -> int * int = "weft_wait_child"
+
+external pidfd_kill : int -> int -> int = "weft_pidfd_kill"
+
+external sigmask_block : int array -> bytes = "weft_sigmask_block"
+
+external sigmask_restore : bytes -> unit = "weft_sigmask_restore"
+
+external signalfd : int array -> int = "weft_signalfd"
+
+external signalfd_read : int -> int array = "weft_signalfd_read"
+
+(* The number of each constructor of [Op.signal], in order. *)
+let numbers = signal_numbers ()
+
+let named =
+  Op.
+    [| SIGHUP
+     ; SIGINT
+     ; SIGQUIT
+     ; SIGILL
+     ; SIGABRT
+     ; SIGFPE
+     ; SIGKILL
+     ; SIGSEGV
+     ; SIGBUS
+     ; SIGPIPE
+     ; SIGALRM
+     ; SIGTERM
+     ; SIGUSR1
+     ; SIGUSR2
+     ; SIGCHLD
+     ; SIGCONT
+     ; SIGSTOP
+     ; SIGTSTP
+     ; SIGWINCH |]
+
+let number_of = function
+  | Op.Other_signal n ->
+      n
+  | s ->
+      let rec find i = if named.(i) = s then numbers.(i) else find (i + 1) in
+      find 0
+
+let signal_of n =
+  let rec find i =
+    if i = Array.length numbers then Op.Other_signal n
+    else if numbers.(i) = n then named.(i)
+    else find (i + 1)
+  in
+  find 0
+
 let eagain, ebadf, econnrefused, econnreset, epipe, eaddrinuse, ewouldblock =
   errno_codes ()
 
@@ -124,6 +184,8 @@ let timer_token = -1
 
 let wake_token = -2
 
+let signal_token = -3
+
 type dom =
   { epfd: int
   ; evfd: int
@@ -141,7 +203,10 @@ type t =
   ; jobs: (int, nativeint) Hashtbl.t  (** The jobs that are not finished. *)
   ; next_job: int Atomic.t
   ; files: (int, unit) Hashtbl.t
-        (** The fds of [Open]: the pool does their close(2). *) }
+        (** The fds of [Open]: the pool does their close(2). *)
+  ; watched: Op.signal list  (** The signals of [run ~signals]. *)
+  ; sigfd: int  (** The signalfd in the poller of domain 0, or [-1]. *)
+  ; old_mask: bytes option  (** The signal mask before [create]. *) }
 
 let check name r = if r < 0 then failwith (name ^ ": " ^ strerror (-r)) else r
 
@@ -153,20 +218,80 @@ let make_dom () =
   ignore (check "epoll_ctl" (epoll_add_in epfd tfd timer_token)) ;
   {epfd; evfd; tfd; armed= 0L}
 
+(* The threads that do not block each signal of [sigs], from the [SigBlk] line
+   of /proc/self/task/*/status (design section 2.7, Not sure). *)
+let unblocked sigs =
+  let blocks dir =
+    match
+      In_channel.with_open_text (dir ^ "/status") In_channel.input_lines
+    with
+    | lines -> (
+      match
+        List.find_map
+          (fun l ->
+            if String.starts_with ~prefix:"SigBlk:" l then
+              Int64.of_string_opt
+                ("0x" ^ String.trim (String.sub l 7 (String.length l - 7)))
+            else None )
+          lines
+      with
+      | Some mask ->
+          List.for_all
+            (fun n -> Int64.logand mask (Int64.shift_left 1L (n - 1)) <> 0L)
+            sigs
+      | None ->
+          true )
+    | exception Sys_error _ ->
+        (* The thread ended. *)
+        true
+  in
+  match Sys.readdir "/proc/self/task" with
+  | tasks ->
+      List.filter
+        (fun task -> not (blocks ("/proc/self/task/" ^ task)))
+        (Array.to_list tasks)
+  | exception Sys_error _ ->
+      []
+
 (* A write to a pipe with no reader then gives EPIPE (design section 2.7,
-   Signals). *)
-let create ?(domains = 1) () =
+   Signals). The signals of [~signals] are blocked in the calling thread before
+   any other thread of the world starts, so each thread copies the mask. *)
+let create ?(domains = 1) ?(signals = []) () =
   Sys.set_signal Sys.sigpipe Sys.Signal_ignore ;
+  let nums = Array.of_list (List.map number_of signals) in
+  let old_mask, sigfd =
+    if signals = [] then (None, -1)
+    else
+      let old = sigmask_block nums in
+      let fd = signalfd nums in
+      if fd < 0 then (
+        sigmask_restore old ;
+        failwith ("signalfd: " ^ strerror (-fd)) ) ;
+      List.iter
+        (fun task ->
+          Printf.eprintf
+            "weft: thread %s does not block the signals of run ~signals: a \
+             signal can go to it\n\
+             %!"
+            task )
+        (unblocked (Array.to_list nums)) ;
+      (Some old, fd)
+  in
   let seed = Bytes.create 8 in
   ignore (check "getrandom" (getrandom seed)) ;
   let doms = Array.init domains (fun _ -> make_dom ()) in
+  if sigfd >= 0 then
+    ignore (check "epoll_ctl" (epoll_add_in doms.(0).epfd sigfd signal_token)) ;
   { doms
   ; rng= Atomic.make (Int64.to_int (Bytes.get_int64_le seed 0))
   ; mbx= mbx_create (Array.map (fun d -> d.evfd) doms)
   ; lock= Mutex.create ()
   ; jobs= Hashtbl.create ~random:false 16
   ; next_job= Atomic.make 0
-  ; files= Hashtbl.create ~random:false 16 }
+  ; files= Hashtbl.create ~random:false 16
+  ; watched= signals
+  ; sigfd
+  ; old_mask }
 
 (* SplitMix64, on 63 bits. *)
 let next t =
@@ -182,6 +307,8 @@ let next t =
 (* After [mbx_close], no worker writes an eventfd of the world. *)
 let close t =
   mbx_close t.mbx ;
+  if t.sigfd >= 0 then ignore (close_fd t.sigfd) ;
+  Option.iter sigmask_restore t.old_mask ;
   Array.iter
     (fun d ->
       ignore (close_fd d.tfd) ;
@@ -414,6 +541,54 @@ module World = struct
           r
       | None ->
           Error Op.Bad_fd )
+    | Op.Spawn sp ->
+        let strings = (sp.prog :: sp.argv) @ Option.value ~default:[] sp.env in
+        if List.exists (fun x -> String.contains x '\000') strings then
+          Error (Op.Other "EINVAL: a NUL byte in a string")
+        else
+          let kind = function
+            | Op.Inherit ->
+                0
+            | Op.Null ->
+                1
+            | Op.Piped ->
+                2
+          in
+          let pid, pidfd, i, o, e =
+            spawn
+              ( sp.prog
+              , Array.of_list sp.argv
+              , Array.of_list (Option.value ~default:[] sp.env)
+              , Option.is_some sp.env
+              , Option.value ~default:"" sp.cwd
+              , [|kind sp.stdin; kind sp.stdout; kind sp.stderr|]
+              , [|number_of Op.SIGPIPE|] )
+          in
+          let fd x = if x < 0 then None else Some x in
+          Result.map
+            (fun pid ->
+              { Op.pid
+              ; pidfd
+              ; to_stdin= fd i
+              ; from_stdout= fd o
+              ; from_stderr= fd e } )
+            (result pid)
+    | Op.Wait_child fd -> (
+        let kind, code = wait_child fd in
+        match kind with
+        | 0 ->
+            Ok None
+        | 1 ->
+            Ok (Some (Op.Exited code))
+        | 2 ->
+            Ok (Some (Op.Signaled (signal_of code)))
+        | e ->
+            Error (error_of (-e)) )
+    | Op.Kill (fd, s) ->
+        unit (pidfd_kill fd (number_of s))
+    | Op.Watch s ->
+        if List.mem s t.watched then Ok ()
+        else Error (Op.Other "the world does not watch this signal")
     | Op.Detach id -> (
       match take_job t id with
       | Some j ->
@@ -449,6 +624,14 @@ module World = struct
           (* A timerfd that fired is not armed. *)
           d.armed <- 0L ;
           [World.Ready.Alarm] )
+        else if token = signal_token then
+          let counts = signalfd_read t.sigfd in
+          List.filter_map
+            (fun n ->
+              if counts.(n) > 0 then
+                Some (World.Ready.Signal (signal_of n, counts.(n)))
+              else None )
+            (List.init (Array.length counts) Fun.id)
         else if token = wake_token then (
           ignore (drain d.evfd) ;
           (* A worker puts the id in the mailbox before it writes the eventfd,
@@ -470,9 +653,9 @@ end
 (* The default number of domains is a start value (open question 6). *)
 let default_domains () = Int.min 4 (Domain.recommended_domain_count ())
 
-let run ?slack ?domains main =
+let run ?slack ?domains ?signals main =
   let domains = match domains with Some n -> n | None -> default_domains () in
-  let t = create ~domains () in
+  let t = create ~domains ?signals () in
   Fun.protect
     ~finally:(fun () -> close t)
     (fun () -> Weft.run ?slack ~domains (module World) t main)

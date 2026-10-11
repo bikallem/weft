@@ -23,6 +23,9 @@ module Ready : sig
     | External of int
         (** A completion that the world gives, for example the end of
             [Sim.settle]. *)
+    | Signal of Op.signal * int
+        (** The signal came [n] times since the last [Wait]. Only domain 0 gets
+            it. *)
 end
 
 type _ Effect.t +=

@@ -80,7 +80,21 @@ type conn =
 type listener =
   {key: string; backlog: conn Queue.t; limit: int; mutable pending: int}
 
-type sfd = Lsn of listener | Conn of conn | Fil of Sim_fs.handle
+(* A fake program: the test scripts it (design section 2.8). *)
+type program =
+  { runs: int64 option  (** The time to the exit, or [None]: until a signal. *)
+  ; code: int
+  ; output: string  (** The data on its stdout. *)
+  ; ignores: Op.signal list }
+
+(* A fake process. The parent holds its pidfd. *)
+type proc =
+  { prog: program
+  ; mutable status: Op.status option
+  ; mutable reaped: bool
+  ; mutable child_ends: conn list  (** The ends of its pipes. *) }
+
+type sfd = Lsn of listener | Conn of conn | Fil of Sim_fs.handle | Pfd of proc
 
 type net =
   { fds: (int, sfd) Hashtbl.t
@@ -131,7 +145,9 @@ type t =
   ; jobs: (int, job) Hashtbl.t
   ; mutable blocking_cost: int64
         (** The limit of the time cost of a job (open question 2). *)
-  ; dns: (string, dns_answer) Hashtbl.t }
+  ; dns: (string, dns_answer) Hashtbl.t
+  ; programs: (string, string list -> program) Hashtbl.t
+  ; mutable next_pid: int }
 
 let sched t = Option.get t.sched
 
@@ -147,6 +163,8 @@ let readable n fd =
       not (Queue.is_empty l.backlog)
   | Some (Conn c) ->
       avail c > 0 || c.eof || c.refused
+  | Some (Pfd p) ->
+      Option.is_some p.status
   | Some (Fil _) | None ->
       false
 
@@ -168,7 +186,7 @@ let writable n fd =
                off
                  "a wrong result here gives a spurious edge: the write gets \
                   EAGAIN and waits again"] )
-  | Some (Lsn _ | Fil _) | None ->
+  | Some (Lsn _ | Fil _ | Pfd _) | None ->
       false
 
 (* An edge for each registration of [fd]. *)
@@ -225,7 +243,7 @@ let handle_of n fd =
   match Hashtbl.find_opt n.fds fd with
   | Some (Fil h) ->
       Ok h
-  | Some (Lsn _ | Conn _) ->
+  | Some (Lsn _ | Conn _ | Pfd _) ->
       Error (Op.Other "ESPIPE")
   | None ->
       Error Op.Bad_fd
@@ -421,6 +439,101 @@ let write_conn t c buf off len =
               edge n p.cfd ~read:true ~write:false ) ;
           Ok k
 
+(* The close of a socket or of an end of a pipe: the peer reads the end of the
+   stream, and a write of the peer gives EPIPE. *)
+let close_conn t c =
+  match c.peer with
+  | Some p ->
+      c.peer <- None ;
+      (if c.role = Sock then later t else fun f -> f ()) (fun () ->
+          p.eof <- true ;
+          p.peer <- None ;
+          edge t.net p.cfd ~read:true ~write:true )
+  | None ->
+      ()
+
+let new_pipe n =
+  let mk role =
+    { role
+    ; inbox= Buffer.create 64
+    ; rpos= 0
+    ; inflight= 0
+    ; peer= None
+    ; eof= false
+    ; shut= false
+    ; established= true
+    ; refused= false
+    ; cfd= new_fd n
+    ; remote= Op.Unix "" }
+  in
+  let r = mk Rd_end and w = mk Wr_end in
+  r.peer <- Some w ;
+  w.peer <- Some r ;
+  (r, w)
+
+(* The exit of a fake process: it closes the ends of its pipes, and its pidfd
+   becomes readable. *)
+let exit_proc n pidfd p status =
+  if Option.is_none p.status then (
+    p.status <- Some status ;
+    List.iter
+      (fun c ->
+        match c.peer with
+        | Some peer ->
+            c.peer <- None ;
+            peer.eof <- true ;
+            peer.peer <- None ;
+            edge n peer.cfd ~read:true ~write:true
+        | None ->
+            () )
+      p.child_ends ;
+    p.child_ends <- [] ;
+    edge n pidfd ~read:true ~write:false )
+
+let spawn t (sp : Op.spawn) =
+  let n = t.net in
+  match Hashtbl.find_opt t.programs sp.prog with
+  | None ->
+      Error Op.No_entry
+  | Some f ->
+      let prog = f (List.tl sp.argv) in
+      let p = {prog; status= None; reaped= false; child_ends= []} in
+      (* The parent gets one end of each pipe, and the child keeps the other. *)
+      let pipe ~parent_reads = function
+        | Op.Piped ->
+            let r, w = new_pipe n in
+            let mine, theirs = if parent_reads then (r, w) else (w, r) in
+            Hashtbl.replace n.fds mine.cfd (Conn mine) ;
+            p.child_ends <- theirs :: p.child_ends ;
+            Some mine
+        | Op.Inherit | Op.Null ->
+            None
+      in
+      let to_stdin = pipe ~parent_reads:false sp.stdin in
+      let from_stdout = pipe ~parent_reads:true sp.stdout in
+      let from_stderr = pipe ~parent_reads:true sp.stderr in
+      Option.iter
+        (fun c ->
+          Buffer.add_string c.inbox prog.output ;
+          if prog.output <> "" then edge n c.cfd ~read:true ~write:false )
+        from_stdout ;
+      let pidfd = new_fd n in
+      Hashtbl.replace n.fds pidfd (Pfd p) ;
+      Option.iter
+        (fun d ->
+          schedule t d (fun () -> exit_proc n pidfd p (Op.Exited prog.code)) )
+        prog.runs ;
+      let pid = t.next_pid in
+      t.next_pid <-
+        (pid + 1) [@mutate off "a counter that goes down is unique too"] ;
+      let fd = Option.map (fun c -> c.cfd) in
+      Ok
+        { Op.pid
+        ; pidfd
+        ; to_stdin= fd to_stdin
+        ; from_stdout= fd from_stdout
+        ; from_stderr= fd from_stderr }
+
 let submit : type a. t -> a Op.t -> (a, Op.error) result =
  fun t op ->
   let n = t.net in
@@ -432,7 +545,7 @@ let submit : type a. t -> a Op.t -> (a, Op.error) result =
         k c
     | Some (Lsn _) ->
         Error (Op.Other "ENOTCONN")
-    | Some (Fil _) ->
+    | Some (Fil _ | Pfd _) ->
         Error (Op.Other "ENOTSOCK")
     | None ->
         Error Op.Bad_fd
@@ -508,7 +621,7 @@ let submit : type a. t -> a Op.t -> (a, Op.error) result =
           Ok (s.cfd, s.remote)
       | None ->
           Error Op.Would_block )
-    | Some (Conn _ | Fil _) ->
+    | Some (Conn _ | Fil _ | Pfd _) ->
         Error (Op.Other "EINVAL")
     | None ->
         Error Op.Bad_fd )
@@ -517,32 +630,53 @@ let submit : type a. t -> a Op.t -> (a, Op.error) result =
   | Op.Write (fd, buf, off, len) ->
       conn fd (fun c -> write_conn t c buf off len)
   | Op.Pipe ->
-      let mk role =
-        { role
-        ; inbox= Buffer.create 64
-        ; rpos= 0
-        ; inflight= 0
-        ; peer= None
-        ; eof= false
-        ; shut= false
-        ; established= true
-        ; refused= false
-        ; cfd= new_fd n
-        ; remote= Op.Unix "" }
-      in
-      let r = mk Rd_end and w = mk Wr_end in
-      r.peer <- Some w ;
-      w.peer <- Some r ;
+      let r, w = new_pipe n in
       Hashtbl.replace n.fds r.cfd (Conn r) ;
       Hashtbl.replace n.fds w.cfd (Conn w) ;
       Ok (r.cfd, w.cfd)
+  | Op.Spawn sp ->
+      spawn t sp
+  | Op.Wait_child fd -> (
+    match Hashtbl.find_opt n.fds fd with
+    | Some (Pfd p) -> (
+      match p.status with
+      | Some _ when p.reaped ->
+          Error (Op.Other "ECHILD")
+      | Some s ->
+          p.reaped <- true ;
+          Ok (Some s)
+      | None ->
+          Ok None )
+    | Some _ ->
+        Error (Op.Other "EINVAL")
+    | None ->
+        Error Op.Bad_fd )
+  | Op.Kill (fd, sg) -> (
+    match Hashtbl.find_opt n.fds fd with
+    | Some (Pfd p) ->
+        ( match (p.status, sg) with
+        | Some _, _ ->
+            ()
+        | None, (Op.SIGSTOP | SIGCONT | SIGCHLD | SIGWINCH) ->
+            ()
+        | None, _ when sg <> Op.SIGKILL && List.mem sg p.prog.ignores ->
+            ()
+        | None, _ ->
+            exit_proc n fd p (Op.Signaled sg) ) ;
+        Ok ()
+    | Some _ ->
+        Error (Op.Other "EINVAL")
+    | None ->
+        Error Op.Bad_fd )
+  | Op.Watch _ ->
+      Ok ()
   | Op.Fd_read (fd, buf, off, len) -> (
     match Hashtbl.find_opt n.fds fd with
     | Some (Conn ({role= Rd_end | Sock; _} as c)) ->
         read_conn n c buf off len
     | Some (Conn {role= Wr_end; _}) | None ->
         Error Op.Bad_fd
-    | Some (Lsn _ | Fil _) ->
+    | Some (Lsn _ | Fil _ | Pfd _) ->
         Error (Op.Other "EINVAL") )
   | Op.Fd_write (fd, buf, off, len) -> (
     match Hashtbl.find_opt n.fds fd with
@@ -550,7 +684,7 @@ let submit : type a. t -> a Op.t -> (a, Op.error) result =
         write_conn t c buf off len
     | Some (Conn {role= Rd_end; _}) | None ->
         Error Op.Bad_fd
-    | Some (Lsn _ | Fil _) ->
+    | Some (Lsn _ | Fil _ | Pfd _) ->
         Error (Op.Other "EINVAL") )
   | Op.Shutdown fd ->
       conn fd (fun c ->
@@ -578,16 +712,8 @@ let submit : type a. t -> a Op.t -> (a, Op.error) result =
       | Some sfd ->
           Hashtbl.remove n.fds fd ;
           ( match sfd with
-          | Conn c -> (
-            match c.peer with
-            | Some p ->
-                c.peer <- None ;
-                (if c.role = Sock then later t else fun f -> f ()) (fun () ->
-                    p.eof <- true ;
-                    p.peer <- None ;
-                    edge n p.cfd ~read:true ~write:true )
-            | None ->
-                () )
+          | Conn c ->
+              close_conn t c
           | Lsn l ->
               Hashtbl.remove n.names l.key ;
               Queue.iter
@@ -600,7 +726,7 @@ let submit : type a. t -> a Op.t -> (a, Op.error) result =
                   | None ->
                       () )
                 l.backlog
-          | Fil _ ->
+          | Fil _ | Pfd _ ->
               () ) ;
           Ok () )
   | Op.Register (d, fd, token) ->
@@ -888,7 +1014,9 @@ let run ?(seed = 0) ?(domains = 1) ?(auto = true) main =
     ; fs= Sim_fs.create ()
     ; jobs= Hashtbl.create ~random:false 16
     ; blocking_cost= 0L
-    ; dns= Hashtbl.create ~random:false 8 }
+    ; dns= Hashtbl.create ~random:false 8
+    ; programs= Hashtbl.create ~random:false 8
+    ; next_pid= 1000 }
   in
   let s = Sched.create ~slack:Weft.Span.zero ~simulated:true ~domains () in
   t.sched <- Some s ;
@@ -945,6 +1073,14 @@ let set_blocking_cost t span =
   t.blocking_cost <- Weft.Span.to_ns span
 
 let set_dns t name answer = Hashtbl.replace t.dns name answer
+
+let program ?runs ?(code = 0) ?(output = "") ?(ignores = []) () =
+  {runs= Option.map Weft.Span.to_ns runs; code; output; ignores}
+
+let add_program t name f = Hashtbl.replace t.programs name f
+
+(* Domain 0 gets the signal at its next [Wait] (design section 2.7). *)
+let signal t sg = t.net.edges <- (0, World.Ready.Signal (sg, 1)) :: t.net.edges
 
 let addr _ s =
   match String.index_opt s ':' with

@@ -55,6 +55,29 @@ val set_dns : t -> string -> dns_answer -> unit
     [Dns.reverse a] gives the first name, in the sort order, whose addresses
     hold [a]. *)
 
+(** A fake program for [Process.spawn]. *)
+type program
+
+val program :
+     ?runs:Weft.Span.t
+  -> ?code:int
+  -> ?output:string
+  -> ?ignores:Weft.Signal.t list
+  -> unit
+  -> program
+(** [program ~runs ~code ~output ()] writes [output] on its stdout, and it exits
+    with [code] after [runs]. With no [~runs], it runs until a signal. A signal
+    that is not in [~ignores] ends it, except [SIGSTOP], [SIGCONT], [SIGCHLD]
+    and [SIGWINCH]. [SIGKILL] always ends it. *)
+
+val add_program : t -> string -> (string list -> program) -> unit
+(** [add_program t name f]: [Process.spawn name args] starts [f args]. A name
+    that is not in the table gives [No_entry]. *)
+
+val signal : t -> Weft.Signal.t -> unit
+(** [signal t s] sends [s] to the program. Domain 0 gets it at its next switch
+    point. *)
+
 (** The fibers that wait. *)
 exception Deadlock of string list
 

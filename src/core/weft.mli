@@ -448,6 +448,94 @@ module Pipe : sig
   (** As [Net.close]. *)
 end
 
+(** {1 Signals and processes} (design section 2.7, Signals) *)
+
+module Signal : sig
+  type t = Private.Op.signal =
+    | SIGHUP
+    | SIGINT
+    | SIGQUIT
+    | SIGILL
+    | SIGABRT
+    | SIGFPE
+    | SIGKILL
+    | SIGSEGV
+    | SIGBUS
+    | SIGPIPE
+    | SIGALRM
+    | SIGTERM
+    | SIGUSR1
+    | SIGUSR2
+    | SIGCHLD
+    | SIGCONT
+    | SIGSTOP
+    | SIGTSTP
+    | SIGWINCH
+    | Other_signal of int  (** A signal with its number on this OS. *)
+
+  val received : t -> int event
+  (** [received s] gives the number of times that [s] came since the last commit
+      of a [received s] event. The number can be 1 for many signals, because the
+      OS does not queue them. One fiber gets each signal: a signal that comes
+      when no fiber waits stays until the next commit. The world must watch [s],
+      for example with [Weft_linux.run ~signals].
+
+      @raise Invalid_argument
+        at [sync], if the world does not watch [s], or if [s] cannot be an
+        event: [SIGILL], [SIGFPE], [SIGSEGV], [SIGBUS], [SIGKILL] and [SIGSTOP].
+  *)
+end
+
+module Process : sig
+  (** The same exception as [Net.Error]. *)
+  exception Error of Net.error * string
+
+  (** A child process. *)
+  type t
+
+  (** How the child gets its fd 0, 1 or 2. *)
+  type stdio =
+    | Inherit  (** The fd of the parent. *)
+    | Null  (** [/dev/null]. *)
+    | Piped  (** A pipe: the parent gets the other end. *)
+
+  type status = Private.Op.status = Exited of int | Signaled of Signal.t
+
+  val spawn :
+       ?env:string list
+    -> ?cwd:string
+    -> ?stdin:stdio
+    -> ?stdout:stdio
+    -> ?stderr:stdio
+    -> string
+    -> string list
+    -> t
+  (** [spawn prog args] starts [prog] with the arguments [args]. A [prog] with
+      no [/] is found in [PATH]. The child gets the default action for each
+      signal, and no blocked signals. Each stdio is [Inherit] by default.
+
+      @raise Error with [No_entry] if the program does not exist. *)
+
+  val pid : t -> int
+
+  val stdin : t -> Pipe.t option
+  (** The write end of the pipe of [~stdin:Piped]. *)
+
+  val stdout : t -> Pipe.t option
+
+  val stderr : t -> Pipe.t option
+
+  val exited : t -> status event
+  (** Ready when the child exited. *)
+
+  val wait : t -> status
+  (** [sync (exited t)]. A program must wait for each child: the wait ends the
+      zombie and closes the fd of the child. *)
+
+  val kill : t -> Signal.t -> unit
+  (** Sends a signal to the child. After the exit, it does nothing. *)
+end
+
 (** {1 Names} *)
 
 module Dns : sig

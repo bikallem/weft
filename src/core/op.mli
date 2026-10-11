@@ -39,6 +39,56 @@ type kind = Regular | Directory | Symlink | Special
 type stat =
   {kind: kind; size: int; perm: int; mtime: int64  (** [Posix], in ns. *)}
 
+(** A signal. [Other_signal n] is a signal with no name here, with its number on
+    this OS. *)
+type signal =
+  | SIGHUP
+  | SIGINT
+  | SIGQUIT
+  | SIGILL
+  | SIGABRT
+  | SIGFPE
+  | SIGKILL
+  | SIGSEGV
+  | SIGBUS
+  | SIGPIPE
+  | SIGALRM
+  | SIGTERM
+  | SIGUSR1
+  | SIGUSR2
+  | SIGCHLD
+  | SIGCONT
+  | SIGSTOP
+  | SIGTSTP
+  | SIGWINCH
+  | Other_signal of int
+
+(** How the child gets one of its fds 0, 1 and 2. *)
+type stdio =
+  | Inherit  (** The fd of the parent. *)
+  | Null  (** [/dev/null]. *)
+  | Piped  (** A pipe. The parent gets the other end. *)
+
+type spawn =
+  { prog: string  (** The program. A name with no [/] is found in [PATH]. *)
+  ; argv: string list  (** The arguments, with the name of the program first. *)
+  ; env: string list option  (** [None]: the environment of the parent. *)
+  ; cwd: string option
+  ; stdin: stdio
+  ; stdout: stdio
+  ; stderr: stdio }
+
+(** A child process: its pid, the fd that tells its exit (a [pidfd] on Linux),
+    and the ends of its pipes. *)
+type spawned =
+  { pid: int
+  ; pidfd: fd
+  ; to_stdin: fd option
+  ; from_stdout: fd option
+  ; from_stderr: fd option }
+
+type status = Exited of int | Signaled of signal
+
 (** An operation with no readiness model. The production worlds run it on a
     thread pool, and the simulator puts its completion in its agenda (design
     section 2.3). *)
@@ -95,6 +145,14 @@ type _ t =
   | Finish : int * 'a blocking -> 'a t
       (** [Finish (id, op)] gives the result of a job that completed. [op] is
           the operation of [Start]. *)
+  | Spawn : spawn -> spawned t
+      (** Starts a child process. The pidfd is readable when the child exits. *)
+  | Wait_child : fd -> status option t
+      (** The status of a child that exited, and the end of the zombie. [None]
+          while the child runs. *)
+  | Kill : fd * signal -> unit t  (** Sends a signal to a child. *)
+  | Watch : signal -> unit t
+      (** [Ok] if the world gives this signal as [Ready.Signal]. *)
   | Detach : int -> unit t
       (** The fiber does not wait for the job any more. The world drops its
           result, and closes the fd that it opened. The completion still comes.

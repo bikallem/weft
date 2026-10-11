@@ -187,7 +187,16 @@ and t =
   ; overflow_lock: Spin.t
   ; externals: (int, ext) Hashtbl.t
         (** The completions of [Ready.External], by id, under its lock. *)
-  ; externals_lock: Spin.t }
+  ; externals_lock: Spin.t
+  ; signals: (Op.signal, sigstate) Hashtbl.t
+        (** The count and the waiters of each signal, under its lock. *)
+  ; signals_lock: Spin.t }
+
+(* A signal (design section 2.7, Signals). A commit of a waiter takes the count,
+   and it puts the count in the cell of the waiter before the commit. *)
+and sigstate =
+  { mutable count: int
+  ; mutable swait: (sync * int * int ref) list  (** The newest first. *) }
 
 (* A completion that the world gives with [Ready.External]: the end of a job of
    the pool, or of [Sim.settle]. *)
@@ -721,7 +730,69 @@ let start_job dom job on_done =
       () ) ;
   r
 
+(* The signals (design section 2.7, Signals). *)
+
+let sigstate t sg =
+  match Hashtbl.find_opt t.signals sg with
+  | Some st ->
+      st
+  | None ->
+      let st = {count= 0; swait= []} in
+      Hashtbl.replace t.signals sg st ;
+      st
+
+(* A waiter of [received sg]: it takes the count if the count is not 0. If not,
+   it waits, and the waiters with a [Done] sync go. *)
+let signal_leaf sg cell : leaf =
+ fun dom s i ->
+  let t = dom.sched in
+  Spin.with_lock t.signals_lock (fun () ->
+      let st = sigstate t sg in
+      if st.count > 0 then (
+        cell := st.count ;
+        match C.self_commit s.word i with
+        | Ok () ->
+            st.count <- 0
+        | Error _ ->
+            () )
+      else
+        st.swait <-
+          (s, i, cell)
+          :: List.filter (fun (s, _, _) -> not (is_done s)) st.swait )
+
+(* [n] more of [sg]: the oldest waiter that can commit takes the count. *)
+let deliver dom sg n =
+  let t = dom.sched in
+  let resumed =
+    Spin.with_lock t.signals_lock (fun () ->
+        let st = sigstate t sg in
+        st.count <- st.count + n ;
+        let rec give resumed = function
+          | [] ->
+              (resumed, [])
+          | ws when st.count = 0 ->
+              (resumed, ws)
+          | (s, i, cell) :: rest -> (
+              cell := st.count ;
+              match C.notify s.word i with
+              | C.Resume ->
+                  st.count <- 0 ;
+                  (s :: resumed, rest)
+              | C.In_scan ->
+                  st.count <- 0 ;
+                  (resumed, rest)
+              | C.Lost _ ->
+                  give resumed rest )
+        in
+        let resumed, rest = give [] (List.rev st.swait) in
+        st.swait <- List.rev rest ;
+        resumed )
+  in
+  List.iter (resume dom) resumed
+
 let on_ready dom = function
+  | World.Ready.Signal (sg, n) ->
+      deliver dom sg n
   | World.Ready.Fd {token; read; write} -> (
       let slot, gen = Fdtab.of_token token in
       match Hashtbl.find_opt dom.regs slot with
@@ -1367,7 +1438,9 @@ let create ?(slack = Span.ms 1) ?(simulated = false) ~domains () =
     ; overflow= Queue.create ()
     ; overflow_lock= Spin.make ()
     ; externals= Hashtbl.create ~random:false 8
-    ; externals_lock= Spin.make () }
+    ; externals_lock= Spin.make ()
+    ; signals= Hashtbl.create ~random:false 4
+    ; signals_lock= Spin.make () }
   in
   t.doms <-
     Array.init domains (fun index ->

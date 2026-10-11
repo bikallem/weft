@@ -35,6 +35,8 @@ module File = Fs.File
 module Dir = Fs.Dir
 module Dns = Fs.Dns
 module Pipe = Pipe
+module Signal = Signal
+module Process = Process
 
 module type WORLD = World.WORLD
 

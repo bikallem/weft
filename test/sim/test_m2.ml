@@ -126,7 +126,167 @@ let jobs =
         dns_timeout
     ; test "the name table of Dns" dns ]
 
+(* Processes and signals (milestone M2). *)
+
+let pipe_all r =
+  let b = Buffer.create 64 and buf = Bytes.create 64 in
+  let rec loop () =
+    match Pipe.read r buf 0 64 with
+    | 0 ->
+        Buffer.contents b
+    | k ->
+        Buffer.add_subbytes b buf 0 k ;
+        loop ()
+  in
+  loop ()
+
+let status_text = function
+  | Process.Exited n ->
+      Printf.sprintf "exited %d" n
+  | Process.Signaled SIGINT ->
+      "SIGINT"
+  | Process.Signaled SIGTERM ->
+      "SIGTERM"
+  | Process.Signaled SIGKILL ->
+      "SIGKILL"
+  | Process.Signaled _ ->
+      "other signal"
+
+let processes =
+  group "processes"
+    [ test "a fake program writes its output and exits at its time" (fun () ->
+          Sim.run (fun sim ->
+              Sim.add_program sim "greet" (fun args ->
+                  Sim.program ~runs:(Span.ms 30) ~code:3
+                    ~output:(String.concat " " ("hello" :: args))
+                    () ) ;
+              let t0 = Time.now Mono in
+              let p = Process.spawn ~stdout:Piped "greet" ["you"] in
+              let out = Option.get (Process.stdout p) in
+              equal string "hello you" (pipe_all out) ;
+              Pipe.close out ;
+              equal string "exited 3" (status_text (Process.wait p)) ;
+              equal int 30 (ms_since t0) ;
+              (* A second wait gives the same status. *)
+              equal string "exited 3" (status_text (Process.wait p)) ) )
+    ; test "a signal ends a fake program, but not one that it ignores"
+        (fun () ->
+          Sim.run (fun sim ->
+              Sim.add_program sim "server" (fun _ ->
+                  Sim.program ~ignores:[SIGHUP] () ) ;
+              let p = Process.spawn "server" [] in
+              Process.kill p SIGHUP ;
+              Time.sleep Mono (Span.ms 1) ;
+              is_true
+                (sync
+                   (choose
+                      [wrap (Process.exited p) (fun _ -> false); always true] ) ) ;
+              Process.kill p SIGINT ;
+              equal string "SIGINT" (status_text (Process.wait p)) ;
+              (* A kill after the exit does nothing. *)
+              Process.kill p SIGKILL ) )
+    ; test "two fibers wait for one child" (fun () ->
+          Sim.run ~domains:4 (fun sim ->
+              Sim.add_program sim "short" (fun _ ->
+                  Sim.program ~runs:(Span.ms 5) () ) ;
+              let p = Process.spawn "short" [] in
+              Fiber.scope (fun s ->
+                  let a = Fiber.fork_promise s (fun () -> Process.wait p) in
+                  let b = Fiber.fork_promise s (fun () -> Process.wait p) in
+                  equal string "exited 0" (status_text (Promise.await a)) ;
+                  equal string "exited 0" (status_text (Promise.await b)) ) ;
+              (* The pidfd and the fds of the process are closed. *)
+              equal int 0 (Sim.open_fds sim) ) )
+    ; test "a write to the stdin of a child that exited gives EPIPE" (fun () ->
+          Sim.run (fun sim ->
+              Sim.add_program sim "quick" (fun _ ->
+                  Sim.program ~runs:(Span.ms 1) () ) ;
+              let p = Process.spawn ~stdin:Piped "quick" [] in
+              ignore (Process.wait p) ;
+              let w = Option.get (Process.stdin p) in
+              raises
+                (Pipe.Error (Broken_pipe, "Pipe.write"))
+                (fun () -> Pipe.write w "x") ;
+              Pipe.close w ) )
+    ; test "an unknown program gives ENOENT" (fun () ->
+          Sim.run (fun _ ->
+              raises
+                (Process.Error (No_entry, "Process.spawn"))
+                (fun () -> ignore (Process.spawn "nothing" [])) ) )
+    ; test "a count of signals goes to one fiber" (fun () ->
+          Sim.run ~domains:4 (fun sim ->
+              Sim.signal sim SIGUSR1 ;
+              Sim.signal sim SIGUSR1 ;
+              Time.sleep Mono (Span.ms 1) ;
+              equal int 2 (sync (Signal.received SIGUSR1)) ;
+              let got = Atomic.make 0 in
+              Fiber.scope (fun s ->
+                  for _ = 1 to 2 do
+                    Fiber.fork s (fun () ->
+                        ignore
+                          (Atomic.fetch_and_add got
+                             (sync (Signal.received SIGUSR1)) ) )
+                  done ;
+                  Time.sleep Mono (Span.ms 1) ;
+                  Sim.signal sim SIGUSR1 ;
+                  Time.sleep Mono (Span.ms 1) ;
+                  equal int 1 (Atomic.get got) ;
+                  Sim.signal sim SIGUSR1 ) ;
+              equal int 2 (Atomic.get got) ) )
+    ; test "SIGKILL cannot be an event" (fun () ->
+          Sim.run (fun _ ->
+              raises
+                (Invalid_argument
+                   "Signal.received: this signal cannot be an event" )
+                (fun () -> sync (Signal.received SIGKILL) ) ) ) ]
+
+(* A graceful shutdown: at SIGTERM, the server stops to accept, and each
+   connection ends its request. *)
+let shutdown seed =
+  Sim.run ~seed ~domains:4 (fun sim ->
+      let a = Sim.addr sim "server:80" in
+      let l = Net.listen a in
+      let served = Atomic.make 0 in
+      Fiber.scope (fun s ->
+          (* The server. *)
+          Fiber.fork s (fun () ->
+              Fiber.scope (fun conns ->
+                  Fiber.scope (fun acceptor ->
+                      Fiber.fork acceptor (fun () ->
+                          while true do
+                            let c, _ = Net.accept l in
+                            Fiber.fork conns (fun () ->
+                                let m = Portable.read_n c 4 in
+                                Time.sleep Mono (Span.ms 20) ;
+                                Net.write c m ;
+                                Net.close c ;
+                                Atomic.incr served )
+                          done ) ;
+                      ignore (sync (Signal.received SIGTERM)) ;
+                      Fiber.cancel acceptor Exit ) ) ;
+              Net.close l ) ;
+          (* Three clients, and SIGTERM while they wait. *)
+          for _ = 1 to 3 do
+            Fiber.fork s (fun () ->
+                let c = Net.connect a in
+                Net.write c "ping" ;
+                equal string "ping" (Portable.read_n c 4) ;
+                Net.close c )
+          done ;
+          Time.sleep Mono (Span.ms 10) ;
+          Sim.signal sim SIGTERM ) ;
+      equal int 3 (Atomic.get served) ;
+      Time.now Mono )
+
+let shutdown_test () =
+  for seed = 1 to 100 do
+    equal int64 20_000_000L (Clock.to_ns Mono (shutdown seed))
+  done
+
 let tests =
   [ Windtrap.group "200 seeds"
       [Portable.layers seeds_200; Portable.files seeds_200]
-  ; jobs ]
+  ; jobs
+  ; processes
+  ; group "signals"
+      [test "SIGTERM gives a graceful shutdown with 100 seeds" shutdown_test] ]

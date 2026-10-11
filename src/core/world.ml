@@ -10,6 +10,7 @@ module Ready = struct
     | Woken
     | Fd of {token: int; read: bool; write: bool}
     | External of int
+    | Signal of Op.signal * int
 end
 
 type _ Effect.t +=

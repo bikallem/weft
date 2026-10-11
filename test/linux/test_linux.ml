@@ -244,6 +244,75 @@ let no_file_leak () =
   equal int before (open_fds ()) ;
   equal int 1000 (Array.length (Sys.readdir d))
 
+(* Processes and signals (milestone M2). *)
+
+let read_pipe r =
+  let b = Buffer.create 64 and buf = Bytes.create 64 in
+  let rec loop () =
+    match Pipe.read r buf 0 64 with
+    | 0 ->
+        Buffer.contents b
+    | k ->
+        Buffer.add_subbytes b buf 0 k ;
+        loop ()
+  in
+  loop ()
+
+(* The child gets no blocked signals, also when run blocks SIGINT. *)
+let child_sigint () =
+  let before = open_fds () in
+  Weft_linux.run ~domains:1 ~signals:[SIGINT] (fun () ->
+      let p = Process.spawn "sleep" ["10"] in
+      Time.sleep Mono (Span.ms 20) ;
+      Process.kill p SIGINT ;
+      is_true (Process.wait p = Process.Signaled SIGINT) ) ;
+  equal int before (open_fds ())
+
+let child_output () =
+  Weft_linux.run ~domains:2 (fun () ->
+      let p =
+        Process.spawn ~stdout:Piped ~stderr:Null "sh"
+          ["-c"; "echo hi; echo err >&2; exit 3"]
+      in
+      let out = Option.get (Process.stdout p) in
+      equal string "hi\n" (read_pipe out) ;
+      Pipe.close out ;
+      is_true (Process.wait p = Process.Exited 3) ;
+      let p = Process.spawn ~stdin:Piped ~stdout:Piped ~cwd:"/" "cat" [] in
+      let i = Option.get (Process.stdin p)
+      and o = Option.get (Process.stdout p) in
+      Pipe.write i "through cat" ;
+      Pipe.close i ;
+      equal string "through cat" (read_pipe o) ;
+      Pipe.close o ;
+      is_true (Process.wait p = Process.Exited 0) ;
+      match Process.spawn "no-such-program-weft" [] with
+      | _ ->
+          failwith "no error"
+      | exception Process.Error (Net.No_entry, "Process.spawn") ->
+          () )
+
+(* SIGTERM to the process: a fiber that waits gets it, and run ends. *)
+let sigterm () =
+  let n =
+    Weft_linux.run ~domains:2 ~signals:[SIGTERM] (fun () ->
+        Fiber.scope (fun s ->
+            let got =
+              Fiber.fork_promise s (fun () -> sync (Signal.received SIGTERM))
+            in
+            Time.sleep Mono (Span.ms 10) ;
+            Unix.kill (Unix.getpid ()) Sys.sigterm ;
+            Promise.await got ) )
+  in
+  at_least int ~than:1 n
+
+let unwatched () =
+  Weft_linux.run ~domains:1 (fun () ->
+      raises
+        (Invalid_argument
+           "Signal.received: the world does not watch this signal" ) (fun () ->
+          sync (Signal.received SIGUSR1) ) )
+
 let linux =
   group "linux"
     [ test "a Unix domain socket echoes" unix_socket
@@ -259,6 +328,10 @@ let linux =
     ; slow "10,000 connections open and close with no fd leak" no_fd_leak
     ; test "Dns.resolve finds localhost" dns_localhost
     ; test "a fiber detaches from an open that blocks" detach_from_open
-    ; test "1,000 files open and close with no fd leak" no_file_leak ]
+    ; test "1,000 files open and close with no fd leak" no_file_leak
+    ; test "a child stops at SIGINT" child_sigint
+    ; test "the pipes of a child" child_output
+    ; test "SIGTERM to the process is an event" sigterm
+    ; test "a signal that run does not watch is not an event" unwatched ]
 
 let () = exit (Windtrap.run "linux" (Portable.tests world @ [linux]))

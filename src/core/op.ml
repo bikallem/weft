@@ -28,6 +28,48 @@ type kind = Regular | Directory | Symlink | Special
 
 type stat = {kind: kind; size: int; perm: int; mtime: int64}
 
+type signal =
+  | SIGHUP
+  | SIGINT
+  | SIGQUIT
+  | SIGILL
+  | SIGABRT
+  | SIGFPE
+  | SIGKILL
+  | SIGSEGV
+  | SIGBUS
+  | SIGPIPE
+  | SIGALRM
+  | SIGTERM
+  | SIGUSR1
+  | SIGUSR2
+  | SIGCHLD
+  | SIGCONT
+  | SIGSTOP
+  | SIGTSTP
+  | SIGWINCH
+  | Other_signal of int
+
+type stdio = Inherit | Null | Piped
+
+type spawn =
+  { prog: string
+  ; argv: string list
+  ; env: string list option
+  ; cwd: string option
+  ; stdin: stdio
+  ; stdout: stdio
+  ; stderr: stdio }
+
+type spawned =
+  { pid: int
+  ; pidfd: fd
+  ; to_stdin: fd option
+  ; from_stdout: fd option
+  ; from_stderr: fd option }
+
+type status = Exited of int | Signaled of signal
+
 type _ blocking =
   | Open : string * open_flag list * int -> fd blocking
   | Pread : fd * bytes * int * int * int -> int blocking
@@ -60,6 +102,10 @@ type _ t =
   | Deregister : int * fd -> unit t
   | Start : int * 'a blocking -> int t
   | Finish : int * 'a blocking -> 'a t
+  | Spawn : spawn -> spawned t
+  | Wait_child : fd -> status option t
+  | Kill : fd * signal -> unit t
+  | Watch : signal -> unit t
   | Detach : int -> unit t
 
 let pp_addr ppf = function
