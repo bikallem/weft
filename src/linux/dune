@@ -11,7 +11,8 @@
   (language c)
   (flags
    (:standard -O2 -Wall -Wextra -Wno-unused-parameter))
-  (names weft_linux_stubs))
+  (names weft_linux_stubs weft_pool))
+ (c_library_flags -lpthread)
  (instrumentation
   (backend ppx_windtrap.coverage))
  (instrumentation

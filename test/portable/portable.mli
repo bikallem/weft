@@ -5,12 +5,17 @@ type world =
   ; domains: int  (** The number of domains of [run]. *)
   ; run: 'a. (unit -> 'a) -> 'a  (** Runs a program in the world. *)
   ; listen: unit -> Weft.Net.t * Weft.Net.addr
-        (** A new listener, and the address that a client connects to. *) }
+        (** A new listener, and the address that a client connects to. *)
+  ; tmp: unit -> string
+        (** A new empty directory, in fiber code: [run] calls it. *) }
 
 val tests : world -> Windtrap.test list
 
 val layers : world -> Windtrap.test
 (** The tests of the fiber layer (milestone M2), also in [tests]. *)
+
+val files : world -> Windtrap.test
+(** The tests of [File] and [Dir] (milestone M2), also in [tests]. *)
 
 (**/**)
 

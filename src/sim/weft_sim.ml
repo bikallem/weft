@@ -76,7 +76,7 @@ type conn =
 type listener =
   {key: string; backlog: conn Queue.t; limit: int; mutable pending: int}
 
-type sfd = Lsn of listener | Conn of conn
+type sfd = Lsn of listener | Conn of conn | Fil of Sim_fs.handle
 
 type net =
   { fds: (int, sfd) Hashtbl.t
@@ -88,6 +88,26 @@ type net =
         (** The edges to give, by domain, the newest first. *)
   ; mutable latency: int64
   ; mutable next_port: int }
+
+(* The result of a job, before [Finish] gives it with its type. *)
+type raw =
+  | R_unit
+  | R_int of int
+  | R_read of string
+  | R_stat of Op.stat
+  | R_names of string list
+  | R_name of string
+
+type job =
+  { jfd: int option  (** The fd that the job uses. *)
+  ; mutable result: (raw, Op.error) result option
+  ; mutable detached: bool
+  ; on_drop: raw -> unit
+        (** The cleanup of a result that nobody gets: the close of the fd that
+            the job opened. *) }
+
+(* The answer of the name table for a host name. *)
+type dns_answer = Addresses of string list | No_answer
 
 type t =
   { prng: Prng.t
@@ -102,9 +122,16 @@ type t =
             the events with the same time that came before it. *)
   ; mutable next_id: int
   ; mutable settles: int list
-  ; mutable advance: (int64 * int) option }
+  ; mutable advance: (int64 * int) option
+  ; fs: Sim_fs.t
+  ; jobs: (int, job) Hashtbl.t
+  ; mutable blocking_cost: int64
+        (** The limit of the time cost of a job (open question 2). *)
+  ; dns: (string, dns_answer) Hashtbl.t }
 
 let sched t = Option.get t.sched
+
+let open_fds t = Hashtbl.length t.net.fds
 
 let key addr = Format.asprintf "%a" Op.pp_addr addr
 
@@ -116,7 +143,7 @@ let readable n fd =
       not (Queue.is_empty l.backlog)
   | Some (Conn c) ->
       avail c > 0 || c.eof || c.refused
-  | None ->
+  | Some (Fil _) | None ->
       false
 
 let writable n fd =
@@ -135,7 +162,7 @@ let writable n fd =
                off
                  "a wrong result here gives a spurious edge: the write gets \
                   EAGAIN and waits again"] )
-  | Some (Lsn _) | None ->
+  | Some (Lsn _ | Fil _) | None ->
       false
 
 (* An edge for each registration of [fd]. *)
@@ -180,6 +207,171 @@ let new_fd n =
 
 let model_error fmt = Printf.ksprintf (fun s -> raise (Model_error s)) fmt
 
+let fresh t =
+  let id = t.next_id in
+  t.next_id <- (id + 1) [@mutate off "a counter that goes down is unique too"] ;
+  id
+
+(* The jobs of the pool (design section 2.8, The wait steps): the operation
+   occurs at the completion. *)
+
+let handle_of n fd =
+  match Hashtbl.find_opt n.fds fd with
+  | Some (Fil h) ->
+      Ok h
+  | Some (Lsn _ | Conn _) ->
+      Error (Op.Other "ESPIPE")
+  | None ->
+      Error Op.Bad_fd
+
+(* The result of a job, or [None] if no answer comes. *)
+let perform : type a. t -> a Op.blocking -> (raw, Op.error) result option =
+ fun t op ->
+  let n = t.net and fs = t.fs and now = Int64.add t.posix0 t.now in
+  let ( let* ) = Result.bind in
+  let unit r = Some (Result.map (fun () -> R_unit) r) in
+  match op with
+  | Op.Open (path, flags, perm) ->
+      Some
+        (let* h = Sim_fs.open_ fs path flags perm ~now in
+         let fd = new_fd n in
+         Hashtbl.replace n.fds fd (Fil h) ;
+         Ok (R_int fd) )
+  | Op.Pread (fd, _, _, len, at) ->
+      Some
+        (let* h = handle_of n fd in
+         Result.map (fun s -> R_read s) (Sim_fs.pread h len at) )
+  | Op.Pwrite (fd, data, at) ->
+      Some
+        (let* h = handle_of n fd in
+         Result.map (fun k -> R_int k) (Sim_fs.pwrite h data at ~now) )
+  | Op.Fsync fd ->
+      Some (Result.map (fun _ -> R_unit) (handle_of n fd))
+  | Op.Fstat fd ->
+      Some
+        (Result.map
+           (fun h -> R_stat (Sim_fs.stat_of h.Sim_fs.node))
+           (handle_of n fd) )
+  | Op.Stat path ->
+      Some (Result.map (fun s -> R_stat s) (Sim_fs.stat fs path))
+  | Op.Ftruncate (fd, size) ->
+      unit
+        (let* h = handle_of n fd in
+         Sim_fs.ftruncate h size ~now )
+  | Op.Mkdir (path, perm) ->
+      unit (Sim_fs.mkdir fs path perm ~now)
+  | Op.Readdir path ->
+      Some (Result.map (fun l -> R_names l) (Sim_fs.readdir fs path))
+  | Op.Rename (src, dst) ->
+      unit (Sim_fs.rename fs src dst)
+  | Op.Unlink path ->
+      unit (Sim_fs.unlink fs path)
+  | Op.Rmdir path ->
+      unit (Sim_fs.rmdir fs path)
+  | Op.Resolve host -> (
+    match Hashtbl.find_opt t.dns host with
+    | Some (Addresses (_ :: _ as l)) ->
+        Some (Ok (R_names l))
+    | Some (Addresses []) | None ->
+        Some (Error Op.No_entry)
+    | Some No_answer ->
+        None )
+  | Op.Reverse addr -> (
+      let names =
+        Hashtbl.fold
+          (fun name a acc ->
+            match a with
+            | Addresses l when List.mem addr l ->
+                name :: acc
+            | _ ->
+                acc )
+          t.dns []
+      in
+      match List.sort String.compare names with
+      | name :: _ ->
+          Some (Ok (R_name name))
+      | [] ->
+          Some (Error Op.No_entry) )
+
+(* The result of a job with the type of its operation. *)
+let finish : type a. a Op.blocking -> raw -> a =
+ fun op raw ->
+  let bad () =
+    model_error "Finish with an operation that is not the operation of Start"
+  in
+  match (op, raw) with
+  | Op.Open _, R_int fd ->
+      fd
+  | Op.Pread (_, buf, off, _, _), R_read s ->
+      Bytes.blit_string s 0 buf off (String.length s) ;
+      String.length s
+  | Op.Pwrite _, R_int k ->
+      k
+  | Op.Fsync _, R_unit ->
+      ()
+  | Op.Fstat _, R_stat s ->
+      s
+  | Op.Stat _, R_stat s ->
+      s
+  | Op.Ftruncate _, R_unit ->
+      ()
+  | Op.Mkdir _, R_unit ->
+      ()
+  | Op.Readdir _, R_names l ->
+      l
+  | Op.Rename _, R_unit ->
+      ()
+  | Op.Unlink _, R_unit ->
+      ()
+  | Op.Rmdir _, R_unit ->
+      ()
+  | Op.Resolve _, R_names l ->
+      l
+  | Op.Reverse _, R_name s ->
+      s
+  | _ ->
+      bad ()
+
+(* A job completes after a time cost from the seed, in the range 0 to the limit,
+   or at once with no limit (open question 2). Its completion goes to the domain
+   that started it, also after a detach. *)
+let start_job : type a. t -> int -> a Op.blocking -> int =
+ fun t d op ->
+  let id = fresh t in
+  let on_drop = function
+    | R_int fd -> (
+      match op with Op.Open _ -> Hashtbl.remove t.net.fds fd | _ -> () )
+    | _ ->
+        ()
+  in
+  let jfd =
+    match op with
+    | Op.Pread (fd, _, _, _, _)
+    | Op.Pwrite (fd, _, _)
+    | Op.Fsync fd
+    | Op.Fstat fd
+    | Op.Ftruncate (fd, _) ->
+        Some fd
+    | _ ->
+        None
+  in
+  let j = {jfd; result= None; detached= false; on_drop} in
+  Hashtbl.replace t.jobs id j ;
+  let complete () =
+    match perform t op with
+    | None ->
+        ()
+    | Some r ->
+        if j.detached then (Result.iter on_drop r ; Hashtbl.remove t.jobs id)
+        else j.result <- Some r ;
+        t.net.edges <- (d, World.Ready.External id) :: t.net.edges
+  in
+  ( if Int64.equal t.blocking_cost 0L then complete ()
+    else
+      let limit = Int64.to_int t.blocking_cost in
+      schedule t (Int64.of_int (Prng.int t.prng (limit + 1))) complete ) ;
+  id
+
 let submit : type a. t -> a Op.t -> (a, Op.error) result =
  fun t op ->
   let n = t.net in
@@ -189,6 +381,8 @@ let submit : type a. t -> a Op.t -> (a, Op.error) result =
         k c
     | Some (Lsn _) ->
         Error (Op.Other "ENOTCONN")
+    | Some (Fil _) ->
+        Error (Op.Other "ENOTSOCK")
     | None ->
         Error Op.Bad_fd
   in
@@ -262,7 +456,7 @@ let submit : type a. t -> a Op.t -> (a, Op.error) result =
           Ok (s.cfd, s.remote)
       | None ->
           Error Op.Would_block )
-    | Some (Conn _) ->
+    | Some (Conn _ | Fil _) ->
         Error (Op.Other "EINVAL")
     | None ->
         Error Op.Bad_fd )
@@ -319,6 +513,12 @@ let submit : type a. t -> a Op.t -> (a, Op.error) result =
   | Op.Close fd -> (
       if Hashtbl.mem n.regs fd then
         model_error "close(2) of fd %d before the Deregister of each domain" fd ;
+      Hashtbl.iter
+        (fun id j ->
+          (* Also after a detach: the job holds a user of the fd. *)
+          if j.jfd = Some fd && Option.is_none j.result then
+            model_error "close(2) of fd %d while job %d uses it" fd id )
+        t.jobs ;
       match Hashtbl.find_opt n.fds fd with
       | None ->
           Error Op.Bad_fd
@@ -346,7 +546,9 @@ let submit : type a. t -> a Op.t -> (a, Op.error) result =
                       edge n c.cfd ~read:true ~write:true
                   | None ->
                       () )
-                l.backlog ) ;
+                l.backlog
+          | Fil _ ->
+              () ) ;
           Ok () )
   | Op.Register (d, fd, token) ->
       if not (Hashtbl.mem n.fds fd) then
@@ -360,6 +562,26 @@ let submit : type a. t -> a Op.t -> (a, Op.error) result =
       if read || write then
         n.edges <- (d, World.Ready.Fd {token; read; write}) :: n.edges ;
       Ok ()
+  | Op.Start (d, job) ->
+      Ok (start_job t d job)
+  | Op.Finish (id, job) -> (
+    match Hashtbl.find_opt t.jobs id with
+    | Some {result= Some r; detached= false; _} ->
+        Hashtbl.remove t.jobs id ;
+        Result.map (finish job) r
+    | _ ->
+        model_error "Finish of job %d before its completion" id )
+  | Op.Detach id -> (
+    match Hashtbl.find_opt t.jobs id with
+    | Some j -> (
+      match j.result with
+      | Some r ->
+          Result.iter j.on_drop r ; Hashtbl.remove t.jobs id ; Ok ()
+      | None ->
+          j.detached <- true ;
+          Ok () )
+    | None ->
+        model_error "Detach of job %d, which does not exist" id )
   | Op.Deregister (d, fd) -> (
     match Hashtbl.find_opt n.regs fd with
     | Some l when List.mem_assoc d l ->
@@ -609,7 +831,11 @@ let run ?(seed = 0) ?(domains = 1) ?(auto = true) main =
     ; agenda= []
     ; next_id= 0
     ; settles= []
-    ; advance= None }
+    ; advance= None
+    ; fs= Sim_fs.create ()
+    ; jobs= Hashtbl.create ~random:false 16
+    ; blocking_cost= 0L
+    ; dns= Hashtbl.create ~random:false 8 }
   in
   let s = Sched.create ~slack:Weft.Span.zero ~simulated:true ~domains () in
   t.sched <- Some s ;
@@ -629,11 +855,6 @@ let run ?(seed = 0) ?(domains = 1) ?(auto = true) main =
         loop ()
   in
   loop () ; result ()
-
-let fresh t =
-  let id = t.next_id in
-  t.next_id <- (id + 1) [@mutate off "a counter that goes down is unique too"] ;
-  id
 
 let wait_external id =
   Event.sync
@@ -664,6 +885,13 @@ let advance_until t target =
       Printexc.raise_with_backtrace e bt
 
 let set_latency t span = t.net.latency <- Weft.Span.to_ns span
+
+let set_blocking_cost t span =
+  if Int64.compare (Weft.Span.to_ns span) 0L < 0 then
+    invalid_arg "Sim.set_blocking_cost: the span is negative" ;
+  t.blocking_cost <- Weft.Span.to_ns span
+
+let set_dns t name answer = Hashtbl.replace t.dns name answer
 
 let addr _ s =
   match String.index_opt s ':' with

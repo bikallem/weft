@@ -944,7 +944,13 @@ let portable_world =
       (fun () ->
         incr n ;
         let a = Net.Tcp ("portable", !n) in
-        (Net.listen a, a) ) }
+        (Net.listen a, a) )
+  ; tmp=
+      (let n = ref 0 in
+       fun () ->
+         incr n ;
+         let d = Printf.sprintf "/tmp%d" !n in
+         Dir.mkdir d ; d ) }
 
 (* The same tests on four virtual domains, with a seed for each run. *)
 let portable_world_4 =
@@ -959,7 +965,13 @@ let portable_world_4 =
       (fun () ->
         incr n ;
         let a = Net.Tcp ("portable4", !n) in
-        (Net.listen a, a) ) }
+        (Net.listen a, a) )
+  ; tmp=
+      (let n = ref 0 in
+       fun () ->
+         incr n ;
+         let d = Printf.sprintf "/tmp%d" !n in
+         Dir.mkdir d ; d ) }
 
 let () =
   exit

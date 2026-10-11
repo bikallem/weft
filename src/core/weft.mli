@@ -260,6 +260,7 @@ module Private : sig
   module Net = Net
   module Chan = Chan
   module Ring = Ring
+  module Job = Job
 end
 
 module Chan : sig
@@ -292,6 +293,11 @@ module Net : sig
     | Reset
     | Broken_pipe
     | In_use
+    | No_entry  (** [ENOENT], or a name that DNS does not know. *)
+    | Exists  (** [EEXIST]. *)
+    | Not_dir  (** [ENOTDIR]. *)
+    | Is_dir  (** [EISDIR]. *)
+    | Not_empty  (** [ENOTEMPTY]. *)
     | Other of string
 
   (** The error, and the name of the function. It is [Private.Net.Error]. *)
@@ -329,4 +335,108 @@ module Net : sig
 
   val writable : t -> unit event
   (** As [readable], for a write. *)
+end
+
+(** {1 Files and directories} (design section 2.3, The I/O modules)
+
+    Each operation runs on the thread pool in production, and the simulator
+    has an in-memory file system. Each operation is a cancellation point: on a
+    cancel, the fiber does not wait for the operation, and the pool completes
+    it alone (design section 2.5, Blocking operations). *)
+
+module File : sig
+  (** An open file. *)
+  type t
+
+  (** The same exception as [Net.Error]: the error, and the name of the
+      function. *)
+  exception Error of Net.error * string
+
+  (** [Read] and [Write] together open the file for read and write. *)
+  type flag = Read | Write | Create | Exclusive | Truncate | Append
+
+  type kind = Private.Op.kind = Regular | Directory | Symlink | Special
+
+  type stat = {kind: kind; size: int; perm: int; mtime: Clock.posix}
+
+  val openfile : ?perm:int -> flag list -> string -> t
+  (** [openfile flags path]. [~perm] is [0o644] by default.
+
+      @raise Error
+        with [No_entry], [Exists] (with [Create] and [Exclusive]), [Not_dir] or
+        [Is_dir] (with [Write]). *)
+
+  val read : t -> bytes -> int -> int -> int
+  (** [read t buf off len] reads at the offset of [t], and moves the offset. It
+      gives 0 at the end of the file.
+
+      @raise Invalid_argument if [len < 1] or the range is not in [buf]. *)
+
+  val pread : t -> file_offset:int -> bytes -> int -> int -> int
+  (** As [read], at [file_offset]. The offset of [t] does not move. *)
+
+  val write : t -> string -> unit
+  (** Writes all of the string at the offset of [t]. *)
+
+  val write_sub : t -> bytes -> int -> int -> int
+  (** Writes at least one byte, and gives the number. *)
+
+  val pwrite : t -> file_offset:int -> bytes -> int -> int -> int
+
+  val fsync : t -> unit
+
+  val fstat : t -> stat
+
+  val stat : string -> stat
+  (** @raise Error with [No_entry] or [Not_dir]. *)
+
+  val truncate : t -> int -> unit
+
+  val close : t -> unit
+  (** As [Net.close]: it never blocks, and the pool does the close(2). *)
+end
+
+module Dir : sig
+  (** The same exception as [Net.Error]: the error, and the name of the
+      function. *)
+  exception Error of Net.error * string
+
+  val mkdir : ?perm:int -> string -> unit
+  (** @raise Error with [Exists], [No_entry] or [Not_dir]. *)
+
+  val readdir : string -> string list
+  (** The names in the directory, sorted, with no ["."] and [".."].
+
+      @raise Error with [No_entry] or [Not_dir]. *)
+
+  val rename : string -> string -> unit
+  (** @raise Error
+        with [No_entry], [Is_dir] (a file on a directory), [Not_dir] or
+        [Not_empty]. *)
+
+  val unlink : string -> unit
+  (** @raise Error with [No_entry] or [Is_dir]. *)
+
+  val rmdir : string -> unit
+  (** @raise Error with [No_entry], [Not_dir] or [Not_empty]. *)
+end
+
+(** {1 Names} *)
+
+module Dns : sig
+  (** The same exception as [Net.Error]: the error, and the name of the
+      function. *)
+  exception Error of Net.error * string
+
+  val resolve : string -> string list
+  (** The addresses of a host name, as text, for example ["127.0.0.1"]. It is a
+      cancellation point, so [Fiber.with_timeout] around it ends at the
+      deadline, also if the DNS server does not answer.
+
+      @raise Error with [No_entry] if the name is not known. *)
+
+  val reverse : string -> string
+  (** The name of an address.
+
+      @raise Error with [No_entry] if the address has no name. *)
 end

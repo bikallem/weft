@@ -4,6 +4,16 @@
 open Windtrap
 open Weft
 
+(* A new directory for each test that needs one. The directories go at the
+   exit. *)
+let tmp =
+  let base = Filename.temp_dir "weft-test" "" and n = ref 0 in
+  at_exit (fun () -> ignore (Sys.command ("rm -rf " ^ Filename.quote base))) ;
+  fun () ->
+    incr n ;
+    let d = Filename.concat base (string_of_int !n) in
+    Sys.mkdir d 0o755 ; d
+
 let world =
   { Portable.name= "linux"
   ; domains= 1
@@ -11,7 +21,8 @@ let world =
   ; listen=
       (fun () ->
         let l = Net.listen (Net.Tcp ("127.0.0.1", 0)) in
-        (l, Net.Tcp ("127.0.0.1", Weft_linux.local_port l)) ) }
+        (l, Net.Tcp ("127.0.0.1", Weft_linux.local_port l)) )
+  ; tmp }
 
 let elapsed_ns f =
   Weft_linux.run ~domains:1 (fun () ->
@@ -136,7 +147,7 @@ let register_failure () =
       ( match Net.accept clone with
       | _ ->
           failwith "no error"
-      | exception Net.Error (Net.Other _, _) ->
+      | exception Net.Error (Net.Exists, _) ->
           () ) ;
       Net.close l )
 
@@ -167,6 +178,72 @@ let port_range () =
       | exception Net.Error (Net.Other _, _) ->
           () )
 
+(* The thread pool (milestone M2). *)
+
+let dns_localhost () =
+  Weft_linux.run ~domains:1 (fun () ->
+      let addrs = Dns.resolve "localhost" in
+      is_true (List.mem "127.0.0.1" addrs || List.mem "::1" addrs) ;
+      (* With no DNS server, the error is not ENOENT. *)
+      match Dns.resolve "no-such-host.invalid" with
+      | _ ->
+          failwith "no error"
+      | exception Dns.Error (_, "Dns.resolve") ->
+          () )
+
+(* An open of a FIFO blocks in the pool until a writer comes. The fiber detaches
+   at the deadline. Then a writer comes, the job completes, and the pool closes
+   the fd that the job opened. *)
+let detach_from_open () =
+  let fifo = Filename.concat (tmp ()) "fifo" in
+  Unix.mkfifo fifo 0o600 ;
+  let before = open_fds () in
+  let t =
+    Weft_linux.run ~domains:1 (fun () ->
+        let t0 = Time.now Mono in
+        raises Fiber.Timeout (fun () ->
+            Fiber.with_timeout Mono (Span.ms 20) (fun () ->
+                File.openfile [Read] fifo ) ) ;
+        let t = Span.to_ns (Time.diff Mono (Time.now Mono) t0) in
+        let w = File.openfile [Write] fifo in
+        File.close w ; t )
+  in
+  at_least int64 ~than:20_000_000L t ;
+  less int64 ~than:100_000_000L t ;
+  (* The pool closes the fds after the end of run. *)
+  let rec wait n =
+    if open_fds () <> before && n > 0 then (
+      Unix.sleepf 0.001 ;
+      wait (n - 1) )
+  in
+  wait 1000 ;
+  equal int before (open_fds ())
+
+(* 1,000 files open and close, and the pool closes each fd. *)
+let no_file_leak () =
+  let d = tmp () in
+  let before = open_fds () in
+  Weft_linux.run ~domains:2 (fun () ->
+      Fiber.scope (fun s ->
+          for i = 1 to 10 do
+            Fiber.fork s (fun () ->
+                for j = 1 to 100 do
+                  let f =
+                    File.openfile [Write; Create]
+                      (Filename.concat d (Printf.sprintf "%d-%d" i j))
+                  in
+                  File.write f "x" ; File.close f
+                done )
+          done ) ) ;
+  let rec wait n =
+    if open_fds () <> before && n > 0 then (
+      Unix.sleepf 0.001 ;
+      wait (n - 1) )
+  in
+  wait 1000 ;
+  equal int before (open_fds ()) ;
+  equal int 1000 (Array.length (Sys.readdir d))
+
 let linux =
   group "linux"
     [ test "a Unix domain socket echoes" unix_socket
@@ -179,6 +256,9 @@ let linux =
     ; test "a 10 ms sleep ends between 10 ms and 12 ms" sleep_10ms
     ; slow "a 10 s sleep ends between 10 s and 10.002 s" sleep_10s
     ; test "the echo server answers a client in another process" other_process
-    ; slow "10,000 connections open and close with no fd leak" no_fd_leak ]
+    ; slow "10,000 connections open and close with no fd leak" no_fd_leak
+    ; test "Dns.resolve finds localhost" dns_localhost
+    ; test "a fiber detaches from an open that blocks" detach_from_open
+    ; test "1,000 files open and close with no fd leak" no_file_leak ]
 
 let () = exit (Windtrap.run "linux" (Portable.tests world @ [linux]))

@@ -37,6 +37,24 @@ val addr : t -> string -> Weft.Net.addr
 val set_latency : t -> Weft.Span.t -> unit
 (** The latency of each packet. It is 0 by default. *)
 
+val set_blocking_cost : t -> Weft.Span.t -> unit
+(** [set_blocking_cost t limit]: each [Blocking] operation (a [File], [Dir] or
+    [Dns] operation) takes a time cost from the seed, in the range 0 to [limit].
+    The operation occurs at the end of its cost. With a limit of 0 (the
+    default), it occurs at once, and its fiber continues at a later switch point
+    (open question 2). *)
+
+(** The answer of the name table for a host name. A name that is not in the
+    table gives [No_entry]. *)
+type dns_answer =
+  | Addresses of string list
+  | No_answer  (** The DNS server never answers. *)
+
+val set_dns : t -> string -> dns_answer -> unit
+(** [set_dns t name answer] adds [name] to the name table of [Dns].
+    [Dns.reverse a] gives the first name, in the sort order, whose addresses
+    hold [a]. *)
+
 (** The fibers that wait. *)
 exception Deadlock of string list
 
@@ -49,3 +67,6 @@ exception Model_error of string
 
 (* For the tests of the checks. *)
 val sched : t -> Weft.Private.Sched.t
+
+(* The number of open fds of the simulator. *)
+val open_fds : t -> int

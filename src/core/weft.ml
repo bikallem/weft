@@ -31,6 +31,9 @@ module Promise = Promise
 module Ivar = Ivar
 module Net = Net
 module Chan = Chan
+module File = Fs.File
+module Dir = Fs.Dir
+module Dns = Fs.Dns
 
 module type WORLD = World.WORLD
 
@@ -129,4 +132,5 @@ module Private = struct
   module Net = Net
   module Chan = Chan
   module Ring = Ring
+  module Job = Job
 end

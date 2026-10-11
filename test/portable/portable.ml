@@ -5,7 +5,8 @@ type world =
   { name: string
   ; domains: int
   ; run: 'a. (unit -> 'a) -> 'a
-  ; listen: unit -> Net.t * Net.addr }
+  ; listen: unit -> Net.t * Net.addr
+  ; tmp: unit -> string }
 
 exception Boom of string
 
@@ -699,7 +700,140 @@ let layers w =
               equal int 2 (Fiber.Mutex.use_rw ~protect:false m (fun () -> 2)) ) )
     ]
 
+(* Files and directories (milestone M2). *)
+
+let fs_error f =
+  match f () with
+  | _ ->
+      "no error"
+  | exception File.Error (e, _) ->
+      Format.asprintf "%a" Private.Op.pp_error e
+
+let write_file path data =
+  let f = File.openfile [Write; Create; Truncate] path in
+  File.write f data ; File.close f
+
+let read_file path =
+  let f = File.openfile [Read] path in
+  let b = Buffer.create 64 and buf = Bytes.create 7 in
+  let rec loop () =
+    match File.read f buf 0 7 with
+    | 0 ->
+        ()
+    | k ->
+        Buffer.add_subbytes b buf 0 k ;
+        loop ()
+  in
+  loop () ; File.close f ; Buffer.contents b
+
+let files w =
+  group "files"
+    [ test "a file gives back its data" (fun () ->
+          w.run (fun () ->
+              let path = Filename.concat (w.tmp ()) "a" in
+              write_file path "hello world" ;
+              equal string "hello world" (read_file path) ;
+              let f = File.openfile [Read] path in
+              let buf = Bytes.make 8 '.' in
+              equal int 5 (File.pread f ~file_offset:6 buf 1 7) ;
+              equal string ".world.." (Bytes.to_string buf) ;
+              (* pread does not move the offset of the file. *)
+              equal int 4 (File.read f buf 0 4) ;
+              equal string "hell" (Bytes.sub_string buf 0 4) ;
+              let st = File.fstat f in
+              equal int 11 st.size ;
+              is_true (st.kind = File.Regular) ;
+              File.close f ;
+              is_true ((File.stat path).kind = File.Regular) ) )
+    ; test "pwrite, truncate and append" (fun () ->
+          w.run (fun () ->
+              let path = Filename.concat (w.tmp ()) "b" in
+              write_file path "abcdef" ;
+              let f = File.openfile [Read; Write] path in
+              equal int 1
+                (File.pwrite f ~file_offset:1 (Bytes.of_string "B") 0 1) ;
+              File.truncate f 4 ;
+              File.fsync f ;
+              File.close f ;
+              equal string "aBcd" (read_file path) ;
+              let f = File.openfile [Write; Append] path in
+              File.write f "XY" ;
+              File.close f ;
+              equal string "aBcdXY" (read_file path) ;
+              equal int 6 (File.stat path).size ) )
+    ; test "the directory operations" (fun () ->
+          w.run (fun () ->
+              let d = w.tmp () in
+              let p = Filename.concat d in
+              Dir.mkdir (p "sub") ;
+              write_file (p "x") "1" ;
+              write_file (p "y") "2" ;
+              equal (list string) ["sub"; "x"; "y"] (Dir.readdir d) ;
+              is_true ((File.stat (p "sub")).kind = File.Directory) ;
+              Dir.rename (p "x") (p "sub/z") ;
+              (* A rename on a file replaces it. *)
+              Dir.rename (p "y") (p "sub/z") ;
+              equal string "2" (read_file (p "sub/z")) ;
+              equal (list string) ["sub"] (Dir.readdir d) ;
+              Dir.unlink (p "sub/z") ;
+              equal (list string) [] (Dir.readdir (p "sub")) ;
+              Dir.rmdir (p "sub") ;
+              equal (list string) [] (Dir.readdir d) ) )
+    ; test "the errors of open question 1" (fun () ->
+          w.run (fun () ->
+              let d = w.tmp () in
+              let p = Filename.concat d in
+              write_file (p "f") "data" ;
+              Dir.mkdir (p "dir") ;
+              write_file (p "dir/g") "" ;
+              let err = fs_error in
+              equal string "ENOENT"
+                (err (fun () -> File.openfile [Read] (p "no"))) ;
+              equal string "ENOENT" (err (fun () -> File.stat (p "no/x"))) ;
+              equal string "EEXIST"
+                (err (fun () ->
+                     File.openfile [Write; Create; Exclusive] (p "f") ) ) ;
+              equal string "EISDIR"
+                (err (fun () -> File.openfile [Write] (p "dir"))) ;
+              equal string "ENOTDIR"
+                (err (fun () -> File.openfile [Read] (p "f/x"))) ;
+              equal string "EEXIST" (err (fun () -> Dir.mkdir (p "dir"))) ;
+              equal string "ENOENT" (err (fun () -> Dir.mkdir (p "no/dir"))) ;
+              equal string "ENOTEMPTY" (err (fun () -> Dir.rmdir (p "dir"))) ;
+              equal string "ENOTDIR" (err (fun () -> Dir.rmdir (p "f"))) ;
+              equal string "ENOENT" (err (fun () -> Dir.rmdir (p "no"))) ;
+              equal string "EISDIR" (err (fun () -> Dir.unlink (p "dir"))) ;
+              equal string "ENOENT" (err (fun () -> Dir.unlink (p "no"))) ;
+              equal string "ENOTDIR" (err (fun () -> Dir.readdir (p "f"))) ;
+              equal string "ENOENT" (err (fun () -> Dir.readdir (p "no"))) ;
+              equal string "EISDIR"
+                (err (fun () -> Dir.rename (p "f") (p "dir"))) ;
+              equal string "ENOTDIR"
+                (err (fun () -> Dir.rename (p "dir") (p "f"))) ;
+              equal string "ENOENT" (err (fun () -> Dir.rename (p "no") (p "x"))) ;
+              Dir.mkdir (p "empty") ;
+              equal string "ENOTEMPTY"
+                (err (fun () -> Dir.rename (p "empty") (p "dir"))) ;
+              (* A write to a file that is open only for read, and a read after
+                 the close. *)
+              let f = File.openfile [Read] (p "f") in
+              equal string "EBADF" (err (fun () -> File.write f "x")) ;
+              File.close f ;
+              equal string "EBADF"
+                (err (fun () -> File.read f (Bytes.create 1) 0 1)) ) )
+    ; test "fibers use many files at the same time" (fun () ->
+          w.run (fun () ->
+              let d = w.tmp () in
+              Fiber.scope (fun s ->
+                  for i = 1 to 20 do
+                    Fiber.fork s (fun () ->
+                        let path = Filename.concat d (string_of_int i) in
+                        write_file path (String.make i 'x') ;
+                        equal int i (String.length (read_file path)) )
+                  done ) ;
+              equal int 20 (List.length (Dir.readdir d)) ) ) ]
+
 let tests w =
   [ group w.name
-      ([events w; chans w; scopes w; net w; overflow_runs w; layers w] @ many w)
-  ]
+      ( [events w; chans w; scopes w; net w; overflow_runs w; layers w; files w]
+      @ many w ) ]

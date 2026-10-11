@@ -14,6 +14,11 @@ type error = Op.error =
   | Reset
   | Broken_pipe
   | In_use
+  | No_entry
+  | Exists
+  | Not_dir
+  | Is_dir
+  | Not_empty
   | Other of string
 
 exception Error of error * string

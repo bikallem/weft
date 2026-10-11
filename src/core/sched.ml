@@ -132,6 +132,11 @@ and _ req =
   | Enqueue : sync list -> unit req
   | Close_notices : fdrec -> unit req
       (** Send a close notice to each domain with a registration. *)
+  | Job : 'a Op.blocking * (unit -> unit) -> (int, Op.error) result req
+      (** Start a job of the pool for the domain that runs the fiber. The
+          function runs at its completion. *)
+  | Detach_job : int -> unit req
+      (** The fiber does not wait for the job any more. *)
 
 and sync_req = {leaves: leaf array; nocancel: bool}
 
@@ -180,9 +185,21 @@ and t =
         (** The bit of each domain that sleeps, or is about to. *)
   ; overflow: ready Queue.t  (** The fibers of full rings, under its lock. *)
   ; overflow_lock: Spin.t
-  ; externals: (int, sync * int) Hashtbl.t
-        (** The waiters of [Ready.External], by id, under its lock. *)
+  ; externals: (int, ext) Hashtbl.t
+        (** The completions of [Ready.External], by id, under its lock. *)
   ; externals_lock: Spin.t }
+
+(* A completion that the world gives with [Ready.External]: the end of a job of
+   the pool, or of [Sim.settle]. *)
+and ext =
+  { mutable ewait: (sync * int) option  (** The waiter, if one. *)
+  ; mutable arrived: bool  (** The completion came before the waiter. *)
+  ; mutable dropped: bool
+        (** The fiber left before its wait started, for example after a cancel.
+        *)
+  ; on_done: unit -> unit
+        (** It runs at the completion, also when the waiter left: it releases
+            the user of the fd of a job. *) }
 
 (* The heap of deadlines of one domain. Only its owner uses it. *)
 and heap =
@@ -664,11 +681,45 @@ let close_notices dom fdr =
           World.perform "Net.close" (World.Wake d.index) ) )
     dom.sched.doms
 
+(* The wait for a completion. If it came first, the branch commits. *)
 let external_leaf id : leaf =
  fun dom s i ->
   let t = dom.sched in
   Spin.with_lock t.externals_lock (fun () ->
-      Hashtbl.replace t.externals id (s, i) )
+      match Hashtbl.find_opt t.externals id with
+      | Some e when e.arrived ->
+          Hashtbl.remove t.externals id ;
+          ignore (C.self_commit s.word i)
+      | Some e ->
+          e.ewait <- Some (s, i)
+      | None ->
+          Hashtbl.replace t.externals id
+            {ewait= Some (s, i); arrived= false; dropped= false; on_done= ignore} )
+
+(* The fiber does not wait for the completion of [id] any more. *)
+let drop_external t id =
+  Spin.with_lock t.externals_lock (fun () ->
+      match Hashtbl.find_opt t.externals id with
+      | Some e when e.arrived ->
+          Hashtbl.remove t.externals id
+      | Some e ->
+          e.dropped <- true
+      | None ->
+          () )
+
+(* Start a job: the domain records its completion before the fiber can wait for
+   it. *)
+let start_job dom job on_done =
+  let r = World.perform "job" (World.Submit (Op.Start (dom.index, job))) in
+  ( match r with
+  | Ok id ->
+      let t = dom.sched in
+      Spin.with_lock t.externals_lock (fun () ->
+          Hashtbl.replace t.externals id
+            {ewait= None; arrived= false; dropped= false; on_done} )
+  | Error _ ->
+      () ) ;
+  r
 
 let on_ready dom = function
   | World.Ready.Fd {token; read; write} -> (
@@ -704,15 +755,26 @@ let on_ready dom = function
           () )
   | World.Ready.External id -> (
       let t = dom.sched in
-      let w =
+      let e =
         Spin.with_lock t.externals_lock (fun () ->
-            let w = Hashtbl.find_opt t.externals id in
-            Hashtbl.remove t.externals id ;
-            w )
+            match Hashtbl.find_opt t.externals id with
+            | Some e when Option.is_some e.ewait || e.dropped ->
+                Hashtbl.remove t.externals id ;
+                Some e
+            | Some e ->
+                e.arrived <- true ;
+                Some e
+            | None ->
+                None )
       in
-      match w with
-      | Some (s, i) -> (
-        match C.notify s.word i with C.Resume -> resume dom s | _ -> () )
+      match e with
+      | Some e -> (
+          e.on_done () ;
+          match e.ewait with
+          | Some (s, i) -> (
+            match C.notify s.word i with C.Resume -> resume dom s | _ -> () )
+          | None ->
+              () )
       | None ->
           () )
   | World.Ready.Alarm | World.Ready.Woken ->
@@ -846,6 +908,12 @@ let rec run_fiber : dom -> fiber -> step -> unit =
       (* Wake an idle domain before the fiber goes on, so that it can take the
          new fiber at once. *)
       flush_wake dom ;
+      run_fiber dom fiber (Effect.Deep.continue k ())
+  | Suspended (Job (job, on_done), k) ->
+      run_fiber dom fiber (Effect.Deep.continue k (start_job dom job on_done))
+  | Suspended (Detach_job id, k) ->
+      drop_external dom.sched id ;
+      ignore (World.perform "job" (World.Submit (Op.Detach id))) ;
       run_fiber dom fiber (Effect.Deep.continue k ())
   | Suspended (Close_notices fdr, k) ->
       close_notices dom fdr ;

@@ -6,6 +6,16 @@ module S = Private.Sched
 
 let domains = 4
 
+(* A new directory for each test that needs one. The directories go at the
+   exit. *)
+let tmp =
+  let base = Filename.temp_dir "weft-test" "" and n = ref 0 in
+  at_exit (fun () -> ignore (Sys.command ("rm -rf " ^ Filename.quote base))) ;
+  fun () ->
+    incr n ;
+    let d = Filename.concat base (string_of_int !n) in
+    Sys.mkdir d 0o755 ; d
+
 let world =
   { Portable.name= "linux on 4 domains"
   ; domains
@@ -13,7 +23,8 @@ let world =
   ; listen=
       (fun () ->
         let l = Net.listen (Net.Tcp ("127.0.0.1", 0)) in
-        (l, Net.Tcp ("127.0.0.1", Weft_linux.local_port l)) ) }
+        (l, Net.Tcp ("127.0.0.1", Weft_linux.local_port l)) )
+  ; tmp }
 
 (* Timers on many domains end after their deadlines. *)
 let timers () =
