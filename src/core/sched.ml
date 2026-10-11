@@ -67,7 +67,12 @@ and ctx =
   ; members: (int, fiber) Hashtbl.t  (** By fiber id, under [lock]. *)
   ; children: (int, ctx) Hashtbl.t
         (** The nested nodes that are not shields, by node id, under [lock]. *)
-  }
+  ; chain: handler
+        (** The handlers of the user on the chain of scopes, the outermost
+            first. Each fiber of the node runs inside it. *) }
+
+(* A handler of the user (design section 2.5, Effect handlers of a scope). *)
+and handler = {handle: 'a. (unit -> 'a) -> 'a}
 
 and kind = Scope_node of scope_state | Shield_node | Daemon_node
 
@@ -718,14 +723,26 @@ let on_ready dom = function
 
 let next_nid = Atomic.make 0
 
-let new_node ?parent kind =
+let no_handler = {handle= (fun f -> f ())}
+
+(* A nested scope composes its handler inside the chain of its parent. *)
+let new_node ?parent ?handler kind =
+  let outer = match parent with Some p -> p.chain | None -> no_handler in
+  let chain =
+    match handler with
+    | None ->
+        outer
+    | Some h ->
+        {handle= (fun f -> outer.handle (fun () -> h.handle f))}
+  in
   { nid= Atomic.fetch_and_add next_nid 1
   ; kind
   ; parent
   ; flag= Atomic.make None
   ; lock= Spin.make ()
   ; members= Hashtbl.create ~random:false 4
-  ; children= Hashtbl.create ~random:false 4 }
+  ; children= Hashtbl.create ~random:false 4
+  ; chain }
 
 let add_member_to n f =
   Spin.with_lock n.lock (fun () -> Hashtbl.replace n.members f.fid f)
@@ -1136,8 +1153,9 @@ let add_member node ~daemon =
   in
   inc ()
 
+(* The body of a fiber runs inside the chain of handlers of its scope. *)
 let run_body scope body =
-  match body () with
+  match scope.chain.handle body with
   | () ->
       ()
   | exception e ->
@@ -1212,16 +1230,24 @@ let finish_scope fiber node result =
   | l ->
       raise (Multiple l)
 
-let scope f =
+(* The body runs inside [handler] only: the fiber already runs inside the chain
+   of its outer scopes. *)
+let scope ?handler f =
   let fiber = self () in
   let parent = List.hd fiber.ctxs in
-  let node = new_node ~parent (Scope_node (new_scope_state ())) in
+  let node = new_node ~parent ?handler (Scope_node (new_scope_state ())) in
   Hashtbl.replace node.members fiber.fid fiber ;
   Spin.with_lock parent.lock (fun () ->
       Hashtbl.replace parent.children node.nid node ) ;
   fiber.ctxs <- node :: fiber.ctxs ;
   let result =
-    match f node with
+    match
+      match handler with
+      | None ->
+          f node
+      | Some h ->
+          h.handle (fun () -> f node)
+    with
     | v ->
         Ok v
     | exception e ->

@@ -9,6 +9,9 @@ type world =
 
 val tests : world -> Windtrap.test list
 
+val layers : world -> Windtrap.test
+(** The tests of the fiber layer (milestone M2), also in [tests]. *)
+
 (**/**)
 
 val echo_server : Weft.Net.t -> unit

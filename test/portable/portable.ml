@@ -427,5 +427,279 @@ let net w =
                   is_true (String.equal data (Promise.await r)) ;
                   Net.close c ) ) ) ]
 
+(* The fiber layer of milestone M2: the handlers of a scope, fork_isolated,
+   Promise.cancel, and the locks for fiber code. *)
+
+type _ Effect.t += Count : int -> unit Effect.t
+
+(* A handler that adds each [Count n] to [total]. *)
+let counting total =
+  { Fiber.handle=
+      (fun f ->
+        Effect.Deep.match_with f ()
+          { retc= Fun.id
+          ; exnc= raise
+          ; effc=
+              (fun (type a) (e : a Effect.t) ->
+                match e with
+                | Count n ->
+                    Some
+                      (fun (k : (a, _) Effect.Deep.continuation) ->
+                        ignore (Atomic.fetch_and_add total n) ;
+                        Effect.Deep.continue k () )
+                | _ ->
+                    None ) } ) }
+
+(* A handler that doubles each [Count n], and gives it to the outer handler. *)
+let doubling =
+  { Fiber.handle=
+      (fun f ->
+        Effect.Deep.match_with f ()
+          { retc= Fun.id
+          ; exnc= raise
+          ; effc=
+              (fun (type a) (e : a Effect.t) ->
+                match e with
+                | Count n ->
+                    Some
+                      (fun (k : (a, _) Effect.Deep.continuation) ->
+                        Effect.perform (Count (2 * n)) ;
+                        Effect.Deep.continue k () )
+                | _ ->
+                    None ) } ) }
+
+(* A server that forks each connection with fork_isolated. A connection that
+   sends "boom" raises. *)
+let isolated_server l errors =
+  Fiber.scope (fun s ->
+      while true do
+        let c, _ = Net.accept l in
+        Fiber.fork_isolated s
+          ~on_error:(fun e _ -> Log.add errors (Printexc.to_string e))
+          (fun () ->
+            Fun.protect
+              ~finally:(fun () -> Net.close c)
+              (fun () ->
+                let m = read_n c 4 in
+                if m = "boom" then raise (Boom m) ;
+                Time.sleep Mono (Span.ms 2) ;
+                Net.write c m ) )
+      done )
+
+let layers w =
+  group "fiber layers"
+    [ test "a user effect from a nested scope reaches the outer handler"
+        (fun () ->
+          w.run (fun () ->
+              let total = Atomic.make 0 in
+              Fiber.scope ~handler:(counting total) (fun outer ->
+                  Effect.perform (Count 1) ;
+                  Fiber.fork outer (fun () ->
+                      Fiber.yield () ; Effect.perform (Count 10) ) ;
+                  Fiber.scope ~handler:doubling (fun inner ->
+                      Effect.perform (Count 100) ;
+                      Fiber.fork inner (fun () ->
+                          Fiber.yield () ;
+                          Effect.perform (Count 1000) ) ;
+                      (* A fiber of the outer scope does not run inside the
+                         handler of the inner scope. *)
+                      Fiber.fork outer (fun () ->
+                          Fiber.yield () ;
+                          Effect.perform (Count 10_000) ) ) ) ;
+              equal int (1 + 10 + 200 + 2000 + 10_000) (Atomic.get total) ) )
+    ; test "an isolated connection that raises does not stop the others"
+        (fun () ->
+          w.run (fun () ->
+              let l, a = w.listen () in
+              let errors = Log.create () in
+              Fiber.scope (fun s ->
+                  Fiber.fork_daemon s (fun () -> isolated_server l errors) ;
+                  Fiber.scope (fun clients ->
+                      List.iter
+                        (fun m ->
+                          Fiber.fork clients (fun () ->
+                              let c = Net.connect a in
+                              Net.write c m ;
+                              equal string
+                                (if m = "boom" then "" else m)
+                                (read_all c) ;
+                              Net.close c ) )
+                        ["aaaa"; "boom"; "cccc"; "dddd"] ) ) ;
+              Net.close l ;
+              equal (list string)
+                [Printexc.to_string (Boom "boom")]
+                (Log.get errors) ) )
+    ; test "on_error that raises makes the scope fail" (fun () ->
+          w.run (fun () ->
+              raises (Boom "again") (fun () ->
+                  Fiber.scope (fun s ->
+                      Fiber.fork_isolated s
+                        ~on_error:(fun _ _ -> raise (Boom "again"))
+                        (fun () -> raise (Boom "first")) ) ) ) )
+    ; test "Promise.cancel cancels only the fiber of the promise" (fun () ->
+          w.run (fun () ->
+              Fiber.scope (fun s ->
+                  let early =
+                    Fiber.fork_promise s (fun () ->
+                        Time.sleep Mono (Span.s 10) ;
+                        1 )
+                  in
+                  let late =
+                    Fiber.fork_promise s (fun () ->
+                        Time.sleep Mono (Span.s 10) ;
+                        2 )
+                  in
+                  let other =
+                    Fiber.fork_promise s (fun () ->
+                        Time.sleep Mono (Span.ms 5) ;
+                        3 )
+                  in
+                  (* Before the fiber starts, and while it sleeps. *)
+                  Promise.cancel early ;
+                  Time.sleep Mono (Span.ms 1) ;
+                  Promise.cancel late ;
+                  raises Promise.Cancelled (fun () -> Promise.await early) ;
+                  raises Promise.Cancelled (fun () -> Promise.await late) ;
+                  equal int 3 (Promise.await other) ;
+                  Promise.cancel other ;
+                  equal int 3 (Promise.await other) ) ) )
+    ; test "a cancel of the outer scope gives Promise.Cancelled" (fun () ->
+          w.run (fun () ->
+              let p = ref None in
+              ( try
+                  Fiber.scope (fun s ->
+                      p :=
+                        Some
+                          (Fiber.fork_promise s (fun () ->
+                               Time.sleep Mono (Span.s 10) ) ) ;
+                      Fiber.cancel s (Boom "stop") ;
+                      Time.sleep Mono (Span.s 10) )
+                with Fiber.Cancelled (Boom _) -> () ) ;
+              match !p with
+              | Some p ->
+                  raises Promise.Cancelled (fun () -> Promise.await p)
+              | None ->
+                  failwith "no promise" ) )
+    ; test "a mutex keeps the counter correct" (fun () ->
+          w.run (fun () ->
+              let m = Fiber.Mutex.create () and n = ref 0 in
+              Fiber.scope (fun s ->
+                  for _ = 1 to 20 do
+                    Fiber.fork s (fun () ->
+                        for _ = 1 to 10 do
+                          Fiber.Mutex.use_rw ~protect:false m (fun () ->
+                              let x = !n in
+                              Fiber.yield () ;
+                              n := x + 1 )
+                        done )
+                  done ) ;
+              equal int 200 !n ) )
+    ; test "an exception poisons the mutex, also for the waiters" (fun () ->
+          w.run (fun () ->
+              let m = Fiber.Mutex.create () in
+              Fiber.scope (fun s ->
+                  let waiter =
+                    Fiber.fork_promise s (fun () ->
+                        Time.sleep Mono (Span.ms 1) ;
+                        Fiber.Mutex.use_ro m ignore )
+                  in
+                  raises (Boom "rw") (fun () ->
+                      Fiber.Mutex.use_rw ~protect:false m (fun () ->
+                          Time.sleep Mono (Span.ms 5) ;
+                          raise (Boom "rw") ) ) ;
+                  raises Fiber.Mutex.Poisoned (fun () -> Promise.await waiter) ;
+                  raises Fiber.Mutex.Poisoned (fun () -> Fiber.Mutex.lock m) ) ) )
+    ; test "use_ro never poisons the mutex" (fun () ->
+          w.run (fun () ->
+              let m = Fiber.Mutex.create () in
+              raises (Boom "ro") (fun () ->
+                  Fiber.Mutex.use_ro m (fun () -> raise (Boom "ro")) ) ;
+              equal int 1 (Fiber.Mutex.use_rw ~protect:false m (fun () -> 1)) ) )
+    ; test "use_rw ~protect:true ends f after a cancel" (fun () ->
+          w.run (fun () ->
+              let m = Fiber.Mutex.create () and ended = ref false in
+              Fiber.scope (fun s ->
+                  Fiber.fork s (fun () ->
+                      Fiber.Mutex.use_rw ~protect:true m (fun () ->
+                          Time.sleep Mono (Span.ms 5) ;
+                          ended := true ) ;
+                      Time.sleep Mono (Span.s 10) ) ;
+                  Time.sleep Mono (Span.ms 1) ;
+                  Fiber.cancel s (Boom "stop") ) ;
+              is_true !ended ;
+              Fiber.Mutex.use_ro m ignore ) )
+    ; test "a fiber that leaves the wait for a lock does not take it" (fun () ->
+          w.run (fun () ->
+              let m = Fiber.Mutex.create () in
+              Fiber.scope (fun s ->
+                  Fiber.Mutex.lock m ;
+                  let p = Fiber.fork_promise s (fun () -> Fiber.Mutex.lock m) in
+                  Time.sleep Mono (Span.ms 1) ;
+                  Promise.cancel p ;
+                  raises Promise.Cancelled (fun () -> Promise.await p) ;
+                  Fiber.Mutex.unlock m ;
+                  Fiber.Mutex.lock m ;
+                  Fiber.Mutex.unlock m ) ) )
+    ; test "a condition gives each item to one consumer" (fun () ->
+          w.run (fun () ->
+              let m = Fiber.Mutex.create () and c = Fiber.Condition.create () in
+              let q = Queue.create () and got = Log.create () in
+              Fiber.scope (fun s ->
+                  for _ = 1 to 4 do
+                    Fiber.fork s (fun () ->
+                        for _ = 1 to 5 do
+                          let x =
+                            Fiber.Mutex.use_rw ~protect:false m (fun () ->
+                                while Queue.is_empty q do
+                                  Fiber.Condition.wait c m
+                                done ;
+                                Queue.pop q )
+                          in
+                          Log.add got x
+                        done )
+                  done ;
+                  for i = 1 to 20 do
+                    Fiber.Mutex.use_rw ~protect:false m (fun () ->
+                        Queue.push i q ; Fiber.Condition.signal c ) ;
+                    if i mod 3 = 0 then Fiber.yield ()
+                  done ) ;
+              equal (list int) (List.init 20 succ)
+                (List.sort compare (Log.get got)) ) )
+    ; test "broadcast wakes each waiter" (fun () ->
+          w.run (fun () ->
+              let m = Fiber.Mutex.create () and c = Fiber.Condition.create () in
+              let go = ref false and woken = Atomic.make 0 in
+              Fiber.scope (fun s ->
+                  for _ = 1 to 5 do
+                    Fiber.fork s (fun () ->
+                        Fiber.Mutex.use_rw ~protect:false m (fun () ->
+                            while not !go do
+                              Fiber.Condition.wait c m
+                            done ) ;
+                        Atomic.incr woken )
+                  done ;
+                  Time.sleep Mono (Span.ms 1) ;
+                  Fiber.Mutex.use_rw ~protect:false m (fun () ->
+                      go := true ;
+                      Fiber.Condition.broadcast c ) ) ;
+              equal int 5 (Atomic.get woken) ) )
+    ; test "a cancel in Condition.wait does not poison, also with protect"
+        (fun () ->
+          w.run (fun () ->
+              let m = Fiber.Mutex.create () and c = Fiber.Condition.create () in
+              Fiber.scope (fun s ->
+                  List.iter
+                    (fun protect ->
+                      Fiber.fork s (fun () ->
+                          Fiber.Mutex.use_rw ~protect m (fun () ->
+                              Fiber.Condition.wait c m ) ) )
+                    [false; true] ;
+                  Time.sleep Mono (Span.ms 1) ;
+                  Fiber.cancel s (Boom "stop") ) ;
+              equal int 2 (Fiber.Mutex.use_rw ~protect:false m (fun () -> 2)) ) )
+    ]
+
 let tests w =
-  [group w.name ([events w; chans w; scopes w; net w; overflow_runs w] @ many w)]
+  [ group w.name
+      ([events w; chans w; scopes w; net w; overflow_runs w; layers w] @ many w)
+  ]

@@ -10,4 +10,5 @@
    (run %{test} --corrected)
    (diff? test_sim.ml test_sim.ml.corrected)
    (diff? test_net.ml test_net.ml.corrected)
-   (diff? test_m1.ml test_m1.ml.corrected))))
+   (diff? test_m1.ml test_m1.ml.corrected)
+   (diff? test_m2.ml test_m2.ml.corrected))))

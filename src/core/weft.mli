@@ -70,15 +70,33 @@ module Promise : sig
 
   val ready : 'a t -> 'a event
   (** The event form of [await]. *)
+
+  val cancel : 'a t -> unit
+  (** [cancel p] cancels only the fiber of [p]: it runs in a scope of its own. A
+      second cancel, or a cancel after the end, does nothing. *)
+
+  (** [await] raises it if the fiber of the promise was cancelled, by [cancel]
+      or by a cancel of an outer scope. Thus the caller can tell it from a
+      cancel of its own context. *)
+  exception Cancelled
 end
 
 module Fiber : sig
   type scope
 
-  val scope : (scope -> 'a) -> 'a
+  (** A handler of the user, for example of a user effect (design section 2.5,
+      Effect handlers of a scope). It must be safe for parallel use, and its
+      [effc] must give [None] for each effect that it does not know. *)
+  type handler = {handle: 'a. (unit -> 'a) -> 'a}
+
+  val scope : ?handler:handler -> (scope -> 'a) -> 'a
   (** [scope f] runs [f] in a new scope, then waits until all fibers of the
       scope end. The wait ignores cancels. If a member failed, it raises the
-      first exception, or [Multiple]. *)
+      first exception, or [Multiple].
+
+      With [~handler], [f] and each fiber of the scope and of its nested scopes
+      run inside [handler.handle]. A nested scope runs its fibers as
+      [outer.handle (fun () -> inner.handle g)]. *)
 
   val fork : ?name:string -> scope -> (unit -> unit) -> unit
   (** [fork scope f] runs [f] in a new fiber of [scope]. If [f] raises, the
@@ -88,6 +106,17 @@ module Fiber : sig
 
   val fork_daemon : ?name:string -> scope -> (unit -> unit) -> unit
   (** The scope cancels a daemon fiber when all other members end. *)
+
+  val fork_isolated :
+       ?name:string
+    -> scope
+    -> on_error:(exn -> Printexc.raw_backtrace -> unit)
+    -> (unit -> unit)
+    -> unit
+  (** As [fork], but if [f] raises an exception that is not [Cancelled],
+      [on_error] gets it with its backtrace, and the scope does not fail. A
+      server forks each connection in this way. If [on_error] raises, the scope
+      fails. *)
 
   val fork_promise : ?name:string -> scope -> (unit -> 'a) -> 'a Promise.t
   (** If the fiber raises, the promise holds the exception, and the scope does
@@ -118,6 +147,54 @@ module Fiber : sig
   exception Internal_error of exn * Printexc.raw_backtrace
 
   exception Scope_closed
+
+  (** A mutex for fiber code: [lock] suspends the fiber, not the domain (design
+      section 2.5, Locks for fiber code). *)
+  module Mutex : sig
+    type t
+
+    val create : unit -> t
+
+    val use_rw : protect:bool -> t -> (unit -> 'a) -> 'a
+    (** [use_rw ~protect m f] locks [m], runs [f] and unlocks [m]. If [f]
+        raises, the protected data can be incorrect, so [m] becomes poisoned. A
+        [Cancelled] from [Condition.wait] does not poison. With [~protect:true],
+        [f] runs in a shield, but [Condition.wait] in [f] sees the cancels from
+        outside.
+
+        @raise Poisoned if [m] is poisoned. *)
+
+    val use_ro : t -> (unit -> 'a) -> 'a
+    (** As [use_rw ~protect:false], but [m] never becomes poisoned. For code
+        that only reads the protected data. *)
+
+    val lock : t -> unit
+    (** A cancellation point.
+
+        @raise Poisoned if [m] is poisoned. *)
+
+    val unlock : t -> unit
+    (** @raise Invalid_argument if [m] is not locked. *)
+
+    exception Poisoned
+  end
+
+  (** A condition variable for fiber code. *)
+  module Condition : sig
+    type t
+
+    val create : unit -> t
+
+    val wait : t -> Mutex.t -> unit
+    (** [wait c m] unlocks [m], waits for a signal, and locks [m] again, also
+        when the fiber is cancelled. It is a cancellation point. *)
+
+    val signal : t -> unit
+    (** Wakes one waiter, if one. *)
+
+    val broadcast : t -> unit
+    (** Wakes all waiters. *)
+  end
 end
 
 module Ivar : sig

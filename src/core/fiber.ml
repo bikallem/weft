@@ -14,9 +14,24 @@ exception Internal_error = Sched.Internal_error
 
 exception Scope_closed = Sched.Scope_closed
 
-let scope = Sched.scope
+type handler = Sched.handler = {handle: 'a. (unit -> 'a) -> 'a}
+
+let scope ?handler f = Sched.scope ?handler f
 
 let fork ?name scope f = Sched.fork ?name scope f
+
+(* A [Cancelled] is not an error of the fiber: it goes to the scope, which
+   ignores it. If [on_error] raises, the scope fails (design section 2.5,
+   Errors). *)
+let fork_isolated ?name scope ~on_error f =
+  fork ?name scope (fun () ->
+      match f () with
+      | () ->
+          ()
+      | exception (Cancelled _ as e) ->
+          raise e
+      | exception e ->
+          on_error e (Printexc.get_raw_backtrace ()) )
 
 let fork_daemon ?name scope f = Sched.fork_daemon ?name scope f
 
@@ -25,6 +40,14 @@ let cancel = Sched.cancel
 let shield = Sched.shield
 
 let yield = Event.yield
+
+module Mutex = struct
+  include Locks.Mutex
+
+  exception Poisoned = Locks.Poisoned
+end
+
+module Condition = Locks.Condition
 
 (* A new scope T with a daemon that cancels T at the deadline (design section
    2.5, Timeouts). [Timeout] only for the own deadline. If an outer context is
