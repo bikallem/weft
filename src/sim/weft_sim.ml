@@ -52,6 +52,8 @@ exception Lost_wakeup of string list
 
 exception Model_error of string
 
+exception Livelock of string list
+
 (* The in-memory network (design section 2.8). *)
 
 (* The capacity of the receive buffer of a connection. *)
@@ -159,6 +161,9 @@ type t =
             newest first. A finaliser can push, so the list is atomic. *)
   ; refused_fills: int Atomic.t  (** The fills with no [~outside_fills]. *)
   ; mutable steps: int  (** The switch points. *)
+  ; livelock: int  (** The limit of the switch points with no progress. *)
+  ; mutable no_progress: int
+        (** The switch points since the last progress or quiescence. *)
   ; mutable fill_log: int list
         (** The switch point of the quiescence that gave each fill. *)
   ; mutable next_pid: int }
@@ -981,8 +986,26 @@ let extra_edge t d =
           (d, World.Ready.Fd {token; read= true; write= true}) :: t.net.edges
 
 (* Answer the effect of domain [d], continue it, and keep its next state. *)
+(* A switch point with no progress: only [Now], [Switch], [Random], or a [Wait]
+   that gives nothing. A loop that yields until a time comes makes no progress,
+   because the time moves only at a quiescence (design section 2.8,
+   Livelock). *)
+let no_progress t =
+  t.no_progress <- t.no_progress + 1 ;
+  if t.no_progress > t.livelock then
+    raise (Livelock (Sched_debug.active (sched t)))
+
+let progress t = t.no_progress <- 0
+
 let step t st d =
   t.steps <- t.steps + 1 ;
+  ( match st.(d) with
+  | Pending ((World.Now _ | World.Switch | World.Random _), _) ->
+      no_progress t
+  | Pending (World.Wait _, _) when not (has_ready t d) ->
+      no_progress t
+  | _ ->
+      progress t ) ;
   let next = function Ended -> Ended_dom | Paused (e, k) -> Pending (e, k) in
   match st.(d) with
   | Start dom ->
@@ -1023,6 +1046,7 @@ let step t st d =
 (* The program is quiescent: each domain sleeps, or ended, and nothing is ready
    (design section 2.8, The wait steps). *)
 let quiescent t st =
+  progress t ;
   let s = sched t in
   ( match
       Sched_debug.lost s ~now:(Weft.Clock.of_ns Mono t.now) @ fd_problems t
@@ -1111,7 +1135,7 @@ let quiescent t st =
                  :: Sched_debug.blocked s ) ) )
 
 let run ?(seed = 0) ?(domains = 1) ?(auto = true) ?(signals = [])
-    ?(outside_fills = false) main =
+    ?(outside_fills = false) ?(livelock = 10_000_000) main =
   let t =
     { prng= Prng.make seed
     ; auto
@@ -1143,6 +1167,8 @@ let run ?(seed = 0) ?(domains = 1) ?(auto = true) ?(signals = [])
     ; fills= Atomic.make []
     ; refused_fills= Atomic.make 0
     ; steps= 0
+    ; livelock
+    ; no_progress= 0
     ; fill_log= []
     ; next_pid= 1000 }
   in

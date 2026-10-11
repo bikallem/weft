@@ -11,6 +11,7 @@ val run :
   -> ?auto:bool
   -> ?signals:Weft.Signal.t list
   -> ?outside_fills:bool
+  -> ?livelock:int
   -> (t -> 'a)
   -> 'a
 (** [run main] runs [main] in the simulator. [~seed] is 0 by default. [~domains]
@@ -25,6 +26,15 @@ val run :
     so a test with such a fill gives the same run only in the same binary with
     the same history. With [~outside_fills:false] (the default), such a fill is
     a [Model_error] at the next quiescence.
+
+    [~livelock] (10{^ 7} by default) is the limit of the switch points with no
+    progress: only [Now], [Switch], [Random], or a poll that gives nothing. A
+    loop that yields until a time comes never ends in the simulator, because the
+    time moves only at a quiescence.
+
+    @raise Livelock
+      with the fibers that are not parked. A long stream of data is progress, so
+      it is not a livelock.
 
     @raise Deadlock
       if the program is quiescent, no deadline exists, and no event can come.
@@ -119,6 +129,9 @@ exception Deadlock of string list
 exception Lost_wakeup of string list
 
 exception Model_error of string
+
+(** The fibers that are not parked. *)
+exception Livelock of string list
 
 (**/**)
 

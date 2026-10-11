@@ -93,6 +93,42 @@ let deadline_form () =
               Time.sleep Mono (Span.s 1) ) ) ;
       equal int64 7_000_000L (Span.to_ns (Time.diff Mono (Time.now Mono) t0)) )
 
+(* A loop that yields until a time comes is a livelock in the simulator. *)
+let livelock () =
+  match
+    Sim.run ~livelock:100_000 (fun _ ->
+        let t0 = Time.now Mono in
+        Fiber.scope (fun s ->
+            Fiber.fork ~name:"waiter" s (fun () ->
+                while
+                  Span.to_ns (Time.diff Mono (Time.now Mono) t0) < 1_000_000L
+                do
+                  Fiber.yield ()
+                done ) ) )
+  with
+  | () ->
+      failwith "no livelock"
+  | exception Sim.Livelock l ->
+      is_true (List.mem "waiter" l)
+
+(* A long stream with no timer is progress, also with a small limit. *)
+let stream () =
+  Sim.run ~livelock:1000 ~domains:2 (fun sim ->
+      let a = Sim.addr sim "stream:1" in
+      let l = Net.listen a in
+      let data = String.make (4 lsl 20) 'x' in
+      Fiber.scope (fun s ->
+          Fiber.fork_daemon s (fun () -> Portable.echo_server l) ;
+          let c = Net.connect a in
+          let got =
+            Fiber.fork_promise s (fun () ->
+                Portable.read_n c (String.length data) )
+          in
+          Net.write c data ;
+          equal int (String.length data) (String.length (Promise.await got)) ;
+          Net.close c ) ;
+      Net.close l )
+
 let tests =
   [ group "m3"
       [ test "pinned fibers run only on domain 0, with 200 seeds" (fun () ->
@@ -102,6 +138,8 @@ let tests =
       ; test "a fill from outside gives at once while the word is Claimed"
           fill_while_claimed
       ; test "the deadline form of with_timeout has no fiber" deadline_form
+      ; test "a yield loop that waits for the time gives Livelock" livelock
+      ; test "a stream of 4 MiB is not a livelock" stream
       ; test "a finaliser fills an Ivar" finaliser
       ; test "a fill from outside needs ~outside_fills" refused
       ; test "no run: fill_from_outside gives false" (fun () ->

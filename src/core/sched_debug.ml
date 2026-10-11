@@ -22,6 +22,17 @@ let blocked t =
           None )
     (fibers t)
 
+(* The fibers that are not parked: they run, or they are in a queue. *)
+let active t =
+  List.filter_map
+    (fun f ->
+      match Atomic.get f.current with
+      | Some s when C.state s.word = C.Parked ->
+          None
+      | _ ->
+          Some (name f) )
+    (fibers t)
+
 (* The parked syncs, by the name of the fiber. A test of the checks uses them to
    plant a lost wakeup. *)
 let parked t =
