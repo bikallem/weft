@@ -223,7 +223,7 @@ let detach_from_open () =
 let no_file_leak () =
   let d = tmp () in
   let before = open_fds () in
-  Weft_linux.run ~domains:2 (fun () ->
+  Weft_linux.run ~domains:1 (fun () ->
       Fiber.scope (fun s ->
           for i = 1 to 10 do
             Fiber.fork s (fun () ->
@@ -269,7 +269,7 @@ let child_sigint () =
   equal int before (open_fds ())
 
 let child_output () =
-  Weft_linux.run ~domains:2 (fun () ->
+  Weft_linux.run ~domains:1 (fun () ->
       let p =
         Process.spawn ~stdout:Piped ~stderr:Null "sh"
           ["-c"; "echo hi; echo err >&2; exit 3"]
@@ -295,7 +295,7 @@ let child_output () =
 (* SIGTERM to the process: a fiber that waits gets it, and run ends. *)
 let sigterm () =
   let n =
-    Weft_linux.run ~domains:2 ~signals:[SIGTERM] (fun () ->
+    Weft_linux.run ~domains:1 ~signals:[SIGTERM] (fun () ->
         Fiber.scope (fun s ->
             let got =
               Fiber.fork_promise s (fun () -> sync (Signal.received SIGTERM))

@@ -149,12 +149,13 @@ module type WORLD = sig
 end
 
 val run :
-  ?domains:int -> ?signals:Signal.t list -> ?slack:Span.t ->
+  ?domains:int -> ?slack:Span.t ->
   (module WORLD with type t = 'w) -> 'w -> (unit -> 'a) -> 'a
 (** [run (module W) w main] installs the world handler and the scheduler,
-    then runs [main] as the first fiber. [~domains] is in milestone M1,
-    and [~signals] in M2. *)
+    then runs [main] as the first fiber. [~domains] is in milestone M1. *)
 ```
+
+The signals are an argument of the world, for example `Weft_linux.run ~signals` (M2). The world must block them before it starts a thread, and only the world starts the threads.
 
 The effect constructors (`Now`, `Submit`, `Wait`, `Wake`, `Random`, `Switch`) are private. The `.mli` does not export them. Thus only `run` and `Sim.run` can handle them, and fiber code cannot catch them by accident. Fiber code calls functions such as `Time.now Mono` or `Net.read fd buf`.
 
@@ -886,9 +887,15 @@ module Sim : sig
 
   val addr : t -> string -> Net.addr
   val set_latency : t -> Span.t -> unit       (* M0: the only fault *)
-  val net_faults : t -> Net_faults.t -> unit  (* milestone M2 *)
   val set_posix : t -> Clock.posix -> unit
-  val signal : t -> Signal.t -> unit          (* milestone M2 *)
+
+  (* Milestone M2 *)
+  type net_faults = { jitter : Span.t; short_io : bool; extra_edges : bool }
+  val net_faults : t -> net_faults -> unit
+  val set_blocking_cost : t -> Span.t -> unit  (* open question 2 *)
+  val set_dns : t -> string -> dns_answer -> unit
+  val add_program : t -> string -> (string list -> program) -> unit
+  val signal : t -> Signal.t -> unit
 
   exception Deadlock of string list           (* the blocked fibers *)
   exception Lost_wakeup of string list
@@ -1057,8 +1064,8 @@ Also on 2026-10-10, the user accepted the milestone plan of section 2.14. Decisi
 
 ## 2.13 New open questions
 
-1. **How close the simulator is to the OS (M2).** The in-memory file system and the fake processes must copy the OS errors, for example `ENOENT`, `EEXIST` and a short write. How much of this is necessary in the first version?
-2. **Blocking operations in the simulator (M2).** A `File` operation on the thread pool takes time in production. Does the simulator give it a time cost from the seed, or zero time?
+1. **How close the simulator is to the OS (M2).** The in-memory file system and the fake processes must copy the OS errors, for example `ENOENT`, `EEXIST` and a short write. How much of this is necessary in the first version? **Answered** on 2026-10-11: the simulator copies the errors that the API of M2 documents (`ENOENT`, `EEXIST`, `ENOTDIR`, `EISDIR`, `ENOTEMPTY` and `EBADF`), and the short reads and writes are an option of `Sim.net_faults`.
+2. **Blocking operations in the simulator (M2).** A `File` operation on the thread pool takes time in production. Does the simulator give it a time cost from the seed, or zero time? **Answered** on 2026-10-11: a time cost from the seed, in the range 0 to a limit that the test gives with `Sim.set_blocking_cost`. The limit is 0 by default, as the latency of the network. With a limit of 0, the operation occurs at once, and its fiber continues at a later switch point.
 3. **The value of `K` (M1).** A busy domain polls each `K` fiber switches (section 2.5). A small `K` gives exact timers and costs more syscalls. A large `K` costs less but makes timers late under load. **Measured** (`bench/m1.ml`, 1 domain with 200 fibers that yield, a 1 ms timer, Linux, 16 CPUs): with `K` = 1, the domain does 1.8 million yields per second, and the timer is late by 109 µs on average. With `K` = 61, it does 13.8 million yields per second, and the timer is late by 19 µs on average and by 59 µs at p99. With `K` = 1024, it does 15.6 million yields per second, and the timer is late by 38 µs on average. `K` stays 61. After the review of M1 (no `Switch` in production), `K` = 61 gives 15.6 million yields per second, and the timer is late by 17 µs on average and by 37 µs at p99.
 4. **The cost of edges that do nothing (M1).** With decision 8, an fd can stay in the poller of a domain that no longer waits on it (section 2.7). **Measured** on an echo server with 64 clients: with no removal, 50%, 75% and 87% of all edges had no live waiter on 2, 4 and 8 domains. With the removal of section 2.7 (An fd in many pollers), the values are 30%, 43% and 52%, with the same throughput. The rest are the edges of data that comes while the fiber still runs, as on one domain.
 5. **The limit of the next slot (M3).** The start value is 3 runs in sequence (section 2.5). This must be measured.
@@ -1187,6 +1194,20 @@ The sections of this document mark each part that does not come in M0 with its m
 - `Promise.cancel` cancels only its own fiber, and `await` then raises `Promise.Cancelled`.
 - A user effect from a fiber of a nested scope reaches the handler of the outer scope.
 - All tests of M0 and M1 pass on macOS and on FreeBSD, and each kqueue fact in section 2.7 that has "I did not verify" is now verified or replaced.
+
+**The state of M2 (2026-10-11).** Each item of the "done" list has a test, except the last one. This machine has only Linux, so the kqueue world does not exist yet. The code settled these points:
+
+- **The jobs.** A `Blocking` operation is a job. `Op.Start (domain, op)` gives the job to the pool and gives its id. The completion comes to the `Wait` of that domain as `Ready.External id`, the same form as the end of `Sim.settle`. Then `Op.Finish (id, op)` gives the result with the type of `op`. On a cancel, the fiber sends `Op.Detach id` and raises at once.
+- **A job holds a user of its fd** until the job completes, also after a detach. Thus the close(2) of a file waits for each job that uses the fd, and the pool never uses a number that the kernel gave to a new file. The simulator checks this rule: a close(2) while a job uses the fd is a `Model_error`.
+- **The pool closes the files.** close(2) of a regular file can block, so the Linux world gives it to the pool with no completion.
+- **The pools after a fork.** A child of `fork` has no workers, so the pools reset their state in the child (`pthread_atfork`). The mutation run of windtrap forks a child for each mutant.
+- **Not done in M2:** the limit of detached jobs of each pool and the warning after 1 s (section 2.3). A pool has a fixed maximum of threads: 16 for the files and 8 for the names.
+- **The signals are an argument of the world** (section 2.3). The guard of `Signal.received` asks the world if it watches the signal (`Op.Watch`). If not, it raises `Invalid_argument`.
+- **The count of a signal.** A commit takes the count. A delivery puts the count in the cell of the waiter before the commit, because the owner can read the cell at once on another domain.
+- **A child process.** `Process.spawn` uses `pidfd_spawnp` (glibc 2.39). The pidfd is a normal fd record in the poller. One fiber reaps the child with `waitid`, fills an Ivar with the status, and then closes the pidfd. The other fibers read the Ivar.
+- **The faults of the network** (`Sim.net_faults`): a jitter, short reads and writes, and an edge with no change one time in 8. A TCP stream loses no data and keeps its order, so the loss and the reordering of packets show only as delays. The partitions need the host of each side of a connection, and the simulator does not record it. Thus the partitions are not done. With the faults, the tests found that the echo server of the tests dropped the rest of a short write.
+- **One exception for all I/O.** `File.Error`, `Dir.Error`, `Pipe.Error`, `Process.Error` and `Dns.Error` are the same exception as `Net.Error`. The error type has five more constructors: `No_entry`, `Exists`, `Not_dir`, `Is_dir` and `Not_empty`. A top-level `Weft.Error` would hide the `Error` constructor of `result` after `open Weft`.
+- **Not in M2:** UDP, `sendto`, `recvfrom` and the socket options of `Net` (section 2.3, The I/O modules), and the `Poll` world.
 
 ### M3: the tuning
 

@@ -366,8 +366,38 @@ static void spawn(struct pool *p) {
   pthread_sigmask(SIG_SETMASK, &old, NULL);
 }
 
+/* After a fork, the child has no workers: it starts new ones, and it drops
+   the jobs of the parent. The pool mutexes are free in the child, because the
+   fork takes them first. */
+static void prepare(void) {
+  pthread_mutex_lock(&file_pool.m);
+  pthread_mutex_lock(&dns_pool.m);
+}
+
+static void parent(void) {
+  pthread_mutex_unlock(&dns_pool.m);
+  pthread_mutex_unlock(&file_pool.m);
+}
+
+static void reset(struct pool *p) {
+  pthread_mutex_init(&p->m, NULL);
+  pthread_cond_init(&p->c, NULL);
+  p->head = p->tail = NULL;
+  p->threads = p->idle = 0;
+}
+
+static void child(void) {
+  reset(&file_pool);
+  reset(&dns_pool);
+}
+
+static pthread_once_t once = PTHREAD_ONCE_INIT;
+
+static void init(void) { pthread_atfork(prepare, parent, child); }
+
 static void submit(struct job *j) {
   struct pool *p = j->pool;
+  pthread_once(&once, init);
   pthread_mutex_lock(&p->m);
   j->next = NULL;
   if (p->tail) p->tail->next = j;
