@@ -491,6 +491,7 @@ In the simulator, the sleep is a normal heap entry, so the result is exact. Mile
 - **shield:** a member of S runs a cleanup in a shield, with a `with_timeout` of its own.
 - **fork:** a member of R forks a fiber into S while S can end.
 - **condwait (M2):** as **shield**, but the `sync` is a `Condition.wait` that opens the shield node.
+- **deadline (M3):** as **shield**, but `with_timeout` has the deadline form. The timer is a heap entry that fires only if it wins a CAS on its word, and the body can end by itself and end the entry. A walk of T can then come after T closed. `DeadlineOK`: a `Timeout` comes only after a fire.
 
 TLC checks these properties in each scenario:
 
@@ -1239,15 +1240,16 @@ The sections of this document mark each part that does not come in M0 with its m
 
 - **The Go rules** (section 2.5, Idle and wake) follow `Wake.tla`: a `searching` count with a limit of half of the domains, no wake at a push while a domain searches, the decrease before the second check, and a wake by the last searching domain that finds work. They replace the wake chain of M1. On 8 domains, they halve the wakes of 100,000 short fibers and double the throughput.
 - **The next slot** gets one fiber that a fiber of the domain wakes: the partner of a channel, or the one fiber of an `Enqueue`. A list of more fibers goes to the tail. The limit is 3 runs in sequence. A thief takes a next slot with a CAS after the local queues, and a push to the next slot wakes an idle domain (open question 5).
-- **Pinned fibers.** `~pinned:true` is on `fork`, `fork_promise` and `fork_isolated`. A push of a pinned fiber goes to the pinned queue and wakes domain 0 only if domain 0 is in `idle`: domain 0 checks the pinned queue in its second check, so the pair is a Dekker pair.
+- **Pinned fibers.** `~pinned:true` is on `fork`, `fork_promise` and `fork_isolated`. A push of a pinned fiber goes to the pinned queue, adds one to its count, and wakes domain 0 only if domain 0 is in `idle`: domain 0 reads the count in its second check, so the pair is a Dekker pair. Domain 0 also reads the count before a sleep, because the expire inside `wait` can resume a pinned fiber with no wake. It takes the pinned queue first at most 3 times in sequence, so a pinned fiber that yields does not starve the local queue (the review of M3).
 - **`Ivar.fill_from_outside`** gives `false` if no `run` is active. One `run` at a time takes these fills: `run` keeps its scheduler and the wake of its world in one global slot. A domain applies the requests of the injection queue each 61st take and before a steal.
 - **The deadline form of `with_timeout`** uses a sync word as the state of its heap entry, so the heap drops an ended entry as a stale one. A call that ends at once costs 4.6 times less than with a daemon fiber.
-- **The report of failed promises.** The closure of the finaliser holds the id of the run, not the scheduler: the scheduler can hold the promise in an old slot of a ring. A ring now clears the slot of each pop. The simulator forces a full GC at its end only if a promise of the run failed and no fiber awaited it.
+- **The report of failed promises.** Only a promise that failed gets a finaliser. Its closure holds the id of the run, not the scheduler: the scheduler can hold the promise in an old slot of a ring. A ring does not clear its slots, because a clear is a store on each pop: in production, a report can thus come late. The simulator clears the slots at its end, and it forces a full GC only if a promise of the run failed and no fiber awaited it.
 - **The watchdog** reads a beat of each domain in a Bigarray: one more at the start and at the end of each fiber. It is in the Linux world (`Weft_linux.run ~watchdog`).
-- **`Livelock`.** A switch point with only `Now`, `Switch`, `Random` or a `Wait` that gives nothing is not progress.
+- **`Livelock`.** A switch point with only `Now`, `Switch`, `Random` or a `Wait` that gives nothing is not progress, unless a commit resumed a fiber on that domain since its last step. Thus a long exchange on a channel is progress.
 - **A yield in a read** after 64 KiB with no wait (section 2.7).
 - **A sync on one base event** has a fast path: 60 words instead of 123.
-- **Not done:** the slack stays 1 ms (open question 7 gives the data for a choice), and `Scope.tla` does not cover the deadline form of `with_timeout`.
+- **Not done:** the slack stays 1 ms (open question 7 gives the data for a choice).
+- **Two known limits.** A fill from outside a fiber goes to the run of the global slot, so a finaliser of an earlier run can fill an Ivar of that run in a later run. A stolen fiber stays in the slot of its old ring until a push writes the slot.
 
 ### Why `dscheck` is in M1
 
@@ -1270,12 +1272,12 @@ It has three problems:
 
 The protocols that run on many domains at the same time have models in PlusCal, in `spec/tla`. The TLC model checker examines each order of their steps. Each model has the protocol of this design, and a set of planted bugs. Each planted bug must give a failure. Thus the model can find the errors that matter, and it is not only a model that always passes. Some models also have simplifications (constants with the prefix `Simp`). A simplification must pass, and section 2.5 uses the ones that passed.
 
-Run all of the models with `nix develop -c spec/tla/check.sh`. `MODELS="Ivar Fd"` selects some of them. The script runs `JOBS` cases at the same time (default 4), each one with `-lncheck final`, so that TLC checks the liveness property one time at the end. The 42 cases take about 16 minutes on a machine with 16 CPUs. The slowest case, `Wake.tla` with no bug and 15.3 million states, takes about 11 minutes, and it is the lower limit of the run time. The flake of the repository gives the TLA+ tools.
+Run all of the models with `nix develop -c spec/tla/check.sh`. `MODELS="Ivar Fd"` selects some of them. The script runs `JOBS` cases at the same time (default 4), each one with `-lncheck final`, so that TLC checks the liveness property one time at the end. The 44 cases take about 17 minutes on a machine with 16 CPUs. The slowest case, `Wake.tla` with no bug and 15.3 million states, takes about 11 minutes, and it is the lower limit of the run time. The flake of the repository gives the TLA+ tools.
 
 | Model | Protocol (section) | Properties | Planted bugs that fail |
 |---|---|---|---|
 | `Commit.tla` | The commit of `choose` (2.4) | At most one resume, correct rendezvous pairs, no lost rendezvous, a correct end state, termination | No `Parked` state, no id order, a partner that gives up on `Claimed`, no channel lock |
-| `Scope.tla` | Scopes and cancellation (2.5), and the open shield of `Condition.wait` (M2) | No orphan fiber, no lost exception, the shield holds, no cancel of a foreign `sync`, a closed scope is empty, the timer reaches a condition wait, termination | A join that a cancel can end, a scope in a shield under the outer scope, no check of the chain, an exception after the end, no read of the flags, a condition wait with the outer context. Simplifications that pass: no flags on nested scopes, no second read at a link, and the two together. |
+| `Scope.tla` | Scopes and cancellation (2.5), the open shield of `Condition.wait` (M2), and the deadline form of `with_timeout` (M3) | No orphan fiber, no lost exception, the shield holds, no cancel of a foreign `sync`, a closed scope is empty, the timer reaches a condition wait, termination | A join that a cancel can end, a scope in a shield under the outer scope, no check of the chain, an exception after the end, no read of the flags, a condition wait with the outer context. Simplifications that pass: no flags on nested scopes, no second read at a link, and the two together. |
 | `Ivar.tla` | The atomic register of an `Ivar`, and `Ivar.fill_from_outside` (2.4, 2.5) | At most one resume, one fill, no waiters after the fill, a correct end state, termination | A finaliser that commits the waiters itself, a register that is not atomic |
 | `Wake.tla` | The loop of a domain: idle and wake, steal, next slot, pinned queue, injection queue (2.5) | Each item runs, a pinned item runs only on domain 0, no lost wakeup | The decrease of `searching` after the second check, no second check, a pinned push that wakes any domain. Simplifications that pass: no steal of a next slot, no search limit, no last wake, no `searching` count. |
 | `Fd.tla` | The fd record: `Rcfd`, the registrations, the close notices, the removal (2.7) | One `close(2)`, no `close(2)` of another file, no use after `close(2)`, no `EPOLL_CTL_DEL` of a new file, `EPOLL_CTL_DEL` before `close(2)`, termination | A count and a closed bit, a Register that reads the state first, a registration with no user. A simplification that passes: no CAS on the domain bit. |
@@ -1579,3 +1581,18 @@ Three subagents reviewed the code of M2 (correctness, conformance to the TLA+ mo
 | C12 | Some errors of the simulator file system were not the errors of Linux, and the NUL check of `spawn` did not cover the directory | The errors agree, and a portable test examines them on the two worlds |
 | Q4 | No test examined the completion of a job or the delivery of a signal with a cancel from another domain | Two `dscheck` tests, and each one finds a planted bug |
 | K1 to K9 | Copies of the range check and of the write loop, of the test helpers, of the errno table and of the close of a pipe end, two atomics in a promise, and a list for each event in the wait of Linux | Each one is simpler |
+
+## 3.9 The review of M3, 2026-10-12
+
+Three subagents reviewed the code of M3 (correctness, conformance to the TLA+ models, and complexity). Each finding of this table is fixed. Each bug has a regression test that fails when the old code is put back.
+
+| No. | Finding | Fix |
+|---|---|---|
+| A, C1 | The expire inside `wait` can resume a pinned fiber on domain 0 with no wake, and domain 0 then slept with the fiber in its queue. A pinned fiber with many short sleeps hung on Linux within 30 sleeps. The simulator cannot find this: its time moves only at a quiescence | Domain 0 reads the count of the pinned queue before a sleep (2.14, the state of M3) |
+| B, C2 | A pinned fiber that yields starved the local queue of domain 0: with one domain, the program hung | At most 3 runs of the pinned queue in sequence |
+| Q2 | No `dscheck` test examined the pinned push against the second check of domain 0 | A test, and it finds a planted bug |
+| Q5 | `Scope.tla` did not cover the deadline form of `with_timeout` | The scenario **deadline** (2.16) |
+| C3 | `Sim.run` did not restore the report of promises when the run raised | The restore runs also on an exception |
+| C4 | A long exchange on a channel gave a false `Livelock` | A resume is progress |
+| C5 | The watchdog accepted a limit of 0, and its thread then did not wait | `Invalid_argument` |
+| K1 to K13 | Two atomic operations and a lock on each take, a store on each pop, a finaliser for each promise, knobs that only the benchmark used, copies of the CAS push and of the `timerfd` stubs, and a log of the simulator that only one test read | Each one is simpler |

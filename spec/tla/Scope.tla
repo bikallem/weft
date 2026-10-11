@@ -17,6 +17,10 @@
 (*   "error"   G1 fails, and G2 is a daemon of S.                          *)
 (*   "shield"  G1 runs its cleanup in a shield with a with_timeout (TT).   *)
 (*   "fork"    K forks G3 into S while S can end.                          *)
+(*   "deadline" as "shield", but with_timeout has the deadline form (M3):  *)
+(*             TT is a heap entry, not a member of T, and it fires only if *)
+(*             it wins a CAS on the word of the entry. The body of G1 can  *)
+(*             also end by itself, and then end the entry.                 *)
 (*   "condwait" as "shield", but the sync of G1 is a Condition.wait in    *)
 (*             use_rw ~protect:true: the wait opens the shield node H, so *)
 (*             the cancels of S and R also reach it (M2).                 *)
@@ -95,7 +99,8 @@ variables
   sRes = "none",             \* the result of Fiber.scope S
   tRes = "none",             \* the scope whose cancel ended G1's sync in T
   toRes = "none",            \* the result of with_timeout in G1
-  hOpen = FALSE;             \* the condition wait opened the shield node H
+  hOpen = FALSE,             \* the condition wait opened the shield node H
+  ttWord = "Live";           \* the deadline form: "Live", "Dead" or "Fired"
 
 define {
   \* The first cancelled context on the chain from c, up to a shield.
@@ -214,7 +219,8 @@ b3:
 c1:
     linked["H"] := TRUE;                                \* Fiber.shield
 c2:
-    linked["T"] := TRUE || members["T"] := {"G1", "TT"};  \* with_timeout
+    linked["T"] := TRUE
+      || members["T"] := IF Scenario = "deadline" THEN {"G1"} ELSE {"G1", "TT"};
 c3:
     if (~SimpNoRecheck /\ cancelled[Parent("T")]) { cancelled["T"] := TRUE; };
 c4:
@@ -225,15 +231,23 @@ c4p:
 c5:
     readFlags("G1", rec["G1"].ctx);
 c6:
-    park("G1");
+    \* In the deadline form, the body can also end by itself.
+    if (Scenario = "deadline") {
+      either { park("G1"); }
+      or { if (rec["G1"].w = "W") { rec["G1"] := [rec["G1"] EXCEPT !.w = "D", !.rs = "self"]; }; };
+    } else { park("G1"); };
 c7:
     await rec["G1"].w = "D";
     tRes := rec["G1"].rs;
     hOpen := FALSE;
+c7d:
+    \* The end of the body ends the entry: a CAS from Live to Dead.
+    if (Scenario = "deadline" /\ ttWord = "Live") { ttWord := "Dead"; };
 c8:
     await members["T"] = {"G1"};                        \* the join of T
     members["T"] := {};
-    toRes := IF tRes = "T" THEN "Timeout" ELSE "Cancelled";
+    toRes := IF tRes = "self" THEN "value"
+             ELSE IF tRes = "T" THEN "Timeout" ELSE "Cancelled";
 c9:
     publish("G1", "S");                                       \* after the shield
 c10:
@@ -299,10 +313,16 @@ e4:
 \* TT: the timer of with_timeout in G1. It fires after its sleep.
 fair process (tt = "TT") {
 t0:
-  if (Scenario \notin {"shield", "condwait"}) { goto Done; };
+  if (Scenario \notin {"shield", "condwait", "deadline"}) { goto Done; };
 t1:
   await linked["T"];
-  call walk("T");
+  if (Scenario = "deadline") {
+    \* The owner of the heap fires the entry only if it wins the CAS. Its walk
+    \* can come after T closed.
+    if (ttWord = "Live") { ttWord := "Fired"; call walk("T"); };
+  } else {
+    call walk("T");
+  };
 t2:
   members["T"] := members["T"] \ {"TT"};
 }
@@ -319,7 +339,7 @@ x1:
 \* BEGIN TRANSLATION
 CONSTANT defaultInitValue
 VARIABLES cancelled, linked, members, closed, exnS, rec, g1Path, g3, sRes, 
-          tRes, toRes, hOpen, pc, stack
+          tRes, toRes, hOpen, ttWord, pc, stack
 
 (* define statement *)
 RECURSIVE FirstFlag(_)
@@ -330,7 +350,7 @@ FirstFlag(c) ==
 VARIABLES x, wt, wf, fx
 
 vars == << cancelled, linked, members, closed, exnS, rec, g1Path, g3, sRes, 
-           tRes, toRes, hOpen, pc, stack, x, wt, wf, fx >>
+           tRes, toRes, hOpen, ttWord, pc, stack, x, wt, wf, fx >>
 
 ProcSet == {"F0"} \cup {"G1"} \cup {"G2"} \cup {"K"} \cup {"G3"} \cup {"TT"} \cup {"C"}
 
@@ -348,6 +368,7 @@ Init == (* Global variables *)
         /\ tRes = "none"
         /\ toRes = "none"
         /\ hOpen = FALSE
+        /\ ttWord = "Live"
         (* Procedure walk *)
         /\ x = [ self \in ProcSet |-> defaultInitValue]
         /\ wt = [ self \in ProcSet |-> {}]
@@ -367,7 +388,7 @@ w1(self) == /\ pc[self] = "w1"
             /\ wt' = [wt EXCEPT ![self] = {x[self]}]
             /\ pc' = [pc EXCEPT ![self] = "w2"]
             /\ UNCHANGED << linked, members, closed, exnS, rec, g1Path, g3, 
-                            sRes, tRes, toRes, hOpen, stack, x, wf, fx >>
+                            sRes, tRes, toRes, hOpen, ttWord, stack, x, wf, fx >>
 
 w2(self) == /\ pc[self] = "w2"
             /\ IF wt[self] # {}
@@ -383,7 +404,7 @@ w2(self) == /\ pc[self] = "w2"
                   ELSE /\ pc' = [pc EXCEPT ![self] = "w3"]
                        /\ UNCHANGED << cancelled, wt, wf >>
             /\ UNCHANGED << linked, members, closed, exnS, rec, g1Path, g3, 
-                            sRes, tRes, toRes, hOpen, stack, x, fx >>
+                            sRes, tRes, toRes, hOpen, ttWord, stack, x, fx >>
 
 w3(self) == /\ pc[self] = "w3"
             /\ IF wf[self] # {}
@@ -398,7 +419,7 @@ w3(self) == /\ pc[self] = "w3"
                   ELSE /\ pc' = [pc EXCEPT ![self] = "w4"]
                        /\ UNCHANGED << rec, wf, fx >>
             /\ UNCHANGED << cancelled, linked, members, closed, exnS, g1Path, 
-                            g3, sRes, tRes, toRes, hOpen, stack, x, wt >>
+                            g3, sRes, tRes, toRes, hOpen, ttWord, stack, x, wt >>
 
 w4(self) == /\ pc[self] = "w4"
             /\ pc' = [pc EXCEPT ![self] = Head(stack[self]).pc]
@@ -408,7 +429,7 @@ w4(self) == /\ pc[self] = "w4"
             /\ x' = [x EXCEPT ![self] = Head(stack[self]).x]
             /\ stack' = [stack EXCEPT ![self] = Tail(stack[self])]
             /\ UNCHANGED << cancelled, linked, members, closed, exnS, rec, 
-                            g1Path, g3, sRes, tRes, toRes, hOpen >>
+                            g1Path, g3, sRes, tRes, toRes, hOpen, ttWord >>
 
 walk(self) == w1(self) \/ w2(self) \/ w3(self) \/ w4(self)
 
@@ -417,7 +438,7 @@ a1 == /\ pc["F0"] = "a1"
          /\ members' = [members EXCEPT !["S"] = {"F0"}]
       /\ pc' = [pc EXCEPT !["F0"] = "a2"]
       /\ UNCHANGED << cancelled, closed, exnS, rec, g1Path, g3, sRes, tRes, 
-                      toRes, hOpen, stack, x, wt, wf, fx >>
+                      toRes, hOpen, ttWord, stack, x, wt, wf, fx >>
 
 a2 == /\ pc["F0"] = "a2"
       /\ IF ~SimpNoRecheck /\ cancelled["R"]
@@ -426,7 +447,7 @@ a2 == /\ pc["F0"] = "a2"
                  /\ UNCHANGED cancelled
       /\ pc' = [pc EXCEPT !["F0"] = "a3"]
       /\ UNCHANGED << linked, members, closed, exnS, rec, g1Path, g3, sRes, 
-                      tRes, toRes, hOpen, stack, x, wt, wf, fx >>
+                      tRes, toRes, hOpen, ttWord, stack, x, wt, wf, fx >>
 
 a3 == /\ pc["F0"] = "a3"
       /\ /\ linked' = [linked EXCEPT !["D2"] = TRUE]
@@ -434,13 +455,13 @@ a3 == /\ pc["F0"] = "a3"
                                        !["D2"] = IF Scenario = "error" THEN {"G2"} ELSE {}]
       /\ pc' = [pc EXCEPT !["F0"] = "a4"]
       /\ UNCHANGED << cancelled, closed, exnS, rec, g1Path, g3, sRes, tRes, 
-                      toRes, hOpen, stack, x, wt, wf, fx >>
+                      toRes, hOpen, ttWord, stack, x, wt, wf, fx >>
 
 a4 == /\ pc["F0"] = "a4"
       /\ rec' = [rec EXCEPT !["F0"] = [ctx |-> "S", w |-> "W", rs |-> "none", op |-> hOpen]]
       /\ pc' = [pc EXCEPT !["F0"] = "a5"]
       /\ UNCHANGED << cancelled, linked, members, closed, exnS, g1Path, g3, 
-                      sRes, tRes, toRes, hOpen, stack, x, wt, wf, fx >>
+                      sRes, tRes, toRes, hOpen, ttWord, stack, x, wt, wf, fx >>
 
 a5 == /\ pc["F0"] = "a5"
       /\ IF ~BugNoFlagCheck /\ FirstFlag("S") # "none" /\ rec["F0"].w = "W"
@@ -449,7 +470,7 @@ a5 == /\ pc["F0"] = "a5"
                  /\ rec' = rec
       /\ pc' = [pc EXCEPT !["F0"] = "a6"]
       /\ UNCHANGED << cancelled, linked, members, closed, exnS, g1Path, g3, 
-                      sRes, tRes, toRes, hOpen, stack, x, wt, wf, fx >>
+                      sRes, tRes, toRes, hOpen, ttWord, stack, x, wt, wf, fx >>
 
 a6 == /\ pc["F0"] = "a6"
       /\ IF rec["F0"].w = "W"
@@ -458,27 +479,29 @@ a6 == /\ pc["F0"] = "a6"
                  /\ rec' = rec
       /\ pc' = [pc EXCEPT !["F0"] = "a7"]
       /\ UNCHANGED << cancelled, linked, members, closed, exnS, g1Path, g3, 
-                      sRes, tRes, toRes, hOpen, stack, x, wt, wf, fx >>
+                      sRes, tRes, toRes, hOpen, ttWord, stack, x, wt, wf, fx >>
 
 a7 == /\ pc["F0"] = "a7"
       /\ rec["F0"].w = "D"
       /\ members' = [members EXCEPT !["S"] = members["S"] \ {"F0"}]
       /\ pc' = [pc EXCEPT !["F0"] = "a8"]
       /\ UNCHANGED << cancelled, linked, closed, exnS, rec, g1Path, g3, sRes, 
-                      tRes, toRes, hOpen, stack, x, wt, wf, fx >>
+                      tRes, toRes, hOpen, ttWord, stack, x, wt, wf, fx >>
 
 a8 == /\ pc["F0"] = "a8"
       /\ IF BugJoinCancellable /\ FirstFlag("S") # "none"
             THEN /\ pc' = [pc EXCEPT !["F0"] = "a11"]
             ELSE /\ pc' = [pc EXCEPT !["F0"] = "a8w"]
       /\ UNCHANGED << cancelled, linked, members, closed, exnS, rec, g1Path, 
-                      g3, sRes, tRes, toRes, hOpen, stack, x, wt, wf, fx >>
+                      g3, sRes, tRes, toRes, hOpen, ttWord, stack, x, wt, wf, 
+                      fx >>
 
 a8w == /\ pc["F0"] = "a8w"
        /\ members["S"] = {}
        /\ pc' = [pc EXCEPT !["F0"] = "a9"]
        /\ UNCHANGED << cancelled, linked, members, closed, exnS, rec, g1Path, 
-                       g3, sRes, tRes, toRes, hOpen, stack, x, wt, wf, fx >>
+                       g3, sRes, tRes, toRes, hOpen, ttWord, stack, x, wt, wf, 
+                       fx >>
 
 a9 == /\ pc["F0"] = "a9"
       /\ /\ stack' = [stack EXCEPT !["F0"] = << [ procedure |->  "walk",
@@ -494,27 +517,27 @@ a9 == /\ pc["F0"] = "a9"
       /\ fx' = [fx EXCEPT !["F0"] = "none"]
       /\ pc' = [pc EXCEPT !["F0"] = "w1"]
       /\ UNCHANGED << cancelled, linked, members, closed, exnS, rec, g1Path, 
-                      g3, sRes, tRes, toRes, hOpen >>
+                      g3, sRes, tRes, toRes, hOpen, ttWord >>
 
 a10 == /\ pc["F0"] = "a10"
        /\ members["S"] = {} /\ members["D2"] = {}
        /\ closed' = TRUE
        /\ pc' = [pc EXCEPT !["F0"] = "a11"]
        /\ UNCHANGED << cancelled, linked, members, exnS, rec, g1Path, g3, sRes, 
-                       tRes, toRes, hOpen, stack, x, wt, wf, fx >>
+                       tRes, toRes, hOpen, ttWord, stack, x, wt, wf, fx >>
 
 a11 == /\ pc["F0"] = "a11"
        /\ sRes' = (IF exnS # "none" THEN "exn"
                    ELSE IF FirstFlag("S") # "none" THEN "cancelled" ELSE "ok")
        /\ pc' = [pc EXCEPT !["F0"] = "a12"]
        /\ UNCHANGED << cancelled, linked, members, closed, exnS, rec, g1Path, 
-                       g3, tRes, toRes, hOpen, stack, x, wt, wf, fx >>
+                       g3, tRes, toRes, hOpen, ttWord, stack, x, wt, wf, fx >>
 
 a12 == /\ pc["F0"] = "a12"
        /\ rec' = [rec EXCEPT !["F0"] = [ctx |-> "R", w |-> "W", rs |-> "none", op |-> hOpen]]
        /\ pc' = [pc EXCEPT !["F0"] = "a13"]
        /\ UNCHANGED << cancelled, linked, members, closed, exnS, g1Path, g3, 
-                       sRes, tRes, toRes, hOpen, stack, x, wt, wf, fx >>
+                       sRes, tRes, toRes, hOpen, ttWord, stack, x, wt, wf, fx >>
 
 a13 == /\ pc["F0"] = "a13"
        /\ IF ~BugNoFlagCheck /\ FirstFlag("R") # "none" /\ rec["F0"].w = "W"
@@ -523,7 +546,7 @@ a13 == /\ pc["F0"] = "a13"
                   /\ rec' = rec
        /\ pc' = [pc EXCEPT !["F0"] = "a14"]
        /\ UNCHANGED << cancelled, linked, members, closed, exnS, g1Path, g3, 
-                       sRes, tRes, toRes, hOpen, stack, x, wt, wf, fx >>
+                       sRes, tRes, toRes, hOpen, ttWord, stack, x, wt, wf, fx >>
 
 a14 == /\ pc["F0"] = "a14"
        /\ IF rec["F0"].w = "W"
@@ -532,20 +555,21 @@ a14 == /\ pc["F0"] = "a14"
                   /\ rec' = rec
        /\ pc' = [pc EXCEPT !["F0"] = "a15"]
        /\ UNCHANGED << cancelled, linked, members, closed, exnS, g1Path, g3, 
-                       sRes, tRes, toRes, hOpen, stack, x, wt, wf, fx >>
+                       sRes, tRes, toRes, hOpen, ttWord, stack, x, wt, wf, fx >>
 
 a15 == /\ pc["F0"] = "a15"
        /\ rec["F0"].w = "D"
        /\ members' = [members EXCEPT !["R"] = members["R"] \ {"F0"}]
        /\ pc' = [pc EXCEPT !["F0"] = "a16"]
        /\ UNCHANGED << cancelled, linked, closed, exnS, rec, g1Path, g3, sRes, 
-                       tRes, toRes, hOpen, stack, x, wt, wf, fx >>
+                       tRes, toRes, hOpen, ttWord, stack, x, wt, wf, fx >>
 
 a16 == /\ pc["F0"] = "a16"
        /\ members["R"] = {}
        /\ pc' = [pc EXCEPT !["F0"] = "Done"]
        /\ UNCHANGED << cancelled, linked, members, closed, exnS, rec, g1Path, 
-                       g3, sRes, tRes, toRes, hOpen, stack, x, wt, wf, fx >>
+                       g3, sRes, tRes, toRes, hOpen, ttWord, stack, x, wt, wf, 
+                       fx >>
 
 f0 == a1 \/ a2 \/ a3 \/ a4 \/ a5 \/ a6 \/ a7 \/ a8 \/ a8w \/ a9 \/ a10
          \/ a11 \/ a12 \/ a13 \/ a14 \/ a15 \/ a16
@@ -555,7 +579,8 @@ b0 == /\ pc["G1"] = "b0"
             THEN /\ pc' = [pc EXCEPT !["G1"] = "Done"]
             ELSE /\ pc' = [pc EXCEPT !["G1"] = "bw"]
       /\ UNCHANGED << cancelled, linked, members, closed, exnS, rec, g1Path, 
-                      g3, sRes, tRes, toRes, hOpen, stack, x, wt, wf, fx >>
+                      g3, sRes, tRes, toRes, hOpen, ttWord, stack, x, wt, wf, 
+                      fx >>
 
 bw == /\ pc["G1"] = "bw"
       /\ "G1" \in members["S"]
@@ -565,7 +590,7 @@ bw == /\ pc["G1"] = "bw"
             ELSE /\ g1Path' = "shield"
                  /\ pc' = [pc EXCEPT !["G1"] = "c1"]
       /\ UNCHANGED << cancelled, linked, members, closed, exnS, rec, g3, sRes, 
-                      tRes, toRes, hOpen, stack, x, wt, wf, fx >>
+                      tRes, toRes, hOpen, ttWord, stack, x, wt, wf, fx >>
 
 b1 == /\ pc["G1"] = "b1"
       /\ IF BugExnAfterEnd
@@ -575,7 +600,7 @@ b1 == /\ pc["G1"] = "b1"
                  /\ UNCHANGED members
       /\ pc' = [pc EXCEPT !["G1"] = "b2"]
       /\ UNCHANGED << cancelled, linked, closed, rec, g1Path, g3, sRes, tRes, 
-                      toRes, hOpen, stack, x, wt, wf, fx >>
+                      toRes, hOpen, ttWord, stack, x, wt, wf, fx >>
 
 b2 == /\ pc["G1"] = "b2"
       /\ IF BugExnAfterEnd
@@ -585,7 +610,7 @@ b2 == /\ pc["G1"] = "b2"
                  /\ exnS' = exnS
       /\ pc' = [pc EXCEPT !["G1"] = "b3"]
       /\ UNCHANGED << cancelled, linked, closed, rec, g1Path, g3, sRes, tRes, 
-                      toRes, hOpen, stack, x, wt, wf, fx >>
+                      toRes, hOpen, ttWord, stack, x, wt, wf, fx >>
 
 b3 == /\ pc["G1"] = "b3"
       /\ /\ stack' = [stack EXCEPT !["G1"] = << [ procedure |->  "walk",
@@ -601,20 +626,20 @@ b3 == /\ pc["G1"] = "b3"
       /\ fx' = [fx EXCEPT !["G1"] = "none"]
       /\ pc' = [pc EXCEPT !["G1"] = "w1"]
       /\ UNCHANGED << cancelled, linked, members, closed, exnS, rec, g1Path, 
-                      g3, sRes, tRes, toRes, hOpen >>
+                      g3, sRes, tRes, toRes, hOpen, ttWord >>
 
 c1 == /\ pc["G1"] = "c1"
       /\ linked' = [linked EXCEPT !["H"] = TRUE]
       /\ pc' = [pc EXCEPT !["G1"] = "c2"]
       /\ UNCHANGED << cancelled, members, closed, exnS, rec, g1Path, g3, sRes, 
-                      tRes, toRes, hOpen, stack, x, wt, wf, fx >>
+                      tRes, toRes, hOpen, ttWord, stack, x, wt, wf, fx >>
 
 c2 == /\ pc["G1"] = "c2"
       /\ /\ linked' = [linked EXCEPT !["T"] = TRUE]
-         /\ members' = [members EXCEPT !["T"] = {"G1", "TT"}]
+         /\ members' = [members EXCEPT !["T"] = IF Scenario = "deadline" THEN {"G1"} ELSE {"G1", "TT"}]
       /\ pc' = [pc EXCEPT !["G1"] = "c3"]
       /\ UNCHANGED << cancelled, closed, exnS, rec, g1Path, g3, sRes, tRes, 
-                      toRes, hOpen, stack, x, wt, wf, fx >>
+                      toRes, hOpen, ttWord, stack, x, wt, wf, fx >>
 
 c3 == /\ pc["G1"] = "c3"
       /\ IF ~SimpNoRecheck /\ cancelled[Parent("T")]
@@ -623,7 +648,7 @@ c3 == /\ pc["G1"] = "c3"
                  /\ UNCHANGED cancelled
       /\ pc' = [pc EXCEPT !["G1"] = "c4"]
       /\ UNCHANGED << linked, members, closed, exnS, rec, g1Path, g3, sRes, 
-                      tRes, toRes, hOpen, stack, x, wt, wf, fx >>
+                      tRes, toRes, hOpen, ttWord, stack, x, wt, wf, fx >>
 
 c4 == /\ pc["G1"] = "c4"
       /\ IF Scenario = "condwait" /\ ~BugCondOuterCtx
@@ -632,13 +657,13 @@ c4 == /\ pc["G1"] = "c4"
                  /\ hOpen' = hOpen
       /\ pc' = [pc EXCEPT !["G1"] = "c4p"]
       /\ UNCHANGED << cancelled, linked, members, closed, exnS, rec, g1Path, 
-                      g3, sRes, tRes, toRes, stack, x, wt, wf, fx >>
+                      g3, sRes, tRes, toRes, ttWord, stack, x, wt, wf, fx >>
 
 c4p == /\ pc["G1"] = "c4p"
        /\ rec' = [rec EXCEPT !["G1"] = [ctx |-> (IF Scenario = "condwait" /\ BugCondOuterCtx THEN "S" ELSE "T"), w |-> "W", rs |-> "none", op |-> hOpen]]
        /\ pc' = [pc EXCEPT !["G1"] = "c5"]
        /\ UNCHANGED << cancelled, linked, members, closed, exnS, g1Path, g3, 
-                       sRes, tRes, toRes, hOpen, stack, x, wt, wf, fx >>
+                       sRes, tRes, toRes, hOpen, ttWord, stack, x, wt, wf, fx >>
 
 c5 == /\ pc["G1"] = "c5"
       /\ IF ~BugNoFlagCheck /\ FirstFlag((rec["G1"].ctx)) # "none" /\ rec["G1"].w = "W"
@@ -647,38 +672,57 @@ c5 == /\ pc["G1"] = "c5"
                  /\ rec' = rec
       /\ pc' = [pc EXCEPT !["G1"] = "c6"]
       /\ UNCHANGED << cancelled, linked, members, closed, exnS, g1Path, g3, 
-                      sRes, tRes, toRes, hOpen, stack, x, wt, wf, fx >>
+                      sRes, tRes, toRes, hOpen, ttWord, stack, x, wt, wf, fx >>
 
 c6 == /\ pc["G1"] = "c6"
-      /\ IF rec["G1"].w = "W"
-            THEN /\ rec' = [rec EXCEPT !["G1"].w = "P"]
-            ELSE /\ TRUE
-                 /\ rec' = rec
+      /\ IF Scenario = "deadline"
+            THEN /\ \/ /\ IF rec["G1"].w = "W"
+                             THEN /\ rec' = [rec EXCEPT !["G1"].w = "P"]
+                             ELSE /\ TRUE
+                                  /\ rec' = rec
+                    \/ /\ IF rec["G1"].w = "W"
+                             THEN /\ rec' = [rec EXCEPT !["G1"] = [rec["G1"] EXCEPT !.w = "D", !.rs = "self"]]
+                             ELSE /\ TRUE
+                                  /\ rec' = rec
+            ELSE /\ IF rec["G1"].w = "W"
+                       THEN /\ rec' = [rec EXCEPT !["G1"].w = "P"]
+                       ELSE /\ TRUE
+                            /\ rec' = rec
       /\ pc' = [pc EXCEPT !["G1"] = "c7"]
       /\ UNCHANGED << cancelled, linked, members, closed, exnS, g1Path, g3, 
-                      sRes, tRes, toRes, hOpen, stack, x, wt, wf, fx >>
+                      sRes, tRes, toRes, hOpen, ttWord, stack, x, wt, wf, fx >>
 
 c7 == /\ pc["G1"] = "c7"
       /\ rec["G1"].w = "D"
       /\ tRes' = rec["G1"].rs
       /\ hOpen' = FALSE
-      /\ pc' = [pc EXCEPT !["G1"] = "c8"]
+      /\ pc' = [pc EXCEPT !["G1"] = "c7d"]
       /\ UNCHANGED << cancelled, linked, members, closed, exnS, rec, g1Path, 
-                      g3, sRes, toRes, stack, x, wt, wf, fx >>
+                      g3, sRes, toRes, ttWord, stack, x, wt, wf, fx >>
+
+c7d == /\ pc["G1"] = "c7d"
+       /\ IF Scenario = "deadline" /\ ttWord = "Live"
+             THEN /\ ttWord' = "Dead"
+             ELSE /\ TRUE
+                  /\ UNCHANGED ttWord
+       /\ pc' = [pc EXCEPT !["G1"] = "c8"]
+       /\ UNCHANGED << cancelled, linked, members, closed, exnS, rec, g1Path, 
+                       g3, sRes, tRes, toRes, hOpen, stack, x, wt, wf, fx >>
 
 c8 == /\ pc["G1"] = "c8"
       /\ members["T"] = {"G1"}
       /\ members' = [members EXCEPT !["T"] = {}]
-      /\ toRes' = (IF tRes = "T" THEN "Timeout" ELSE "Cancelled")
+      /\ toRes' = (IF tRes = "self" THEN "value"
+                   ELSE IF tRes = "T" THEN "Timeout" ELSE "Cancelled")
       /\ pc' = [pc EXCEPT !["G1"] = "c9"]
       /\ UNCHANGED << cancelled, linked, closed, exnS, rec, g1Path, g3, sRes, 
-                      tRes, hOpen, stack, x, wt, wf, fx >>
+                      tRes, hOpen, ttWord, stack, x, wt, wf, fx >>
 
 c9 == /\ pc["G1"] = "c9"
       /\ rec' = [rec EXCEPT !["G1"] = [ctx |-> "S", w |-> "W", rs |-> "none", op |-> hOpen]]
       /\ pc' = [pc EXCEPT !["G1"] = "c10"]
       /\ UNCHANGED << cancelled, linked, members, closed, exnS, g1Path, g3, 
-                      sRes, tRes, toRes, hOpen, stack, x, wt, wf, fx >>
+                      sRes, tRes, toRes, hOpen, ttWord, stack, x, wt, wf, fx >>
 
 c10 == /\ pc["G1"] = "c10"
        /\ IF ~BugNoFlagCheck /\ FirstFlag("S") # "none" /\ rec["G1"].w = "W"
@@ -687,7 +731,7 @@ c10 == /\ pc["G1"] = "c10"
                   /\ rec' = rec
        /\ pc' = [pc EXCEPT !["G1"] = "c11"]
        /\ UNCHANGED << cancelled, linked, members, closed, exnS, g1Path, g3, 
-                       sRes, tRes, toRes, hOpen, stack, x, wt, wf, fx >>
+                       sRes, tRes, toRes, hOpen, ttWord, stack, x, wt, wf, fx >>
 
 c11 == /\ pc["G1"] = "c11"
        /\ IF rec["G1"].w = "W"
@@ -696,36 +740,38 @@ c11 == /\ pc["G1"] = "c11"
                   /\ rec' = rec
        /\ pc' = [pc EXCEPT !["G1"] = "c12"]
        /\ UNCHANGED << cancelled, linked, members, closed, exnS, g1Path, g3, 
-                       sRes, tRes, toRes, hOpen, stack, x, wt, wf, fx >>
+                       sRes, tRes, toRes, hOpen, ttWord, stack, x, wt, wf, fx >>
 
 c12 == /\ pc["G1"] = "c12"
        /\ rec["G1"].w = "D"
        /\ members' = [members EXCEPT !["S"] = members["S"] \ {"G1"}]
        /\ pc' = [pc EXCEPT !["G1"] = "Done"]
        /\ UNCHANGED << cancelled, linked, closed, exnS, rec, g1Path, g3, sRes, 
-                       tRes, toRes, hOpen, stack, x, wt, wf, fx >>
+                       tRes, toRes, hOpen, ttWord, stack, x, wt, wf, fx >>
 
 g1 == b0 \/ bw \/ b1 \/ b2 \/ b3 \/ c1 \/ c2 \/ c3 \/ c4 \/ c4p \/ c5 \/ c6
-         \/ c7 \/ c8 \/ c9 \/ c10 \/ c11 \/ c12
+         \/ c7 \/ c7d \/ c8 \/ c9 \/ c10 \/ c11 \/ c12
 
 d0 == /\ pc["G2"] = "d0"
       /\ IF Scenario # "error"
             THEN /\ pc' = [pc EXCEPT !["G2"] = "Done"]
             ELSE /\ pc' = [pc EXCEPT !["G2"] = "dw"]
       /\ UNCHANGED << cancelled, linked, members, closed, exnS, rec, g1Path, 
-                      g3, sRes, tRes, toRes, hOpen, stack, x, wt, wf, fx >>
+                      g3, sRes, tRes, toRes, hOpen, ttWord, stack, x, wt, wf, 
+                      fx >>
 
 dw == /\ pc["G2"] = "dw"
       /\ "G2" \in members["D2"]
       /\ pc' = [pc EXCEPT !["G2"] = "d1"]
       /\ UNCHANGED << cancelled, linked, members, closed, exnS, rec, g1Path, 
-                      g3, sRes, tRes, toRes, hOpen, stack, x, wt, wf, fx >>
+                      g3, sRes, tRes, toRes, hOpen, ttWord, stack, x, wt, wf, 
+                      fx >>
 
 d1 == /\ pc["G2"] = "d1"
       /\ rec' = [rec EXCEPT !["G2"] = [ctx |-> "D2", w |-> "W", rs |-> "none", op |-> hOpen]]
       /\ pc' = [pc EXCEPT !["G2"] = "d2"]
       /\ UNCHANGED << cancelled, linked, members, closed, exnS, g1Path, g3, 
-                      sRes, tRes, toRes, hOpen, stack, x, wt, wf, fx >>
+                      sRes, tRes, toRes, hOpen, ttWord, stack, x, wt, wf, fx >>
 
 d2 == /\ pc["G2"] = "d2"
       /\ IF ~BugNoFlagCheck /\ FirstFlag("D2") # "none" /\ rec["G2"].w = "W"
@@ -734,7 +780,7 @@ d2 == /\ pc["G2"] = "d2"
                  /\ rec' = rec
       /\ pc' = [pc EXCEPT !["G2"] = "d3"]
       /\ UNCHANGED << cancelled, linked, members, closed, exnS, g1Path, g3, 
-                      sRes, tRes, toRes, hOpen, stack, x, wt, wf, fx >>
+                      sRes, tRes, toRes, hOpen, ttWord, stack, x, wt, wf, fx >>
 
 d3 == /\ pc["G2"] = "d3"
       /\ IF rec["G2"].w = "W"
@@ -743,14 +789,14 @@ d3 == /\ pc["G2"] = "d3"
                  /\ rec' = rec
       /\ pc' = [pc EXCEPT !["G2"] = "d4"]
       /\ UNCHANGED << cancelled, linked, members, closed, exnS, g1Path, g3, 
-                      sRes, tRes, toRes, hOpen, stack, x, wt, wf, fx >>
+                      sRes, tRes, toRes, hOpen, ttWord, stack, x, wt, wf, fx >>
 
 d4 == /\ pc["G2"] = "d4"
       /\ rec["G2"].w = "D"
       /\ members' = [members EXCEPT !["D2"] = {}]
       /\ pc' = [pc EXCEPT !["G2"] = "Done"]
       /\ UNCHANGED << cancelled, linked, closed, exnS, rec, g1Path, g3, sRes, 
-                      tRes, toRes, hOpen, stack, x, wt, wf, fx >>
+                      tRes, toRes, hOpen, ttWord, stack, x, wt, wf, fx >>
 
 g2 == d0 \/ dw \/ d1 \/ d2 \/ d3 \/ d4
 
@@ -759,7 +805,8 @@ k0 == /\ pc["K"] = "k0"
             THEN /\ pc' = [pc EXCEPT !["K"] = "Done"]
             ELSE /\ pc' = [pc EXCEPT !["K"] = "k1"]
       /\ UNCHANGED << cancelled, linked, members, closed, exnS, rec, g1Path, 
-                      g3, sRes, tRes, toRes, hOpen, stack, x, wt, wf, fx >>
+                      g3, sRes, tRes, toRes, hOpen, ttWord, stack, x, wt, wf, 
+                      fx >>
 
 k1 == /\ pc["K"] = "k1"
       /\ IF linked["S"] /\ ~closed /\ FirstFlag("S") = "none"
@@ -769,13 +816,13 @@ k1 == /\ pc["K"] = "k1"
                  /\ UNCHANGED members
       /\ pc' = [pc EXCEPT !["K"] = "k2"]
       /\ UNCHANGED << cancelled, linked, closed, exnS, rec, g1Path, sRes, tRes, 
-                      toRes, hOpen, stack, x, wt, wf, fx >>
+                      toRes, hOpen, ttWord, stack, x, wt, wf, fx >>
 
 k2 == /\ pc["K"] = "k2"
       /\ members' = [members EXCEPT !["R"] = members["R"] \ {"K"}]
       /\ pc' = [pc EXCEPT !["K"] = "Done"]
       /\ UNCHANGED << cancelled, linked, closed, exnS, rec, g1Path, g3, sRes, 
-                      tRes, toRes, hOpen, stack, x, wt, wf, fx >>
+                      tRes, toRes, hOpen, ttWord, stack, x, wt, wf, fx >>
 
 k == k0 \/ k1 \/ k2
 
@@ -785,13 +832,14 @@ e0 == /\ pc["G3"] = "e0"
             THEN /\ pc' = [pc EXCEPT !["G3"] = "Done"]
             ELSE /\ pc' = [pc EXCEPT !["G3"] = "e1"]
       /\ UNCHANGED << cancelled, linked, members, closed, exnS, rec, g1Path, 
-                      g3, sRes, tRes, toRes, hOpen, stack, x, wt, wf, fx >>
+                      g3, sRes, tRes, toRes, hOpen, ttWord, stack, x, wt, wf, 
+                      fx >>
 
 e1 == /\ pc["G3"] = "e1"
       /\ rec' = [rec EXCEPT !["G3"] = [ctx |-> "S", w |-> "W", rs |-> "none", op |-> hOpen]]
       /\ pc' = [pc EXCEPT !["G3"] = "e2"]
       /\ UNCHANGED << cancelled, linked, members, closed, exnS, g1Path, g3, 
-                      sRes, tRes, toRes, hOpen, stack, x, wt, wf, fx >>
+                      sRes, tRes, toRes, hOpen, ttWord, stack, x, wt, wf, fx >>
 
 e2 == /\ pc["G3"] = "e2"
       /\ IF ~BugNoFlagCheck /\ FirstFlag("S") # "none" /\ rec["G3"].w = "W"
@@ -800,7 +848,7 @@ e2 == /\ pc["G3"] = "e2"
                  /\ rec' = rec
       /\ pc' = [pc EXCEPT !["G3"] = "e3"]
       /\ UNCHANGED << cancelled, linked, members, closed, exnS, g1Path, g3, 
-                      sRes, tRes, toRes, hOpen, stack, x, wt, wf, fx >>
+                      sRes, tRes, toRes, hOpen, ttWord, stack, x, wt, wf, fx >>
 
 e3 == /\ pc["G3"] = "e3"
       /\ IF rec["G3"].w = "W"
@@ -809,38 +857,57 @@ e3 == /\ pc["G3"] = "e3"
                  /\ rec' = rec
       /\ pc' = [pc EXCEPT !["G3"] = "e4"]
       /\ UNCHANGED << cancelled, linked, members, closed, exnS, g1Path, g3, 
-                      sRes, tRes, toRes, hOpen, stack, x, wt, wf, fx >>
+                      sRes, tRes, toRes, hOpen, ttWord, stack, x, wt, wf, fx >>
 
 e4 == /\ pc["G3"] = "e4"
       /\ rec["G3"].w = "D"
       /\ members' = [members EXCEPT !["S"] = members["S"] \ {"G3"}]
       /\ pc' = [pc EXCEPT !["G3"] = "Done"]
       /\ UNCHANGED << cancelled, linked, closed, exnS, rec, g1Path, g3, sRes, 
-                      tRes, toRes, hOpen, stack, x, wt, wf, fx >>
+                      tRes, toRes, hOpen, ttWord, stack, x, wt, wf, fx >>
 
 g3p == e0 \/ e1 \/ e2 \/ e3 \/ e4
 
 t0 == /\ pc["TT"] = "t0"
-      /\ IF Scenario \notin {"shield", "condwait"}
+      /\ IF Scenario \notin {"shield", "condwait", "deadline"}
             THEN /\ pc' = [pc EXCEPT !["TT"] = "Done"]
             ELSE /\ pc' = [pc EXCEPT !["TT"] = "t1"]
       /\ UNCHANGED << cancelled, linked, members, closed, exnS, rec, g1Path, 
-                      g3, sRes, tRes, toRes, hOpen, stack, x, wt, wf, fx >>
+                      g3, sRes, tRes, toRes, hOpen, ttWord, stack, x, wt, wf, 
+                      fx >>
 
 t1 == /\ pc["TT"] = "t1"
       /\ linked["T"]
-      /\ /\ stack' = [stack EXCEPT !["TT"] = << [ procedure |->  "walk",
-                                                  pc        |->  "t2",
-                                                  wt        |->  wt["TT"],
-                                                  wf        |->  wf["TT"],
-                                                  fx        |->  fx["TT"],
-                                                  x         |->  x["TT"] ] >>
-                                              \o stack["TT"]]
-         /\ x' = [x EXCEPT !["TT"] = "T"]
-      /\ wt' = [wt EXCEPT !["TT"] = {}]
-      /\ wf' = [wf EXCEPT !["TT"] = {}]
-      /\ fx' = [fx EXCEPT !["TT"] = "none"]
-      /\ pc' = [pc EXCEPT !["TT"] = "w1"]
+      /\ IF Scenario = "deadline"
+            THEN /\ IF ttWord = "Live"
+                       THEN /\ ttWord' = "Fired"
+                            /\ /\ stack' = [stack EXCEPT !["TT"] = << [ procedure |->  "walk",
+                                                                        pc        |->  "t2",
+                                                                        wt        |->  wt["TT"],
+                                                                        wf        |->  wf["TT"],
+                                                                        fx        |->  fx["TT"],
+                                                                        x         |->  x["TT"] ] >>
+                                                                    \o stack["TT"]]
+                               /\ x' = [x EXCEPT !["TT"] = "T"]
+                            /\ wt' = [wt EXCEPT !["TT"] = {}]
+                            /\ wf' = [wf EXCEPT !["TT"] = {}]
+                            /\ fx' = [fx EXCEPT !["TT"] = "none"]
+                            /\ pc' = [pc EXCEPT !["TT"] = "w1"]
+                       ELSE /\ pc' = [pc EXCEPT !["TT"] = "t2"]
+                            /\ UNCHANGED << ttWord, stack, x, wt, wf, fx >>
+            ELSE /\ /\ stack' = [stack EXCEPT !["TT"] = << [ procedure |->  "walk",
+                                                             pc        |->  "t2",
+                                                             wt        |->  wt["TT"],
+                                                             wf        |->  wf["TT"],
+                                                             fx        |->  fx["TT"],
+                                                             x         |->  x["TT"] ] >>
+                                                         \o stack["TT"]]
+                    /\ x' = [x EXCEPT !["TT"] = "T"]
+                 /\ wt' = [wt EXCEPT !["TT"] = {}]
+                 /\ wf' = [wf EXCEPT !["TT"] = {}]
+                 /\ fx' = [fx EXCEPT !["TT"] = "none"]
+                 /\ pc' = [pc EXCEPT !["TT"] = "w1"]
+                 /\ UNCHANGED ttWord
       /\ UNCHANGED << cancelled, linked, members, closed, exnS, rec, g1Path, 
                       g3, sRes, tRes, toRes, hOpen >>
 
@@ -848,7 +915,7 @@ t2 == /\ pc["TT"] = "t2"
       /\ members' = [members EXCEPT !["T"] = members["T"] \ {"TT"}]
       /\ pc' = [pc EXCEPT !["TT"] = "Done"]
       /\ UNCHANGED << cancelled, linked, closed, exnS, rec, g1Path, g3, sRes, 
-                      tRes, toRes, hOpen, stack, x, wt, wf, fx >>
+                      tRes, toRes, hOpen, ttWord, stack, x, wt, wf, fx >>
 
 tt == t0 \/ t1 \/ t2
 
@@ -869,7 +936,7 @@ x0 == /\ pc["C"] = "x0"
             /\ pc' = [pc EXCEPT !["C"] = "x1"]
             /\ UNCHANGED <<stack, x, wt, wf, fx>>
       /\ UNCHANGED << cancelled, linked, members, closed, exnS, rec, g1Path, 
-                      g3, sRes, tRes, toRes, hOpen >>
+                      g3, sRes, tRes, toRes, hOpen, ttWord >>
 
 x1 == /\ pc["C"] = "x1"
       /\ /\ stack' = [stack EXCEPT !["C"] = << [ procedure |->  "walk",
@@ -885,7 +952,7 @@ x1 == /\ pc["C"] = "x1"
       /\ fx' = [fx EXCEPT !["C"] = "none"]
       /\ pc' = [pc EXCEPT !["C"] = "w1"]
       /\ UNCHANGED << cancelled, linked, members, closed, exnS, rec, g1Path, 
-                      g3, sRes, tRes, toRes, hOpen >>
+                      g3, sRes, tRes, toRes, hOpen, ttWord >>
 
 canc == x0 \/ x1
 
@@ -922,14 +989,20 @@ ExnSeen == (g1Path = "error" /\ pc["G1"] = "Done" /\ sRes # "none") => sRes = "e
 
 \* The shield: a cancel from outside never ends the sync inside the shield.
 \* A condition wait opens the shield, so the property is not for it.
-ShieldHolds == Scenario = "condwait" \/ tRes \in {"none", "T"}
+ShieldHolds == Scenario = "condwait" \/ tRes \in {"none", "T", "self"}
 
 \* with_timeout raises Timeout only for its own deadline.
-TimeoutOK == Scenario = "condwait" \/ toRes \in {"none", "Timeout"}
+TimeoutOK == Scenario = "condwait" \/ toRes \in {"none", "Timeout", "value"}
 
 \* A cancel of X ends only a sync whose context chain reaches X.
 NoForeignCancel ==
-  \A f \in Fibers : rec[f].w = "D" => OnChain(rec[f].ctx, rec[f].rs, rec[f].op)
+  \A f \in Fibers :
+    (rec[f].w = "D" /\ rec[f].rs # "self") => OnChain(rec[f].ctx, rec[f].rs, rec[f].op)
+
+\* The deadline form: the timer and the end of the body agree. If the body
+\* ended by itself, the result is its value, and a timeout only after a fire.
+DeadlineOK ==
+  Scenario # "deadline" \/ (toRes = "Timeout" => ttWord = "Fired")
 
 \* The condition wait: when the timer of with_timeout ended its walk of T, the
 \* wait of G1 is not parked (the review of M2, F1).

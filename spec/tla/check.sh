@@ -89,7 +89,7 @@ commit fail   cross    FALSE    FALSE     FALSE TRUE
 
 scope() { want Scope || return 0 # expect scenario joinCancellable shieldNotNode noRecheck noChainCheck exnAfterEnd noFlagCheck
   run Scope "$1" \
-    "NoOrphan ExnNotLost ExnSeen ShieldHolds TimeoutOK NoForeignCancel ClosedEmpty TimerReachesWait" \
+    "NoOrphan ExnNotLost ExnSeen ShieldHolds TimeoutOK NoForeignCancel ClosedEmpty TimerReachesWait DeadlineOK" \
     "Scenario=\"$2\"" BugJoinCancellable="$3" BugShieldNotNode="$4" SimpNoRecheck="$5" \
     BugNoChainCheck="$6" BugExnAfterEnd="$7" BugNoFlagCheck="$8" \
     SimpNoChildFlags="${9:-FALSE}" BugCondOuterCtx="${10:-FALSE}" \
@@ -118,6 +118,9 @@ scope pass   fork     FALSE FALSE  TRUE    FALSE FALSE FALSE TRUE
 # is the code before the review of M2: the wait takes the outer context.
 scope pass   condwait FALSE FALSE  FALSE   FALSE FALSE FALSE
 scope fail   condwait FALSE FALSE  FALSE   FALSE FALSE FALSE FALSE TRUE
+# M3: the deadline form of with_timeout. A walk of T can come after T closed.
+scope pass   deadline FALSE FALSE  FALSE   FALSE FALSE FALSE
+scope fail   deadline FALSE TRUE   FALSE   FALSE FALSE FALSE
 
 ivar() { want Ivar || return 0 # expect directFill nonAtomicRegister
   run Ivar "$1" "AtMostOneResume FullNoWaiters OneFill EndState" \
