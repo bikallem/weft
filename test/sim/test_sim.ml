@@ -977,6 +977,6 @@ let () =
   exit
     (Windtrap.run "sim"
        ( [time; timers; events; chans; scopes; reviews; checks; properties]
-       @ Test_net.tests @ Test_m1.tests @ Test_m2.tests
+       @ Test_net.tests @ Test_m1.tests @ Test_m2.tests @ Test_m3.tests
        @ Portable.tests portable_world
        @ Portable.tests portable_world_4 ) )

@@ -10,6 +10,7 @@ val run :
   -> ?domains:int
   -> ?auto:bool
   -> ?signals:Weft.Signal.t list
+  -> ?outside_fills:bool
   -> (t -> 'a)
   -> 'a
 (** [run main] runs [main] in the simulator. [~seed] is 0 by default. [~domains]
@@ -18,6 +19,12 @@ val run :
     time moves to the next deadline at each quiescence. With [~auto:false], only
     {!advance_until} moves the time. [~signals] are the signals that the program
     watches, as for [Weft_linux.run ~signals]: none by default.
+
+    [~outside_fills:true] accepts [Ivar.fill_from_outside]. The simulator gives
+    each such fill at the next quiescence. The GC selects when a finaliser runs,
+    so a test with such a fill gives the same run only in the same binary with
+    the same history. With [~outside_fills:false] (the default), such a fill is
+    a [Model_error] at the next quiescence.
 
     @raise Deadlock
       if the program is quiescent, no deadline exists, and no event can come.
@@ -120,3 +127,7 @@ val sched : t -> Weft.Private.Sched.t
 
 (* The number of open fds of the simulator. *)
 val open_fds : t -> int
+
+(* The switch point of the quiescence that gave each fill from outside a
+   fiber. *)
+val fill_log : t -> int list

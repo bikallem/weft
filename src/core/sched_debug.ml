@@ -54,6 +54,15 @@ let lost t ~now =
       queues
     else "the overflow queue is not empty" :: queues
   in
+  let queues =
+    if Spin.with_lock t.pinned_lock (fun () -> Queue.is_empty t.pinned_q) then
+      queues
+    else "the pinned queue is not empty" :: queues
+  in
+  let queues =
+    if Atomic.get t.inject = [] then queues
+    else "the injection queue is not empty" :: queues
+  in
   let timers =
     Array.to_list t.doms
     |> List.concat_map (fun d ->

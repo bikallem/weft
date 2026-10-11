@@ -25,9 +25,9 @@ let rec start p inner =
   | Running _ ->
       assert false (* Only the fiber of the promise starts it. *)
 
-let fork ?name scope f =
+let fork ?name ?pinned scope f =
   let p = {result= Ivar.create (); state= Atomic.make Not_started} in
-  Fiber.fork ?name scope (fun () ->
+  Fiber.fork ?name ?pinned scope (fun () ->
       let r =
         match Fiber.scope (fun inner -> start p inner ; f ()) with
         | v ->

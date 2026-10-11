@@ -6,4 +6,4 @@
  (name test_linux_md)
  (enabled_if
   (= %{system} linux))
- (libraries weft weft.linux windtrap portable))
+ (libraries weft weft.linux windtrap portable unix))

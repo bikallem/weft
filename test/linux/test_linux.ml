@@ -351,6 +351,21 @@ let blocked_threads () =
       (* No thread blocks SIGHUP. *)
       is_true (Weft_linux.unblocked_threads [SIGUSR2; SIGHUP] <> []) )
 
+(* M3: a finaliser fills an Ivar from outside a fiber, and the fiber that waits
+   wakes. *)
+let finaliser_fill () =
+  Weft_linux.run ~domains:1 (fun () ->
+      let iv = Ivar.create () in
+      let () =
+        let x = ref 1 in
+        Gc.finalise (fun _ -> ignore (Ivar.fill_from_outside iv "gc")) x
+      in
+      Fiber.scope (fun s ->
+          let p = Fiber.fork_promise s (fun () -> sync (Ivar.read iv)) in
+          Fiber.yield () ;
+          Gc.full_major () ;
+          equal string "gc" (Promise.await p) ) )
+
 let unwatched () =
   Weft_linux.run ~domains:1 (fun () ->
       raises
@@ -380,6 +395,7 @@ let linux =
     ; test "SIGTERM to the process is an event" sigterm
     ; test "C7: Other_signal 10 is SIGUSR1" signal_number
     ; test "each thread of run ~signals blocks the signals" blocked_threads
+    ; test "a finaliser fills an Ivar from outside a fiber" finaliser_fill
     ; test "a signal that run does not watch is not an event" unwatched ]
 
 let () = exit (Windtrap.run "linux" (Portable.tests world @ [linux]))

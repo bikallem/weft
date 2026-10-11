@@ -18,13 +18,13 @@ type handler = Sched.handler = {handle: 'a. (unit -> 'a) -> 'a}
 
 let scope ?handler f = Sched.scope ?handler f
 
-let fork ?name scope f = Sched.fork ?name scope f
+let fork ?name ?pinned scope f = Sched.fork ?name ?pinned scope f
 
 (* A [Cancelled] is not an error of the fiber: it goes to the scope, which
    ignores it. If [on_error] raises, the scope fails (design section 2.5,
    Errors). *)
-let fork_isolated ?name scope ~on_error f =
-  fork ?name scope (fun () ->
+let fork_isolated ?name ?pinned scope ~on_error f =
+  fork ?name ?pinned scope (fun () ->
       match f () with
       | () ->
           ()

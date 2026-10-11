@@ -313,6 +313,27 @@ let search_push () =
       fun () ->
         Atomic.get found || (not (Atomic.get slept)) || Atomic.get w.wakes = 1 )
 
+(* The injection queue (M3, Wake.tla): domain 0 goes idle while a thread outside
+   the domains pushes a fill and wakes an idle domain. Domain 0 sees the request
+   in its second check, or it sleeps and gets one wake. *)
+let inject_idle () =
+  trace (fun () ->
+      let t = S.create ~domains:1 () in
+      let w = world () in
+      let slept = Atomic.make false and outside_wakes = Atomic.make 0 in
+      let d0 = t.S.doms.(0) in
+      spawn_in w (fun () ->
+          S.Idle.add t 0 ;
+          if not (S.work_for d0) then Atomic.set slept true ) ;
+      spawn (fun () ->
+          S.inject t (fun _ -> ()) ;
+          match S.Idle.take_any t with
+          | Some _ ->
+              Atomic.incr outside_wakes
+          | None ->
+              () ) ;
+      fun () -> (not (Atomic.get slept)) || Atomic.get outside_wakes = 1 )
+
 (* The next slot (M3): the owner puts a fiber and takes it, while a thief takes
    the slot with a CAS. The fiber runs exactly one time. *)
 let next_steal () =
@@ -628,6 +649,7 @@ let () =
   case "idle: a searching domain goes idle while another domain pushes"
     search_push ;
   case "next slot: a take by the owner and a steal at the same time" next_steal ;
+  case "inject: a fill from outside while a domain goes idle" inject_idle ;
   case "register: a send and a recv on an empty channel at the same time"
     chan_meet ;
   case "register: a fill of an Ivar during a register" ivar_fill_register ;

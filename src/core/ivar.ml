@@ -13,6 +13,8 @@ let try_fill t v =
 let fill t v =
   if not (try_fill t v) then invalid_arg "Ivar.fill: the Ivar is full"
 
+let fill_from_outside = Sched.fill_from_outside
+
 let read t = Event.of_ivar t
 
 let peek t =

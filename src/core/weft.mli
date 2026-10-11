@@ -98,9 +98,11 @@ module Fiber : sig
       run inside [handler.handle]. A nested scope runs its fibers as
       [outer.handle (fun () -> inner.handle g)]. *)
 
-  val fork : ?name:string -> scope -> (unit -> unit) -> unit
+  val fork : ?name:string -> ?pinned:bool -> scope -> (unit -> unit) -> unit
   (** [fork scope f] runs [f] in a new fiber of [scope]. If [f] raises, the
-      scope fails.
+      scope fails. With [~pinned:true], the fiber runs only on domain 0, the
+      domain of the thread that called [run]: for example for a C library that
+      is not thread-safe.
 
       @raise Scope_closed if the scope ended or a context of it is cancelled. *)
 
@@ -109,6 +111,7 @@ module Fiber : sig
 
   val fork_isolated :
        ?name:string
+    -> ?pinned:bool
     -> scope
     -> on_error:(exn -> Printexc.raw_backtrace -> unit)
     -> (unit -> unit)
@@ -118,7 +121,8 @@ module Fiber : sig
       server forks each connection in this way. If [on_error] raises, the scope
       fails. *)
 
-  val fork_promise : ?name:string -> scope -> (unit -> 'a) -> 'a Promise.t
+  val fork_promise :
+    ?name:string -> ?pinned:bool -> scope -> (unit -> 'a) -> 'a Promise.t
   (** If the fiber raises, the promise holds the exception, and the scope does
       not fail. *)
 
@@ -206,6 +210,15 @@ module Ivar : sig
   (** @raise Invalid_argument if the Ivar is full. *)
 
   val try_fill : 'a t -> 'a -> bool
+
+  val fill_from_outside : 'a t -> 'a -> bool
+  (** The fill for code that does not run in a fiber: a finaliser, a
+      [Sys.signal] handler, a thread of [Thread.create], or a C callback. It
+      touches no sync word and no lock: a domain does the fill at a safe point
+      (design section 2.5, Fiber code with no handler). If the Ivar is full at
+      that time, the fill does nothing. It gives [false] if no [run] is active.
+      One [run] at a time takes these fills. The simulator accepts them only
+      with [Sim.run ~outside_fills:true]. *)
 
   val read : 'a t -> 'a event
 

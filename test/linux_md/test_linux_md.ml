@@ -84,6 +84,44 @@ let next_slot_steal () =
           less int64 ~than:50_000_000L
             (Span.to_ns (Time.diff Mono (Promise.await got) t0)) ) )
 
+(* M3: a domain with no handler fills an Ivar from outside a fiber, while each
+   domain of the run sleeps. *)
+let outside_domain () =
+  Weft_linux.run ~domains (fun () ->
+      let iv = Ivar.create () in
+      Fiber.scope (fun s ->
+          let p = Fiber.fork_promise s (fun () -> sync (Ivar.read iv)) in
+          let d =
+            Domain.spawn (fun () ->
+                Unix.sleepf 0.01 ;
+                Ivar.fill_from_outside iv 42 )
+          in
+          equal int 42 (Promise.await p) ;
+          is_true (Domain.join d) ) )
+
+(* M3: pinned fibers run only on domain 0, also when other domains wake them. *)
+let pinned () =
+  Weft_linux.run ~domains (fun () ->
+      let off = Atomic.make 0 and c = Chan.create () in
+      let check () = if S.prog "test" S.Dom_index <> 0 then Atomic.incr off in
+      Fiber.scope (fun s ->
+          for _ = 1 to 20 do
+            Fiber.fork ~pinned:true s (fun () ->
+                for _ = 1 to 10 do
+                  check () ; Fiber.yield ()
+                done ;
+                Time.sleep Mono (Span.ms 1) ;
+                check () ;
+                sync (Chan.recv c) ;
+                check () )
+          done ;
+          for _ = 1 to 20 do
+            Fiber.fork s (fun () ->
+                Time.sleep Mono (Span.ms 2) ;
+                sync (Chan.send c ()) )
+          done ) ;
+      equal int 0 (Atomic.get off) )
+
 let () =
   exit
     (Windtrap.run "linux_md"
@@ -92,5 +130,7 @@ let () =
              [ test "timers on many domains end after their deadlines" timers
              ; test "a thief takes the next slot of a busy domain"
                  next_slot_steal
+             ; test "a domain with no handler fills an Ivar" outside_domain
+             ; test "pinned fibers run only on domain 0" pinned
              ; test "2,000 connections on 4 domains with no fd leak" no_fd_leak
              ] ] ) )

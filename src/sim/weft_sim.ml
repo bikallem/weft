@@ -154,11 +154,20 @@ type t =
   ; dns: (string, dns_answer) Hashtbl.t
   ; programs: (string, string list -> program) Hashtbl.t
   ; watched: Op.signal list  (** The signals of [run ~signals]. *)
+  ; fills: (Sched.dom -> unit) list Atomic.t
+        (** The fills from outside a fiber that wait for the quiescence, the
+            newest first. A finaliser can push, so the list is atomic. *)
+  ; refused_fills: int Atomic.t  (** The fills with no [~outside_fills]. *)
+  ; mutable steps: int  (** The switch points. *)
+  ; mutable fill_log: int list
+        (** The switch point of the quiescence that gave each fill. *)
   ; mutable next_pid: int }
 
 let sched t = Option.get t.sched
 
 let open_fds t = Hashtbl.length t.net.fds
+
+let fill_log t = List.rev t.fill_log
 
 let key addr = Format.asprintf "%a" Op.pp_addr addr
 
@@ -973,6 +982,7 @@ let extra_edge t d =
 
 (* Answer the effect of domain [d], continue it, and keep its next state. *)
 let step t st d =
+  t.steps <- t.steps + 1 ;
   let next = function Ended -> Ended_dom | Paused (e, k) -> Pending (e, k) in
   match st.(d) with
   | Start dom ->
@@ -1059,13 +1069,21 @@ let quiescent t st =
         if Int64.compare dl t.now <= 0 then give d World.Ready.Alarm )
       deadlines
   in
-  match t.settles with
-  | _ :: _ ->
+  if Atomic.get t.refused_fills > 0 then
+    model_error
+      "a fill from outside a fiber, with no Sim.run ~outside_fills:true" ;
+  match (Atomic.exchange t.fills [], t.settles) with
+  | (_ :: _ as fills), _ ->
+      (* The fills go to the injection queue, and a domain wakes. *)
+      List.iter (Sched.inject s) (List.rev fills) ;
+      t.fill_log <- t.steps :: t.fill_log ;
+      give first World.Ready.Woken
+  | [], _ :: _ ->
       List.iter
         (fun id -> give first (World.Ready.External id))
         (List.rev t.settles) ;
       t.settles <- []
-  | [] -> (
+  | [], [] -> (
       if t.auto then
         match earliest deadline next_agenda with
         | Some at ->
@@ -1092,7 +1110,8 @@ let quiescent t st =
                  ( "manual mode: only advance_until moves the time"
                  :: Sched_debug.blocked s ) ) )
 
-let run ?(seed = 0) ?(domains = 1) ?(auto = true) ?(signals = []) main =
+let run ?(seed = 0) ?(domains = 1) ?(auto = true) ?(signals = [])
+    ?(outside_fills = false) main =
   let t =
     { prng= Prng.make seed
     ; auto
@@ -1121,10 +1140,29 @@ let run ?(seed = 0) ?(domains = 1) ?(auto = true) ?(signals = []) main =
     ; dns= Hashtbl.create ~random:false 8
     ; programs= Hashtbl.create ~random:false 8
     ; watched= signals
+    ; fills= Atomic.make []
+    ; refused_fills= Atomic.make 0
+    ; steps= 0
+    ; fill_log= []
     ; next_pid= 1000 }
   in
   let s = Sched.create ~slack:Weft.Span.zero ~simulated:true ~domains () in
   t.sched <- Some s ;
+  (* A fill from outside a fiber waits for the quiescence. The GC selects when a
+     finaliser runs, so a seed gives the same run only in the same binary with
+     the same history (design section 2.9). *)
+  let rec push_fill req =
+    let l = Atomic.get t.fills in
+    if not (Atomic.compare_and_set t.fills l (req :: l)) then push_fill req
+  in
+  let slot =
+    Some
+      ( s
+      , fun req ->
+          if outside_fills then push_fill req else Atomic.incr t.refused_fills
+      )
+  in
+  Atomic.set Sched.outside slot ;
   let result = Sched.start s (fun () -> main t) in
   let st = Array.map (fun d -> Start d) s.doms in
   let all = List.init domains Fun.id in
@@ -1140,7 +1178,10 @@ let run ?(seed = 0) ?(domains = 1) ?(auto = true) ?(signals = []) main =
         step t st (List.nth ds (Prng.int t.prng (List.length ds))) ;
         loop ()
   in
-  loop () ; result ()
+  Fun.protect
+    ~finally:(fun () -> ignore (Atomic.compare_and_set Sched.outside slot None))
+    loop ;
+  result ()
 
 let settle t =
   let id = fresh t in

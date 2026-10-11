@@ -92,6 +92,20 @@ let run_world (type w) ?slack ?(domains = 1) ?on_create
     Atomic.set t.finished true ;
     Array.iter (fun d -> W.wake w ~domain:d.Sched.index) t.doms
   in
+  (* The fills from outside a fiber: a push to the injection queue, then a wake
+     of an idle domain. The wake of the world is safe from any thread. *)
+  let slot =
+    Some
+      ( t
+      , fun req ->
+          Sched.inject t req ;
+          match Sched.Idle.take_any t with
+          | Some d ->
+              W.wake w ~domain:d
+          | None ->
+              () )
+  in
+  Atomic.set Sched.outside slot ;
   (* If a spawn fails, the domains that started must stop before the error goes
      on: they hold the fds of the world. *)
   let others =
@@ -104,6 +118,7 @@ let run_world (type w) ?slack ?(domains = 1) ?on_create
             let bt = Printexc.get_raw_backtrace () in
             stop () ;
             List.iter (fun d -> ignore (Domain.join d)) started ;
+            ignore (Atomic.compare_and_set Sched.outside slot None) ;
             Printexc.raise_with_backtrace e bt )
       []
       (Array.to_list (Array.sub t.doms 1 (domains - 1)))
@@ -111,6 +126,7 @@ let run_world (type w) ?slack ?(domains = 1) ?on_create
   in
   let first = run_dom t.doms.(0) () in
   let rest = List.map Domain.join others in
+  ignore (Atomic.compare_and_set Sched.outside slot None) ;
   match List.find_opt Result.is_error (first :: rest) with
   | Some (Error (e, bt)) ->
       Printexc.raise_with_backtrace e bt
