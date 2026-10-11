@@ -6,6 +6,7 @@ open Weft
 
 let world =
   { Portable.name= "linux"
+  ; domains= 1
   ; run= (fun f -> Weft_linux.run ~domains:1 f)
   ; listen=
       (fun () ->

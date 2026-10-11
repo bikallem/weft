@@ -84,50 +84,6 @@ let thief_uses_its_state () =
   done ;
   is_true !stolen_any
 
-(* A fiber that blocks on one socket from two domains in sequence gets all of
-   its data. *)
-let fd_from_two_domains seed =
-  Sim.run ~seed ~domains:4 (fun sim ->
-      let a = Sim.addr sim "server:1" in
-      let l = Net.listen a in
-      let two = ref false in
-      Fiber.scope (fun s ->
-          Fiber.fork s (fun () ->
-              let c, _ = Net.accept l in
-              for i = 1 to 20 do
-                Net.write c (string_of_int (i mod 10)) ;
-                Time.sleep Mono (Span.ms 1)
-              done ;
-              Net.close c ) ;
-          let c : Private.Net.t = Net.connect a in
-          let b = Buffer.create 20 and buf = Bytes.create 8 in
-          let rec loop () =
-            match Net.read c buf 0 8 with
-            | 0 ->
-                ()
-            | k ->
-                Buffer.add_subbytes b buf 0 k ;
-                let doms = Atomic.get c.S.doms in
-                if doms land (doms - 1) <> 0 then two := true ;
-                (* A yield lets a thief take the fiber. *)
-                Fiber.yield () ;
-                loop ()
-          in
-          loop () ;
-          equal string "12345678901234567890" (Buffer.contents b) ;
-          Net.close c ;
-          (* A quiescence after the close: each domain with a registration must
-             take its close notice. *)
-          Time.sleep Mono (Span.ms 1) ) ;
-      !two )
-
-let fd_two_domains () =
-  let any = ref false in
-  for seed = 1 to 200 do
-    if fd_from_two_domains seed then any := true
-  done ;
-  is_true !any
-
 (* A seed gives the same order of events when it runs again. *)
 let trace seed =
   let log = ref [] in
@@ -150,11 +106,10 @@ let trace seed =
   !log
 
 let replay () =
-  for seed = 1 to 20 do
-    is_true (trace seed = trace seed)
-  done ;
-  let traces = List.init 20 (fun s -> trace (s + 1)) in
-  greater int ~than:1 (List.length (List.sort_uniq compare traces))
+  let first = List.init 20 (fun s -> trace (s + 1)) in
+  let again = List.init 20 (fun s -> trace (s + 1)) in
+  is_true (first = again) ;
+  greater int ~than:1 (List.length (List.sort_uniq compare first))
 
 (* The protocol of with_nack (design section 2.4): a client sends a request with
    its nack, and it waits for the reply or a timeout. The server waits to send
@@ -199,6 +154,8 @@ let nack_server seed =
 (* The counters of the measurements (open questions 3, 4 and 8) count. *)
 let counters_of seed =
   Sim.run ~seed ~domains:2 (fun sim ->
+      (* Domain 1 is idle when the forks come. *)
+      Time.sleep Mono (Span.ms 1) ;
       let a = Sim.addr sim "server:2" in
       let l = Net.listen a in
       Fiber.scope (fun s ->
@@ -234,6 +191,7 @@ let counters () =
   greater int ~than:0 e ;
   greater int ~than:0 b ;
   greater int ~than:0 w ;
+  at_most int ~than:e i ;
   at_least int ~than:0 i
 
 let seeds n f =
@@ -243,13 +201,7 @@ let seeds n f =
 
 let tests =
   [ group "many domains"
-      [ test "work stealing: fibers run on more than one domain" (fun () ->
-            seeds 100 work_stealing )
-      ; test "chained timers end at their deadlines" (fun () ->
-            seeds 100 chained_timers )
-      ; test "a stolen fiber uses the state of the thief" thief_uses_its_state
-      ; test "a fiber that blocks on one fd from two domains gets all data"
-          fd_two_domains
+      [ test "a stolen fiber uses the state of the thief" thief_uses_its_state
       ; test "a seed gives the same order of events" replay
       ; test "the counters of the measurements count" counters
       ; test "the server gets the nack of each client that left" (fun () ->

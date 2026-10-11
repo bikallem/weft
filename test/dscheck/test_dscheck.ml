@@ -139,12 +139,13 @@ let two_partners () =
 
 (* Two fibers that sync on each other: each claims the other in its scan. The id
    order prevents a deadlock. *)
-let cross () =
-  trace (fun () ->
-      let x = fiber 0 and y = fiber 1 in
-      spawn (fun () -> claim x y ; park x) ;
-      spawn (fun () -> claim y x ; park y) ;
-      one_resume [x; y] )
+let cross_setup () =
+  let x = fiber 0 and y = fiber 1 in
+  spawn (fun () -> claim x y ; park x) ;
+  spawn (fun () -> claim y x ; park y) ;
+  one_resume [x; y]
+
+let cross () = trace cross_setup
 
 (* The objects of the scheduler for a test. *)
 
@@ -155,13 +156,16 @@ type world =
   { closes: int Atomic.t
   ; wakes: int Atomic.t
   ; registers: int Atomic.t
-  ; dels: int Atomic.t }
+  ; dels: int Atomic.t
+  ; early_close: bool Atomic.t  (** A close(2) before the DEL of a Register. *)
+  }
 
 let world () =
   { closes= Atomic.make 0
   ; wakes= Atomic.make 0
   ; registers= Atomic.make 0
-  ; dels= Atomic.make 0 }
+  ; dels= Atomic.make 0
+  ; early_close= Atomic.make false }
 
 let in_world w f () =
   Effect.Deep.match_with f ()
@@ -334,8 +338,9 @@ let ivar_fill_register () =
       fun () ->
         C.state r.S.word <> C.Parked && Atomic.get continued + queued t r = 1 )
 
-(* The self-commit: a yield, which commits its own branch, and a cancel at the
-   same time. One of them wins, and the fiber continues one time. *)
+(* The self-commit: a ready branch (always, a full Ivar, a set fd flag), which
+   commits itself, and a cancel at the same time. One of them wins, and the
+   fiber continues one time. *)
 let self_and_cancel () =
   trace (fun () ->
       let s = fiber 0 in
@@ -443,30 +448,60 @@ let register_and_close () =
       let w = world () in
       let fdr = new_fdrec () in
       let d0 = t.S.doms.(0) in
-      let del_first = Atomic.make true in
+      (* The thread of domain 0: a Register in a scan, then the mailbox between
+         fibers, two times. Only this thread takes the mailbox of domain 0, and
+         never during its own Register (busy[d] of Fd.tla). *)
       spawn_in w (fun () ->
           ignore (S.ensure_reg d0 fdr) ;
-          (* The domain takes its mailbox between fibers. *)
+          S.take_mail d0 ;
           S.take_mail d0 ) ;
       spawn_in w (fun () ->
           if S.Rc.close fdr then S.close_notices t.S.doms.(1) fdr ) ;
-      spawn_in w (fun () ->
-          (* The domain takes its mailbox again later. *)
-          S.take_mail d0 ;
-          if
-            Atomic.get w.closes = 1
-            && Atomic.get w.registers > Atomic.get w.dels
-          then Atomic.set del_first false ) ;
       fun () ->
-        (* Each Register has its DEL, and close(2) occurs one time. A notice
-           that waits in the mailbox is not lost: the domain takes it. *)
+        (* close(2) never comes before a DEL. Each Register has its DEL and
+           close(2) occurs one time, or a notice waits in the mailbox: the
+           domain takes it at its next turn. *)
         let pending =
           match Atomic.get d0.S.mailbox with [] -> false | _ -> true
         in
-        Atomic.get del_first
+        (not (Atomic.get w.early_close))
         && ( pending
            || Atomic.get w.registers = Atomic.get w.dels
               && Atomic.get w.closes = 1 ) )
+
+(* A one-word partner while a claim of its sync is put back: x (id 1) claims p
+   (id 0) first, then its own word, which a cancel made Done. x puts p back to
+   Parked. A cancel of p at the same time must not be lost (Commit.tla,
+   BugDropOnClaimed). *)
+let notify_while_put_back () =
+  trace (fun () ->
+      let p = fiber 0 and x = fiber 1 in
+      ignore (C.park p.sync) ;
+      spawn (fun () -> claim x p ; park x) ;
+      spawn (fun () -> notify x 1) ;
+      spawn (fun () -> notify p 2) ;
+      fun () ->
+        one_resume [x; p] ()
+        && match C.state p.sync with C.Done _ -> true | _ -> false )
+
+(* The scope: a fork_daemon while the last member that is not a daemon ends. The
+   daemon is not added, or its node gets the cancel. *)
+let daemon_and_end () =
+  trace (fun () ->
+      let w = world () in
+      let node = scope_node () in
+      let st = S.state_of node in
+      spawn_in w (fun () ->
+          match S.start_fiber (fun () -> S.fork_daemon node ignore) () with
+          | _ ->
+              ()
+          | exception S.Scope_closed ->
+              () ) ;
+      spawn_in w (fun () -> ignore (S.member_end node ~daemon:false)) ;
+      fun () ->
+        List.for_all
+          (fun d -> Option.is_some (Atomic.get d.S.flag))
+          (S.by_id st.S.daemons) )
 
 let () =
   print_endline "dscheck" ;
@@ -479,16 +514,16 @@ let () =
   case "register: a send and a recv on an empty channel at the same time"
     chan_meet ;
   case "register: a fill of an Ivar during a register" ivar_fill_register ;
-  case "self-commit: a yield and a cancel at the same time" self_and_cancel ;
+  case "self-commit: a ready branch and a cancel at the same time"
+    self_and_cancel ;
+  case "commit: a cancel while a claim of its sync is put back"
+    notify_while_put_back ;
+  case "scope: a fork_daemon while the last member ends" daemon_and_end ;
   case "cancel: a walk while a fiber starts a sync" cancel_and_sync ;
   case "cancel: a walk while the fiber leaves the scope" cancel_and_leave ;
   case "scope: a fork while the last member ends" fork_and_end ;
   case "fd: a submit and a close at the same time" submit_and_close ;
   case "fd: a Register and a close at the same time" register_and_close ;
   case "commit: two fibers that sync on each other, liveness" (fun () ->
-      live (fun () ->
-          let x = fiber 0 and y = fiber 1 in
-          spawn (fun () -> claim x y ; park x) ;
-          spawn (fun () -> claim y x ; park y) ;
-          one_resume [x; y] ) ) ;
+      live cross_setup ) ;
   if !failures > 0 then exit 1

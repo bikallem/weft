@@ -284,7 +284,7 @@ At the end of the scan, the fiber changes its word from `Waiting` to `Parked` wi
 
 **One-word partners.** A cancel, a timer, an fd event, `Ivar.fill`, a nack and a completed `Blocking` operation change only the word of the blocked fiber. If the word is `Claimed`, they retry with `Atomic.Backoff` until the word is `Waiting`, `Parked` or `Done`. They stop only at `Done`. They never drop the event because the word is `Claimed`. affect's `synced_unblock_is_ours` does the same.
 
-**A ready branch with no partner.** Some branches are ready with no partner: `always`, an `Ivar` that is full, a set fd flag, an expired deadline and the event of `Fiber.yield`. The fiber commits such a branch itself, with a CAS on its own word from `Waiting` to `Done i`. If the CAS finds `Done`, a cancel or a partner won, and the fiber takes that result. A yield does this CAS before it puts the fiber in the tail of the queue. Thus a fiber in a queue always has a word with `Done`, and a cancel cannot resume it a second time.
+**A ready branch with no partner.** Some branches are ready with no partner: `always`, an `Ivar` that is full, a set fd flag and an expired deadline. The fiber commits such a branch itself, with a CAS on its own word from `Waiting` to `Done i`. If the CAS finds `Done`, a cancel or a partner won, and the fiber takes that result. `Fiber.yield` is not a sync (section 2.2): a fiber in the queue after a yield has no sync, so a cancel cannot resume it a second time.
 
 **The atomic register.** The scan reads "if a partner offer is present, commit, else register". For a shared object, this check and this act must be one atomic step. If not, this occurs: X does `recv c` on domain A and Y does `send c v` on domain B at the same time. Each finds no partner, each registers, and the two sleep forever. Thus each shared object has one point where the order is decided:
 
@@ -623,7 +623,7 @@ Steps 1 and 3 and the next slot come in milestone M3. Before M3, step 2 takes on
 
 1. On domain 0, take a fiber from the pinned queue first. affect has the same rule for `only_main`.
 2. Take a fiber from the next slot, else from the head of the local queue.
-3. Each 61st time, take from the global injection queue first. This prevents starvation of the injection queue. Go uses the same rule.
+3. Each 61st time, take from the overflow queue first (from M1), and in M3 also from the global injection queue. This prevents starvation of these queues. Go uses the same rule. A full ring moves its older half and the new fiber to the overflow queue, as Go's `runqputslow` does, so the order stays FIFO. The review of M1 found that without this rule, a fiber in the overflow queue never runs while more than 256 fibers yield.
 4. If there is no fiber, steal. Select a domain with the PRNG and take half of its local queue. Try each domain one time. Then try the next slots.
 5. If there is a fiber, perform `Switch`, then run the fiber until it blocks, yields or ends. Go to step 1.
 6. If there is no fiber, poll. Read `Now`, expire the deadlines of this domain, take the mailbox, and `Wait` with timeout 0. If this made a fiber ready, go to step 1.
@@ -904,7 +904,7 @@ end
 A virtual domain is one scheduler instance with its own queues, poller registrations, heap, mailbox and wake source. The simulator world keeps the registrations of each virtual domain. The simulator runs all of the virtual domains on one OS thread:
 
 1. Each world effect from a virtual domain is a switch point. The simulator keeps the continuation of that domain.
-2. The scheduler also performs a `Switch` world effect each time it starts a different fiber. The production worlds handle `Switch` with no action.
+2. The scheduler also performs a `Switch` world effect each time it starts a different fiber, but only in the simulator: the scheduler knows that it runs in the simulator (`Sched.create ~simulated:true`), and production does not pay for the effect.
 3. At each switch point, the PRNG selects the virtual domain that continues.
 
 Work stealing between virtual domains is thus deterministic, and the seed sets the order. For this to work, the scheduler obeys three rules:
@@ -1059,12 +1059,12 @@ Also on 2026-10-10, the user accepted the milestone plan of section 2.14. Decisi
 
 1. **How close the simulator is to the OS (M2).** The in-memory file system and the fake processes must copy the OS errors, for example `ENOENT`, `EEXIST` and a short write. How much of this is necessary in the first version?
 2. **Blocking operations in the simulator (M2).** A `File` operation on the thread pool takes time in production. Does the simulator give it a time cost from the seed, or zero time?
-3. **The value of `K` (M1).** A busy domain polls each `K` fiber switches (section 2.5). A small `K` gives exact timers and costs more syscalls. A large `K` costs less but makes timers late under load. **Measured** (`bench/m1.ml`, 1 domain with 200 fibers that yield, a 1 ms timer, Linux, 16 CPUs): with `K` = 1, the domain does 1.8 million yields per second, and the timer is late by 109 µs on average. With `K` = 61, it does 13.8 million yields per second, and the timer is late by 19 µs on average and by 59 µs at p99. With `K` = 1024, it does 15.6 million yields per second, and the timer is late by 38 µs on average. `K` stays 61.
+3. **The value of `K` (M1).** A busy domain polls each `K` fiber switches (section 2.5). A small `K` gives exact timers and costs more syscalls. A large `K` costs less but makes timers late under load. **Measured** (`bench/m1.ml`, 1 domain with 200 fibers that yield, a 1 ms timer, Linux, 16 CPUs): with `K` = 1, the domain does 1.8 million yields per second, and the timer is late by 109 µs on average. With `K` = 61, it does 13.8 million yields per second, and the timer is late by 19 µs on average and by 59 µs at p99. With `K` = 1024, it does 15.6 million yields per second, and the timer is late by 38 µs on average. `K` stays 61. After the review of M1 (no `Switch` in production), `K` = 61 gives 15.6 million yields per second, and the timer is late by 17 µs on average and by 37 µs at p99.
 4. **The cost of edges that do nothing (M1).** With decision 8, an fd can stay in the poller of a domain that no longer waits on it (section 2.7). **Measured** on an echo server with 64 clients: with no removal, 50%, 75% and 87% of all edges had no live waiter on 2, 4 and 8 domains. With the removal of section 2.7 (An fd in many pollers), the values are 30%, 43% and 52%, with the same throughput. The rest are the edges of data that comes while the fiber still runs, as on one domain.
 5. **The limit of the next slot (M3).** The start value is 3 runs in sequence (section 2.5). This must be measured.
 6. **The default number of domains (M1).** The start value is 4 (section 2.5). The GC pauses and the throughput must be measured for different numbers of domains. **Measured** on the echo server: 93,000, 161,000, 290,000 and 516,000 round trips per second on 1, 2, 4 and 8 domains. More domains gave more throughput up to 8 on this machine with 16 CPUs. I did not measure the GC pauses. The default stays `min 4 (Domain.recommended_domain_count ())` until M3 measures the pauses.
 7. **The limits of the watchdog (M3) and the slack (M0).** The start values are 10 ms (section 2.5, The limit of a busy domain) and 1 ms (section 2.5, Timers and domains).
-8. **The cost of more wakes (M1).** With no `searching` count, a push wakes an idle domain each time that one exists (section 2.5, Idle and wake). This must be measured on a server with many short fibers. If the cost is too high, M3 adds the Go rules. **Measured** with 100,000 short fibers: 1.1, 2.9, 2.1 and 0.7 million fibers per second on 1, 2, 4 and 8 domains, with 0, 0, 0.13 and 0.97 wakes for each fiber. On 8 domains, nearly each fork wakes an idle domain, and the throughput is 4 times less than on 2 domains. Thus the cost is too high, and M3 adds the Go rules. On the echo server, the wakes are less than 0.01 for each round trip, because the domains are busy.
+8. **The cost of more wakes (M1).** With no `searching` count, a push wakes an idle domain each time that one exists (section 2.5, Idle and wake). This must be measured on a server with many short fibers. If the cost is too high, M3 adds the Go rules. **Measured** with 100,000 short fibers: 1.1, 2.9, 2.1 and 0.7 million fibers per second on 1, 2, 4 and 8 domains, with 0, 0, 0.13 and 0.97 wakes for each fiber. On 8 domains, nearly each fork wakes an idle domain, and the throughput is 4 times less than on 2 domains. After the review of M1 (the scan order and the wakes), the values are 1.5, 3.5, 2.8 and 0.9 million fibers per second, with 0.8 wakes for each fiber on 8 domains. Thus the cost is still too high, and M3 adds the Go rules. On the echo server, the wakes are less than 0.01 for each round trip, because the domains are busy.
 
 **An answer to an earlier question: the cost of `Switch`.** A review measured one perform and continue with one deep handler at 5.6 ns (OCaml 5.5.1, `-O3`, a loop with warm caches). Each more handler level costs about 3 to 5 ns. Thus the `Switch` effect is cheap, and the scheduler does not need to be a functor over the world. The real costs are the syscalls and the wakes between cores. For example, an empty `epoll_wait` costs about 0.26 µs, and `timerfd_settime` about 0.6 µs (measured).
 
@@ -1496,3 +1496,20 @@ Three subagents reviewed the code of M0 (correctness, conformance to the TLA+ mo
 | L7 | The text said that each I/O function is a cancellation point | The text now agrees with the code (2.5) |
 
 These findings stay open, with their milestone: the Register order of `Fd.tla` and idle and wake (M1), the table of live fibers and the allocations of a sync (M3). The state of M0 in section 2.14 lists them.
+
+## 3.7 The review of M1, 2026-10-11
+
+Three subagents reviewed the code of M1 (correctness, conformance to the TLA+ models, and complexity). Each finding of this table is fixed. Each bug has a regression test that fails when the old code is put back.
+
+| No. | Finding | Fix |
+|---|---|---|
+| T1, C1 | A fiber in the overflow queue never runs while more than 256 fibers yield, because a domain reads the overflow queue only when its ring is empty | Each 61st take reads the overflow queue first, and a full ring moves its older half to the overflow queue (2.5) |
+| C2 | The `eventfd` and the `timerfd` had `EPOLLOUT`: each drain gave one more event, so each wake made two returns from `epoll_wait` | `EPOLLIN` only for these two fds |
+| C3 | If a `Domain.spawn` failed, the domains that started went on with the closed fds of the world | `run_world` stops and joins them, then raises the error |
+| T2, C4, T8 | A wake waited for the next effect of the fiber, a thief did not wake more domains, and a domain could take its own bit | A wake before the fiber goes on, the wake chain of Go after a steal of more than one fiber, and `Idle.take` skips the caller |
+| T3 | A `dscheck` test let a thread take the mailbox during a Register, an order that the code cannot have (`busy[d]` of `Fd.tla`) | The thread of the domain does its Register and its mailbox in sequence |
+| T4, T6 | No `dscheck` test for a one-word partner while a claim is put back, or for a `fork_daemon` at the end of the last member | Two tests, and each one finds a planted bug |
+| T5 | The design said that a yield does a CAS on a sync word | The text now agrees with the code (2.4) |
+| T7, C5, K4 | `on_ready` went on with a registration that it had removed | The two parts are in the `else` |
+| K1, K2, K3 | The table of fibers and the names cost each fork, `Switch` cost each fiber start, and the order of the scan took one world effect for each branch, with one shared atomic counter on Linux | The table and `Switch` only in the simulator, and the order from the PRNG of the domain, seeded from the world when the domain starts (2.5) |
+| K5 to K11 | Stale comments, copies of tests, a body that a test copied, a steal that made a list, small copies in the fd code | Each one is simpler |

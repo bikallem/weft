@@ -19,7 +19,7 @@ type _ Effect.t +=
   | Wake : int -> unit Effect.t
   | Random : int -> int Effect.t
   | Random_bytes : bytes -> unit Effect.t
-  | Switch : int -> unit Effect.t
+  | Switch : unit Effect.t
 
 module type WORLD = sig
   type t

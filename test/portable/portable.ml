@@ -2,7 +2,10 @@ open Windtrap
 open Weft
 
 type world =
-  {name: string; run: 'a. (unit -> 'a) -> 'a; listen: unit -> Net.t * Net.addr}
+  { name: string
+  ; domains: int
+  ; run: 'a. (unit -> 'a) -> 'a
+  ; listen: unit -> Net.t * Net.addr }
 
 exception Boom of string
 
@@ -159,6 +162,103 @@ let chans w =
                       ; wrap (Chan.recv c) (fun _ -> "met")
                       ; wrap (Time.after Mono (Span.ms 5)) (fun () -> "timeout")
                       ] ) ) ) ) ]
+
+(* More than 256 fibers that yield: the fiber in the overflow queue runs (the
+   review of M1, T1). *)
+let overflow_runs w =
+  test "a fiber in the overflow queue runs while the ring is full" (fun () ->
+      w.run (fun () ->
+          let flag = Atomic.make false in
+          Fiber.scope (fun s ->
+              (* The first fiber: a full ring moves its oldest half, with this
+                 fiber, to the overflow queue. *)
+              Fiber.fork s (fun () -> Atomic.set flag true) ;
+              for _ = 1 to 300 do
+                Fiber.fork s (fun () ->
+                    let n = ref 0 in
+                    while not (Atomic.get flag) do
+                      incr n ;
+                      if !n > 1_000_000 then failwith "starved" ;
+                      Fiber.yield ()
+                    done )
+              done ) ) )
+
+(* The tests of many domains (milestone M1). They run only when the world has
+   more than one domain. *)
+
+let dom () = Private.Sched.prog "test" Private.Sched.Dom_index
+
+(* Fibers that start on domain 0 run on other domains too, and each one ends. *)
+let work_stealing w () =
+  let any = ref false in
+  for _ = 1 to 20 do
+    w.run (fun () ->
+        let seen = Array.init w.domains (fun _ -> Atomic.make false) in
+        let ends = Atomic.make 0 in
+        Fiber.scope (fun s ->
+            for _ = 1 to 40 do
+              Fiber.fork s (fun () ->
+                  for _ = 1 to 50 do
+                    Atomic.set seen.(dom ()) true ;
+                    Fiber.yield ()
+                  done ;
+                  Atomic.incr ends )
+            done ) ;
+        equal int 40 (Atomic.get ends) ;
+        if
+          Array.exists
+            (fun a -> Atomic.get a)
+            (Array.sub seen 1 (w.domains - 1))
+        then any := true )
+  done ;
+  is_true !any
+
+(* A fiber that blocks on one fd from two domains in sequence gets all of its
+   data. After the close, a sleep gives the simulator a quiescence, so that a
+   close notice that waits is a lost wakeup. *)
+let fd_from_two_domains w () =
+  let two = ref false in
+  for _ = 1 to 50 do
+    w.run (fun () ->
+        let l, a = w.listen () in
+        Fiber.scope (fun s ->
+            Fiber.fork s (fun () ->
+                let c, _ = Net.accept l in
+                for i = 1 to 20 do
+                  Net.write c (string_of_int (i mod 10)) ;
+                  Time.sleep Mono (Span.ms 1)
+                done ;
+                Net.close c ) ;
+            let c : Private.Net.t = Net.connect a in
+            let b = Buffer.create 20 and buf = Bytes.create 8 in
+            let rec loop () =
+              match Net.read c buf 0 8 with
+              | 0 ->
+                  ()
+              | k ->
+                  Buffer.add_subbytes b buf 0 k ;
+                  let ds = Atomic.get c.Private.Sched.doms in
+                  if ds land (ds - 1) <> 0 then two := true ;
+                  (* A yield lets a thief take the fiber. *)
+                  Fiber.yield () ;
+                  loop ()
+            in
+            loop () ;
+            equal string "12345678901234567890" (Buffer.contents b) ;
+            Net.close c ;
+            Time.sleep Mono (Span.ms 1) ) ;
+        Net.close l )
+  done ;
+  is_true !two
+
+let many w =
+  if w.domains = 1 then []
+  else
+    [ group "many domains"
+        [ test "work stealing: fibers run on more than one domain"
+            (work_stealing w)
+        ; test "a fiber that blocks on one fd from two domains gets all data"
+            (fd_from_two_domains w) ] ]
 
 let scopes w =
   group "scopes"
@@ -327,4 +427,5 @@ let net w =
                   is_true (String.equal data (Promise.await r)) ;
                   Net.close c ) ) ) ]
 
-let tests w = [group w.name [events w; chans w; scopes w; net w]]
+let tests w =
+  [group w.name ([events w; chans w; scopes w; net w; overflow_runs w] @ many w)]

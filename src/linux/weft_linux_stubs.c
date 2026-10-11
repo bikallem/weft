@@ -18,6 +18,7 @@
 #include <unistd.h>
 
 #include <caml/alloc.h>
+#include <caml/fail.h>
 #include <caml/memory.h>
 #include <caml/mlvalues.h>
 #include <caml/signals.h>
@@ -75,20 +76,30 @@ value weft_eventfd_signal(value fd) {
   return Val_int(r < 0 ? ERR : 0);
 }
 
-static int ctl(int epfd, int op, int fd, int64_t token) {
+static int ctl(int epfd, int op, int fd, int64_t token, uint32_t events) {
   struct epoll_event ev;
   memset(&ev, 0, sizeof ev);
-  ev.events = EPOLLIN | EPOLLOUT | EPOLLRDHUP | EPOLLET;
+  ev.events = events;
   ev.data.u64 = (uint64_t)token;
   return epoll_ctl(epfd, op, fd, &ev) < 0 ? ERR : 0;
 }
 
+#define FD_EVENTS (EPOLLIN | EPOLLOUT | EPOLLRDHUP | EPOLLET)
+
 value weft_epoll_add(value epfd, value fd, value token) {
-  return Val_int(ctl(Int_val(epfd), EPOLL_CTL_ADD, Int_val(fd), Long_val(token)));
+  return Val_int(
+      ctl(Int_val(epfd), EPOLL_CTL_ADD, Int_val(fd), Long_val(token), FD_EVENTS));
+}
+
+/* The eventfd and the timerfd of a domain: EPOLLIN only. With EPOLLOUT, each
+   drain of a count gives one more event. */
+value weft_epoll_add_in(value epfd, value fd, value token) {
+  return Val_int(ctl(Int_val(epfd), EPOLL_CTL_ADD, Int_val(fd), Long_val(token),
+                     EPOLLIN | EPOLLET));
 }
 
 value weft_epoll_del(value epfd, value fd) {
-  return Val_int(ctl(Int_val(epfd), EPOLL_CTL_DEL, Int_val(fd), 0));
+  return Val_int(ctl(Int_val(epfd), EPOLL_CTL_DEL, Int_val(fd), 0, 0));
 }
 
 #define MAX_EVENTS 256
@@ -108,7 +119,11 @@ value weft_epoll_wait(value epfd, value sleep) {
   } else {
     n = epoll_wait(fd, evs, MAX_EVENTS, 0);
   }
-  if (n < 0) n = 0; /* EINTR: the loop polls again. */
+  if (n < 0) {
+    /* EINTR: the loop polls again. Each other error is a bug of the world. */
+    if (errno != EINTR) caml_failwith("epoll_wait");
+    n = 0;
+  }
   result = caml_alloc_tuple(n);
   for (int i = 0; i < n; i++) {
     uint32_t e = evs[i].events;

@@ -25,8 +25,7 @@ module Prng = struct
   (* A value in the range 0 to [n - 1], with no bias. *)
   let int t n =
     if
-      ( n <= 0 )
-      [@mutate off "the scheduler asks only for n >= 2; Int64.rem fails at 0"]
+      (n <= 0) [@mutate off "each caller asks for n >= 1; Int64.rem fails at 0"]
     then invalid_arg "random" ;
     let n64 = Int64.of_int n in
     let rec draw () =
@@ -442,7 +441,7 @@ let start_dom d =
           | World.Wake _
           | World.Random _
           | World.Random_bytes _
-          | World.Switch _ ->
+          | World.Switch ->
               Some
                 (fun (k : (a, dstep) Effect.Deep.continuation) -> Paused (e, k))
           | _ ->
@@ -492,13 +491,14 @@ let step t st d =
           go (Prng.int t.prng n)
       | World.Random_bytes b ->
           go (Prng.bytes t.prng b)
-      | World.Switch _ ->
+      | World.Switch ->
           go ()
       | World.Wake d' ->
           t.woken.(d') <- true ;
           go ()
-      | World.Wait (dd, w) -> (
-        match (take_ready t dd, w.timeout) with
+      | World.Wait (_, w) -> (
+        (* A domain waits only on its own poller. *)
+        match (take_ready t d, w.timeout) with
         | (_ :: _ as ready), _ ->
             go ready
         | [], World.Wait.Poll ->
@@ -611,7 +611,7 @@ let run ?(seed = 0) ?(domains = 1) ?(auto = true) main =
     ; settles= []
     ; advance= None }
   in
-  let s = Sched.create ~slack:Weft.Span.zero ~domains () in
+  let s = Sched.create ~slack:Weft.Span.zero ~simulated:true ~domains () in
   t.sched <- Some s ;
   let result = Sched.start s (fun () -> main t) in
   let st = Array.map (fun d -> Start d) s.doms in

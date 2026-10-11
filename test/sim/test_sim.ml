@@ -938,6 +938,7 @@ let properties =
 let portable_world =
   let n = ref 0 in
   { Portable.name= "portable"
+  ; domains= 1
   ; run= (fun f -> run f)
   ; listen=
       (fun () ->
@@ -949,6 +950,7 @@ let portable_world =
 let portable_world_4 =
   let n = ref 0 and seed = ref 0 in
   { Portable.name= "portable on 4 domains"
+  ; domains= 4
   ; run=
       (fun f ->
         incr seed ;

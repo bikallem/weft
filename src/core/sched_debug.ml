@@ -3,6 +3,9 @@
 
 open Sched
 
+(* The name of a fiber: its own, or "fiber-<id>". *)
+let name f = if f.name = "" then "fiber-" ^ string_of_int f.fid else f.name
+
 let fibers t =
   Spin.with_lock t.fibers_lock (fun () ->
       Hashtbl.fold (fun _ f acc -> f :: acc) t.fibers [] )
@@ -14,7 +17,7 @@ let blocked t =
     (fun f ->
       match Atomic.get f.current with
       | Some s when not (is_done s) ->
-          Some f.name
+          Some (name f)
       | _ ->
           None )
     (fibers t)
@@ -26,7 +29,7 @@ let parked t =
     (fun f ->
       match Atomic.get f.current with
       | Some s when C.state s.word = C.Parked ->
-          Some (f.name, s)
+          Some (name f, s)
       | _ ->
           None )
     (fibers t)
@@ -66,7 +69,8 @@ let lost t ~now =
                       sleep, so an entry at now is a bug in expire, not in \
                       this check"]
             then
-              Some (Printf.sprintf "%s has an expired timer" e.esync.owner.name)
+              Some
+                (Printf.sprintf "%s has an expired timer" (name e.esync.owner))
             else None ) )
   in
   let done_not_queued =
@@ -74,7 +78,7 @@ let lost t ~now =
       (fun f ->
         match Atomic.get f.current with
         | Some s when is_done s && not f.queued ->
-            Some (Printf.sprintf "%s is committed but not in a queue" f.name)
+            Some (Printf.sprintf "%s is committed but not in a queue" (name f))
         | _ ->
             None )
       (fibers t)
@@ -97,7 +101,7 @@ let live_timers t =
 let fd_waiters t =
   let names w =
     List.filter_map
-      (fun (s, _) -> if is_done s then None else Some s.owner.name)
+      (fun (s, _) -> if is_done s then None else Some (name s.owner))
       (Waiters.to_list w)
   in
   Array.to_list t.doms

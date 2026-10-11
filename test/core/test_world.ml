@@ -160,20 +160,16 @@ let idle_poll_finds_timer () =
   run ~slack:Span.zero w (fun () -> Time.sleep Mono (Span.ms 1)) ;
   equal (list int64) [] w.alarms
 
-let choose_uses_world_random () =
+(* The scan order comes from the PRNG of the domain. The world gives its seed
+   one time, when the domain starts. *)
+let one_seed_for_each_domain () =
   let w = Manual.make () in
-  let r =
-    run w (fun () -> sync (choose [always "a"; always "b"; always "c"]))
-  in
-  equal int 2 w.randoms ;
-  (* The shuffle with [random n = n - 1] keeps the order: the first branch is
-     scanned first. *)
-  equal string "a" r
-
-let one_branch_no_random () =
-  let w = Manual.make () in
-  ignore (run w (fun () -> sync (always ()))) ;
-  equal int 0 w.randoms
+  ignore
+    (run w (fun () ->
+         for _ = 1 to 10 do
+           ignore (sync (choose [always "a"; always "b"; always "c"]))
+         done ) ) ;
+  equal int 1 w.randoms
 
 (* K1: a deadline that passes between the poll and the sleep. The domain must
    not sleep with the fiber in its queue. *)
@@ -204,8 +200,7 @@ let world =
     ; test "a busy domain polls its timers" busy_domain_polls
     ; test "an idle poll that makes a timer ready does not sleep"
         idle_poll_finds_timer
-    ; test "choose takes its order from the world" choose_uses_world_random
-    ; test "a sync with one branch does not use random" one_branch_no_random
+    ; test "the world gives one seed for each domain" one_seed_for_each_domain
     ; test ~timeout:5. "K1: a deadline between the poll and the sleep fires"
         expire_before_sleep
     ; test ~timeout:5. "C4: the alarm near the largest time saturates"

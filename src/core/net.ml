@@ -63,12 +63,10 @@ let writable fd = fd_event ~write:true ~clear:false fd
 
 let ok name = function Ok v -> v | Error e -> raise (Error (e, name))
 
-(* [close] holds a user while it removes the registration, so close(2) comes
-   after the Deregister (design section 2.7). A second [close] does nothing. *)
-(* [close] never blocks. If users remain, each domain with a registration
-   gets a close notice, and the last user calls close(2) (design section 2.7,
-   spec/tla/Fd.tla). A second close does nothing. [Self] first: outside a
-   fiber, [close] raises [Not_in_fiber] before it changes the state. *)
+(* [close] never blocks. If users remain, each domain with a registration gets a
+   close notice, and the last user calls close(2) (design section 2.7,
+   spec/tla/Fd.tla). A second close does nothing. [Self] first: outside a fiber,
+   [close] raises [Not_in_fiber] before it changes the state. *)
 let close fd =
   ignore (self ()) ;
   if Rc.close fd then prog "Net.close" (Close_notices fd)

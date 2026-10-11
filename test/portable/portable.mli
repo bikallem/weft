@@ -2,6 +2,7 @@
 
 type world =
   { name: string
+  ; domains: int  (** The number of domains of [run]. *)
   ; run: 'a. (unit -> 'a) -> 'a  (** Runs a program in the world. *)
   ; listen: unit -> Weft.Net.t * Weft.Net.addr
         (** A new listener, and the address that a client connects to. *) }

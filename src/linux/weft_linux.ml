@@ -18,6 +18,8 @@ external eventfd_signal : int -> int = "weft_eventfd_signal"
 
 external epoll_add : int -> int -> int -> int = "weft_epoll_add"
 
+external epoll_add_in : int -> int -> int -> int = "weft_epoll_add_in"
+
 external epoll_del : int -> int -> int = "weft_epoll_del"
 
 external epoll_wait : int -> bool -> (int * bool * bool) array
@@ -89,8 +91,8 @@ let make_dom () =
   let epfd = check "epoll_create1" (epoll_create ()) in
   let evfd = check "eventfd" (eventfd ()) in
   let tfd = check "timerfd_create" (timerfd ()) in
-  ignore (check "epoll_ctl" (epoll_add epfd evfd wake_token)) ;
-  ignore (check "epoll_ctl" (epoll_add epfd tfd timer_token)) ;
+  ignore (check "epoll_ctl" (epoll_add_in epfd evfd wake_token)) ;
+  ignore (check "epoll_ctl" (epoll_add_in epfd tfd timer_token)) ;
   {epfd; evfd; tfd; armed= 0L}
 
 let create ?(domains = 1) () =

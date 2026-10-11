@@ -60,7 +60,7 @@ let handle (type w) (module W : WORLD with type t = w) (w : w) f =
               Some (fun k -> continue k (W.random w n))
           | World.Random_bytes b ->
               Some (fun k -> continue k (W.random_bytes w b))
-          | World.Switch _ ->
+          | World.Switch ->
               Some (fun k -> continue k ())
           | _ ->
               None ) }
@@ -82,9 +82,26 @@ let run_world (type w) ?slack ?(domains = 1) ?on_create
         Array.iter (fun d -> W.wake w ~domain:d.Sched.index) t.doms ;
         Error (e, bt)
   in
+  let stop () =
+    Atomic.set t.finished true ;
+    Array.iter (fun d -> W.wake w ~domain:d.Sched.index) t.doms
+  in
+  (* If a spawn fails, the domains that started must stop before the error goes
+     on: they hold the fds of the world. *)
   let others =
-    Array.to_list (Array.sub t.doms 1 (domains - 1))
-    |> List.map (fun d -> Domain.spawn (run_dom d))
+    List.fold_left
+      (fun started d ->
+        match Domain.spawn (run_dom d) with
+        | dom ->
+            dom :: started
+        | exception e ->
+            let bt = Printexc.get_raw_backtrace () in
+            stop () ;
+            List.iter (fun d -> ignore (Domain.join d)) started ;
+            Printexc.raise_with_backtrace e bt )
+      []
+      (Array.to_list (Array.sub t.doms 1 (domains - 1)))
+    |> List.rev
   in
   let first = run_dom t.doms.(0) () in
   let rest = List.map Domain.join others in

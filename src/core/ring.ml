@@ -37,8 +37,9 @@ let is_empty r = Atomic.get r.tail - Atomic.get r.head <= 0
 
 (* A thief takes half of the queue of [from], and puts all but one of them in
    its own ring [into], which is empty. It gives the one that it keeps. The
-   thief reads the slots before its CAS on the head: until the head moves, the
-   owner cannot write these slots. *)
+   thief copies the slots into [into] before its CAS on the head: until the head
+   moves, the owner cannot write these slots, and until the thief sets the tail
+   of [into], nobody reads them. *)
 let rec steal ~from ~into =
   let h = Atomic.get from.head in
   let t = Atomic.get from.tail in
@@ -51,14 +52,18 @@ let rec steal ~from ~into =
   then None
   else if n > size / 2 then steal ~from ~into (* the two reads did not agree *)
   else
-    let xs = List.init n (fun i -> Atomic.get from.buf.((h + i) land mask)) in
+    let base = Atomic.get into.tail in
+    for
+      i = 1
+      to ( n - 1 )
+         [@mutate off "a slot past the new tail of the thief is not visible"]
+    do
+      Atomic.set
+        into.buf.((base + i - 1) land mask)
+        (Atomic.get from.buf.((h + i) land mask))
+    done ;
+    let first = Atomic.get from.buf.(h land mask) in
     if not (Atomic.compare_and_set from.head h (h + n)) then steal ~from ~into
-    else
-      match xs with
-      | first :: rest ->
-          List.iter
-            (function Some x -> ignore (push into x) | None -> ())
-            rest ;
-          first
-      | [] ->
-          None
+    else (
+      Atomic.set into.tail (base + n - 1) ;
+      first )
