@@ -192,6 +192,8 @@ and t =
   ; finished: bool Atomic.t
   ; idle: int Atomic.t
         (** The bit of each domain that sleeps, or is about to. *)
+  ; searching: int Atomic.t
+        (** The domains that steal at this time (the Go rules, M3). *)
   ; overflow: ready Queue.t  (** The fibers of full rings, under its lock. *)
   ; overflow_lock: Spin.t
   ; externals: (int, ext) Hashtbl.t
@@ -566,7 +568,8 @@ let push dom f run =
               ()
         done ;
         Queue.push r t.overflow ) ;
-  if Atomic.get t.idle <> 0 then dom.wake <- true
+  (* A domain that searches finds the fiber: no wake (the Go rules). *)
+  if Atomic.get t.idle <> 0 && Atomic.get t.searching = 0 then dom.wake <- true
 
 (* Wake one idle domain if a push marked it. No lock is held here. *)
 let flush_wake dom =
@@ -1126,10 +1129,26 @@ let take_overflow t =
 
 (* A steal: try each other domain one time, from a start that the PRNG of the
    domain selects. *)
+(* A domain searches only if fewer than half of the domains search (at least
+   one). It gives [false] if it cannot search. *)
+let start_search (t : t) =
+  let limit = Int.max 1 (Array.length t.doms / 2) in
+  let rec inc () =
+    let s = Atomic.get t.searching in
+    s < limit && (Atomic.compare_and_set t.searching s (s + 1) || inc ())
+  in
+  inc ()
+
+(* The steal of the Go rules (design section 2.5, Idle and wake, and
+   spec/tla/Wake.tla). A searching domain that finds no work decreases
+   [searching] before its second check. The last searching domain that finds
+   work wakes one idle domain, because the pushes woke nobody while it
+   searched. *)
 let steal dom =
-  let doms = dom.sched.doms in
+  let t = dom.sched in
+  let doms = t.doms in
   let n = Array.length doms in
-  if n = 1 then None
+  if n = 1 || not (start_search t) then None
   else
     let start = next_rand dom mod n in
     let rec try_ i =
@@ -1140,18 +1159,14 @@ let steal dom =
         else
           match Ring.steal ~from:v.ring ~into:dom.ring with
           | Some r ->
-              (* The thief has more fibers in its ring: it wakes one more idle
-                 domain, as Go does. *)
-              if
-                ( (not (Ring.is_empty dom.ring))
-                && Atomic.get dom.sched.idle <> 0 )
-                [@mutate off "the wake chain gives only parallelism"]
-              then dom.wake <- true ;
               Some r
           | None ->
               try_ (i + 1)
     in
-    try_ 0
+    let r = try_ 0 in
+    if Atomic.fetch_and_add t.searching (-1) = 1 && Option.is_some r then
+      if Atomic.get t.idle <> 0 then dom.wake <- true ;
+    r
 
 (* Steps 2 to 4 of the loop: the local queue, the overflow queue, then a steal.
    Each 61st take tries the overflow queue first, so that its fibers do not
@@ -1474,6 +1489,7 @@ let create ?(slack = Span.ms 1) ?(simulated = false) ~domains () =
     ; simulated
     ; finished= Atomic.make false
     ; idle= Atomic.make 0
+    ; searching= Atomic.make 0
     ; overflow= Queue.create ()
     ; overflow_lock= Spin.make ()
     ; externals= Hashtbl.create ~random:false 8

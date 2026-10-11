@@ -291,6 +291,28 @@ let idle_push () =
           S.flush_wake d1 ) ;
       fun () -> (not (Atomic.get slept)) || Atomic.get w.wakes = 1 )
 
+(* The Go rules (M3, Wake.tla): domain 0 searches, finds nothing, decreases
+   [searching], goes idle and checks again, while domain 1 pushes. A push wakes
+   nobody while a domain searches. Domain 0 finds the fiber, or it sleeps and
+   gets one wake. *)
+let search_push () =
+  trace (fun () ->
+      let t = S.create ~domains:2 () in
+      let w = world () in
+      let found = Atomic.make false and slept = Atomic.make false in
+      let d0 = t.S.doms.(0) and d1 = t.S.doms.(1) in
+      let f = S.new_fiber [scope_node ()] in
+      spawn_in w (fun () ->
+          if Option.is_some (S.steal d0) then Atomic.set found true
+          else (
+            S.Idle.add t 0 ;
+            if not (S.work_for d0) then Atomic.set slept true ) ) ;
+      spawn_in w (fun () ->
+          S.push d1 f (fun () -> S.Finished) ;
+          S.flush_wake d1 ) ;
+      fun () ->
+        Atomic.get found || (not (Atomic.get slept)) || Atomic.get w.wakes = 1 )
+
 (* The atomic register of a channel: a send and a recv on an empty channel at
    the same time. They meet. *)
 let chan_meet () =
@@ -581,6 +603,8 @@ let () =
   case "commit: two fibers that sync on each other" cross ;
   case "ring: a push by the owner and a steal by two thieves" ring_steal ;
   case "idle: a domain goes idle while another domain pushes work" idle_push ;
+  case "idle: a searching domain goes idle while another domain pushes"
+    search_push ;
   case "register: a send and a recv on an empty channel at the same time"
     chan_meet ;
   case "register: a fill of an Ivar during a register" ivar_fill_register ;
