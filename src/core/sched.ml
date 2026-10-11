@@ -165,6 +165,8 @@ and dom =
         (** The next slot: a fiber that a fiber of this domain woke. The owner
             puts and takes, and a thief takes with a CAS (M3). *)
   ; mutable next_runs: int  (** The runs from the next slot in sequence. *)
+  ; mutable pinned_runs: int
+        (** On domain 0: the runs from the pinned queue in sequence. *)
   ; heap: heap
   ; pheap: heap  (** The [Posix] deadlines (M3). *)
   ; ids: Commit.Id.gen
@@ -193,7 +195,9 @@ and stats =
   { mutable wakes: int  (** The wakes that the pushes did. *)
   ; mutable edges: int  (** The fd events. *)
   ; mutable idle_edges: int  (** The fd events with no live waiter. *)
-  ; mutable busy_polls: int  (** The polls of a busy domain. *) }
+  ; mutable busy_polls: int  (** The polls of a busy domain. *)
+  ; mutable resumes: int
+        (** The fibers that a commit resumed: progress for [Livelock]. *) }
 
 and t =
   { run_id: int  (** The id of the run. *)
@@ -216,6 +220,8 @@ and t =
   ; pinned_q: ready Queue.t
         (** The pinned fibers: only domain 0 takes them. Under its lock. *)
   ; pinned_lock: Spin.t
+  ; pinned_n: int Atomic.t
+        (** The length of the pinned queue: domain 0 reads it with no lock. *)
   ; unawaited: int Atomic.t
         (** The promises of the run that failed, with no fiber that got the
             exception. The simulator forces a GC at its end only if it is not 0.
@@ -598,11 +604,22 @@ end
    idle, the push marks a wake: the scheduler does it at the next safe point,
    because a wake is a world effect, and a lock can be held here. *)
 (* A pinned fiber goes to the pinned queue, and the push wakes domain 0
-   directly: another domain cannot run it (Wake.tla). *)
+   directly: another domain cannot run it (Wake.tla). The count comes after the
+   push, and domain 0 reads it after it adds itself to [idle]: a Dekker pair
+   with the wake. *)
 let push_pinned dom r =
   let t = dom.sched in
   Spin.with_lock t.pinned_lock (fun () -> Queue.push r t.pinned_q) ;
+  Atomic.incr t.pinned_n ;
   if dom.index <> 0 then dom.wake0 <- true
+
+let has_pinned dom = dom.index = 0 && Atomic.get dom.sched.pinned_n > 0
+
+(* A push wakes an idle domain, but not while a domain searches: that domain
+   finds the fiber (the Go rules). *)
+let mark_wake dom =
+  let t = dom.sched in
+  if Atomic.get t.idle <> 0 && Atomic.get t.searching = 0 then dom.wake <- true
 
 let push_ready dom r =
   r.rfiber.queued <- true ;
@@ -619,9 +636,7 @@ let push_ready dom r =
                 ()
           done ;
           Queue.push r t.overflow ) ;
-    (* A domain that searches finds the fiber: no wake (the Go rules). *)
-    if Atomic.get t.idle <> 0 && Atomic.get t.searching = 0 then
-      dom.wake <- true )
+    mark_wake dom )
 
 let push dom f run = push_ready dom {rfiber= f; run}
 
@@ -629,17 +644,13 @@ let push dom f run = push_ready dom {rfiber= f; run}
    was in the slot goes to the tail (design section 2.5, Where a woken fiber
    goes). A thief can take the slot, so the push wakes an idle domain by the
    normal rule. *)
-let wake_on_next = ref true
-
 let push_next dom f run =
   if f.pinned then push dom f run
   else (
     f.queued <- true ;
     Option.iter (push_ready dom)
       (Atomic.exchange dom.next (Some {rfiber= f; run})) ;
-    let t = dom.sched in
-    if !wake_on_next && Atomic.get t.idle <> 0 && Atomic.get t.searching = 0
-    then dom.wake <- true )
+    mark_wake dom )
 
 (* Wake one idle domain if a push marked it. No lock is held here. *)
 let flush_wake dom =
@@ -663,6 +674,7 @@ let resume ?(next = false) dom s =
   let i = match C.state s.word with C.Done i -> i | _ -> assert false in
   let k = match s.k with Some k -> k | None -> assert false in
   s.k <- None ;
+  dom.stats.resumes <- dom.stats.resumes + 1 ;
   (if next then push_next else push) dom s.owner (fun () ->
       Atomic.set s.owner.current None ;
       Effect.Deep.continue k i )
@@ -1224,9 +1236,13 @@ let wait dom timeout =
   take_mail dom ;
   expire dom ;
   flush_wake dom ;
+  (* The expire can resume a pinned fiber on domain 0 with no wake. *)
   let timeout =
-    if Ring.is_empty dom.ring && Option.is_none (Atomic.get dom.next) then
-      timeout
+    if
+      Ring.is_empty dom.ring
+      && Option.is_none (Atomic.get dom.next)
+      && not (has_pinned dom)
+    then timeout
     else World.Wait.Poll
   in
   let w =
@@ -1296,16 +1312,22 @@ let steal dom =
 
 (* The next slot runs at most [next_limit] times in sequence. Then its fiber
    goes to the tail, so that two fibers that wake each other do not starve the
-   local queue (open question 5). *)
-let next_limit = ref 3
+   local queue (open question 5). The pinned queue has the same limit. *)
+let next_limit = 3
 
 let take_next dom =
-  match Atomic.exchange dom.next None with
+  match
+    match Atomic.get dom.next with
+    | None ->
+        None
+    | Some _ ->
+        Atomic.exchange dom.next None
+  with
   | None ->
       dom.next_runs <- 0 ;
       None
   | Some r ->
-      if dom.next_runs < !next_limit then (
+      if dom.next_runs < next_limit then (
         dom.next_runs <- dom.next_runs + 1 ;
         Some r )
       else (
@@ -1319,17 +1341,34 @@ let take_next dom =
 (* The requests of the injection queue, the oldest first: each one fills an
    Ivar on this domain. *)
 let take_injected dom =
-  match Atomic.exchange dom.sched.inject [] with
-  | [] ->
-      ()
-  | l ->
-      List.iter (fun req -> req dom) (List.rev l)
+  let t = dom.sched in
+  if Atomic.get t.inject <> [] then
+    List.iter (fun req -> req dom) (List.rev (Atomic.exchange t.inject []))
 
 let take_pinned dom =
-  if dom.index <> 0 then None
+  if not (has_pinned dom) then None
   else
     let t = dom.sched in
-    Spin.with_lock t.pinned_lock (fun () -> Queue.take_opt t.pinned_q)
+    let r =
+      Spin.with_lock t.pinned_lock (fun () -> Queue.take_opt t.pinned_q)
+    in
+    if Option.is_some r then Atomic.decr t.pinned_n ;
+    r
+
+(* Domain 0 takes the pinned queue first, but at most [next_limit] times in
+   sequence: a pinned fiber that yields must not starve the local queue. *)
+let take_pinned_first dom =
+  if dom.pinned_runs >= next_limit then (
+    dom.pinned_runs <- 0 ;
+    None )
+  else
+    match take_pinned dom with
+    | Some r ->
+        dom.pinned_runs <- dom.pinned_runs + 1 ;
+        Some r
+    | None ->
+        dom.pinned_runs <- 0 ;
+        None
 
 let take dom =
   dom.ticks <- dom.ticks + 1 ;
@@ -1343,7 +1382,7 @@ let take dom =
       take_overflow dom.sched )
     else None
   in
-  match match first with Some r -> Some r | None -> take_pinned dom with
+  match match first with Some r -> Some r | None -> take_pinned_first dom with
   | Some r ->
       Some r
   | None -> (
@@ -1361,8 +1400,12 @@ let take dom =
         | None -> (
             (* The fills from outside resume their fibers to this domain. *)
             take_injected dom ;
-            match Ring.pop dom.ring with Some r -> Some r | None -> steal dom )
-        ) ) )
+            match Ring.pop dom.ring with
+            | Some r ->
+                Some r
+            | None -> (
+              match take_pinned dom with Some r -> Some r | None -> steal dom )
+            ) ) ) )
 
 (* The second check of a domain that is in [idle]: did [main] end, or is there a
    fiber in a queue that it can take? The check needs [finished]: a poll in the
@@ -1372,8 +1415,7 @@ let work_for dom =
   let t = dom.sched in
   Atomic.get t.finished
   || Atomic.get t.inject <> []
-  || dom.index = 0
-     && not (Spin.with_lock t.pinned_lock (fun () -> Queue.is_empty t.pinned_q))
+  || has_pinned dom
   || Array.exists
        (fun d ->
          (not (Ring.is_empty d.ring)) || Option.is_some (Atomic.get d.next) )
@@ -1684,6 +1726,7 @@ let create ?(slack = Span.ms 1) ?(simulated = false) ~domains () =
     ; searching= Atomic.make 0
     ; pinned_q= Queue.create ()
     ; pinned_lock= Spin.make ()
+    ; pinned_n= Atomic.make 0
     ; unawaited= Atomic.make 0
     ; inject= Atomic.make []
     ; overflow= Queue.create ()
@@ -1699,6 +1742,7 @@ let create ?(slack = Span.ms 1) ?(simulated = false) ~domains () =
         ; ring= Ring.create ()
         ; next= Atomic.make None
         ; next_runs= 0
+        ; pinned_runs= 0
         ; heap= Heap.create ()
         ; pheap= Heap.create ()
         ; ids= Commit.Id.gen ~domain:index ~max_domains:domains
@@ -1708,7 +1752,7 @@ let create ?(slack = Span.ms 1) ?(simulated = false) ~domains () =
         ; rng= 0
         ; wake= false
         ; wake0= false
-        ; stats= {wakes= 0; edges= 0; idle_edges= 0; busy_polls= 0}
+        ; stats= {wakes= 0; edges= 0; idle_edges= 0; busy_polls= 0; resumes= 0}
         ; held= 0
         ; regs= Hashtbl.create ~random:false 64
         ; mailbox= Atomic.make [] } ) ;
@@ -1753,10 +1797,13 @@ let start t main =
    queue of the simulator. *)
 let outside : (t * ((dom -> unit) -> unit)) option Atomic.t = Atomic.make None
 
-(* Push a request to the injection queue with a CAS: no lock, no sync word. *)
-let rec inject t req =
-  let l = Atomic.get t.inject in
-  if not (Atomic.compare_and_set t.inject l (req :: l)) then inject t req
+(* A push to an atomic list with a CAS: no lock. A finaliser can do it. *)
+let rec push_list l x =
+  let old = Atomic.get l in
+  if not (Atomic.compare_and_set l old (x :: old)) then push_list l x
+
+(* Push a request to the injection queue: no lock, no sync word. *)
+let inject t req = push_list t.inject req
 
 (* It touches no sync word, no waiter list and no lock: a domain does the fill
    at a safe point. It gives [false] if no run takes the fill. *)

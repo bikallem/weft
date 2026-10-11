@@ -161,20 +161,17 @@ type t =
   ; fills: (Sched.dom -> unit) list Atomic.t
         (** The fills from outside a fiber that wait for the quiescence, the
             newest first. A finaliser can push, so the list is atomic. *)
-  ; refused_fills: int Atomic.t  (** The fills with no [~outside_fills]. *)
-  ; mutable steps: int  (** The switch points. *)
+  ; refused_fill: bool Atomic.t  (** A fill with no [~outside_fills]. *)
+  ; resumes_seen: int array
+        (** The resumes of each domain at its last step, for [Livelock]. *)
   ; livelock: int  (** The limit of the switch points with no progress. *)
   ; mutable no_progress: int
         (** The switch points since the last progress or quiescence. *)
-  ; mutable fill_log: int list
-        (** The switch point of the quiescence that gave each fill. *)
   ; mutable next_pid: int }
 
 let sched t = Option.get t.sched
 
 let open_fds t = Hashtbl.length t.net.fds
-
-let fill_log t = List.rev t.fill_log
 
 let key addr = Format.asprintf "%a" Op.pp_addr addr
 
@@ -1000,14 +997,19 @@ let no_progress t =
 let progress t = t.no_progress <- 0
 
 let step t st d =
-  t.steps <- t.steps + 1 ;
-  ( match st.(d) with
-  | Pending ((World.Now _ | World.Switch | World.Random _), _) ->
-      no_progress t
-  | Pending (World.Wait _, _) when not (has_ready t d) ->
-      no_progress t
-  | _ ->
-      progress t ) ;
+  (* A fiber that a commit resumed is progress, for example on a channel. *)
+  let resumes = (sched t).doms.(d).stats.resumes in
+  ( if resumes <> t.resumes_seen.(d) then (
+      t.resumes_seen.(d) <- resumes ;
+      progress t )
+    else
+      match st.(d) with
+      | Pending ((World.Now _ | World.Switch | World.Random _), _) ->
+          no_progress t
+      | Pending (World.Wait _, _) when not (has_ready t d) ->
+          no_progress t
+      | _ ->
+          progress t ) ;
   let next = function Ended -> Ended_dom | Paused (e, k) -> Pending (e, k) in
   match st.(d) with
   | Start dom ->
@@ -1109,14 +1111,13 @@ let quiescent t st =
       (fun (d, dl, alarm) -> if Int64.compare dl t.now <= 0 then give d alarm)
       deadlines
   in
-  if Atomic.get t.refused_fills > 0 then
+  if Atomic.get t.refused_fill then
     model_error
       "a fill from outside a fiber, with no Sim.run ~outside_fills:true" ;
   match (Atomic.exchange t.fills [], t.settles) with
   | (_ :: _ as fills), _ ->
       (* The fills go to the injection queue, and a domain wakes. *)
       List.iter (Sched.inject s) (List.rev fills) ;
-      t.fill_log <- t.steps :: t.fill_log ;
       give first World.Ready.Woken
   | [], _ :: _ ->
       List.iter
@@ -1181,11 +1182,10 @@ let run ?(seed = 0) ?(domains = 1) ?(auto = true) ?(signals = [])
     ; programs= Hashtbl.create ~random:false 8
     ; watched= signals
     ; fills= Atomic.make []
-    ; refused_fills= Atomic.make 0
-    ; steps= 0
+    ; refused_fill= Atomic.make false
+    ; resumes_seen= Array.make domains 0
     ; livelock
     ; no_progress= 0
-    ; fill_log= []
     ; next_pid= 1000 }
   in
   let s = Sched.create ~slack:Weft.Span.zero ~simulated:true ~domains () in
@@ -1193,31 +1193,29 @@ let run ?(seed = 0) ?(domains = 1) ?(auto = true) ?(signals = [])
   (* A fill from outside a fiber waits for the quiescence. The GC selects when a
      finaliser runs, so a seed gives the same run only in the same binary with
      the same history (design section 2.9). *)
-  let rec push_fill req =
-    let l = Atomic.get t.fills in
-    if not (Atomic.compare_and_set t.fills l (req :: l)) then push_fill req
-  in
   let slot =
     Some
       ( s
       , fun req ->
-          if outside_fills then push_fill req else Atomic.incr t.refused_fills
-      )
+          if outside_fills then Sched.push_list t.fills req
+          else Atomic.set t.refused_fill true )
   in
   Atomic.set Sched.outside slot ;
   (* The promises of this run that failed and that no fiber awaited. *)
   let unawaited = Atomic.make [] in
   let old_report = Atomic.get Weft.Private.promise_report in
-  let rec collect e =
-    let l = Atomic.get unawaited in
-    if not (Atomic.compare_and_set unawaited l (e :: l)) then collect e
-  in
   Atomic.set Weft.Private.promise_report (fun run e ->
       match run with
       | Some r when r = s.run_id ->
-          collect (try Printexc.to_string e with _ -> "an exception")
+          Sched.push_list unawaited
+            (try Printexc.to_string e with _ -> "an exception")
       | _ ->
           old_report run e ) ;
+  (* Also when the run raises: the next runs must not get these hooks. *)
+  let restore () =
+    ignore (Atomic.compare_and_set Sched.outside slot None) ;
+    Atomic.set Weft.Private.promise_report old_report
+  in
   let result = Sched.start s (fun () -> main t) in
   let st = Array.map (fun d -> Start d) s.doms in
   let all = List.init domains Fun.id in
@@ -1233,22 +1231,28 @@ let run ?(seed = 0) ?(domains = 1) ?(auto = true) ?(signals = [])
         step t st (List.nth ds (Prng.int t.prng (List.length ds))) ;
         loop ()
   in
-  Fun.protect
-    ~finally:(fun () -> ignore (Atomic.compare_and_set Sched.outside slot None))
-    loop ;
-  let v = result () in
-  (* The queues are empty, but their old slots keep the closures of the fibers
-     that ran, and thus their promises. *)
-  Array.iter
-    (fun d ->
-      Array.iter (fun slot -> Atomic.set slot None) d.Sched.ring.Ring.buf ;
-      Atomic.set d.Sched.next None )
-    s.doms ;
-  (* The run holds no promise at this time: a full GC runs the finalisers of its
-     promises. [Gc.finalise_last] needs two cycles. *)
-  if Atomic.get s.unawaited > 0 then (Gc.full_major () ; Gc.full_major ()) ;
-  Atomic.set Weft.Private.promise_report old_report ;
-  match Atomic.get unawaited with [] -> v | l -> raise (Unawaited (List.rev l))
+  match loop () ; result () with
+  | exception e ->
+      let bt = Printexc.get_raw_backtrace () in
+      restore () ;
+      Printexc.raise_with_backtrace e bt
+  | v -> (
+      (* The queues are empty, but their old slots keep the closures of the
+         fibers that ran, and thus their promises. *)
+      Array.iter
+        (fun d ->
+          Array.iter (fun slot -> Atomic.set slot None) d.Sched.ring.Ring.buf ;
+          Atomic.set d.Sched.next None )
+        s.doms ;
+      (* The run holds no promise at this time: a full GC runs the finalisers of
+         its promises. [Gc.finalise_last] needs two cycles. *)
+      if Atomic.get s.unawaited > 0 then (Gc.full_major () ; Gc.full_major ()) ;
+      restore () ;
+      match Atomic.get unawaited with
+      | [] ->
+          v
+      | l ->
+          raise (Unawaited (List.rev l)) )
 
 let settle t =
   let id = fresh t in

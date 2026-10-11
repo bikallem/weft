@@ -8,13 +8,10 @@ external epoll_create : unit -> int = "weft_epoll_create"
 
 external eventfd : unit -> int = "weft_eventfd"
 
-external timerfd : unit -> int = "weft_timerfd"
+external timerfd : bool -> int = "weft_timerfd"
 
-external timerfd_set : int -> int64 -> int = "weft_timerfd_set"
-
-external timerfd_realtime : unit -> int = "weft_timerfd_realtime"
-
-external timerfd_set_posix : int -> int64 -> int = "weft_timerfd_set_posix"
+(* [timerfd_set fd posix ns]. *)
+external timerfd_set : int -> bool -> int64 -> int = "weft_timerfd_set"
 
 external drain : int -> int = "weft_drain"
 
@@ -220,8 +217,8 @@ let check name r = if r < 0 then failwith (name ^ ": " ^ strerror (-r)) else r
 let make_dom () =
   let epfd = check "epoll_create1" (epoll_create ()) in
   let evfd = check "eventfd" (eventfd ()) in
-  let tfd = check "timerfd_create" (timerfd ()) in
-  let ptfd = check "timerfd_create" (timerfd_realtime ()) in
+  let tfd = check "timerfd_create" (timerfd false) in
+  let ptfd = check "timerfd_create" (timerfd true) in
   ignore (check "epoll_ctl" (epoll_add_in epfd evfd wake_token)) ;
   ignore (check "epoll_ctl" (epoll_add_in epfd tfd timer_token)) ;
   ignore (check "epoll_ctl" (epoll_add_in epfd ptfd posix_token)) ;
@@ -631,12 +628,12 @@ module World = struct
     let t = target (Weft.Clock.to_ns Mono) w.deadline in
     if not (Int64.equal t d.armed) then (
       Atomic.incr alarm_sets ;
-      ignore (timerfd_set d.tfd t) ;
+      ignore (timerfd_set d.tfd false t) ;
       d.armed <- t ) ;
     let p = target (Weft.Clock.to_ns Posix) w.posix_deadline in
     if not (Int64.equal p d.parmed) then (
       Atomic.incr alarm_sets ;
-      ignore (timerfd_set_posix d.ptfd p) ;
+      ignore (timerfd_set d.ptfd true p) ;
       d.parmed <- p )
 
   let wait t ~domain (w : World.Wait.t) =
@@ -700,6 +697,11 @@ let run ?slack ?domains ?signals ?(watchdog = Some (Weft.Span.ms 10)) main =
   let domains = match domains with Some n -> n | None -> default_domains () in
   let t = create ~domains ?signals () in
   let dog = ref None in
+  ( match watchdog with
+  | Some l when Int64.compare (Weft.Span.to_ns l) 0L <= 0 ->
+      invalid_arg "Weft_linux.run: the limit of the watchdog is not positive"
+  | _ ->
+      () ) ;
   let start (s : Sched.t) =
     Option.iter
       (fun limit ->

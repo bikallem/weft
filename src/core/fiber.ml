@@ -84,13 +84,7 @@ let with_timeout (_ : Clock.mono Clock.line) span f =
               | Error _ ->
                   fired := true
             in
-            match f () with
-            | v ->
-                finish () ; v
-            | exception e ->
-                let bt = Printexc.get_raw_backtrace () in
-                finish () ;
-                Printexc.raise_with_backtrace e bt )
+            Fun.protect ~finally:finish f )
       with
       | v ->
           v

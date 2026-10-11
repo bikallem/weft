@@ -405,7 +405,9 @@ let watchdog () =
   Weft_linux.run ~domains:1 ~watchdog:None (fun () -> busy_ms 50) ;
   equal int (before + 1) (Weft_linux.watchdog_reports ())
 
-(* M3: a Posix sleep ends after its deadline on the wall clock. *)
+(* M3: a Posix sleep ends after its deadline on the wall clock. A sleep on Mono
+   also passes this test: a step of the clock needs root, so only the simulator
+   tests the step. *)
 let posix_sleep () =
   Weft_linux.run ~domains:1 (fun () ->
       let p0 = Time.now Posix and t0 = Time.now Mono in
@@ -450,6 +452,28 @@ let busy_reader () =
   in
   less int64 ~than:20_000_000L worst
 
+(* The review of M3, A: the expire inside wait resumes a pinned fiber on domain
+   0. The domain must poll, not sleep. *)
+let pinned_sleeps () =
+  Weft_linux.run ~domains:1 ~slack:Span.zero (fun () ->
+      Fiber.scope (fun s ->
+          Fiber.fork ~pinned:true s (fun () ->
+              for i = 1 to 20_000 do
+                Time.sleep Mono (Span.ns (i mod 4000))
+              done ) ) )
+
+(* The review of M3, B: a pinned fiber that yields does not starve the other
+   fibers of domain 0. *)
+let pinned_yield () =
+  Weft_linux.run ~domains:1 (fun () ->
+      let flag = Atomic.make false in
+      Fiber.scope (fun s ->
+          Fiber.fork ~pinned:true s (fun () ->
+              while not (Atomic.get flag) do
+                Fiber.yield ()
+              done ) ;
+          Fiber.fork s (fun () -> Atomic.set flag true) ) )
+
 let unwatched () =
   Weft_linux.run ~domains:1 (fun () ->
       raises
@@ -484,6 +508,10 @@ let linux =
     ; test "the watchdog reports a fiber that computes 200 ms" watchdog
     ; test "a Posix sleep ends after its deadline" posix_sleep
     ; test "a reader that never waits yields after 64 KiB" busy_reader
+    ; test ~timeout:30. "A: a pinned fiber with many short sleeps ends"
+        pinned_sleeps
+    ; test ~timeout:30. "B: a pinned fiber that yields does not starve"
+        pinned_yield
     ; test "a signal that run does not watch is not an event" unwatched ]
 
 let () = exit (Windtrap.run "linux" (Portable.tests world @ [linux]))

@@ -12,7 +12,9 @@ let dom () = S.prog "test" S.Dom_index
    sleep, and after a wake by a fiber of another domain. *)
 let pinned seed =
   Sim.run ~seed ~domains:4 (fun _ ->
-      let off = Atomic.make 0 and c = Chan.create () in
+      let off = Atomic.make 0
+      and c = Chan.create ()
+      and other = Atomic.make 0 in
       let check () = if dom () <> 0 then Atomic.incr off in
       Fiber.scope (fun s ->
           for _ = 1 to 4 do
@@ -28,13 +30,15 @@ let pinned seed =
           for _ = 1 to 4 do
             Fiber.fork s (fun () ->
                 Fiber.yield () ;
+                if dom () <> 0 then Atomic.incr other ;
                 sync (Chan.send c ()) )
           done ) ;
-      Atomic.get off )
+      (Atomic.get off, Atomic.get other) )
 
 (* A fill from outside a fiber touches no sync word: it gives at once, also
    while the sync word of the waiter is Claimed, for example by the code that a
-   finaliser interrupts. A plain fill would spin on Claimed forever. *)
+   finaliser interrupts. A plain fill would spin on Claimed forever: with that
+   bug, this test does not end. *)
 let fill_while_claimed () =
   Sim.run ~outside_fills:true (fun _ ->
       let iv = Ivar.create () and waiter = ref None in
@@ -57,15 +61,14 @@ let fill_while_claimed () =
 
 (* A finaliser fills an Ivar from outside a fiber. *)
 let finaliser () =
-  Sim.run ~outside_fills:true (fun sim ->
+  Sim.run ~outside_fills:true (fun _ ->
       let iv = Ivar.create () in
       let () =
         let x = ref 1 in
         Gc.finalise (fun _ -> ignore (Ivar.fill_from_outside iv "gc")) x
       in
       Gc.full_major () ;
-      equal string "gc" (sync (Ivar.read iv)) ;
-      equal int 1 (List.length (Sim.fill_log sim)) )
+      equal string "gc" (sync (Ivar.read iv)) )
 
 let refused () =
   raises
@@ -190,17 +193,57 @@ let posix_timers () =
           Sim.set_posix sim (Option.get (Time.add Posix p1 (Span.s (-99)))) ;
           equal int (1_000 + 109_000) (Promise.await posix) ) )
 
+(* The review of M3, B: a pinned fiber that yields does not starve the local
+   queue of domain 0. *)
+let pinned_yield () =
+  Sim.run ~livelock:100_000 (fun _ ->
+      let flag = Atomic.make false in
+      Fiber.scope (fun s ->
+          Fiber.fork ~pinned:true s (fun () ->
+              while not (Atomic.get flag) do
+                Fiber.yield ()
+              done ) ;
+          Fiber.fork s (fun () -> Atomic.set flag true) ) )
+
+(* The review of M3: a long exchange on a channel is progress, also with a small
+   limit of Livelock. *)
+let channel_progress () =
+  Sim.run ~livelock:1000 (fun _ ->
+      let c = Chan.create () in
+      Fiber.scope (fun s ->
+          Fiber.fork s (fun () ->
+              for i = 1 to 5000 do
+                sync (Chan.send c i)
+              done ) ;
+          for _ = 1 to 5000 do
+            ignore (sync (Chan.recv c))
+          done ) )
+
+(* The review of M3: a run that raises restores the report of the promises. *)
+let restore_report () =
+  let old = Atomic.get Private.promise_report in
+  raises Exit (fun () -> Sim.run (fun _ -> raise Exit)) ;
+  is_true (Atomic.get Private.promise_report == old)
+
 let tests =
   [ group "m3"
       [ test "pinned fibers run only on domain 0, with 200 seeds" (fun () ->
+            (* The senders also run on other domains. *)
+            let other = ref 0 in
             for seed = 1 to 200 do
-              equal ~msg:(Printf.sprintf "seed %d" seed) int 0 (pinned seed)
-            done )
+              let off, o = pinned seed in
+              equal ~msg:(Printf.sprintf "seed %d" seed) int 0 off ;
+              other := !other + o
+            done ;
+            greater int ~than:0 !other )
+      ; test "B: a pinned fiber that yields does not starve" pinned_yield
       ; test "a fill from outside gives at once while the word is Claimed"
           fill_while_claimed
       ; test "the deadline form of with_timeout has no fiber" deadline_form
       ; test "a yield loop that waits for the time gives Livelock" livelock
       ; test "a stream of 4 MiB is not a livelock" stream
+      ; test "a long exchange on a channel is not a livelock" channel_progress
+      ; test "a run that raises restores the report of promises" restore_report
       ; test "a failed promise that nobody awaits gives Unawaited" unawaited
       ; test "a step of the wall clock moves a Posix timer only" posix_timers
       ; test "a finaliser fills an Ivar" finaliser

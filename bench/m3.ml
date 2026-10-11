@@ -36,20 +36,14 @@ let ping_pong ~domains ~n =
 
 let q5 () =
   print_endline
-    "Q5: the limit of the next slot (ping-pong of 200,000 round trips, and a \
-     fiber that yields)" ;
-  Printf.printf "  %6s %8s %14s %18s\n" "limit" "domains" "trips/s"
-    "yields/trip" ;
+    "Q5: the next slot with its limit of 3 (ping-pong of 200,000 round trips, \
+     and a fiber that yields)" ;
+  Printf.printf "  %8s %14s %18s\n" "domains" "trips/s" "yields/trip" ;
   List.iter
-    (fun limit ->
-      S.next_limit := limit ;
-      List.iter
-        (fun domains ->
-          let trips, yields = ping_pong ~domains ~n:200_000 in
-          Printf.printf "  %6d %8d %14.0f %18.3f\n%!" limit domains trips yields )
-        [1; 4] )
-    [0; 1; 3; 16; 1_000_000] ;
-  S.next_limit := 3
+    (fun domains ->
+      let trips, yields = ping_pong ~domains ~n:200_000 in
+      Printf.printf "  %8d %14.0f %18.3f\n%!" domains trips yields )
+    [1; 4]
 
 (* The steal of the next slot: F1 wakes F2 into its next slot and then computes
    for 50 ms with no switch. With no steal of the next slot, F2 waits for the
@@ -212,10 +206,6 @@ let () =
   Printf.printf "with_timeout around a call that ends at once: %.0f/s\n%!"
     (timeouts ()) ;
   q5 () ;
-  print_endline "Q5 with no wake at a push to the next slot" ;
-  S.wake_on_next := false ;
-  q5 () ;
-  S.wake_on_next := true ;
   print_endline
     "The steal of the next slot: F2 waits for F1 that computes 50 ms" ;
   List.iter

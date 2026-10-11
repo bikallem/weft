@@ -339,6 +339,24 @@ let inject_idle () =
               () ) ;
       fun () -> (not (Atomic.get slept)) || Atomic.get outside_wakes = 1 )
 
+(* The pinned queue (M3, Wake.tla): domain 1 pushes a pinned fiber and wakes
+   domain 0 only if domain 0 is in [idle]. At the same time, domain 0 goes idle
+   and checks again. Domain 0 sees the fiber, or it sleeps and gets one wake. *)
+let pinned_push () =
+  trace (fun () ->
+      let t = S.create ~domains:2 () in
+      let w = world () in
+      let slept = Atomic.make false in
+      let d0 = t.S.doms.(0) and d1 = t.S.doms.(1) in
+      let f = S.new_fiber ~pinned:true [scope_node ()] in
+      spawn_in w (fun () ->
+          S.Idle.add t 0 ;
+          if not (S.work_for d0) then Atomic.set slept true ) ;
+      spawn_in w (fun () ->
+          S.push d1 f (fun () -> S.Finished) ;
+          S.flush_wake d1 ) ;
+      fun () -> (not (Atomic.get slept)) || Atomic.get w.wakes = 1 )
+
 (* The next slot (M3): the owner puts a fiber and takes it, while a thief takes
    the slot with a CAS. The fiber runs exactly one time. *)
 let next_steal () =
@@ -655,6 +673,7 @@ let () =
     search_push ;
   case "next slot: a take by the owner and a steal at the same time" next_steal ;
   case "inject: a fill from outside while a domain goes idle" inject_idle ;
+  case "pinned: a pinned push while domain 0 goes idle" pinned_push ;
   case "register: a send and a recv on an empty channel at the same time"
     chan_meet ;
   case "register: a fill of an Ivar during a register" ivar_fill_register ;

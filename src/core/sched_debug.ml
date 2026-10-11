@@ -67,8 +67,7 @@ let lost ?posix t ~now =
     else "the overflow queue is not empty" :: queues
   in
   let queues =
-    if Spin.with_lock t.pinned_lock (fun () -> Queue.is_empty t.pinned_q) then
-      queues
+    if Atomic.get t.pinned_n = 0 then queues
     else "the pinned queue is not empty" :: queues
   in
   let queues =

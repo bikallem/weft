@@ -150,7 +150,3 @@ val sched : t -> Weft.Private.Sched.t
 
 (* The number of open fds of the simulator. *)
 val open_fds : t -> int
-
-(* The switch point of the quiescence that gave each fill from outside a
-   fiber. *)
-val fill_log : t -> int list

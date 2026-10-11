@@ -45,13 +45,17 @@ value weft_eventfd(value unit) {
   return Val_int(eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC));
 }
 
-value weft_timerfd(value unit) {
-  return Val_int(timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC));
+/* A timerfd on CLOCK_MONOTONIC, or on CLOCK_REALTIME for the Posix alarm
+   (M3). */
+value weft_timerfd(value posix) {
+  clockid_t c = Bool_val(posix) ? CLOCK_REALTIME : CLOCK_MONOTONIC;
+  return Val_int(timerfd_create(c, TFD_NONBLOCK | TFD_CLOEXEC));
 }
 
-/* Arm the timerfd at an absolute time on CLOCK_MONOTONIC. A time <= 0
-   disarms it. */
-value weft_timerfd_set(value fd, value ns) {
+/* Arm a timerfd at an absolute time. A time <= 0 disarms it. The Posix alarm
+   has TFD_TIMER_CANCEL_ON_SET: a step of the clock makes the fd readable, and
+   the read gives ECANCELED. */
+value weft_timerfd_set(value fd, value posix, value ns) {
   int64_t t = Int64_val(ns);
   struct itimerspec its;
   memset(&its, 0, sizeof its);
@@ -59,29 +63,8 @@ value weft_timerfd_set(value fd, value ns) {
     its.it_value.tv_sec = t / 1000000000;
     its.it_value.tv_nsec = t % 1000000000;
   }
-  if (timerfd_settime(Int_val(fd), TFD_TIMER_ABSTIME, &its, NULL) < 0)
-    return Val_int(ERR);
-  return Val_int(0);
-}
-
-/* The Posix alarm (M3): a timerfd on CLOCK_REALTIME. With
-   TFD_TIMER_CANCEL_ON_SET, a step of the clock makes the fd readable, and the
-   read gives ECANCELED. */
-value weft_timerfd_realtime(value unit) {
-  return Val_int(timerfd_create(CLOCK_REALTIME, TFD_NONBLOCK | TFD_CLOEXEC));
-}
-
-value weft_timerfd_set_posix(value fd, value ns) {
-  int64_t t = Int64_val(ns);
-  struct itimerspec its;
-  memset(&its, 0, sizeof its);
-  if (t > 0) {
-    its.it_value.tv_sec = t / 1000000000;
-    its.it_value.tv_nsec = t % 1000000000;
-  }
-  if (timerfd_settime(Int_val(fd), TFD_TIMER_ABSTIME | TFD_TIMER_CANCEL_ON_SET, &its,
-                      NULL) < 0)
-    return Val_int(ERR);
+  int flags = TFD_TIMER_ABSTIME | (Bool_val(posix) ? TFD_TIMER_CANCEL_ON_SET : 0);
+  if (timerfd_settime(Int_val(fd), flags, &its, NULL) < 0) return Val_int(ERR);
   return Val_int(0);
 }
 
