@@ -49,10 +49,12 @@ end
 
 module Condition = Locks.Condition
 
-(* A new scope T with a daemon that cancels T at the deadline (design section
-   2.5, Timeouts). [Timeout] only for the own deadline. If an outer context is
-   cancelled, the call raises its [Cancelled], also when it is cancelled before
-   the start. *)
+(* A new scope T and a deadline on T: an entry in the heap of the domain, with
+   no fiber (design section 2.5, Timeouts, the deadline form of M3). At the
+   deadline, the owner of the heap cancels T. When [f] ends, the caller ends the
+   entry with a CAS on its word: if the CAS fails, the deadline came first.
+   [Timeout] only for the own deadline. If an outer context is cancelled, the
+   call raises its [Cancelled], also when it is cancelled before the start. *)
 let with_timeout (_ : Clock.mono Clock.line) span f =
   let outer = List.hd (Sched.self ()).ctxs in
   let outer_cancel () =
@@ -63,18 +65,36 @@ let with_timeout (_ : Clock.mono Clock.line) span f =
         ()
   in
   outer_cancel () ;
-  let fired = ref false in
-  match
-    scope (fun t ->
-        fork_daemon ~name:"with_timeout" t (fun () ->
-            Time.sleep Mono span ;
-            fired := true ;
-            cancel t Timeout ) ;
-        f () )
-  with
-  | v ->
-      v
-  | exception (Cancelled _ as e) ->
-      let bt = Printexc.get_raw_backtrace () in
-      outer_cancel () ;
-      if !fired then raise Timeout else Printexc.raise_with_backtrace e bt
+  match Time.add Mono (Time.now Mono) span with
+  | None ->
+      (* The deadline overflows: it never comes. *)
+      scope (fun _ -> f ())
+  | Some at -> (
+      let fired = ref false in
+      match
+        scope (fun t ->
+            let word =
+              Sched.prog "Fiber.with_timeout"
+                (Sched.Cancel_at (Clock.to_ns Mono at, t))
+            in
+            let finish () =
+              match Sched.C.self_commit word 1 with
+              | Ok () ->
+                  ()
+              | Error _ ->
+                  fired := true
+            in
+            match f () with
+            | v ->
+                finish () ; v
+            | exception e ->
+                let bt = Printexc.get_raw_backtrace () in
+                finish () ;
+                Printexc.raise_with_backtrace e bt )
+      with
+      | v ->
+          v
+      | exception (Cancelled _ as e) ->
+          let bt = Printexc.get_raw_backtrace () in
+          outer_cancel () ;
+          if !fired then raise Timeout else Printexc.raise_with_backtrace e bt )

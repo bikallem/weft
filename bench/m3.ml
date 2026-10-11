@@ -69,8 +69,20 @@ let next_latency ~domains =
           let t0 = Promise.await got in
           (now_s () -. t0) *. 1000. ) )
 
+(* The cost of with_timeout around a call that ends at once. *)
+let timeouts () =
+  Weft_linux.run ~domains:1 (fun () ->
+      let n = 200_000 in
+      let t0 = now_s () in
+      for _ = 1 to n do
+        Fiber.with_timeout Mono (Span.s 10) ignore
+      done ;
+      float n /. (now_s () -. t0) )
+
 let () =
   Printf.printf "CPUs: %d\n" (Domain.recommended_domain_count ()) ;
+  Printf.printf "with_timeout around a call that ends at once: %.0f/s\n%!"
+    (timeouts ()) ;
   q5 () ;
   print_endline "Q5 with no wake at a push to the next slot" ;
   S.wake_on_next := false ;

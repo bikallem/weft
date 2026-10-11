@@ -77,6 +77,22 @@ let refused () =
           ignore (Ivar.fill_from_outside iv ()) ;
           sync (Ivar.read iv) ) )
 
+(* The deadline form of with_timeout: no fiber, and the entries that the caller
+   ended go from the heap. The Timeout comes at exactly the deadline. *)
+let deadline_form () =
+  Sim.run (fun sim ->
+      let sched = Sim.sched sim in
+      for _ = 1 to 1000 do
+        Fiber.with_timeout Mono (Span.s 10) ignore
+      done ;
+      equal int 1 (Hashtbl.length sched.S.fibers) ;
+      at_most int ~than:128 sched.S.doms.(0).S.heap.S.size ;
+      let t0 = Time.now Mono in
+      raises Fiber.Timeout (fun () ->
+          Fiber.with_timeout Mono (Span.ms 7) (fun () ->
+              Time.sleep Mono (Span.s 1) ) ) ;
+      equal int64 7_000_000L (Span.to_ns (Time.diff Mono (Time.now Mono) t0)) )
+
 let tests =
   [ group "m3"
       [ test "pinned fibers run only on domain 0, with 200 seeds" (fun () ->
@@ -85,6 +101,7 @@ let tests =
             done )
       ; test "a fill from outside gives at once while the word is Claimed"
           fill_while_claimed
+      ; test "the deadline form of with_timeout has no fiber" deadline_form
       ; test "a finaliser fills an Ivar" finaliser
       ; test "a fill from outside needs ~outside_fills" refused
       ; test "no run: fill_from_outside gives false" (fun () ->

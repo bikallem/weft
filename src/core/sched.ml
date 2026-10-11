@@ -144,6 +144,9 @@ and _ req =
           function runs at its completion. *)
   | Detach_job : int -> unit req
       (** The fiber does not wait for the job any more. *)
+  | Cancel_at : int64 * ctx -> C.t req
+      (** The deadline of [with_timeout]: an entry in the heap of the domain
+          that cancels the node. The word is the state of the entry. *)
 
 and sync_req = {leaves: leaf array; nocancel: bool}
 
@@ -242,7 +245,16 @@ and heap =
   ; mutable next_seq: int
   ; mutable rebuild_at: int }
 
-and entry = {deadline: int64; seq: int; esync: sync; branch: int}
+and entry =
+  { deadline: int64
+  ; seq: int
+  ; esync: sync
+  ; branch: int
+  ; cancels: ctx option
+        (** The deadline of [with_timeout] (M3): at the deadline, the owner
+            cancels this node. [esync] is then only a state word: [Waiting]
+            while the entry is live, [Done 1] after the caller ended it, and
+            [Done 0] after the owner fired it. *) }
 
 type _ Effect.t += Prog : 'a req -> 'a Effect.t
 
@@ -359,8 +371,8 @@ module Heap = struct
   (* An add drops the stale entries at the head, and rebuilds the heap when it
      has grown to twice its size after the last rebuild (design section 2.5,
      Timers and domains). *)
-  let push h ~deadline esync branch =
-    let e = {deadline; seq= h.next_seq; esync; branch} in
+  let push ?cancels h ~deadline esync branch =
+    let e = {deadline; seq= h.next_seq; esync; branch; cancels} in
     h.next_seq <- h.next_seq + 1 ;
     drop_stale h ;
     if (h.size >= h.rebuild_at) [@mutate off "one more entry before a rebuild"]
@@ -1058,6 +1070,16 @@ let rec run_fiber : dom -> fiber -> step -> unit =
       run_fiber dom fiber (Effect.Deep.continue k ())
   | Suspended (Job (job, on_done), k) ->
       run_fiber dom fiber (Effect.Deep.continue k (start_job dom job on_done))
+  | Suspended (Cancel_at (deadline, node), k) ->
+      let s =
+        { word= C.make (Commit.Id.next dom.ids)
+        ; owner= fiber
+        ; sctx= node
+        ; cancellable= false
+        ; k= None }
+      in
+      Heap.push dom.heap ~cancels:node ~deadline s 0 ;
+      run_fiber dom fiber (Effect.Deep.continue k s.word)
   | Suspended (Detach_job id, k) ->
       drop_external dom.sched id ;
       ignore (World.perform "job" (World.Submit (Op.Detach id))) ;
@@ -1130,10 +1152,13 @@ let expire dom =
     match Heap.top dom.heap with
     | Some e when Int64.compare e.deadline limit <= 0 ->
         Heap.pop dom.heap ;
-        ( match C.notify e.esync.word e.branch with
-        | C.Resume ->
+        ( match (C.notify e.esync.word e.branch, e.cancels) with
+        | C.Resume, _ ->
             resume dom e.esync
-        | C.In_scan | C.Lost _ ->
+        | C.In_scan, Some node ->
+            (* The deadline of [with_timeout] came first. *)
+            List.iter (resume dom) (cancel_node node Timeout)
+        | C.In_scan, None | C.Lost _, _ ->
             () ) ;
         loop ()
     | _ ->
