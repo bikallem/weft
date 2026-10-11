@@ -171,8 +171,31 @@ let busy_reader () =
       , List.fold_left Float.max 0. l
       , float !bytes /. dt /. 1048576. ) )
 
+(* The words that one sync allocates, and the syncs per second: an event that is
+   ready, and an Ivar that is full. *)
+let sync_cost () =
+  Weft_linux.run ~domains:1 (fun () ->
+      let iv = Ivar.create () in
+      Ivar.fill iv 1 ;
+      let measure name ev =
+        let n = 200_000 in
+        let w0 = Gc.minor_words () and t0 = now_s () in
+        for _ = 1 to n do
+          ignore (sync ev)
+        done ;
+        let dt = now_s () -. t0 and w = Gc.minor_words () -. w0 in
+        Printf.printf "  %-14s %8.1f words  %10.0f syncs/s\n%!" name
+          (w /. float n)
+          (float n /. dt)
+      in
+      measure "always" (always ()) ;
+      measure "a full Ivar" (Ivar.read iv) ;
+      measure "a choose of 2" (choose [Ivar.read iv; never]) )
+
 let () =
   Printf.printf "CPUs: %d\n" (Domain.recommended_domain_count ()) ;
+  print_endline "The cost of one sync" ;
+  sync_cost () ;
   print_endline
     "The yield of a read: a reader of a full pipe that works 20 us on each 64 \
      KiB, and a 1 ms timer, on 1 domain" ;

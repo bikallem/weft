@@ -75,11 +75,18 @@ let enable nacks i =
       if i < nk.first || i >= nk.last then ignore (fill_resume nk.niv ()) )
     nacks
 
+(* A base event, the most frequent form, needs no flatten (M3). *)
 let sync_with ~nocancel ev =
-  let leaves, results, nacks = flatten ev in
-  let i = sync_req ~nocancel leaves in
-  enable nacks i ;
-  if i < 0 then raise (Cancelled (reason ())) else results.(i) ()
+  match ev with
+  | Base mk ->
+      let p = mk () in
+      let i = sync_req ~nocancel [|p.leaf|] in
+      if i < 0 then raise (Cancelled (reason ())) else p.result ()
+  | _ ->
+      let leaves, results, nacks = flatten ev in
+      let i = sync_req ~nocancel leaves in
+      enable nacks i ;
+      if i < 0 then raise (Cancelled (reason ())) else results.(i) ()
 
 let sync ev = sync_with ~nocancel:false ev
 

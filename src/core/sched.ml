@@ -1054,15 +1054,19 @@ let next_rand dom =
 
 (* The order of the scan, from the PRNG of the domain: a random order when more
    than one branch is ready (design section 2.4). *)
+let one = [|0|]
+
 let shuffle dom n =
-  let a = Array.init n Fun.id in
-  for i = n - 1 downto 1 do
-    let j = next_rand dom mod (i + 1) in
-    let x = a.(i) in
-    a.(i) <- a.(j) ;
-    a.(j) <- x
-  done ;
-  a
+  if n = 1 then one
+  else
+    let a = Array.init n Fun.id in
+    for i = n - 1 downto 1 do
+      let j = next_rand dom mod (i + 1) in
+      let x = a.(i) in
+      a.(i) <- a.(j) ;
+      a.(j) <- x
+    done ;
+    a
 
 let rec run_fiber : dom -> fiber -> step -> unit =
  fun dom fiber step ->
@@ -1134,12 +1138,11 @@ and sync dom fiber (r : sync_req) (k : (int, step) Effect.Deep.continuation) =
     ignore (C.self_commit s.word (-1)) ;
   let n = Array.length r.leaves in
   let order = shuffle dom n in
-  let rec scan j =
-    if j < n && not (is_done s) then (
-      r.leaves.(order.(j)) dom s order.(j) ;
-      scan (j + 1) )
-  in
-  scan 0 ;
+  let j = ref 0 in
+  while !j < n && not (is_done s) do
+    r.leaves.(order.(!j)) dom s order.(!j) ;
+    incr j
+  done ;
   s.k <- Some k ;
   match C.park s.word with
   | `Parked ->
