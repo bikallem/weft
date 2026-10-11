@@ -219,7 +219,7 @@ let make_dom () =
 
 (* The threads that do not block each signal of [sigs], from the [SigBlk] line
    of /proc/self/task/*/status (design section 2.7, Not sure). *)
-let unblocked sigs =
+let unblocked_numbers sigs =
   let blocks dir =
     match
       In_channel.with_open_text (dir ^ "/status") In_channel.input_lines
@@ -252,6 +252,8 @@ let unblocked sigs =
   | exception Sys_error _ ->
       []
 
+let unblocked_threads sigs = unblocked_numbers (List.map number_of sigs)
+
 (* A write to a pipe with no reader then gives EPIPE (design section 2.7,
    Signals). The signals of [~signals] are blocked in the calling thread before
    any other thread of the world starts, so each thread copies the mask. *)
@@ -263,7 +265,7 @@ let create ?(domains = 1) ?(signals = []) () =
     else
       let old = sigmask_block nums in
       let fd = signalfd nums in
-      if fd < 0 then (
+      if (fd < 0) [@mutate off "fd 0 is the stdin of the process"] then (
         sigmask_restore old ;
         failwith ("signalfd: " ^ strerror (-fd)) ) ;
       List.iter
@@ -273,7 +275,7 @@ let create ?(domains = 1) ?(signals = []) () =
              signal can go to it\n\
              %!"
             task )
-        (unblocked (Array.to_list nums)) ;
+        (unblocked_numbers (Array.to_list nums)) ;
       (Some old, fd)
   in
   let seed = Bytes.create 8 in
@@ -567,7 +569,11 @@ module World = struct
               , Option.value ~default:"" sp.cwd
               , [|kind sp.stdin; kind sp.stdout; kind sp.stderr|] )
           in
-          let fd x = if x < 0 then None else Some x in
+          let fd x =
+            if (x < 0) [@mutate off "fd 0 is the stdin of the process"] then
+              None
+            else Some x
+          in
           Result.map
             (fun pid ->
               { Op.pid
@@ -632,8 +638,8 @@ module World = struct
           let counts = signalfd_read t.sigfd in
           let acc = ref acc in
           for n = Array.length counts - 1 downto 0 do
-            if counts.(n) > 0 then
-              acc := World.Ready.Signal (signal_of n, counts.(n)) :: !acc
+            if (counts.(n) > 0) [@mutate off "a count of 0 commits no waiter"]
+            then acc := World.Ready.Signal (signal_of n, counts.(n)) :: !acc
           done ;
           !acc )
         else if token = wake_token then (

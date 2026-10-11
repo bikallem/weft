@@ -46,8 +46,14 @@ let rec cancel p =
   ignore (Sched.self ()) ;
   match Atomic.get p.state with
   | Not_started ->
-      if not (Atomic.compare_and_set p.state Not_started Requested) then
-        cancel p
+      if
+        not
+          (Atomic.compare_and_set p.state Not_started Requested)
+        [@mutate
+          off
+            "the retry runs only when the fiber starts on another domain \
+             between the read and the CAS, an order that a test cannot select"]
+      then cancel p
   | Requested ->
       ()
   | Running n ->

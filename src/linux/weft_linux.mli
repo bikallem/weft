@@ -32,3 +32,9 @@ val run :
 
 val local_port : Weft.Net.t -> int
 (** The port of a TCP socket, for example after a listen on port 0. *)
+
+(**/**)
+
+val unblocked_threads : Weft.Signal.t list -> string list
+(** The threads of the process that do not block each of these signals. For the
+    tests. *)

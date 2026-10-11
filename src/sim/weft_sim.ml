@@ -175,6 +175,9 @@ let readable n fd =
   | Some (Fil _) | None ->
       false
 
+(* PIPE_BUF on Linux. *)
+let pipe_buf = 4096
+
 let writable n fd =
   match Hashtbl.find_opt n.fds fd with
   | Some (Conn {role= Rd_end; _}) ->
@@ -186,9 +189,11 @@ let writable n fd =
       | None ->
           true
       | Some p ->
+          (* A pipe is writable with a free page, PIPE_BUF bytes: a write of at
+             most PIPE_BUF bytes can wait for that much space. *)
           c.established
           && ( avail p + p.inflight
-             < capacity )
+             <= capacity - if c.role = Wr_end then pipe_buf else 1 )
              [@mutate
                off
                  "a wrong result here gives a spurious edge: the write gets \
@@ -231,8 +236,16 @@ let run_agenda t =
 let delay t =
   let j = t.net.jitter in
   Int64.add t.net.latency
-    ( if Int64.equal j 0L then 0L
-      else Int64.of_int (Prng.int t.prng (Int64.to_int j + 1)) )
+    ( if
+        Int64.equal j 0L
+        [@mutate
+          off "a draw in 0 to 0 gives 0 too; only the seed sequence changes"]
+      then 0L
+      else
+        Int64.of_int
+          (Prng.int t.prng
+             (( Int64.to_int j + 1 )
+              [@mutate off "the limit is in the range, or 1 ns less"] ) ) )
 
 (* After the delay, or at once. *)
 let later t f =
@@ -244,7 +257,13 @@ let later t f =
 let later_to t p f =
   let at = Int64.max (Int64.add t.now (delay t)) p.last_at in
   p.last_at <- at ;
-  if Int64.compare at t.now <= 0 then f ()
+  if
+    ( Int64.compare at t.now <= 0 )
+    [@mutate
+      off
+        "at the time of now, the agenda gives the delivery at the next \
+         quiescence of the same time; the order of the stream stays"]
+  then f ()
   else schedule t (Int64.sub at t.now) f
 
 (* The data of a socket [c] comes to [p] after the delay, and the data of a pipe
@@ -252,7 +271,10 @@ let later_to t p f =
 let deliver t c p f = if c.role = Sock then later_to t p f else f ()
 
 (* With [short_io], a read or a write moves a random part of [k] bytes. *)
-let part t k = if t.net.short_io && k > 1 then 1 + Prng.int t.prng k else k
+let part t k =
+  if t.net.short_io && (k > 1) [@mutate off "a part of 1 byte is 1 byte"] then
+    1 + Prng.int t.prng k
+  else k
 
 let new_fd n =
   let fd = n.next_fd in
@@ -296,6 +318,13 @@ let perform : type a. t -> a Op.blocking -> (raw, Op.error) result option =
         (let* h = handle_of n fd in
          Result.map (fun s -> R_read s) (Sim_fs.pread h len at) )
   | Op.Pwrite (fd, data, at) ->
+      (* With [short_io], a write of a file can be short too. *)
+      let k = part t (String.length data) in
+      let data =
+        if (k < String.length data) [@mutate off "a copy of the whole string"]
+        then String.sub data 0 k
+        else data
+      in
       Some
         (let* h = handle_of n fd in
          Result.map (fun k -> R_int k) (Sim_fs.pwrite h data at ~now) )
@@ -423,7 +452,12 @@ let start_job : type a. t -> int -> a Op.blocking -> int =
   ( if Int64.equal t.blocking_cost 0L then complete ()
     else
       let limit = Int64.to_int t.blocking_cost in
-      schedule t (Int64.of_int (Prng.int t.prng (limit + 1))) complete ) ;
+      schedule t
+        (Int64.of_int
+           (Prng.int t.prng
+              (( limit + 1 )
+               [@mutate off "the limit is in the range, or 1 ns less"] ) ) )
+        complete ) ;
   id
 
 (* A read of a socket or of the read end of a pipe. *)
@@ -448,9 +482,6 @@ let read_conn t c buf off len =
   else if c.refused then Error Op.Reset
   else Error Op.Would_block
 
-(* PIPE_BUF on Linux. *)
-let pipe_buf = 4096
-
 (* A write of a socket or of the write end of a pipe. The data of a pipe arrives
    at once, and the data of a socket after the latency. *)
 let write_conn t c buf off len =
@@ -462,15 +493,16 @@ let write_conn t c buf off len =
         Error Op.Broken_pipe
     | Some p ->
         let space = capacity - avail p - p.inflight in
+        (* A write of at most PIPE_BUF bytes to a pipe is atomic. *)
+        let atomic = c.role = Wr_end && len <= pipe_buf in
         if space <= 0 then Error Op.Would_block
-        else if c.role = Wr_end && len <= pipe_buf && space < len then
-          Error Op.Would_block
+        else if
+          atomic
+          && ( space < len )
+             [@mutate off "with space = len, the write waits for one more read"]
+        then Error Op.Would_block
         else
-          (* A write of at most PIPE_BUF bytes to a pipe is atomic. *)
-          let k =
-            if c.role = Wr_end && len <= pipe_buf then len
-            else part t (Int.min len space)
-          in
+          let k = if atomic then len else part t (Int.min len space) in
           let data = Bytes.sub_string buf off k in
           p.inflight <- p.inflight + k ;
           deliver t c p (fun () ->
@@ -545,8 +577,8 @@ let spawn t (sp : Op.spawn) =
       let from_stderr = pipe ~parent_reads:true sp.stderr in
       Option.iter
         (fun c ->
-          Buffer.add_string c.inbox prog.output ;
-          if prog.output <> "" then edge n c.cfd ~read:true ~write:false )
+          (* No edge: the Register of the fd gives one, because it is ready. *)
+          Buffer.add_string c.inbox prog.output )
         from_stdout ;
       let pidfd = new_fd n in
       Hashtbl.replace n.fds pidfd (Pfd p) ;
@@ -917,7 +949,16 @@ let extra_edge t d =
       Hashtbl.fold
         (fun _ l acc ->
           List.filter_map
-            (fun (d', token) -> if d' = d then Some token else None)
+            (fun (d', token) ->
+              if
+                ( d' = d )
+                [@mutate
+                  off
+                    "a token of another domain goes to a domain with no \
+                     registration, which drops it: only the number of edges \
+                     changes"]
+              then Some token
+              else None )
             l
           @ acc )
         t.net.regs []

@@ -839,7 +839,12 @@ let on_ready dom = function
       let e =
         Spin.with_lock t.externals_lock (fun () ->
             match Hashtbl.find_opt t.externals id with
-            | Some e when Option.is_some e.ewait || e.dropped ->
+            | Some e
+              when ( Option.is_some e.ewait || e.dropped )
+                   [@mutate
+                     off
+                       "the dscheck test of the jobs kills this mutant, and \
+                        dscheck is not in the mutation run"] ->
                 Hashtbl.remove t.externals id ;
                 Some e
             | Some e ->

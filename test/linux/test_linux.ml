@@ -340,6 +340,17 @@ let signal_number () =
   in
   at_least int ~than:1 n
 
+(* The check of the threads: out of run, the calling thread does not block
+   SIGUSR2. In run ~signals, each thread of the process blocks it, and no thread
+   blocks SIGHUP. *)
+let blocked_threads () =
+  let self = string_of_int (Unix.getpid ()) in
+  is_true (List.mem self (Weft_linux.unblocked_threads [SIGUSR2])) ;
+  Weft_linux.run ~domains:1 ~signals:[SIGUSR2] (fun () ->
+      equal (list string) [] (Weft_linux.unblocked_threads [SIGUSR2]) ;
+      (* No thread blocks SIGHUP. *)
+      is_true (Weft_linux.unblocked_threads [SIGUSR2; SIGHUP] <> []) )
+
 let unwatched () =
   Weft_linux.run ~domains:1 (fun () ->
       raises
@@ -368,6 +379,7 @@ let linux =
     ; test "the pipes of a child" child_output
     ; test "SIGTERM to the process is an event" sigterm
     ; test "C7: Other_signal 10 is SIGUSR1" signal_number
+    ; test "each thread of run ~signals blocks the signals" blocked_threads
     ; test "a signal that run does not watch is not an event" unwatched ]
 
 let () = exit (Windtrap.run "linux" (Portable.tests world @ [linux]))

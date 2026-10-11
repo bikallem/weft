@@ -1213,6 +1213,7 @@ The sections of this document mark each part that does not come in M0 with its m
 - **A child process.** `Process.spawn` uses `pidfd_spawnp` (glibc 2.39). The pidfd is a normal fd record in the poller. One fiber reaps the child with `waitid`, fills an Ivar with the status, and then closes the pidfd. The other fibers read the Ivar.
 - **The faults of the network** (`Sim.net_faults`): a jitter, short reads and writes, and an edge with no change one time in 8. A write of at most 4096 bytes (`PIPE_BUF`) to a pipe is atomic, as on Linux. A TCP stream loses no data and keeps its order, so the loss and the reordering of packets show only as delays. The partitions need the host of each side of a connection, and the simulator does not record it. Thus the partitions are not done. With the faults, the tests found that the echo server of the tests dropped the rest of a short write.
 - **One exception for all I/O.** `File.Error`, `Dir.Error`, `Pipe.Error`, `Process.Error` and `Dns.Error` are the same exception as `Net.Error`. The error type has five more constructors: `No_entry`, `Exists`, `Not_dir`, `Is_dir` and `Not_empty`. A top-level `Weft.Error` would hide the `Error` constructor of `result` after `open Weft`.
+- **The mutation run** kills each mutant that a test reaches, or a comment with `[@mutate off]` gives the reason. Two tests of Linux start one domain only, because the mutation run forks a child for each mutant, and OCaml refuses a fork after a domain started. With `short_io`, a write of a file can be short too.
 - **Not in M2:** UDP, `sendto`, `recvfrom` and the socket options of `Net` (section 2.3, The I/O modules), and the `Poll` world.
 
 ### M3: the tuning
@@ -1558,6 +1559,7 @@ Three subagents reviewed the code of M2 (correctness, conformance to the TLA+ mo
 | C8 | The simulator watched each signal, and Linux only the signals of `run ~signals` | `Sim.run ~signals` |
 | C9 | In the simulator, `SIGTSTP` and the signal 0 ended a fake program | They do not end it |
 | C10 | With short writes, the simulator split a pipe write of at most `PIPE_BUF` bytes | Such a write is atomic |
+| M1 | The mutation run found that a pipe with less than `PIPE_BUF` bytes of space was writable in the simulator. A writer of 4096 bytes then waited on a writable fd, and the check at quiescence gave `Lost_wakeup` | A pipe is writable only with `PIPE_BUF` bytes of space, as with the free page of Linux |
 | C11 | `Process.kill` could raise for a child that another domain reaped at the same time | The error of the send is not an error after a reap |
 | C12 | Some errors of the simulator file system were not the errors of Linux, and the NUL check of `spawn` did not cover the directory | The errors agree, and a portable test examines them on the two worlds |
 | Q4 | No test examined the completion of a job or the delivery of a signal with a cancel from another domain | Two `dscheck` tests, and each one finds a planted bug |

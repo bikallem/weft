@@ -139,7 +139,8 @@ let pread h len at =
     Ok (if n = 0 then "" else Bytes.sub_string f.data p n)
 
 let grow f size =
-  if size > Bytes.length f.data then (
+  if (size > Bytes.length f.data) [@mutate off "a copy more at the same size"]
+  then (
     let b = Bytes.make (Int.max size (2 * Bytes.length f.data)) '\000' in
     Bytes.blit f.data 0 b 0 f.size ;
     f.data <- b )
@@ -150,11 +151,16 @@ let pwrite h data at ~now =
     let* f = file_of h in
     let p = if h.append then f.size else if at < 0 then h.pos else at in
     let n = String.length data in
-    if p + n > max_size then Error (Op.Other "EFBIG")
+    if
+      ( p + n > max_size )
+      [@mutate
+        off "a limit of the memory of the simulator: a test would allocate it"]
+    then Error (Op.Other "EFBIG")
     else (
       grow f (p + n) ;
       (* A write past the end leaves zeros in the gap. *)
-      if p > f.size then Bytes.fill f.data f.size (p - f.size) '\000' ;
+      if (p > f.size) [@mutate off "a fill of 0 bytes"] then
+        Bytes.fill f.data f.size (p - f.size) '\000' ;
       Bytes.blit_string data 0 f.data p n ;
       f.size <- Int.max f.size (p + n) ;
       f.fmtime <- now ;
@@ -164,11 +170,16 @@ let pwrite h data at ~now =
 (* Linux gives EINVAL for an fd that is not open for write. *)
 let ftruncate h size ~now =
   if not h.wr then Error (Op.Other "EINVAL")
-  else if size > max_size then Error (Op.Other "EFBIG")
+  else if
+    ( size > max_size )
+    [@mutate
+      off "a limit of the memory of the simulator: a test would allocate it"]
+  then Error (Op.Other "EFBIG")
   else
     let* f = file_of h in
     grow f size ;
-    if size > f.size then Bytes.fill f.data f.size (size - f.size) '\000' ;
+    if (size > f.size) [@mutate off "a fill of 0 bytes"] then
+      Bytes.fill f.data f.size (size - f.size) '\000' ;
     f.size <- size ;
     f.fmtime <- now ;
     Ok ()

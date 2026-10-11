@@ -672,6 +672,27 @@ let layers w =
                   done ) ;
               equal (list int) (List.init 20 succ)
                 (List.sort compare (Log.get got)) ) )
+    ; test "signal wakes one waiter" (fun () ->
+          w.run (fun () ->
+              let m = Fiber.Mutex.create () and c = Fiber.Condition.create () in
+              let woken = Atomic.make 0 in
+              Fiber.scope (fun s ->
+                  for _ = 1 to 2 do
+                    Fiber.fork s (fun () ->
+                        Fiber.Mutex.use_rw ~protect:false m (fun () ->
+                            Fiber.Condition.wait c m ) ;
+                        Atomic.incr woken )
+                  done ;
+                  Time.sleep Mono (Span.ms 1) ;
+                  Fiber.Mutex.use_rw ~protect:false m (fun () ->
+                      Fiber.Condition.signal c ) ;
+                  while Atomic.get woken = 0 do
+                    Fiber.yield ()
+                  done ;
+                  Time.sleep Mono (Span.ms 2) ;
+                  equal int 1 (Atomic.get woken) ;
+                  Fiber.Mutex.use_rw ~protect:false m (fun () ->
+                      Fiber.Condition.broadcast c ) ) ) )
     ; test "broadcast wakes each waiter" (fun () ->
           w.run (fun () ->
               let m = Fiber.Mutex.create () and c = Fiber.Condition.create () in
@@ -883,7 +904,37 @@ let files w =
               equal string "EISDIR"
                 (err (fun () -> File.openfile [Read; Create] (p "dir"))) ;
               equal string "ENOENT" (err (fun () -> File.openfile [Read] "")) ;
-              equal string "other" (err (fun () -> Dir.rmdir (p "dir/."))) ) )
+              equal string "other" (err (fun () -> Dir.rmdir (p "dir/."))) ;
+              (* A directory cannot go into itself, and it can replace an empty
+                 directory. *)
+              Dir.mkdir (p "dir/sub") ;
+              equal string "other"
+                (err (fun () -> Dir.rename (p "dir") (p "dir/sub/x"))) ;
+              Dir.mkdir (p "empty") ;
+              Dir.rename (p "dir/sub") (p "empty") ;
+              equal (list string) [] (Dir.readdir (p "dir")) ;
+              is_true ((File.stat (p "empty")).kind = File.Directory) ) )
+    ; test "pread and pwrite at offset 0 do not move the offset" (fun () ->
+          w.run (fun () ->
+              let path = Filename.concat (w.tmp ()) "o" in
+              write_file path "abcdefgh" ;
+              let f = File.openfile [Read; Write] path in
+              let buf = Bytes.create 4 in
+              equal int 4 (File.read f buf 0 4) ;
+              equal int 2 (File.pread f ~file_offset:0 buf 0 2) ;
+              equal string "ab" (Bytes.sub_string buf 0 2) ;
+              equal int 1
+                (File.pwrite f ~file_offset:0 (Bytes.of_string "A") 0 1) ;
+              equal int 4 (File.read f buf 0 4) ;
+              equal string "efgh" (Bytes.to_string buf) ;
+              File.close f ;
+              equal string "Abcdefgh" (read_file path) ;
+              (* Two writes at the offset of the file follow each other. *)
+              let f = File.openfile [Write; Truncate] path in
+              File.write f "ab" ;
+              File.write f "cd" ;
+              File.close f ;
+              equal string "abcd" (read_file path) ) )
     ; test "fibers use many files at the same time" (fun () ->
           w.run (fun () ->
               let d = w.tmp () in

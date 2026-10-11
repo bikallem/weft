@@ -133,7 +133,11 @@ let jobs =
           greater int ~than:1 (List.length (List.sort_uniq compare costs)) ;
           equal (list int) costs (List.init 50 (fun s -> cost (s + 1))) )
     ; test "with no cost, a job takes no time" (fun () ->
-          Sim.run (fun _ ->
+          Sim.run (fun sim ->
+              Sim.set_blocking_cost sim Span.zero ;
+              raises
+                (Invalid_argument "Sim.set_blocking_cost: the span is negative")
+                (fun () -> Sim.set_blocking_cost sim (Span.ms (-1)) ) ;
               let t0 = Time.now Mono in
               Dir.mkdir "/x" ;
               equal int 0 (ms_since t0) ) )
@@ -246,26 +250,68 @@ let processes =
                 let r, w = Pipe.create () in
                 let got =
                   Fiber.scope (fun s ->
-                      let got = Fiber.fork_promise s (fun () -> pipe_all r) in
+                      (* The reader starts late, so the pipe becomes full. *)
+                      let got =
+                        Fiber.fork_promise s (fun () ->
+                            Time.sleep Mono (Span.ms 1) ;
+                            pipe_all r )
+                      in
                       Fiber.scope (fun writers ->
+                          (* 100 bytes, and exactly PIPE_BUF bytes with an
+                             uppercase letter. *)
                           List.iter
                             (fun c ->
                               Fiber.fork writers (fun () ->
                                   for _ = 1 to 20 do
                                     Pipe.write w (String.make 100 c)
+                                  done ;
+                                  for _ = 1 to 8 do
+                                    Pipe.write w
+                                      (String.make 4096 (Char.uppercase_ascii c))
                                   done ) )
                             ['a'; 'b'] ) ;
                       Pipe.close w ;
                       Promise.await got )
                 in
                 Pipe.close r ;
-                for i = 0 to (String.length got / 100) - 1 do
-                  equal string
-                    (String.make 100 got.[i * 100])
-                    (String.sub got (i * 100) 100)
-                done ;
-                equal int 4000 (String.length got) )
+                (* Each run of one letter is whole messages: a multiple of 100
+                   bytes, or exactly 4096 bytes. *)
+                let rec check off =
+                  if off < String.length got then (
+                    let c = got.[off] in
+                    let rec stop i =
+                      if i < String.length got && got.[i] = c then stop (i + 1)
+                      else i
+                    in
+                    let n = stop off - off in
+                    is_true
+                      ( if c = 'A' || c = 'B' then n mod 4096 = 0
+                        else n mod 100 = 0 ) ;
+                    check (off + n) )
+                in
+                check 0 ;
+                equal int (4000 + (16 * 4096)) (String.length got) )
           done )
+    ; test "short_io splits a small write of a socket" (fun () ->
+          let short = ref false in
+          for seed = 1 to 20 do
+            Sim.run ~seed (fun sim ->
+                Sim.net_faults sim {Sim.no_faults with short_io= true} ;
+                let a = Sim.addr sim "s:1" in
+                let l = Net.listen a in
+                Fiber.scope (fun s ->
+                    Fiber.fork s (fun () ->
+                        let c, _ = Net.accept l in
+                        ignore (Portable.read_n c 100) ;
+                        Net.close c ) ;
+                    let c = Net.connect a in
+                    let n = Net.write_sub c (Bytes.make 100 'x') 0 100 in
+                    if n < 100 then short := true ;
+                    Net.write c (String.make (100 - n) 'x') ;
+                    Net.close c ) ;
+                Net.close l )
+          done ;
+          is_true !short )
     ; test "an unknown program gives ENOENT" (fun () ->
           Sim.run (fun _ ->
               raises
