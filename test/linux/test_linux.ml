@@ -366,6 +366,24 @@ let finaliser_fill () =
           Gc.full_major () ;
           equal string "gc" (Promise.await p) ) )
 
+exception Lost_exn
+
+(* M3: the finaliser of a failed promise that no fiber awaited gives the
+   report. *)
+let promise_report () =
+  let got = ref [] in
+  let old = Atomic.get Private.promise_report in
+  Atomic.set Private.promise_report (fun _ e -> got := e :: !got) ;
+  Fun.protect
+    ~finally:(fun () -> Atomic.set Private.promise_report old)
+    (fun () ->
+      Weft_linux.run ~domains:1 (fun () ->
+          Fiber.scope (fun s ->
+              ignore (Fiber.fork_promise s (fun () -> raise Lost_exn)) ) ) ;
+      Gc.full_major () ;
+      Gc.full_major () ;
+      is_true (List.mem Lost_exn !got) )
+
 let unwatched () =
   Weft_linux.run ~domains:1 (fun () ->
       raises
@@ -396,6 +414,7 @@ let linux =
     ; test "C7: Other_signal 10 is SIGUSR1" signal_number
     ; test "each thread of run ~signals blocks the signals" blocked_threads
     ; test "a finaliser fills an Ivar from outside a fiber" finaliser_fill
+    ; test "a failed promise that nobody awaits gives a report" promise_report
     ; test "a signal that run does not watch is not an event" unwatched ]
 
 let () = exit (Windtrap.run "linux" (Portable.tests world @ [linux]))

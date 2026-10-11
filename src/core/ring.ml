@@ -25,13 +25,18 @@ let push r x =
     true )
 
 (* The owner only. A thief can take the head at the same time, so the take is a
-   CAS on the head. *)
+   CAS on the head. After the CAS, the owner clears the slot, so that the ring
+   does not keep the item alive: a thief that read the old head fails its CAS,
+   and only the owner writes a slot. *)
 let rec pop r =
   let h = Atomic.get r.head in
   if Atomic.get r.tail = h then None
   else
     let x = Atomic.get r.buf.(h land mask) in
-    if Atomic.compare_and_set r.head h (h + 1) then x else pop r
+    if Atomic.compare_and_set r.head h (h + 1) then (
+      Atomic.set r.buf.(h land mask) None ;
+      x )
+    else pop r
 
 let is_empty r = Atomic.get r.tail - Atomic.get r.head <= 0
 

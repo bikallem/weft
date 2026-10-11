@@ -129,6 +129,24 @@ let stream () =
           Net.close c ) ;
       Net.close l )
 
+exception Boom
+
+(* The report of a promise that failed and that no fiber awaited. *)
+let unawaited () =
+  raises
+    (Sim.Unawaited [Printexc.to_string Boom])
+    (fun () ->
+      Sim.run (fun _ ->
+          Fiber.scope (fun s ->
+              ignore (Fiber.fork_promise s (fun () -> raise Boom)) ) ) ) ;
+  (* An awaited failure, and a cancelled promise, give no report. *)
+  Sim.run (fun _ ->
+      Fiber.scope (fun s ->
+          let p = Fiber.fork_promise s (fun () -> raise Boom) in
+          raises Boom (fun () -> Promise.await p) ;
+          let q = Fiber.fork_promise s (fun () -> Time.sleep Mono (Span.s 1)) in
+          Promise.cancel q ) )
+
 let tests =
   [ group "m3"
       [ test "pinned fibers run only on domain 0, with 200 seeds" (fun () ->
@@ -140,6 +158,7 @@ let tests =
       ; test "the deadline form of with_timeout has no fiber" deadline_form
       ; test "a yield loop that waits for the time gives Livelock" livelock
       ; test "a stream of 4 MiB is not a livelock" stream
+      ; test "a failed promise that nobody awaits gives Unawaited" unawaited
       ; test "a finaliser fills an Ivar" finaliser
       ; test "a fill from outside needs ~outside_fills" refused
       ; test "no run: fill_from_outside gives false" (fun () ->

@@ -142,6 +142,8 @@ module Private = struct
 
   let ivar_state (iv : 'a Ivar.t) = Atomic.get iv
 
+  let promise_report = Promise.report
+
   module Commit = Commit
   module World = World
   module Op = Op

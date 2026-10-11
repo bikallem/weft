@@ -133,6 +133,10 @@ exception Model_error of string
 (** The fibers that are not parked. *)
 exception Livelock of string list
 
+(** The exceptions of the promises of the run that failed and that no fiber
+    awaited. [run] raises it at its end, after a full GC. *)
+exception Unawaited of string list
+
 (**/**)
 
 (* For the tests of the checks. *)

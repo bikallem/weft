@@ -54,6 +54,8 @@ exception Model_error of string
 
 exception Livelock of string list
 
+exception Unawaited of string list
+
 (* The in-memory network (design section 2.8). *)
 
 (* The capacity of the receive buffer of a connection. *)
@@ -1189,6 +1191,19 @@ let run ?(seed = 0) ?(domains = 1) ?(auto = true) ?(signals = [])
       )
   in
   Atomic.set Sched.outside slot ;
+  (* The promises of this run that failed and that no fiber awaited. *)
+  let unawaited = Atomic.make [] in
+  let old_report = Atomic.get Weft.Private.promise_report in
+  let rec collect e =
+    let l = Atomic.get unawaited in
+    if not (Atomic.compare_and_set unawaited l (e :: l)) then collect e
+  in
+  Atomic.set Weft.Private.promise_report (fun run e ->
+      match run with
+      | Some r when r = s.run_id ->
+          collect (try Printexc.to_string e with _ -> "an exception")
+      | _ ->
+          old_report run e ) ;
   let result = Sched.start s (fun () -> main t) in
   let st = Array.map (fun d -> Start d) s.doms in
   let all = List.init domains Fun.id in
@@ -1207,7 +1222,19 @@ let run ?(seed = 0) ?(domains = 1) ?(auto = true) ?(signals = [])
   Fun.protect
     ~finally:(fun () -> ignore (Atomic.compare_and_set Sched.outside slot None))
     loop ;
-  result ()
+  let v = result () in
+  (* The queues are empty, but their old slots keep the closures of the fibers
+     that ran, and thus their promises. *)
+  Array.iter
+    (fun d ->
+      Array.iter (fun slot -> Atomic.set slot None) d.Sched.ring.Ring.buf ;
+      Atomic.set d.Sched.next None )
+    s.doms ;
+  (* The run holds no promise at this time: a full GC runs the finalisers of its
+     promises. [Gc.finalise_last] needs two cycles. *)
+  if Atomic.get s.unawaited > 0 then (Gc.full_major () ; Gc.full_major ()) ;
+  Atomic.set Weft.Private.promise_report old_report ;
+  match Atomic.get unawaited with [] -> v | l -> raise (Unawaited (List.rev l))
 
 let settle t =
   let id = fresh t in

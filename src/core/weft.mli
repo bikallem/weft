@@ -264,6 +264,12 @@ module Private : sig
   val ivar_state : 'a Ivar.t -> 'a Sched.ivar_state
   (** The state of an Ivar, for the tests. *)
 
+  val promise_report : (int option -> exn -> unit) Atomic.t
+  (** The report of a promise that failed and that no fiber awaited, with the id
+      of the run of the promise ([Sched.t.run_id]). By default, it writes the
+      exception to [stderr]. It runs in a finaliser: it must not perform an
+      effect or raise. *)
+
   module Commit = Commit
   module World = World
   module Op = Op

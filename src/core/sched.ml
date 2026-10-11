@@ -192,7 +192,8 @@ and stats =
   ; mutable busy_polls: int  (** The polls of a busy domain. *) }
 
 and t =
-  { mutable doms: dom array
+  { run_id: int  (** The id of the run. *)
+  ; mutable doms: dom array
   ; slack: int64
   ; fibers: (int, fiber) Hashtbl.t  (** The live fibers, for the debug. *)
   ; fibers_lock: Spin.t
@@ -207,6 +208,10 @@ and t =
   ; pinned_q: ready Queue.t
         (** The pinned fibers: only domain 0 takes them. Under its lock. *)
   ; pinned_lock: Spin.t
+  ; unawaited: int Atomic.t
+        (** The promises of the run that failed, with no fiber that got the
+            exception. The simulator forces a GC at its end only if it is not 0.
+        *)
   ; inject: (dom -> unit) list Atomic.t
         (** The global injection queue: the fills from outside a fiber, the
             newest first. It is lock-free, because a finaliser can push to it
@@ -1625,12 +1630,15 @@ let reason () =
   | None ->
       assert false (* A sync commits with -1 only after a flag. *)
 
+let next_run = Atomic.make 0
+
 (* The scheduler of [domains] domains. *)
 let create ?(slack = Span.ms 1) ?(simulated = false) ~domains () =
   if domains < 1 || domains > 62 then
     invalid_arg "run: the number of domains is not in the range 1 to 62" ;
   let t =
-    { doms= [||]
+    { run_id= Atomic.fetch_and_add next_run 1
+    ; doms= [||]
     ; slack= Span.to_ns slack
     ; fibers= Hashtbl.create ~random:false 64
     ; fibers_lock= Spin.make ()
@@ -1640,6 +1648,7 @@ let create ?(slack = Span.ms 1) ?(simulated = false) ~domains () =
     ; searching= Atomic.make 0
     ; pinned_q= Queue.create ()
     ; pinned_lock= Spin.make ()
+    ; unawaited= Atomic.make 0
     ; inject= Atomic.make []
     ; overflow= Queue.create ()
     ; overflow_lock= Spin.make ()
