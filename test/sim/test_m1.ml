@@ -196,6 +196,46 @@ let nack_server seed =
       equal int 5 !timeouts ;
       equal int !timeouts !abandoned )
 
+(* The counters of the measurements (open questions 3, 4 and 8) count. *)
+let counters_of seed =
+  Sim.run ~seed ~domains:2 (fun sim ->
+      let a = Sim.addr sim "server:2" in
+      let l = Net.listen a in
+      Fiber.scope (fun s ->
+          Fiber.fork s (fun () ->
+              let c, _ = Net.accept l in
+              Net.write c "x" ; Net.close c ) ;
+          for _ = 1 to 20 do
+            Fiber.fork s (fun () ->
+                for _ = 1 to 200 do
+                  Fiber.yield ()
+                done )
+          done ;
+          let c = Net.connect a in
+          ignore (Net.read c (Bytes.create 1) 0 1) ;
+          Net.close c ) ;
+      let sum f =
+        Array.fold_left (fun n d -> n + f d.S.stats) 0 (Sim.sched sim).S.doms
+      in
+      ( sum (fun s -> s.S.edges)
+      , sum (fun s -> s.S.busy_polls)
+      , sum (fun s -> s.S.wakes)
+      , sum (fun s -> s.S.idle_edges) ) )
+
+(* Over ten seeds, a domain is idle at some push. *)
+let counters () =
+  let e, b, w, i =
+    List.fold_left
+      (fun (e, b, w, i) seed ->
+        let e', b', w', i' = counters_of seed in
+        (e + e', b + b', w + w', i + i') )
+      (0, 0, 0, 0) (List.init 10 succ)
+  in
+  greater int ~than:0 e ;
+  greater int ~than:0 b ;
+  greater int ~than:0 w ;
+  at_least int ~than:0 i
+
 let seeds n f =
   for seed = 1 to n do
     f seed
@@ -211,6 +251,7 @@ let tests =
       ; test "a fiber that blocks on one fd from two domains gets all data"
           fd_two_domains
       ; test "a seed gives the same order of events" replay
+      ; test "the counters of the measurements count" counters
       ; test "the server gets the nack of each client that left" (fun () ->
             seeds 200 nack_server )
       ; slow "echo with 4 domains and 10,000 seeds" (fun () ->

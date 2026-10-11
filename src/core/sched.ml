@@ -144,10 +144,19 @@ and dom =
   ; mutable switches: int
   ; mutable rng: int  (** The PRNG of the steal. *)
   ; mutable wake: bool  (** A push to do a wake at the next safe point. *)
+  ; stats: stats  (** The counters of the domain, for the measurements. *)
   ; regs: (int, reg) Hashtbl.t  (** The registrations, by slot. *)
   ; mailbox: fdrec list Atomic.t  (** The close notices, the newest first. *) }
 
 and ready = {rfiber: fiber; run: unit -> step}
+
+(* The counters of a domain (open questions 3, 4 and 8). Only the owner writes
+   them. *)
+and stats =
+  { mutable wakes: int  (** The wakes that the pushes did. *)
+  ; mutable edges: int  (** The fd events. *)
+  ; mutable idle_edges: int  (** The fd events with no live waiter. *)
+  ; mutable busy_polls: int  (** The polls of a busy domain. *) }
 
 and t =
   { mutable doms: dom array
@@ -507,6 +516,7 @@ let flush_wake dom =
     dom.wake <- false ;
     match Idle.take dom.sched with
     | Some d ->
+        dom.stats.wakes <- dom.stats.wakes + 1 ;
         World.perform "sched" (World.Wake d)
     | None ->
         () )
@@ -583,20 +593,27 @@ let fd_leaf ~write ~clear ~err fdr : leaf =
       else if write then reg.wwait <- Waiters.add s i reg.wwait
       else reg.rwait <- Waiters.add s i reg.rwait
 
-(* A close notice on [dom]: if the registration is live, remove it, clear the
-   bit, commit its waiters (they retry and get [EBADF]), remove the fd from the
-   poller, and release the user of the registration. *)
+(* Remove a live registration of [dom]: clear the bit, commit its waiters (on a
+   close, they retry and get [EBADF]), remove the fd from the poller, and
+   release the user of the registration. A close notice and the removal of an
+   unused registration both do it, on the thread of the domain, so the two never
+   interleave. *)
+let remove_reg dom reg =
+  let fdr = reg.fdr in
+  Hashtbl.remove dom.regs fdr.slot ;
+  ignore (Atomic.fetch_and_add fdr.doms (-(1 lsl dom.index))) ;
+  wake_all dom reg.rwait ;
+  wake_all dom reg.wwait ;
+  ignore
+    (World.perform "Net.close"
+       (World.Submit (Op.Deregister (dom.index, fdr.os))) ) ;
+  Rc.release fdr
+
+(* A close notice on [dom] acts only on a live registration. *)
 let close_notice dom fdr =
   match Hashtbl.find_opt dom.regs fdr.slot with
   | Some reg when reg.fdr == fdr ->
-      Hashtbl.remove dom.regs fdr.slot ;
-      ignore (Atomic.fetch_and_add fdr.doms (-(1 lsl dom.index))) ;
-      wake_all dom reg.rwait ;
-      wake_all dom reg.wwait ;
-      ignore
-        (World.perform "Net.close"
-           (World.Submit (Op.Deregister (dom.index, fdr.os))) ) ;
-      Rc.release fdr
+      remove_reg dom reg
   | _ ->
       ()
 
@@ -632,7 +649,20 @@ let on_ready dom = function
       let slot, gen = Fdtab.of_token token in
       match Hashtbl.find_opt dom.regs slot with
       | Some reg when reg.fdr.gen = gen ->
-          if read then (
+          let live w = List.exists (fun (s, _) -> not (is_done s)) w.ws in
+          dom.stats.edges <- dom.stats.edges + 1 ;
+          if
+            not
+              ((read && live reg.rwait) || (write && live reg.wwait))
+            [@mutate off "the condition of a counter of the measurements only"]
+          then dom.stats.idle_edges <- dom.stats.idle_edges + 1 ;
+          let others = Atomic.get reg.fdr.doms land lnot (1 lsl dom.index) in
+          if others <> 0 && not (live reg.rwait || live reg.wwait) then
+            (* An edge with no live waiter, and another domain has a
+               registration: the fiber of the fd moved. The domain removes its
+               registration (design section 2.7, An fd in many pollers). *)
+            remove_reg dom reg
+          else if read then (
             reg.rflag <- true ;
             let w = reg.rwait in
             reg.rwait <- Waiters.empty ;
@@ -811,7 +841,7 @@ and sync dom fiber (r : sync_req) (k : (int, step) Effect.Deep.continuation) =
 (* The loop of one domain (design section 2.5). *)
 
 (* A busy domain polls each [k_poll] switches (open question 3). *)
-let k_poll = 61
+let k_poll = ref 61
 
 let now_ns () = Clock.to_ns Mono (World.perform "sched" (World.Now Mono))
 
@@ -930,10 +960,11 @@ let run_ready dom r =
   r.rfiber.queued <- false ;
   dom.switches <- dom.switches + 1 ;
   if
-    ( dom.switches >= k_poll )
+    ( dom.switches >= !k_poll )
     [@mutate off "61 or 62 switches: k_poll is a start value"]
   then (
     dom.switches <- 0 ;
+    dom.stats.busy_polls <- dom.stats.busy_polls + 1 ;
     wait dom World.Wait.Poll ) ;
   World.perform "sched" (World.Switch dom.index) ;
   run_fiber dom r.rfiber (r.run ()) ;
@@ -1186,6 +1217,7 @@ let create ?(slack = Span.ms 1) ~domains () =
         ; switches= 0
         ; rng= (index + 1) [@mutate off "a seed of the PRNG"]
         ; wake= false
+        ; stats= {wakes= 0; edges= 0; idle_edges= 0; busy_polls= 0}
         ; regs= Hashtbl.create ~random:false 64
         ; mailbox= Atomic.make [] } ) ;
   t
