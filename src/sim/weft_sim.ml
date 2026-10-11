@@ -153,6 +153,7 @@ type t =
         (** The limit of the time cost of a job (open question 2). *)
   ; dns: (string, dns_answer) Hashtbl.t
   ; programs: (string, string list -> program) Hashtbl.t
+  ; watched: Op.signal list  (** The signals of [run ~signals]. *)
   ; mutable next_pid: int }
 
 let sched t = Option.get t.sched
@@ -245,6 +246,10 @@ let later_to t p f =
   p.last_at <- at ;
   if Int64.compare at t.now <= 0 then f ()
   else schedule t (Int64.sub at t.now) f
+
+(* The data of a socket [c] comes to [p] after the delay, and the data of a pipe
+   at once. *)
+let deliver t c p f = if c.role = Sock then later_to t p f else f ()
 
 (* With [short_io], a read or a write moves a random part of [k] bytes. *)
 let part t k = if t.net.short_io && k > 1 then 1 + Prng.int t.prng k else k
@@ -443,6 +448,9 @@ let read_conn t c buf off len =
   else if c.refused then Error Op.Reset
   else Error Op.Would_block
 
+(* PIPE_BUF on Linux. *)
+let pipe_buf = 4096
+
 (* A write of a socket or of the write end of a pipe. The data of a pipe arrives
    at once, and the data of a socket after the latency. *)
 let write_conn t c buf off len =
@@ -455,11 +463,17 @@ let write_conn t c buf off len =
     | Some p ->
         let space = capacity - avail p - p.inflight in
         if space <= 0 then Error Op.Would_block
+        else if c.role = Wr_end && len <= pipe_buf && space < len then
+          Error Op.Would_block
         else
-          let k = part t (Int.min len space) in
+          (* A write of at most PIPE_BUF bytes to a pipe is atomic. *)
+          let k =
+            if c.role = Wr_end && len <= pipe_buf then len
+            else part t (Int.min len space)
+          in
           let data = Bytes.sub_string buf off k in
           p.inflight <- p.inflight + k ;
-          (if c.role = Sock then later_to t p else fun f -> f ()) (fun () ->
+          deliver t c p (fun () ->
               p.inflight <- p.inflight - k ;
               Buffer.add_string p.inbox data ;
               edge n p.cfd ~read:true ~write:false ) ;
@@ -471,7 +485,7 @@ let close_conn t c =
   match c.peer with
   | Some p ->
       c.peer <- None ;
-      (if c.role = Sock then later_to t p else fun f -> f ()) (fun () ->
+      deliver t c p (fun () ->
           p.eof <- true ;
           p.peer <- None ;
           edge t.net p.cfd ~read:true ~write:true )
@@ -500,22 +514,12 @@ let new_pipe n =
 
 (* The exit of a fake process: it closes the ends of its pipes, and its pidfd
    becomes readable. *)
-let exit_proc n pidfd p status =
+let exit_proc t pidfd p status =
   if Option.is_none p.status then (
     p.status <- Some status ;
-    List.iter
-      (fun c ->
-        match c.peer with
-        | Some peer ->
-            c.peer <- None ;
-            peer.eof <- true ;
-            peer.peer <- None ;
-            edge n peer.cfd ~read:true ~write:true
-        | None ->
-            () )
-      p.child_ends ;
+    List.iter (close_conn t) p.child_ends ;
     p.child_ends <- [] ;
-    edge n pidfd ~read:true ~write:false )
+    edge t.net pidfd ~read:true ~write:false )
 
 let spawn t (sp : Op.spawn) =
   let n = t.net in
@@ -548,7 +552,7 @@ let spawn t (sp : Op.spawn) =
       Hashtbl.replace n.fds pidfd (Pfd p) ;
       Option.iter
         (fun d ->
-          schedule t d (fun () -> exit_proc n pidfd p (Op.Exited prog.code)) )
+          schedule t d (fun () -> exit_proc t pidfd p (Op.Exited prog.code)) )
         prog.runs ;
       let pid = t.next_pid in
       t.next_pid <-
@@ -685,19 +689,24 @@ let submit : type a. t -> a Op.t -> (a, Op.error) result =
         ( match (p.status, sg) with
         | Some _, _ ->
             ()
-        | None, (Op.SIGSTOP | SIGCONT | SIGCHLD | SIGWINCH) ->
+        | None, (Op.SIGSTOP | SIGTSTP | SIGCONT | SIGCHLD | SIGWINCH) ->
+            (* The default action of these signals does not end the process, and
+               signal 0 only tells that the process exists. *)
+            ()
+        | None, Op.Other_signal 0 ->
             ()
         | None, _ when sg <> Op.SIGKILL && List.mem sg p.prog.ignores ->
             ()
         | None, _ ->
-            exit_proc n fd p (Op.Signaled sg) ) ;
+            exit_proc t fd p (Op.Signaled sg) ) ;
         Ok ()
     | Some _ ->
         Error (Op.Other "EINVAL")
     | None ->
         Error Op.Bad_fd )
-  | Op.Watch _ ->
-      Ok ()
+  | Op.Watch sg ->
+      if List.mem sg t.watched then Ok sg
+      else Error (Op.Other "the world does not watch this signal")
   | Op.Fd_read (fd, buf, off, len) -> (
     match Hashtbl.find_opt n.fds fd with
     | Some (Conn ({role= Rd_end | Sock; _} as c)) ->
@@ -1042,7 +1051,7 @@ let quiescent t st =
                  ( "manual mode: only advance_until moves the time"
                  :: Sched_debug.blocked s ) ) )
 
-let run ?(seed = 0) ?(domains = 1) ?(auto = true) main =
+let run ?(seed = 0) ?(domains = 1) ?(auto = true) ?(signals = []) main =
   let t =
     { prng= Prng.make seed
     ; auto
@@ -1070,6 +1079,7 @@ let run ?(seed = 0) ?(domains = 1) ?(auto = true) main =
     ; blocking_cost= 0L
     ; dns= Hashtbl.create ~random:false 8
     ; programs= Hashtbl.create ~random:false 8
+    ; watched= signals
     ; next_pid= 1000 }
   in
   let s = Sched.create ~slack:Weft.Span.zero ~simulated:true ~domains () in
@@ -1091,14 +1101,10 @@ let run ?(seed = 0) ?(domains = 1) ?(auto = true) main =
   in
   loop () ; result ()
 
-let wait_external id =
-  Event.sync
-    (Event.Base (fun () -> {Event.leaf= Sched.external_leaf id; result= ignore}))
-
 let settle t =
   let id = fresh t in
   t.settles <- id :: t.settles ;
-  wait_external id
+  Job.wait id
 
 let advance_until t target =
   if t.auto then invalid_arg "Sim.advance_until: the simulator is in auto mode" ;
@@ -1107,7 +1113,7 @@ let advance_until t target =
   let id = fresh t in
   t.advance <- Some (Weft.Clock.to_ns Mono target, id) ;
   (* A cancel ends the advance. *)
-  match wait_external id with
+  match Job.wait id with
   | () ->
       ()
   | exception e ->
@@ -1144,8 +1150,13 @@ let program ?runs ?(code = 0) ?(output = "") ?(ignores = []) () =
 
 let add_program t name f = Hashtbl.replace t.programs name f
 
-(* Domain 0 gets the signal at its next [Wait] (design section 2.7). *)
-let signal t sg = t.net.edges <- (0, World.Ready.Signal (sg, 1)) :: t.net.edges
+(* Domain 0 gets the signal at its next [Wait] (design section 2.7). A signal
+   that the program does not watch has its default action on Linux, which ends
+   the process for most signals. *)
+let signal t sg =
+  if not (List.mem sg t.watched) then
+    model_error "Sim.signal: the program does not watch this signal" ;
+  t.net.edges <- (0, World.Ready.Signal (sg, 1)) :: t.net.edges
 
 let addr _ s =
   match String.index_opt s ':' with

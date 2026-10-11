@@ -92,19 +92,42 @@ let dns () =
       equal (list string) ["10.0.0.1"; "10.0.0.2"] (Dns.resolve "server") ;
       equal string "alias" (Dns.reverse "10.0.0.2") ;
       equal string "server" (Dns.reverse "10.0.0.1") ;
-      let err f =
-        match f () with
-        | _ ->
-            "no error"
-        | exception Dns.Error (e, _) ->
-            Format.asprintf "%a" Private.Op.pp_error e
-      in
+      let err = Portable.error_of in
       equal string "ENOENT" (err (fun () -> Dns.resolve "nobody")) ;
       equal string "ENOENT" (err (fun () -> Dns.reverse "10.9.9.9")) )
 
+(* F4: a read that a cancel detached is still in the pool when main returns. The
+   domain waits for it at the end of run, so the fd closes. *)
+let detached_at_end seed =
+  let saved = ref None in
+  let timed_out =
+    Sim.run ~seed (fun sim ->
+        saved := Some sim ;
+        let f = File.openfile [Read; Write; Create] "/f" in
+        File.write f "data" ;
+        Sim.set_blocking_cost sim (Span.ms 50) ;
+        let r =
+          match
+            Fiber.with_timeout Mono (Span.ms 1) (fun () ->
+                File.pread f ~file_offset:0 (Bytes.create 4) 0 4 )
+          with
+          | _ ->
+              false
+          | exception Fiber.Timeout ->
+              true
+        in
+        File.close f ; r )
+  in
+  equal int 0 (Sim.open_fds (Option.get !saved)) ;
+  timed_out
+
 let jobs =
   group "jobs"
-    [ test "a job takes a time cost from the seed" (fun () ->
+    [ test "F4: a detached job at the end of run releases its fd" (fun () ->
+          is_true
+            (List.exists Fun.id
+               (List.init 20 (fun s -> detached_at_end (s + 1))) ) )
+    ; test "a job takes a time cost from the seed" (fun () ->
           let costs = List.init 50 (fun s -> cost (s + 1)) in
           List.iter (fun c -> at_most int ~than:40 c) costs ;
           greater int ~than:1 (List.length (List.sort_uniq compare costs)) ;
@@ -128,17 +151,7 @@ let jobs =
 
 (* Processes and signals (milestone M2). *)
 
-let pipe_all r =
-  let b = Buffer.create 64 and buf = Bytes.create 64 in
-  let rec loop () =
-    match Pipe.read r buf 0 64 with
-    | 0 ->
-        Buffer.contents b
-    | k ->
-        Buffer.add_subbytes b buf 0 k ;
-        loop ()
-  in
-  loop ()
+let pipe_all = Portable.drain Pipe.read
 
 let status_text = function
   | Process.Exited n ->
@@ -195,8 +208,26 @@ let processes =
                   let b = Fiber.fork_promise s (fun () -> Process.wait p) in
                   equal string "exited 0" (status_text (Promise.await a)) ;
                   equal string "exited 0" (status_text (Promise.await b)) ) ;
-              (* The pidfd and the fds of the process are closed. *)
+              (* The pidfd closes when each domain took its close notice. *)
+              Time.sleep Mono (Span.ms 1) ;
               equal int 0 (Sim.open_fds sim) ) )
+    ; test "C3: a waiter goes on when the reaper leaves, with 500 seeds"
+        (fun () ->
+          for seed = 1 to 500 do
+            Sim.run ~seed ~domains:4 (fun sim ->
+                Sim.net_faults sim {Sim.no_faults with extra_edges= true} ;
+                Sim.add_program sim "long" (fun _ ->
+                    Sim.program ~runs:(Span.ms 100) () ) ;
+                let p = Process.spawn "long" [] in
+                Fiber.scope (fun s ->
+                    Fiber.fork s (fun () ->
+                        try
+                          ignore
+                            (Fiber.with_timeout Mono (Span.ms 20) (fun () ->
+                                 Process.wait p ) )
+                        with Fiber.Timeout -> () ) ;
+                    equal string "exited 0" (status_text (Process.wait p)) ) )
+          done )
     ; test "a write to the stdin of a child that exited gives EPIPE" (fun () ->
           Sim.run (fun sim ->
               Sim.add_program sim "quick" (fun _ ->
@@ -208,13 +239,40 @@ let processes =
                 (Pipe.Error (Broken_pipe, "Pipe.write"))
                 (fun () -> Pipe.write w "x") ;
               Pipe.close w ) )
+    ; test "C10: a pipe write of PIPE_BUF bytes or less is atomic" (fun () ->
+          for seed = 1 to 50 do
+            Sim.run ~seed ~domains:4 (fun sim ->
+                Sim.net_faults sim {Sim.no_faults with short_io= true} ;
+                let r, w = Pipe.create () in
+                let got =
+                  Fiber.scope (fun s ->
+                      let got = Fiber.fork_promise s (fun () -> pipe_all r) in
+                      Fiber.scope (fun writers ->
+                          List.iter
+                            (fun c ->
+                              Fiber.fork writers (fun () ->
+                                  for _ = 1 to 20 do
+                                    Pipe.write w (String.make 100 c)
+                                  done ) )
+                            ['a'; 'b'] ) ;
+                      Pipe.close w ;
+                      Promise.await got )
+                in
+                Pipe.close r ;
+                for i = 0 to (String.length got / 100) - 1 do
+                  equal string
+                    (String.make 100 got.[i * 100])
+                    (String.sub got (i * 100) 100)
+                done ;
+                equal int 4000 (String.length got) )
+          done )
     ; test "an unknown program gives ENOENT" (fun () ->
           Sim.run (fun _ ->
               raises
                 (Process.Error (No_entry, "Process.spawn"))
                 (fun () -> ignore (Process.spawn "nothing" [])) ) )
     ; test "a count of signals goes to one fiber" (fun () ->
-          Sim.run ~domains:4 (fun sim ->
+          Sim.run ~domains:4 ~signals:[SIGUSR1] (fun sim ->
               Sim.signal sim SIGUSR1 ;
               Sim.signal sim SIGUSR1 ;
               Time.sleep Mono (Span.ms 1) ;
@@ -233,6 +291,30 @@ let processes =
                   equal int 1 (Atomic.get got) ;
                   Sim.signal sim SIGUSR1 ) ;
               equal int 2 (Atomic.get got) ) )
+    ; test "C8: the simulator watches only the signals of run ~signals"
+        (fun () ->
+          Sim.run (fun sim ->
+              raises
+                (Invalid_argument
+                   "Signal.received: the world does not watch this signal" )
+                (fun () -> sync (Signal.received SIGTERM) ) ;
+              raises
+                (Sim.Model_error
+                   "Sim.signal: the program does not watch this signal" )
+                (fun () -> Sim.signal sim SIGTERM ) ) )
+    ; test "C9: SIGTSTP and signal 0 do not end a fake program" (fun () ->
+          Sim.run (fun sim ->
+              Sim.add_program sim "p" (fun _ -> Sim.program ()) ;
+              let p = Process.spawn "p" [] in
+              Process.kill p SIGTSTP ;
+              Process.kill p (Other_signal 0) ;
+              Time.sleep Mono (Span.ms 1) ;
+              is_true
+                (sync
+                   (choose
+                      [wrap (Process.exited p) (fun _ -> false); always true] ) ) ;
+              Process.kill p SIGTERM ;
+              equal string "SIGTERM" (status_text (Process.wait p)) ) )
     ; test "SIGKILL cannot be an event" (fun () ->
           Sim.run (fun _ ->
               raises
@@ -243,7 +325,7 @@ let processes =
 (* A graceful shutdown: at SIGTERM, the server stops to accept, and each
    connection ends its request. *)
 let shutdown seed =
-  Sim.run ~seed ~domains:4 (fun sim ->
+  Sim.run ~seed ~domains:4 ~signals:[SIGTERM] (fun sim ->
       let a = Sim.addr sim "server:80" in
       let l = Net.listen a in
       let served = Atomic.make 0 in

@@ -503,6 +503,76 @@ let daemon_and_end () =
           (fun d -> Option.is_some (Atomic.get d.S.flag))
           (S.by_id st.S.daemons) )
 
+(* The completions of the jobs (design section 2.14, the state of M2). Domain 0
+   runs the fiber: its leaf, its park, and then the completion of the job, in
+   this order, because the completion goes to the domain that started the job. A
+   cancel from domain 1 resumes the fiber there, and the fiber drops its wait.
+   The release of the fd runs exactly one time, the fiber continues one time,
+   and the table is empty at the end. *)
+let job_completion () =
+  trace (fun () ->
+      let t = S.create ~domains:2 () in
+      let w = world () in
+      let d0 = t.S.doms.(0) and d1 = t.S.doms.(1) in
+      let id = 5 and released = Atomic.make 0 and continued = Atomic.make 0 in
+      Hashtbl.replace t.S.externals id
+        { S.ewait= None
+        ; arrived= false
+        ; dropped= false
+        ; on_done= Some (fun () -> Atomic.incr released) } ;
+      d0.S.held <- 1 ;
+      let s = new_sync (scope_node ()) in
+      spawn_in w (fun () ->
+          (* The scan does not run the leaf of a sync that is done. *)
+          if not (S.is_done s) then S.external_leaf id d0 s 0 ;
+          ( match C.park s.S.word with
+          | `Done i ->
+              Atomic.incr continued ;
+              if i < 0 then S.drop_external t id
+          | `Parked ->
+              () ) ;
+          S.on_ready d0 (World.Ready.External id) ) ;
+      spawn_in w (fun () ->
+          match C.notify s.S.word (-1) with
+          | C.Resume ->
+              S.resume d1 s ; S.drop_external t id
+          | C.In_scan | C.Lost _ ->
+              () ) ;
+      fun () ->
+        Atomic.get released = 1
+        && d0.S.held = 0
+        && Atomic.get continued + queued t s = 1
+        && Hashtbl.length t.S.externals = 0 )
+
+(* The delivery of a signal on domain 0, a waiter on domain 1, and a cancel of
+   the waiter from domain 2. The waiter gets the signal (its cell holds 1), or
+   the count stays 1. The waiter continues one time. *)
+let signal_delivery () =
+  trace (fun () ->
+      let t = S.create ~domains:3 () in
+      let w = world () in
+      let s = new_sync (scope_node ()) and cell = ref 0 in
+      let continued = Atomic.make 0 in
+      spawn_in w (fun () -> S.deliver t.S.doms.(0) Op.SIGUSR1 1) ;
+      spawn_in w (fun () ->
+          S.signal_leaf Op.SIGUSR1 cell t.S.doms.(1) s 0 ;
+          match C.park s.S.word with
+          | `Done _ ->
+              Atomic.incr continued
+          | `Parked ->
+              () ) ;
+      spawn_in w (fun () ->
+          match C.notify s.S.word (-1) with
+          | C.Resume ->
+              S.resume t.S.doms.(2) s
+          | C.In_scan | C.Lost _ ->
+              () ) ;
+      fun () ->
+        let count = (S.sigstate t Op.SIGUSR1).S.count in
+        let got = C.state s.S.word = C.Done 0 in
+        Atomic.get continued + queued t s = 1
+        && if got then !cell = 1 && count = 0 else count = 1 )
+
 let () =
   print_endline "dscheck" ;
   case "commit: a commit during the scan" commit_during_scan ;
@@ -524,6 +594,8 @@ let () =
   case "scope: a fork while the last member ends" fork_and_end ;
   case "fd: a submit and a close at the same time" submit_and_close ;
   case "fd: a Register and a close at the same time" register_and_close ;
+  case "jobs: a completion and a cancel of its waiter" job_completion ;
+  case "signals: a delivery and a cancel of the waiter" signal_delivery ;
   case "commit: two fibers that sync on each other, liveness" (fun () ->
       live cross_setup ) ;
   if !failures > 0 then exit 1

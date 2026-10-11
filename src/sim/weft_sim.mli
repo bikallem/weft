@@ -5,12 +5,19 @@
 (** The state of one simulation. *)
 type t
 
-val run : ?seed:int -> ?domains:int -> ?auto:bool -> (t -> 'a) -> 'a
+val run :
+     ?seed:int
+  -> ?domains:int
+  -> ?auto:bool
+  -> ?signals:Weft.Signal.t list
+  -> (t -> 'a)
+  -> 'a
 (** [run main] runs [main] in the simulator. [~seed] is 0 by default. [~domains]
     is the number of virtual domains, 1 by default: the seed selects the domain
     that continues at each world effect. With [~auto:true] (the default), the
     time moves to the next deadline at each quiescence. With [~auto:false], only
-    {!advance_until} moves the time.
+    {!advance_until} moves the time. [~signals] are the signals that the program
+    watches, as for [Weft_linux.run ~signals]: none by default.
 
     @raise Deadlock
       if the program is quiescent, no deadline exists, and no event can come.
@@ -85,8 +92,8 @@ val program :
   -> program
 (** [program ~runs ~code ~output ()] writes [output] on its stdout, and it exits
     with [code] after [runs]. With no [~runs], it runs until a signal. A signal
-    that is not in [~ignores] ends it, except [SIGSTOP], [SIGCONT], [SIGCHLD]
-    and [SIGWINCH]. [SIGKILL] always ends it. *)
+    that is not in [~ignores] ends it, except [SIGSTOP], [SIGTSTP], [SIGCONT],
+    [SIGCHLD], [SIGWINCH] and [Other_signal 0]. [SIGKILL] always ends it. *)
 
 val add_program : t -> string -> (string list -> program) -> unit
 (** [add_program t name f]: [Process.spawn name args] starts [f args]. A name
@@ -94,7 +101,9 @@ val add_program : t -> string -> (string list -> program) -> unit
 
 val signal : t -> Weft.Signal.t -> unit
 (** [signal t s] sends [s] to the program. Domain 0 gets it at its next switch
-    point. *)
+    point.
+
+    @raise Model_error if [run ~signals] does not hold [s]. *)
 
 (** The fibers that wait. *)
 exception Deadlock of string list

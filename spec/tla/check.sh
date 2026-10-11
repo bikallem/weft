@@ -89,10 +89,11 @@ commit fail   cross    FALSE    FALSE     FALSE TRUE
 
 scope() { want Scope || return 0 # expect scenario joinCancellable shieldNotNode noRecheck noChainCheck exnAfterEnd noFlagCheck
   run Scope "$1" \
-    "NoOrphan ExnNotLost ExnSeen ShieldHolds TimeoutOK NoForeignCancel ClosedEmpty" \
+    "NoOrphan ExnNotLost ExnSeen ShieldHolds TimeoutOK NoForeignCancel ClosedEmpty TimerReachesWait" \
     "Scenario=\"$2\"" BugJoinCancellable="$3" BugShieldNotNode="$4" SimpNoRecheck="$5" \
     BugNoChainCheck="$6" BugExnAfterEnd="$7" BugNoFlagCheck="$8" \
-    SimpNoChildFlags="${9:-FALSE}" defaultInitValue=defaultInitValue
+    SimpNoChildFlags="${9:-FALSE}" BugCondOuterCtx="${10:-FALSE}" \
+    defaultInitValue=defaultInitValue
 }
 #     expect scenario join  shield recheck chain exn   flag
 scope pass   error    FALSE FALSE  FALSE   FALSE FALSE FALSE
@@ -113,6 +114,10 @@ scope pass   fork     FALSE FALSE  FALSE   FALSE FALSE FALSE TRUE
 scope pass   error    FALSE FALSE  TRUE    FALSE FALSE FALSE TRUE
 scope pass   shield   FALSE FALSE  TRUE    FALSE FALSE FALSE TRUE
 scope pass   fork     FALSE FALSE  TRUE    FALSE FALSE FALSE TRUE
+# M2: a condition wait in use_rw ~protect:true opens the shield node. The bug
+# is the code before the review of M2: the wait takes the outer context.
+scope pass   condwait FALSE FALSE  FALSE   FALSE FALSE FALSE
+scope fail   condwait FALSE FALSE  FALSE   FALSE FALSE FALSE FALSE TRUE
 
 ivar() { want Ivar || return 0 # expect directFill nonAtomicRegister
   run Ivar "$1" "AtMostOneResume FullNoWaiters OneFill EndState" \

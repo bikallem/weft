@@ -184,12 +184,21 @@ let dns_localhost () =
   Weft_linux.run ~domains:1 (fun () ->
       let addrs = Dns.resolve "localhost" in
       is_true (List.mem "127.0.0.1" addrs || List.mem "::1" addrs) ;
-      (* With no DNS server, the error is not ENOENT. *)
+      (* With no DNS server, the error can be another error than ENOENT. *)
       match Dns.resolve "no-such-host.invalid" with
       | _ ->
           failwith "no error"
       | exception Dns.Error (_, "Dns.resolve") ->
           () )
+
+(* The pool closes the fds after the end of run: wait up to 1 s for it. *)
+let fds_back_to before =
+  let rec wait n =
+    if open_fds () <> before && n > 0 then (
+      Unix.sleepf 0.001 ;
+      wait (n - 1) )
+  in
+  wait 1000
 
 (* An open of a FIFO blocks in the pool until a writer comes. The fiber detaches
    at the deadline. Then a writer comes, the job completes, and the pool closes
@@ -211,13 +220,38 @@ let detach_from_open () =
   at_least int64 ~than:20_000_000L t ;
   less int64 ~than:100_000_000L t ;
   (* The pool closes the fds after the end of run. *)
-  let rec wait n =
-    if open_fds () <> before && n > 0 then (
-      Unix.sleepf 0.001 ;
-      wait (n - 1) )
-  in
-  wait 1000 ;
+  fds_back_to before ;
   equal int before (open_fds ())
+
+(* C4: a job that blocks does not stop the next job of the pool. *)
+let blocked_job () =
+  let fifo = Filename.concat (tmp ()) "fifo" in
+  Unix.mkfifo fifo 0o600 ;
+  Weft_linux.run ~domains:1 (fun () ->
+      (* After this job, a thread of the pool is idle. *)
+      ignore (File.stat "/") ;
+      Fiber.scope (fun s ->
+          (* The two jobs come at the same time to the idle thread. *)
+          let r = Fiber.fork_promise s (fun () -> File.openfile [Read] fifo) in
+          let t0 = Time.now Mono in
+          let st =
+            Fiber.fork_promise s (fun () ->
+                ignore (File.stat "/") ;
+                Time.diff Mono (Time.now Mono) t0 )
+          in
+          let ns =
+            match
+              Fiber.with_timeout Mono (Span.ms 500) (fun () -> Promise.await st)
+            with
+            | d ->
+                Span.to_ns d
+            | exception Fiber.Timeout ->
+                Int64.max_int
+          in
+          let w = File.openfile [Write] fifo in
+          File.close w ;
+          File.close (Promise.await r) ;
+          less int64 ~than:100_000_000L ns ) )
 
 (* 1,000 files open and close, and the pool closes each fd. *)
 let no_file_leak () =
@@ -235,28 +269,13 @@ let no_file_leak () =
                   File.write f "x" ; File.close f
                 done )
           done ) ) ;
-  let rec wait n =
-    if open_fds () <> before && n > 0 then (
-      Unix.sleepf 0.001 ;
-      wait (n - 1) )
-  in
-  wait 1000 ;
+  fds_back_to before ;
   equal int before (open_fds ()) ;
   equal int 1000 (Array.length (Sys.readdir d))
 
 (* Processes and signals (milestone M2). *)
 
-let read_pipe r =
-  let b = Buffer.create 64 and buf = Bytes.create 64 in
-  let rec loop () =
-    match Pipe.read r buf 0 64 with
-    | 0 ->
-        Buffer.contents b
-    | k ->
-        Buffer.add_subbytes b buf 0 k ;
-        loop ()
-  in
-  loop ()
+let read_pipe = Portable.drain Pipe.read
 
 (* The child gets no blocked signals, also when run blocks SIGINT. *)
 let child_sigint () =
@@ -306,6 +325,21 @@ let sigterm () =
   in
   at_least int ~than:1 n
 
+(* C7: a signal by its number is the same event as by its name. *)
+let signal_number () =
+  let n =
+    Weft_linux.run ~domains:1 ~signals:[SIGUSR1] (fun () ->
+        Fiber.scope (fun s ->
+            let got =
+              Fiber.fork_promise s (fun () ->
+                  sync (Signal.received (Other_signal 10)) )
+            in
+            Time.sleep Mono (Span.ms 10) ;
+            Unix.kill (Unix.getpid ()) Sys.sigusr1 ;
+            Promise.await got ) )
+  in
+  at_least int ~than:1 n
+
 let unwatched () =
   Weft_linux.run ~domains:1 (fun () ->
       raises
@@ -329,9 +363,11 @@ let linux =
     ; test "Dns.resolve finds localhost" dns_localhost
     ; test "a fiber detaches from an open that blocks" detach_from_open
     ; test "1,000 files open and close with no fd leak" no_file_leak
+    ; test "C4: a job that blocks does not stop the next job" blocked_job
     ; test "a child stops at SIGINT" child_sigint
     ; test "the pipes of a child" child_output
     ; test "SIGTERM to the process is an event" sigterm
+    ; test "C7: Other_signal 10 is SIGUSR1" signal_number
     ; test "a signal that run does not watch is not an event" unwatched ]
 
 let () = exit (Windtrap.run "linux" (Portable.tests world @ [linux]))

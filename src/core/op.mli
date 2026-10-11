@@ -151,8 +151,10 @@ type _ t =
       (** The status of a child that exited, and the end of the zombie. [None]
           while the child runs. *)
   | Kill : fd * signal -> unit t  (** Sends a signal to a child. *)
-  | Watch : signal -> unit t
-      (** [Ok] if the world gives this signal as [Ready.Signal]. *)
+  | Watch : signal -> signal t
+      (** [Ok s] if the world gives this signal as [Ready.Signal s]: [s] is the
+          form of the signal in [Ready.Signal], for example [SIGUSR1] for
+          [Other_signal 10] on Linux. *)
   | Detach : int -> unit t
       (** The fiber does not wait for the job any more. The world drops its
           result, and closes the fd that it opened. The completion still comes.

@@ -30,10 +30,11 @@ let read_n c n =
   in
   Bytes.sub_string buf 0 (loop 0)
 
-let read_all c =
+(* Read until the end of the stream. *)
+let drain read r =
   let b = Buffer.create 64 and buf = Bytes.create 4096 in
   let rec loop () =
-    match Net.read c buf 0 4096 with
+    match read r buf 0 4096 with
     | 0 ->
         Buffer.contents b
     | k ->
@@ -41,6 +42,8 @@ let read_all c =
         loop ()
   in
   loop ()
+
+let read_all = drain Net.read
 
 let echo_server l =
   Fiber.scope (fun s ->
@@ -701,16 +704,42 @@ let layers w =
                   Time.sleep Mono (Span.ms 1) ;
                   Fiber.cancel s (Boom "stop") ) ;
               equal int 2 (Fiber.Mutex.use_rw ~protect:false m (fun () -> 2)) ) )
-    ]
+    ; test "R1: a timeout inside use_rw ~protect:true ends Condition.wait"
+        (fun () ->
+          w.run (fun () ->
+              let m = Fiber.Mutex.create () and c = Fiber.Condition.create () in
+              raises Fiber.Timeout (fun () ->
+                  Fiber.Mutex.use_rw ~protect:true m (fun () ->
+                      Fiber.with_timeout Mono (Span.ms 5) (fun () ->
+                          Fiber.Condition.wait c m ) ) ) ) )
+    ; test "R2: a wait in use_ro does not use the shield of another holder"
+        (fun () ->
+          w.run (fun () ->
+              let m = Fiber.Mutex.create () and c = Fiber.Condition.create () in
+              Fiber.scope (fun s ->
+                  Fiber.fork_daemon s (fun () ->
+                      Fiber.Mutex.use_rw ~protect:true m (fun () ->
+                          Fiber.Condition.wait c m ) ) ;
+                  Time.sleep Mono (Span.ms 1) ;
+                  raises Fiber.Timeout (fun () ->
+                      Fiber.with_timeout Mono (Span.ms 5) (fun () ->
+                          Fiber.Mutex.use_ro m (fun () ->
+                              Fiber.Condition.wait c m ) ) ) ) ) )
+    ; test "R3: Mutex.lock is a cancellation point when the mutex is free"
+        (fun () ->
+          w.run (fun () ->
+              let m = Fiber.Mutex.create () in
+              Fiber.scope (fun s ->
+                  Fiber.cancel s (Boom "stop") ;
+                  raises (Fiber.Cancelled (Boom "stop")) (fun () ->
+                      Fiber.Mutex.lock m ) ) ;
+              Fiber.Mutex.lock m ;
+              Fiber.Mutex.unlock m ) ) ]
 
 (* Files and directories (milestone M2). *)
 
-let fs_error f =
-  match f () with
-  | _ ->
-      "no error"
-  | exception File.Error (e, _) ->
-      Format.asprintf "%a" Private.Op.pp_error e
+(* [File.Error] is [Net.Error]. *)
+let fs_error = error_of
 
 let write_file path data =
   let f = File.openfile [Write; Create; Truncate] path in
@@ -824,6 +853,37 @@ let files w =
               File.close f ;
               equal string "EBADF"
                 (err (fun () -> File.read f (Bytes.create 1) 0 1)) ) )
+    ; test "C5 and C12: more errors agree with Linux" (fun () ->
+          w.run (fun () ->
+              let p = Filename.concat (w.tmp ()) in
+              write_file (p "f") "data" ;
+              Dir.mkdir (p "dir") ;
+              (* The text of [Other] is not the same in each world. *)
+              let err f =
+                match fs_error f with
+                | ( "ENOENT"
+                  | "ENOTDIR"
+                  | "EISDIR"
+                  | "EEXIST"
+                  | "ENOTEMPTY"
+                  | "EBADF"
+                  | "no error" ) as e ->
+                    e
+                | _ ->
+                    "other"
+              in
+              let f = File.openfile [Read] (p "f") in
+              equal int 0 (File.pread f ~file_offset:100 (Bytes.create 4) 0 4) ;
+              equal string "other" (err (fun () -> File.truncate f 0)) ;
+              File.close f ;
+              equal string "ENOTDIR"
+                (err (fun () -> File.openfile [Read] (p "f/"))) ;
+              equal string "ENOTDIR" (err (fun () -> File.stat (p "f/"))) ;
+              equal string "ENOTDIR" (err (fun () -> Dir.unlink (p "f/"))) ;
+              equal string "EISDIR"
+                (err (fun () -> File.openfile [Read; Create] (p "dir"))) ;
+              equal string "ENOENT" (err (fun () -> File.openfile [Read] "")) ;
+              equal string "other" (err (fun () -> Dir.rmdir (p "dir/."))) ) )
     ; test "fibers use many files at the same time" (fun () ->
           w.run (fun () ->
               let d = w.tmp () in
@@ -838,24 +898,9 @@ let files w =
 
 (* Pipes (milestone M2). *)
 
-let pipe_error f =
-  match f () with
-  | _ ->
-      "no error"
-  | exception Pipe.Error (e, _) ->
-      Format.asprintf "%a" Private.Op.pp_error e
+let pipe_error = error_of
 
-let pipe_read_all r =
-  let b = Buffer.create 64 and buf = Bytes.create 4096 in
-  let rec loop () =
-    match Pipe.read r buf 0 4096 with
-    | 0 ->
-        Buffer.contents b
-    | k ->
-        Buffer.add_subbytes b buf 0 k ;
-        loop ()
-  in
-  loop ()
+let pipe_read_all = drain Pipe.read
 
 let pipes w =
   group "pipes"

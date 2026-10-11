@@ -31,11 +31,14 @@ let received s =
           invalid_arg "Signal.received: this signal cannot be an event"
       | _ ->
           () ) ;
-      ( match Net.submit "Signal.received" (Op.Watch s) with
-      | Ok () ->
-          ()
-      | Error _ ->
-          invalid_arg "Signal.received: the world does not watch this signal" ) ;
+      (* The world gives the form of [s] that it delivers. *)
+      let s =
+        match Net.submit "Signal.received" (Op.Watch s) with
+        | Ok s ->
+            s
+        | Error _ ->
+            invalid_arg "Signal.received: the world does not watch this signal"
+      in
       Event.Base
         (fun () ->
           let cell = ref 0 in

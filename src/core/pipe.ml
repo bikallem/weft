@@ -6,30 +6,19 @@ type t = Sched.fdrec
 exception Error = Net.Error
 
 let create () =
-  match Net.submit "Pipe.create" Op.Pipe with
-  | Ok (r, w) ->
-      (Sched.Fdtab.alloc r, Sched.Fdtab.alloc w)
-  | Error e ->
-      raise (Error (e, "Pipe.create"))
+  let r, w = Net.ok "Pipe.create" (Net.submit "Pipe.create" Op.Pipe) in
+  (Sched.Fdtab.alloc r, Sched.Fdtab.alloc w)
 
 let read fd buf off len =
-  if off < 0 || len < 1 || off > Bytes.length buf - len then
-    invalid_arg "Pipe.read" ;
+  Net.check_range ~read:true "Pipe.read" buf off len ;
   Net.retry ~write:false fd "Pipe.read" (fun os ->
       Op.Fd_read (os, buf, off, len) )
 
 let write_sub fd buf off len =
-  if off < 0 || len < 0 || off > Bytes.length buf - len then
-    invalid_arg "Pipe.write_sub" ;
+  Net.check_range ~read:false "Pipe.write_sub" buf off len ;
   Net.retry ~write:true fd "Pipe.write" (fun os ->
       Op.Fd_write (os, buf, off, len) )
 
-let write fd s =
-  let b = Bytes.unsafe_of_string s in
-  let rec loop off =
-    if off < Bytes.length b then
-      loop (off + write_sub fd b off (Bytes.length b - off))
-  in
-  loop 0
+let write = Net.write_all write_sub
 
 let close = Net.close

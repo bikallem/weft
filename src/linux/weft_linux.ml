@@ -51,13 +51,9 @@ external close_fd : int -> int = "weft_close"
 
 external getrandom : bytes -> int = "weft_getrandom"
 
-external errno_codes : unit -> int * int * int * int * int * int * int
-  = "weft_errno_codes"
+external errno_codes : unit -> int array = "weft_errno_codes"
 
 external strerror : int -> string = "weft_strerror"
-
-external errno_codes2 : unit -> int * int * int * int * int
-  = "weft_errno_codes2"
 
 (* The thread pools (weft_pool.c). *)
 
@@ -97,7 +93,7 @@ external close_async : int -> unit = "weft_close_async"
 external signal_numbers : unit -> int array = "weft_signal_numbers"
 
 external spawn :
-     string * string array * string array * bool * string * int array * int array
+     string * string array * string array * bool * string * int array
   -> int * int * int * int * int = "weft_spawn"
 
 external wait_child : int -> int * int = "weft_wait_child"
@@ -152,10 +148,13 @@ let signal_of n =
   in
   find 0
 
-let eagain, ebadf, econnrefused, econnreset, epipe, eaddrinuse, ewouldblock =
-  errno_codes ()
+let codes = errno_codes ()
 
-let enoent, eexist, enotdir, eisdir, enotempty = errno_codes2 ()
+let eagain, ebadf, econnrefused, econnreset, epipe, eaddrinuse, ewouldblock =
+  (codes.(0), codes.(1), codes.(2), codes.(3), codes.(4), codes.(5), codes.(6))
+
+let enoent, eexist, enotdir, eisdir, enotempty =
+  (codes.(7), codes.(8), codes.(9), codes.(10), codes.(11))
 
 let error_of e =
   if
@@ -289,7 +288,7 @@ let create ?(domains = 1) ?(signals = []) () =
   ; jobs= Hashtbl.create ~random:false 16
   ; next_job= Atomic.make 0
   ; files= Hashtbl.create ~random:false 16
-  ; watched= signals
+  ; watched= List.map (fun s -> signal_of (number_of s)) signals
   ; sigfd
   ; old_mask }
 
@@ -394,7 +393,9 @@ let args_of : type a. int -> int -> a Op.blocking -> job_args =
       {base with s1= host}
 
 (* The C side reads each string up to its first NUL byte. *)
-let has_nul a = String.contains a.s1 '\000' || String.contains a.s2 '\000'
+let has_nul = List.exists (fun s -> String.contains s '\000')
+
+let nul_error = Error (Op.Other "EINVAL: a NUL byte in a string")
 
 let kind_of_int = function
   | 0 ->
@@ -522,7 +523,7 @@ module World = struct
     | Op.Start (dom, op) ->
         let id = Atomic.fetch_and_add t.next_job 1 in
         let args = args_of id dom op in
-        if has_nul args then Error (Op.Other "EINVAL: a NUL byte in a name")
+        if has_nul [args.s1; args.s2] then nul_error
         else
           (* The lock covers the start, so the job is in the table before its
              completion can come. *)
@@ -542,9 +543,12 @@ module World = struct
       | None ->
           Error Op.Bad_fd )
     | Op.Spawn sp ->
-        let strings = (sp.prog :: sp.argv) @ Option.value ~default:[] sp.env in
-        if List.exists (fun x -> String.contains x '\000') strings then
-          Error (Op.Other "EINVAL: a NUL byte in a string")
+        if
+          has_nul
+            ( (sp.prog :: sp.argv)
+            @ Option.value ~default:[] sp.env
+            @ Option.to_list sp.cwd )
+        then nul_error
         else
           let kind = function
             | Op.Inherit ->
@@ -561,8 +565,7 @@ module World = struct
               , Array.of_list (Option.value ~default:[] sp.env)
               , Option.is_some sp.env
               , Option.value ~default:"" sp.cwd
-              , [|kind sp.stdin; kind sp.stdout; kind sp.stderr|]
-              , [|number_of Op.SIGPIPE|] )
+              , [|kind sp.stdin; kind sp.stdout; kind sp.stderr|] )
           in
           let fd x = if x < 0 then None else Some x in
           Result.map
@@ -587,7 +590,8 @@ module World = struct
     | Op.Kill (fd, s) ->
         unit (pidfd_kill fd (number_of s))
     | Op.Watch s ->
-        if List.mem s t.watched then Ok ()
+        let s = signal_of (number_of s) in
+        if List.mem s t.watched then Ok s
         else Error (Op.Other "the world does not watch this signal")
     | Op.Detach id -> (
       match take_job t id with
@@ -617,31 +621,31 @@ module World = struct
     let d = t.doms.(domain) in
     arm d w.deadline ;
     let events = epoll_wait d.epfd (w.timeout = World.Wait.Sleep) in
-    Array.to_list events
-    |> List.map (fun (token, read, write) ->
+    Array.fold_right
+      (fun (token, read, write) acc ->
         if token = timer_token then (
           ignore (drain d.tfd) ;
           (* A timerfd that fired is not armed. *)
           d.armed <- 0L ;
-          [World.Ready.Alarm] )
-        else if token = signal_token then
+          World.Ready.Alarm :: acc )
+        else if token = signal_token then (
           let counts = signalfd_read t.sigfd in
-          List.filter_map
-            (fun n ->
-              if counts.(n) > 0 then
-                Some (World.Ready.Signal (signal_of n, counts.(n)))
-              else None )
-            (List.init (Array.length counts) Fun.id)
+          let acc = ref acc in
+          for n = Array.length counts - 1 downto 0 do
+            if counts.(n) > 0 then
+              acc := World.Ready.Signal (signal_of n, counts.(n)) :: !acc
+          done ;
+          !acc )
         else if token = wake_token then (
           ignore (drain d.evfd) ;
           (* A worker puts the id in the mailbox before it writes the eventfd,
              so the take after the drain gets each id of this wake. *)
           World.Ready.Woken
-          :: List.map
-               (fun id -> World.Ready.External id)
-               (Array.to_list (mbx_take t.mbx domain)) )
-        else [World.Ready.Fd {token; read; write}] )
-    |> List.concat
+          :: Array.fold_right
+               (fun id acc -> World.Ready.External id :: acc)
+               (mbx_take t.mbx domain) acc )
+        else World.Ready.Fd {token; read; write} :: acc )
+      events []
 
   let wake t ~domain = ignore (eventfd_signal t.doms.(domain).evfd)
 

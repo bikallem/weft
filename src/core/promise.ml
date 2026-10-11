@@ -6,28 +6,30 @@ exception Cancelled
 (* The reason of the cancel of [cancel]. *)
 exception Cancel_request
 
+(* A [cancel] before the start of the fiber leaves [Requested], and the fiber
+   cancels its scope when it starts. *)
+type state = Not_started | Requested | Running of Sched.ctx
+
 type 'a t =
   { result: ('a, exn * Printexc.raw_backtrace) result Ivar.t
-  ; node: Sched.ctx option Atomic.t  (** The scope of the fiber. *)
-  ; requested: bool Atomic.t  (** [cancel] occurred. *) }
+  ; state: state Atomic.t }
 
-(* [cancel] sets [requested] and then reads [node]. The fiber sets [node] and
-   then reads [requested]. Thus at least one of the two cancels the scope, also
-   when [cancel] comes before the fiber starts. *)
+let rec start p inner =
+  match Atomic.get p.state with
+  | Not_started ->
+      if not (Atomic.compare_and_set p.state Not_started (Running inner)) then
+        start p inner
+  | Requested ->
+      Atomic.set p.state (Running inner) ;
+      Fiber.cancel inner Cancel_request
+  | Running _ ->
+      assert false (* Only the fiber of the promise starts it. *)
+
 let fork ?name scope f =
-  let p =
-    { result= Ivar.create ()
-    ; node= Atomic.make None
-    ; requested= Atomic.make false }
-  in
+  let p = {result= Ivar.create (); state= Atomic.make Not_started} in
   Fiber.fork ?name scope (fun () ->
       let r =
-        match
-          Fiber.scope (fun inner ->
-              Atomic.set p.node (Some inner) ;
-              if Atomic.get p.requested then Fiber.cancel inner Cancel_request ;
-              f () )
-        with
+        match Fiber.scope (fun inner -> start p inner ; f ()) with
         | v ->
             Ok v
         | exception Fiber.Cancelled _ ->
@@ -40,14 +42,16 @@ let fork ?name scope f =
 
 (* [Self] first: outside a fiber, [cancel] raises [Not_in_fiber] before it
    changes the promise. *)
-let cancel p =
+let rec cancel p =
   ignore (Sched.self ()) ;
-  Atomic.set p.requested true ;
-  match Atomic.get p.node with
-  | Some n ->
-      Fiber.cancel n Cancel_request
-  | None ->
+  match Atomic.get p.state with
+  | Not_started ->
+      if not (Atomic.compare_and_set p.state Not_started Requested) then
+        cancel p
+  | Requested ->
       ()
+  | Running n ->
+      Fiber.cancel n Cancel_request
 
 let ready p =
   Event.wrap (Ivar.read p.result) (function

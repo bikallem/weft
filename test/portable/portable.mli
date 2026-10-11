@@ -22,3 +22,9 @@ val files : world -> Windtrap.test
 val echo_server : Weft.Net.t -> unit
 
 val read_n : Weft.Net.t -> int -> string
+
+val drain : ('a -> bytes -> int -> int -> int) -> 'a -> string
+(** [drain read r] reads until the end of the stream. *)
+
+val error_of : (unit -> 'a) -> string
+(** The text of the error that [f] raises, or ["no error"]. *)

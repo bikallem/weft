@@ -89,13 +89,13 @@ struct pool {
   pthread_mutex_t m;
   pthread_cond_t c;
   struct job *head, *tail;
-  int threads, idle, max;
+  int queued, threads, idle, max;
 };
 
 static struct pool file_pool = {PTHREAD_MUTEX_INITIALIZER,
-                                PTHREAD_COND_INITIALIZER, NULL, NULL, 0, 0, 16};
+                                PTHREAD_COND_INITIALIZER, NULL, NULL, 0, 0, 0, 16};
 static struct pool dns_pool = {PTHREAD_MUTEX_INITIALIZER,
-                               PTHREAD_COND_INITIALIZER, NULL, NULL, 0, 0, 8};
+                               PTHREAD_COND_INITIALIZER, NULL, NULL, 0, 0, 0, 8};
 
 static void unref(struct mbx *w) {
   if (__atomic_sub_fetch(&w->refs, 1, __ATOMIC_ACQ_REL) == 0) {
@@ -330,6 +330,7 @@ static void *worker(void *arg) {
     struct job *j = p->head;
     p->head = j->next;
     if (p->head == NULL) p->tail = NULL;
+    p->queued--;
     pthread_mutex_unlock(&p->m);
     run(j);
     pthread_mutex_lock(&p->m);
@@ -353,7 +354,7 @@ static void *worker(void *arg) {
 
 /* A new thread copies the signal mask of its creator. Thus the creator blocks
    all signals for the time of the create. */
-static void spawn(struct pool *p) {
+static int spawn(struct pool *p) {
   sigset_t all, old;
   pthread_attr_t attr;
   pthread_t t;
@@ -361,9 +362,32 @@ static void spawn(struct pool *p) {
   pthread_sigmask(SIG_SETMASK, &all, &old);
   pthread_attr_init(&attr);
   pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
-  if (pthread_create(&t, &attr, worker, p) == 0) p->threads++;
+  int ok = pthread_create(&t, &attr, worker, p) == 0;
+  if (ok) p->threads++;
   pthread_attr_destroy(&attr);
   pthread_sigmask(SIG_SETMASK, &old, NULL);
+  return ok;
+}
+
+/* With no worker, the queued jobs complete with EAGAIN. Under the pool
+   mutex. */
+static void fail_all(struct pool *p) {
+  struct job *j = p->head;
+  p->head = p->tail = NULL;
+  p->queued = 0;
+  while (j != NULL) {
+    struct job *next = j->next;
+    j->res = -1;
+    j->err = EAGAIN;
+    j->done = 1;
+    struct mbx *w = j->mbx;
+    if (w != NULL) {
+      post(w, j->dom, j->id);
+      unref(w);
+    }
+    if (j->detached) free_job(j);
+    j = next;
+  }
 }
 
 /* After a fork, the child has no workers: it starts new ones, and it drops
@@ -383,7 +407,7 @@ static void reset(struct pool *p) {
   pthread_mutex_init(&p->m, NULL);
   pthread_cond_init(&p->c, NULL);
   p->head = p->tail = NULL;
-  p->threads = p->idle = 0;
+  p->queued = p->threads = p->idle = 0;
 }
 
 static void child(void) {
@@ -403,7 +427,11 @@ static void submit(struct job *j) {
   if (p->tail) p->tail->next = j;
   else p->head = j;
   p->tail = j;
-  if (p->idle == 0 && p->threads < p->max) spawn(p);
+  p->queued++;
+  /* A new thread for each job that no idle thread can take: a job that blocks
+     does not stop the jobs after it, up to the maximum. */
+  if (p->queued > p->idle && p->threads < p->max && !spawn(p) && p->threads == 0)
+    fail_all(p);
   else pthread_cond_signal(&p->c);
   pthread_mutex_unlock(&p->m);
 }
@@ -557,14 +585,4 @@ value weft_job_detach(value job) {
     free_job(j);
   }
   return Val_unit;
-}
-
-value weft_errno_codes2(value unit) {
-  value r = caml_alloc_tuple(5);
-  Store_field(r, 0, Val_int(ENOENT));
-  Store_field(r, 1, Val_int(EEXIST));
-  Store_field(r, 2, Val_int(ENOTDIR));
-  Store_field(r, 3, Val_int(EISDIR));
-  Store_field(r, 4, Val_int(ENOTEMPTY));
-  return r;
 }

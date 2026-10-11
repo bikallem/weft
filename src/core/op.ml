@@ -105,7 +105,7 @@ type _ t =
   | Spawn : spawn -> spawned t
   | Wait_child : fd -> status option t
   | Kill : fd * signal -> unit t
-  | Watch : signal -> unit t
+  | Watch : signal -> signal t
   | Detach : int -> unit t
 
 let pp_addr ppf = function

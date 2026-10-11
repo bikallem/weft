@@ -8,26 +8,19 @@ let wait id =
   Event.sync
     (Event.Base (fun () -> {Event.leaf= external_leaf id; result= ignore}))
 
-(* The fiber does not start a job in a cancelled context. *)
-let check_cancel () =
-  match first_flag (List.hd (self ()).ctxs) with
-  | Some r ->
-      raise (Cancelled r)
-  | None ->
-      ()
-
 (* Run [job]. With [~fd], the job holds a user of the fd until it completes,
    also after a detach: thus the world never closes the fd while the pool uses
-   it. *)
+   it. At the end of [run], a domain waits for such a job. *)
 let run ?fd name job =
+  (* The fiber does not start a job in a cancelled context. *)
   check_cancel () ;
   Option.iter (fun fd -> Net.acquire fd name) fd ;
-  let on_done () = Option.iter Rc.release fd in
+  let on_done = Option.map (fun fd () -> Rc.release fd) fd in
   match prog name (Job (job, on_done)) with
   | Error e ->
-      on_done () ;
+      Option.iter Rc.release fd ;
       raise (Net.Error (e, name))
-  | Ok id -> (
+  | Ok id ->
       ( match wait id with
       | () ->
           ()
@@ -35,8 +28,4 @@ let run ?fd name job =
           let bt = Printexc.get_raw_backtrace () in
           prog name (Detach_job id) ;
           Printexc.raise_with_backtrace e bt ) ;
-      match World.perform name (World.Submit (Op.Finish (id, job))) with
-      | Ok v ->
-          v
-      | Error e ->
-          raise (Net.Error (e, name)) )
+      Net.ok name (Net.submit name (Op.Finish (id, job)))

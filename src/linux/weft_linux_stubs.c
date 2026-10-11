@@ -325,9 +325,11 @@ value weft_getrandom(value buf) {
 value weft_errno_codes(value unit) {
   CAMLparam0();
   CAMLlocal1(r);
-  int codes[] = {EAGAIN, EBADF, ECONNREFUSED, ECONNRESET, EPIPE, EADDRINUSE, EWOULDBLOCK};
-  r = caml_alloc_tuple(7);
-  for (int i = 0; i < 7; i++) Store_field(r, i, Val_int(codes[i]));
+  int codes[] = {EAGAIN, EBADF,  ECONNREFUSED, ECONNRESET, EPIPE,  EADDRINUSE,
+                 EWOULDBLOCK, ENOENT, EEXIST, ENOTDIR, EISDIR, ENOTEMPTY};
+  int n = sizeof codes / sizeof codes[0];
+  r = caml_alloc_tuple(n);
+  for (int i = 0; i < n; i++) Store_field(r, i, Val_int(codes[i]));
   CAMLreturn(r);
 }
 

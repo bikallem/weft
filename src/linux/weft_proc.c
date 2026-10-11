@@ -56,9 +56,8 @@ static char **c_strings(value a) {
   return c;
 }
 
-/* [args] is (prog, argv, env, has_env, cwd, stdio, sigdef): stdio has a kind
-   for the fds 0, 1 and 2 (0 inherit, 1 /dev/null, 2 a pipe), and sigdef has
-   the signals that get their default action. The result is (pid, pidfd,
+/* [args] is (prog, argv, env, has_env, cwd, stdio): stdio has a kind for the
+   fds 0, 1 and 2 (0 inherit, 1 /dev/null, 2 a pipe). The result is (pid, pidfd,
    stdin, stdout, stderr): the parent ends of the pipes, or -1. pid is -errno
    on an error. */
 value weft_spawn(value args) {
@@ -103,7 +102,8 @@ value weft_spawn(value args) {
     /* The child gets no blocked signals, and the default action for SIGPIPE,
        which the world ignores. */
     sigemptyset(&none);
-    set_of(Field(args, 6), &def);
+    sigemptyset(&def);
+    sigaddset(&def, SIGPIPE);
     posix_spawnattr_setsigmask(&at, &none);
     posix_spawnattr_setsigdefault(&at, &def);
     posix_spawnattr_setflags(&at, POSIX_SPAWN_SETSIGMASK | POSIX_SPAWN_SETSIGDEF);

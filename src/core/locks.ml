@@ -22,15 +22,30 @@ let give w = Option.value ~default:[] (Iv.fill w.wiv ())
 let rec first q =
   match Queue.take_opt q with Some w when w.gone -> first q | x -> x
 
+(* Give to each waiter that did not leave. *)
+let give_all q =
+  let rec all acc =
+    match first q with Some w -> all (give w @ acc) | None -> acc
+  in
+  all []
+
+(* A waiter leaves after a cancel, under the lock of its queue. It gives [true]
+   if it got the lock or the signal before. *)
+let leave lock w =
+  Spin.with_lock lock (fun () ->
+      w.gone <- true ;
+      is_full w )
+
 module Mutex = struct
   type t =
     { lock: Spin.t
     ; mutable held: bool
     ; mutable poisoned: bool
     ; waiters: waiter Queue.t
-    ; mutable outer: ctx list option
-          (** Only the holder uses it: the contexts outside the shield of
-              [use_rw ~protect:true], for [Condition.wait]. *)
+    ; mutable shield: ctx option
+          (** Only the holder uses it: the shield node of
+              [use_rw ~protect:true], which [Condition.wait] opens. It is [None]
+              when the mutex is free. *)
     ; mutable wait_exn: exn option
           (** Only the holder uses it: the [Cancelled] that [Condition.wait]
               raised. It does not poison. *) }
@@ -40,7 +55,7 @@ module Mutex = struct
     ; held= false
     ; poisoned= false
     ; waiters= Queue.create ()
-    ; outer= None
+    ; shield= None
     ; wait_exn= None }
 
   (* Give the mutex to the first waiter, or make it free. *)
@@ -63,23 +78,15 @@ module Mutex = struct
 
   (* Each waiter wakes and raises [Poisoned]. *)
   let poison m =
-    let resumed =
-      Spin.with_lock m.lock (fun () ->
-          m.poisoned <- true ;
-          m.held <- false ;
-          let rec all acc =
-            match first m.waiters with
-            | Some w ->
-                all (give w @ acc)
-            | None ->
-                acc
-          in
-          all [] )
-    in
-    enqueue resumed
+    enqueue
+      (Spin.with_lock m.lock (fun () ->
+           m.poisoned <- true ;
+           m.held <- false ;
+           give_all m.waiters ) )
 
+  (* A cancellation point, also when the mutex is free. *)
   let lock m =
-    ignore (self ()) ;
+    check_cancel () ;
     let w =
       Spin.with_lock m.lock (fun () ->
           if m.poisoned then raise Poisoned ;
@@ -101,31 +108,31 @@ module Mutex = struct
           let bt = Printexc.get_raw_backtrace () in
           (* The unlock can give the mutex to [w] after the cancel. Then [w]
              owns it and gives it on. *)
-          let owned =
-            Spin.with_lock m.lock (fun () ->
-                w.gone <- true ;
-                is_full w )
-          in
-          if owned then unlock m ;
+          if leave m.lock w then unlock m ;
           Printexc.raise_with_backtrace e bt )
 
   let use_rw ~protect m f =
     lock m ;
-    m.outer <- (if protect then Some (self ()).ctxs else None) ;
     m.wait_exn <- None ;
-    match if protect then shield f else f () with
+    let body () =
+      if protect then
+        shield_node (fun node ->
+            m.shield <- Some node ;
+            f () )
+      else f ()
+    in
+    match body () with
     | v ->
-        m.outer <- None ;
+        m.shield <- None ;
         unlock m ;
         v
     | exception e ->
         let bt = Printexc.get_raw_backtrace () in
+        m.shield <- None ;
         ( match m.wait_exn with
         | Some e' when e' == e ->
-            m.outer <- None ;
             unlock m
         | _ ->
-            m.outer <- None ;
             poison m ) ;
         Printexc.raise_with_backtrace e bt
 
@@ -153,29 +160,23 @@ module Condition = struct
 
   let broadcast c =
     ignore (self ()) ;
-    enqueue
-      (Spin.with_lock c.clock (fun () ->
-           let rec all acc =
-             match first c.cwaiters with
-             | Some w ->
-                 all (give w @ acc)
-             | None ->
-                 acc
-           in
-           all [] ) )
+    enqueue (Spin.with_lock c.clock (fun () -> give_all c.cwaiters))
 
-  (* Inside [use_rw ~protect:true], the wait sees the cancels from outside the
-     shield: the fiber waits with the contexts of [m.outer]. The lock again is
-     in a shield, so the fiber always holds [m] when [wait] returns or
-     raises. *)
+  let set_open node o =
+    match node with Some {kind= Shield_node a; _} -> Atomic.set a o | _ -> ()
+
+  (* Inside [use_rw ~protect:true], the wait opens the shield of [use_rw]: it
+     sees the cancels from outside and from the scopes inside. The node opens
+     before the sync publishes its record, so a cancel walk that sees the sync
+     sees the open node. The lock again is in a shield, so the fiber always
+     holds [m] when [wait] returns or raises. *)
   let wait c (m : Mutex.t) =
-    let fiber = self () in
     let w = new_waiter () in
     Spin.with_lock c.clock (fun () -> Queue.push w c.cwaiters) ;
-    let outer = m.outer in
+    let node = m.shield in
+    m.shield <- None ;
     Mutex.unlock m ;
-    let saved = fiber.ctxs in
-    Option.iter (fun ctxs -> fiber.ctxs <- ctxs) outer ;
+    set_open node true ;
     let r =
       match Event.sync (Event.of_ivar w.wiv) with
       | () ->
@@ -183,20 +184,11 @@ module Condition = struct
       | exception (Cancelled _ as e) ->
           Some (e, Printexc.get_raw_backtrace ())
     in
-    fiber.ctxs <- saved ;
-    ( match r with
-    | Some _ ->
-        (* A signal that came after the cancel goes to another waiter. *)
-        let signalled =
-          Spin.with_lock c.clock (fun () ->
-              w.gone <- true ;
-              is_full w )
-        in
-        if signalled then signal c
-    | None ->
-        () ) ;
+    set_open node false ;
+    (* A signal that came after the cancel goes to another waiter. *)
+    if Option.is_some r && leave c.clock w then signal c ;
     shield (fun () -> Mutex.lock m) ;
-    m.outer <- outer ;
+    m.shield <- node ;
     match r with
     | None ->
         ()

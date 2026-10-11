@@ -490,6 +490,7 @@ In the simulator, the sleep is a normal heap entry, so the result is exact. Mile
 - **error:** a member of S fails while a daemon of S runs.
 - **shield:** a member of S runs a cleanup in a shield, with a `with_timeout` of its own.
 - **fork:** a member of R forks a fiber into S while S can end.
+- **condwait (M2):** as **shield**, but the `sync` is a `Condition.wait` that opens the shield node.
 
 TLC checks these properties in each scenario:
 
@@ -498,6 +499,7 @@ TLC checks these properties in each scenario:
 - A cancel from outside never ends a `sync` inside a shield (`ShieldHolds`), and `with_timeout` raises `Timeout` only for its own deadline (`TimeoutOK`).
 - A cancel of X ends only a `sync` whose chain of contexts reaches X (`NoForeignCancel`).
 - A closed scope has no members (`ClosedEmpty`).
+- In **condwait**, when the timer of `with_timeout` ended its walk, the wait is not parked (`TimerReachesWait`). The two shield properties do not apply, because the wait opens the shield.
 - With weak fairness, each process ends. Thus each cancel reaches each fiber that it must reach, and each join ends.
 
 All three scenarios pass. Five planted bugs each give a failure: a join that a cancel can end, a scope in a shield that links under the outer scope, a walk with no check of the chain, a member that ends before it stores its exception, and a `sync` that parks with no read of the flags. Section 2.16 lists all of the TLA+ models. The model makes each commit one atomic step, and `Commit.tla` examines the commit itself. The model does not cover promises, `fork_isolated`, `Fiber.Mutex`, more than one nested scope in each scenario, or the deadline form of `with_timeout`.
@@ -512,7 +514,7 @@ All three scenarios pass. Five planted bugs each give a failure: a join that a c
 - `Fiber.scope` raises it again with `Printexc.raise_with_backtrace`. `Multiple` holds a backtrace for each exception.
 - `Promise.await` does the same with the exception of the promise. affect's `get` keeps the backtrace in the same way.
 
-**A server must isolate each connection.** Suppose that `Server.serve` forks each handler with `Fiber.fork`. Then one handler that raises makes the server scope fail, and all other connections are cancelled. Thus a server forks each handler with `Fiber.fork_isolated ~on_error`. It runs the handler in a scope of its own, and an exception goes to `on_error`, not to the server scope. Eio's `run_server` does the same with `~on_error`. A cancel of the server scope still goes down to each handler.
+**A server must isolate each connection.** Suppose that `Server.serve` forks each handler with `Fiber.fork`. Then one handler that raises makes the server scope fail, and all other connections are cancelled. Thus a server forks each handler with `Fiber.fork_isolated ~on_error`. An exception of the handler goes to `on_error`, not to the server scope. Eio's `run_server` does the same with `~on_error`. A cancel of the server scope still goes down to each handler.
 
 **A guard that raises.** Suppose that `sync (choose [a; b])` runs the guard of `a`, and this guard sends a request to a server with `with_nack`. Then the guard of `b` raises. Branch `a` never commits, so the server must get its nack. Thus, if a guard raises, `sync` enables the nacks of all guards that already ran, and then it raises the exception.
 
@@ -702,6 +704,8 @@ Fiber code must not hold a stdlib `Mutex` across a `sync` or a world effect, for
 - With full stealing, the holder can resume on a different domain. Its `unlock` then gives `Sys_error` (`EPERM`), and the mutex stays locked forever. Each domain that waits on it then stops. A review verified these two results with a test program (`mutex.mli` agrees).
 
 **A cancel in `Condition.wait` does not poison.** By contract, the protected data is correct at a wait point. Thus a `Cancelled` that comes out of `Condition.wait` does not poison the mutex, and `use_rw` raises it with no poison. Also, inside `use_rw ~protect:true`, `Condition.wait` sees the cancels from outside. If it did not, a consumer that waits for a producer that never comes would make its scope wait forever. Eio poisons in this case (`eio_mutex.ml`, `condition.ml`).
+
+**How the wait sees the cancels (M2).** The shield node of `use_rw ~protect:true` has an open flag. `Condition.wait` opens the node before its `sync` publishes its record, and it shuts the node after the `sync`. While the node is open, the read of the flags and the check of the chain go through it. Thus the wait sees the cancels of the outer scopes and of the scopes inside the shield, for example a `with_timeout` around the wait. The walk of a cancel never goes into a shield node, but it finds the fiber as a member of the outer scope. The mutex holds the node only while a fiber holds the mutex, and `Condition.wait` clears it before the unlock, so a later holder never uses the node of another fiber. The review of M2 found that the first form (the wait used the contexts from outside the shield) missed the cancels from inside, and `Scope.tla` has a scenario for it (section 2.16).
 
 `Fiber.Condition.wait` must lock the mutex again before it returns, also when the fiber is cancelled. That lock is a `sync`, so `Condition.wait` does it in a shield. Without the shield, the lock raises `Cancelled`, and the caller continues without the mutex. This shield has no time limit. It is an exception to the rule of the shield: the lock waits only for the other holders of the mutex, and each of them must unlock it.
 
@@ -1201,11 +1205,13 @@ The sections of this document mark each part that does not come in M0 with its m
 - **A job holds a user of its fd** until the job completes, also after a detach. Thus the close(2) of a file waits for each job that uses the fd, and the pool never uses a number that the kernel gave to a new file. The simulator checks this rule: a close(2) while a job uses the fd is a `Model_error`.
 - **The pool closes the files.** close(2) of a regular file can block, so the Linux world gives it to the pool with no completion.
 - **The pools after a fork.** A child of `fork` has no workers, so the pools reset their state in the child (`pthread_atfork`). The mutation run of windtrap forks a child for each mutant.
+- **The end of `run`.** A job that a fiber detached can still hold the user of an fd when `main` returns. The domain that started the job waits for its completion before its loop ends, so the fd closes. A job with no fd, for example `Dns.resolve`, does not hold the end of `run`.
+- **The threads of a pool.** A new job starts a thread when the idle threads are fewer than the queued jobs, up to the maximum. Thus a job that blocks does not stop the next job. If a pool has no thread and cannot start one, its queued jobs complete with `EAGAIN`.
 - **Not done in M2:** the limit of detached jobs of each pool and the warning after 1 s (section 2.3). A pool has a fixed maximum of threads: 16 for the files and 8 for the names.
-- **The signals are an argument of the world** (section 2.3). The guard of `Signal.received` asks the world if it watches the signal (`Op.Watch`). If not, it raises `Invalid_argument`.
+- **The signals are an argument of the world** (section 2.3): `Weft_linux.run ~signals` and `Sim.run ~signals`. The guard of `Signal.received` asks the world if it watches the signal (`Op.Watch`). If not, it raises `Invalid_argument`. The world also gives the form of the signal that it delivers, so `Other_signal 10` and `SIGUSR1` are one event on Linux. `Sim.signal` of a signal that the program does not watch is a `Model_error`, because the OS does the default action.
 - **The count of a signal.** A commit takes the count. A delivery puts the count in the cell of the waiter before the commit, because the owner can read the cell at once on another domain.
 - **A child process.** `Process.spawn` uses `pidfd_spawnp` (glibc 2.39). The pidfd is a normal fd record in the poller. One fiber reaps the child with `waitid`, fills an Ivar with the status, and then closes the pidfd. The other fibers read the Ivar.
-- **The faults of the network** (`Sim.net_faults`): a jitter, short reads and writes, and an edge with no change one time in 8. A TCP stream loses no data and keeps its order, so the loss and the reordering of packets show only as delays. The partitions need the host of each side of a connection, and the simulator does not record it. Thus the partitions are not done. With the faults, the tests found that the echo server of the tests dropped the rest of a short write.
+- **The faults of the network** (`Sim.net_faults`): a jitter, short reads and writes, and an edge with no change one time in 8. A write of at most 4096 bytes (`PIPE_BUF`) to a pipe is atomic, as on Linux. A TCP stream loses no data and keeps its order, so the loss and the reordering of packets show only as delays. The partitions need the host of each side of a connection, and the simulator does not record it. Thus the partitions are not done. With the faults, the tests found that the echo server of the tests dropped the rest of a short write.
 - **One exception for all I/O.** `File.Error`, `Dir.Error`, `Pipe.Error`, `Process.Error` and `Dns.Error` are the same exception as `Net.Error`. The error type has five more constructors: `No_entry`, `Exists`, `Not_dir`, `Is_dir` and `Not_empty`. A top-level `Weft.Error` would hide the `Error` constructor of `result` after `open Weft`.
 - **Not in M2:** UDP, `sendto`, `recvfrom` and the socket options of `Net` (section 2.3, The I/O modules), and the `Poll` world.
 
@@ -1248,12 +1254,12 @@ It has three problems:
 
 The protocols that run on many domains at the same time have models in PlusCal, in `spec/tla`. The TLC model checker examines each order of their steps. Each model has the protocol of this design, and a set of planted bugs. Each planted bug must give a failure. Thus the model can find the errors that matter, and it is not only a model that always passes. Some models also have simplifications (constants with the prefix `Simp`). A simplification must pass, and section 2.5 uses the ones that passed.
 
-Run all of the models with `nix develop -c spec/tla/check.sh`. `MODELS="Ivar Fd"` selects some of them. The script runs `JOBS` cases at the same time (default 4), each one with `-lncheck final`, so that TLC checks the liveness property one time at the end. The 40 cases take about 16 minutes on a machine with 16 CPUs. The slowest case, `Wake.tla` with no bug and 15.3 million states, takes about 11 minutes, and it is the lower limit of the run time. The flake of the repository gives the TLA+ tools.
+Run all of the models with `nix develop -c spec/tla/check.sh`. `MODELS="Ivar Fd"` selects some of them. The script runs `JOBS` cases at the same time (default 4), each one with `-lncheck final`, so that TLC checks the liveness property one time at the end. The 42 cases take about 16 minutes on a machine with 16 CPUs. The slowest case, `Wake.tla` with no bug and 15.3 million states, takes about 11 minutes, and it is the lower limit of the run time. The flake of the repository gives the TLA+ tools.
 
 | Model | Protocol (section) | Properties | Planted bugs that fail |
 |---|---|---|---|
 | `Commit.tla` | The commit of `choose` (2.4) | At most one resume, correct rendezvous pairs, no lost rendezvous, a correct end state, termination | No `Parked` state, no id order, a partner that gives up on `Claimed`, no channel lock |
-| `Scope.tla` | Scopes and cancellation (2.5) | No orphan fiber, no lost exception, the shield holds, no cancel of a foreign `sync`, a closed scope is empty, termination | A join that a cancel can end, a scope in a shield under the outer scope, no check of the chain, an exception after the end, no read of the flags. Simplifications that pass: no flags on nested scopes, no second read at a link, and the two together. |
+| `Scope.tla` | Scopes and cancellation (2.5), and the open shield of `Condition.wait` (M2) | No orphan fiber, no lost exception, the shield holds, no cancel of a foreign `sync`, a closed scope is empty, the timer reaches a condition wait, termination | A join that a cancel can end, a scope in a shield under the outer scope, no check of the chain, an exception after the end, no read of the flags, a condition wait with the outer context. Simplifications that pass: no flags on nested scopes, no second read at a link, and the two together. |
 | `Ivar.tla` | The atomic register of an `Ivar`, and `Ivar.fill_from_outside` (2.4, 2.5) | At most one resume, one fill, no waiters after the fill, a correct end state, termination | A finaliser that commits the waiters itself, a register that is not atomic |
 | `Wake.tla` | The loop of a domain: idle and wake, steal, next slot, pinned queue, injection queue (2.5) | Each item runs, a pinned item runs only on domain 0, no lost wakeup | The decrease of `searching` after the second check, no second check, a pinned push that wakes any domain. Simplifications that pass: no steal of a next slot, no search limit, no last wake, no `searching` count. |
 | `Fd.tla` | The fd record: `Rcfd`, the registrations, the close notices, the removal (2.7) | One `close(2)`, no `close(2)` of another file, no use after `close(2)`, no `EPOLL_CTL_DEL` of a new file, `EPOLL_CTL_DEL` before `close(2)`, termination | A count and a closed bit, a Register that reads the state first, a registration with no user. A simplification that passes: no CAS on the domain bit. |
@@ -1269,7 +1275,7 @@ Run all of the models with `nix develop -c spec/tla/check.sh`. `MODELS="Ivar Fd"
 
 **A correction from the review of M0.** In `Scope.tla`, the fork of K checked only the flag of S. The design and the code read the flags of the whole chain of S, because the nested scopes have no flags of their own. The fork step now reads `FirstFlag("S")`, and the 16 cases of `Scope.tla` give the expected results.
 
-**The limits.** The models are small: two or three fibers or domains in each scenario, a few work items, and one fd. Each model takes some details as one atomic step, and another model examines them, for example the commit in `Scope.tla` and `Ivar.tla`. The models do not cover the simulator, the OS facts, `Fiber.Mutex`, `Condition`, promises or signals. `dscheck` still examines the OCaml code in milestone M1, because the OCaml code can differ from the model.
+**The limits.** The models are small: two or three fibers or domains in each scenario, a few work items, and one fd. Each model takes some details as one atomic step, and another model examines them, for example the commit in `Scope.tla` and `Ivar.tla`. The models do not cover the simulator, the OS facts, the handoff of `Fiber.Mutex`, promises or signals. `dscheck` still examines the OCaml code, because the OCaml code can differ from the model. In M2, two `dscheck` tests examine the completion of a job and the delivery of a signal, each with a cancel from another domain (section 3.8).
 
 ## 2.17 Tests with windtrap
 
@@ -1534,3 +1540,25 @@ Three subagents reviewed the code of M1 (correctness, conformance to the TLA+ mo
 | T7, C5, K4 | `on_ready` went on with a registration that it had removed | The two parts are in the `else` |
 | K1, K2, K3 | The table of fibers and the names cost each fork, `Switch` cost each fiber start, and the order of the scan took one world effect for each branch, with one shared atomic counter on Linux | The table and `Switch` only in the simulator, and the order from the PRNG of the domain, seeded from the world when the domain starts (2.5) |
 | K5 to K11 | Stale comments, copies of tests, a body that a test copied, a steal that made a list, small copies in the fd code | Each one is simpler |
+
+## 3.8 The review of M2, 2026-10-11
+
+Three subagents reviewed the code of M2 (correctness, conformance to the TLA+ models, and complexity). Each finding of this table is fixed. Each bug has a regression test that fails when the old code is put back, except two: C11 is a race with one reap on another domain, and the NUL check of C12 is one line.
+
+| No. | Finding | Fix |
+|---|---|---|
+| F1, C1 | In `use_rw ~protect:true`, `Condition.wait` used the contexts from outside the shield, so a cancel of a scope inside the shield (for example `with_timeout`) never ended the wait | The wait opens the shield node of `use_rw` (2.5, Locks for fiber code), and `Scope.tla` has the scenario **condwait** |
+| F2, C2 | A fiber that held the mutex with `use_ro` or `lock` used the contexts of the last `use_rw` holder in `Condition.wait` | The mutex holds the shield node only while its holder holds it |
+| F3 | `Mutex.lock` did not read the flags when the mutex was free | `lock` is a cancellation point in each case |
+| F4, C6 | A job that a fiber detached, and that was in the pool at the end of `main`, never released its fd | The domain waits for it at the end of its loop (2.14, the state of M2) |
+| C3 | A second `Process.wait` waited only for the status, and the reaper could leave with no status | Each waiter also watches the pidfd |
+| C4 | A job waited behind a job that blocked, while the pool could start a thread | A thread for each queued job that no idle thread takes |
+| C5 | `pread` past the end of a file raised an exception in the simulator | It gives 0 bytes, as on Linux |
+| C7 | A fiber that waited for `Other_signal 10` never got `SIGUSR1` | `Op.Watch` gives the form of the signal that the world delivers |
+| C8 | The simulator watched each signal, and Linux only the signals of `run ~signals` | `Sim.run ~signals` |
+| C9 | In the simulator, `SIGTSTP` and the signal 0 ended a fake program | They do not end it |
+| C10 | With short writes, the simulator split a pipe write of at most `PIPE_BUF` bytes | Such a write is atomic |
+| C11 | `Process.kill` could raise for a child that another domain reaped at the same time | The error of the send is not an error after a reap |
+| C12 | Some errors of the simulator file system were not the errors of Linux, and the NUL check of `spawn` did not cover the directory | The errors agree, and a portable test examines them on the two worlds |
+| Q4 | No test examined the completion of a job or the delivery of a signal with a cancel from another domain | Two `dscheck` tests, and each one finds a planted bug |
+| K1 to K9 | Copies of the range check and of the write loop, of the test helpers, of the errno table and of the close of a pipe end, two atomics in a promise, and a list for each event in the wait of Linux | Each one is simpler |

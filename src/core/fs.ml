@@ -33,21 +33,18 @@ module File = struct
     Sched.Fdtab.alloc
       (Job.run "File.openfile" (Op.Open (path, List.map op_flag flags, perm)))
 
-  let check name buf off len =
-    if off < 0 || len < 1 || off > Bytes.length buf - len then invalid_arg name
-
   let read fd buf off len =
-    check "File.read" buf off len ;
+    Net.check_range ~read:true "File.read" buf off len ;
     Job.run ~fd "File.read" (Op.Pread (fd.Sched.os, buf, off, len, -1))
 
   let pread fd ~file_offset buf off len =
-    check "File.pread" buf off len ;
+    Net.check_range ~read:true "File.pread" buf off len ;
     if file_offset < 0 then invalid_arg "File.pread" ;
     Job.run ~fd "File.pread" (Op.Pread (fd.Sched.os, buf, off, len, file_offset))
 
   (* The world copies the data before the job starts (design section 2.3). *)
   let write_at name fd file_offset buf off len =
-    if off < 0 || len < 0 || off > Bytes.length buf - len then invalid_arg name ;
+    Net.check_range ~read:false name buf off len ;
     Job.run ~fd name
       (Op.Pwrite (fd.Sched.os, Bytes.sub_string buf off len, file_offset))
 
@@ -57,11 +54,13 @@ module File = struct
     if file_offset < 0 then invalid_arg "File.pwrite" ;
     write_at "File.pwrite" fd file_offset buf off len
 
+  (* The first job gets the string with no copy. *)
   let write fd s =
-    let b = Bytes.unsafe_of_string s in
+    let n = String.length s in
     let rec loop off =
-      if off < Bytes.length b then
-        loop (off + write_sub fd b off (Bytes.length b - off))
+      if off < n then
+        let data = if off = 0 then s else String.sub s off (n - off) in
+        loop (off + Job.run ~fd "File.write" (Op.Pwrite (fd.Sched.os, data, -1)))
     in
     loop 0
 

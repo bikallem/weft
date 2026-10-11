@@ -96,25 +96,30 @@ let connect addr =
       close fd ;
       Printexc.raise_with_backtrace e bt
 
-let read fd buf off len =
-  (* A read of 0 bytes would give 0, the same result as the end of the
-     stream. *)
-  if off < 0 || len < 1 || off > Bytes.length buf - len then
-    invalid_arg "Net.read" ;
-  retry ~write:false fd "Net.read" (fun os -> Op.Read (os, buf, off, len))
+(* The range of a read or a write. A read needs at least one byte: a read of 0
+   bytes would give 0, the same result as the end of the stream. *)
+let check_range ~read name buf off len =
+  if off < 0 || (len < if read then 1 else 0) || off > Bytes.length buf - len
+  then invalid_arg name
 
-let write_sub fd buf off len =
-  if off < 0 || len < 0 || off > Bytes.length buf - len then
-    invalid_arg "Net.write_sub" ;
-  retry ~write:true fd "Net.write" (fun os -> Op.Write (os, buf, off, len))
-
-let write fd s =
+(* Write all of [s] with a function that can write a part. *)
+let write_all write_sub fd s =
   let b = Bytes.unsafe_of_string s in
   let rec loop off =
     if off < Bytes.length b then
       loop (off + write_sub fd b off (Bytes.length b - off))
   in
   loop 0
+
+let read fd buf off len =
+  check_range ~read:true "Net.read" buf off len ;
+  retry ~write:false fd "Net.read" (fun os -> Op.Read (os, buf, off, len))
+
+let write_sub fd buf off len =
+  check_range ~read:false "Net.write_sub" buf off len ;
+  retry ~write:true fd "Net.write" (fun os -> Op.Write (os, buf, off, len))
+
+let write = write_all write_sub
 
 let shutdown fd =
   ok "Net.shutdown" (attempt fd "Net.shutdown" (fun os -> Op.Shutdown os))

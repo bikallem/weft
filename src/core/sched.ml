@@ -74,8 +74,14 @@ and ctx =
 (* A handler of the user (design section 2.5, Effect handlers of a scope). *)
 and handler = {handle: 'a. (unit -> 'a) -> 'a}
 
-and kind = Scope_node of scope_state | Shield_node | Daemon_node
+and kind =
+  | Scope_node of scope_state
+  | Shield_node of bool Atomic.t
+  | Daemon_node
 
+(* The flag of a shield node tells that it is open: the cancels from outside go
+   through it. Only [Condition.wait] opens a shield, for the time of its wait
+   (design section 2.5, Locks for fiber code). *)
 and scope_state =
   { counts: int Atomic.t
         (** The closed bit, the members that are not daemons, and all members.
@@ -132,7 +138,7 @@ and _ req =
   | Enqueue : sync list -> unit req
   | Close_notices : fdrec -> unit req
       (** Send a close notice to each domain with a registration. *)
-  | Job : 'a Op.blocking * (unit -> unit) -> (int, Op.error) result req
+  | Job : 'a Op.blocking * (unit -> unit) option -> (int, Op.error) result req
       (** Start a job of the pool for the domain that runs the fiber. The
           function runs at its completion. *)
   | Detach_job : int -> unit req
@@ -159,6 +165,9 @@ and dom =
             seed when the domain starts. *)
   ; mutable wake: bool  (** A push to do a wake at the next safe point. *)
   ; stats: stats  (** The counters of the domain, for the measurements. *)
+  ; mutable held: int
+        (** The jobs that this domain started, that hold the user of an fd, and
+            that did not complete. *)
   ; regs: (int, reg) Hashtbl.t  (** The registrations, by slot. *)
   ; mailbox: fdrec list Atomic.t  (** The close notices, the newest first. *) }
 
@@ -206,9 +215,9 @@ and ext =
   ; mutable dropped: bool
         (** The fiber left before its wait started, for example after a cancel.
         *)
-  ; on_done: unit -> unit
-        (** It runs at the completion, also when the waiter left: it releases
-            the user of the fd of a job. *) }
+  ; on_done: (unit -> unit) option
+        (** For a job that holds the user of an fd: the release, at the
+            completion, also when the waiter left. *) }
 
 (* The heap of deadlines of one domain. Only its owner uses it. *)
 and heap =
@@ -703,7 +712,7 @@ let external_leaf id : leaf =
           e.ewait <- Some (s, i)
       | None ->
           Hashtbl.replace t.externals id
-            {ewait= Some (s, i); arrived= false; dropped= false; on_done= ignore} )
+            {ewait= Some (s, i); arrived= false; dropped= false; on_done= None} )
 
 (* The fiber does not wait for the completion of [id] any more. *)
 let drop_external t id =
@@ -722,6 +731,7 @@ let start_job dom job on_done =
   let r = World.perform "job" (World.Submit (Op.Start (dom.index, job))) in
   ( match r with
   | Ok id ->
+      if Option.is_some on_done then dom.held <- dom.held + 1 ;
       let t = dom.sched in
       Spin.with_lock t.externals_lock (fun () ->
           Hashtbl.replace t.externals id
@@ -840,7 +850,11 @@ let on_ready dom = function
       in
       match e with
       | Some e -> (
-          e.on_done () ;
+          Option.iter
+            (fun f ->
+              dom.held <- dom.held - 1 ;
+              f () )
+            e.on_done ;
           match e.ewait with
           | Some (s, i) -> (
             match C.notify s.word i with C.Resume -> resume dom s | _ -> () )
@@ -892,8 +906,10 @@ let by_id tbl =
 (* The first cancelled context on the chain from [c], up to a shield. *)
 let rec first_flag c =
   match c.kind with
-  | Shield_node ->
+  | Shield_node o when not (Atomic.get o) ->
       None
+  | Shield_node _ ->
+      Option.bind c.parent first_flag
   | Scope_node _ | Daemon_node -> (
     match Atomic.get c.flag with
     | Some _ as e ->
@@ -906,8 +922,10 @@ let rec on_chain c x =
   c == x
   ||
   match c.kind with
-  | Shield_node ->
+  | Shield_node o when not (Atomic.get o) ->
       false
+  | Shield_node _ ->
+      Option.fold ~none:false ~some:(fun p -> on_chain p x) c.parent
   | Scope_node _ | Daemon_node -> (
     match c.parent with None -> false | Some p -> on_chain p x )
 
@@ -1196,10 +1214,13 @@ let run_ready dom r =
 (* The loop of one domain. It ends when [main] ended. Each close came before the
    end of [main], because the root scope waited for each fiber. Thus the domain
    takes its last close notices when it leaves the loop, and each registration
-   releases its user. *)
+   releases its user. A job that a fiber detached can still hold the user of an
+   fd: the domain waits for its completion, so that the fd closes. *)
 let rec loop dom =
   let t = dom.sched in
-  if Atomic.get t.finished then take_mail dom
+  if Atomic.get t.finished then (
+    take_mail dom ;
+    if dom.held > 0 then (wait dom World.Wait.Sleep ; loop dom) )
   else (
     ( match take dom with
     | Some r ->
@@ -1241,7 +1262,7 @@ let state_of node =
   match node.kind with
   | Scope_node st ->
       st
-  | Shield_node | Daemon_node ->
+  | Shield_node _ | Daemon_node ->
       assert false (* Only a scope node has members that end. *)
 
 (* A failed member stores its exception before it ends, then it cancels the
@@ -1395,18 +1416,31 @@ let scope ?handler f =
   fiber.ctxs <- List.tl fiber.ctxs ;
   finish_scope fiber node result
 
-let shield f =
+(* [f] gets the shield node. *)
+let shield_node f =
   let fiber = self () in
-  let node = new_node ~parent:(List.hd fiber.ctxs) Shield_node in
+  let node =
+    new_node ~parent:(List.hd fiber.ctxs) (Shield_node (Atomic.make false))
+  in
   fiber.ctxs <- node :: fiber.ctxs ;
   let pop () = fiber.ctxs <- List.tl fiber.ctxs in
-  match f () with
+  match f node with
   | v ->
       pop () ; v
   | exception e ->
       let bt = Printexc.get_raw_backtrace () in
       pop () ;
       Printexc.raise_with_backtrace e bt
+
+let shield f = shield_node (fun _ -> f ())
+
+(* A cancellation point with no wait: it raises the cancel of the chain. *)
+let check_cancel () =
+  match first_flag (List.hd (self ()).ctxs) with
+  | Some r ->
+      raise (Cancelled r)
+  | None ->
+      ()
 
 (* [Self] first: outside a fiber, the cancel raises [Not_in_fiber] before it
    changes a word that nobody would then resume. *)
@@ -1454,6 +1488,7 @@ let create ?(slack = Span.ms 1) ?(simulated = false) ~domains () =
         ; rng= 0
         ; wake= false
         ; stats= {wakes= 0; edges= 0; idle_edges= 0; busy_polls= 0}
+        ; held= 0
         ; regs= Hashtbl.create ~random:false 64
         ; mailbox= Atomic.make [] } ) ;
   t

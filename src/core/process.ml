@@ -20,18 +20,15 @@ type t =
 let spawn ?env ?cwd ?(stdin = Inherit) ?(stdout = Inherit) ?(stderr = Inherit)
     prog args =
   let sp = {Op.prog; argv= prog :: args; env; cwd; stdin; stdout; stderr} in
-  match Net.submit "Process.spawn" (Op.Spawn sp) with
-  | Ok r ->
-      let alloc = Option.map Sched.Fdtab.alloc in
-      { pid= r.pid
-      ; pidfd= Sched.Fdtab.alloc r.pidfd
-      ; stdin= alloc r.to_stdin
-      ; stdout= alloc r.from_stdout
-      ; stderr= alloc r.from_stderr
-      ; status= Ivar.create ()
-      ; reaping= Atomic.make false }
-  | Error e ->
-      raise (Error (e, "Process.spawn"))
+  let r = Net.ok "Process.spawn" (Net.submit "Process.spawn" (Op.Spawn sp)) in
+  let alloc = Option.map Sched.Fdtab.alloc in
+  { pid= r.pid
+  ; pidfd= Sched.Fdtab.alloc r.pidfd
+  ; stdin= alloc r.to_stdin
+  ; stdout= alloc r.from_stdout
+  ; stderr= alloc r.from_stderr
+  ; status= Ivar.create ()
+  ; reaping= Atomic.make false }
 
 let pid t = t.pid
 
@@ -55,7 +52,9 @@ let rec exited_ev ~clear t =
                   reap t ) ] )
 
 (* The first fiber reaps the child, fills the status, and then closes the pidfd.
-   The others wait for the status. *)
+   The others also watch the pidfd, because the reaper can leave with no status
+   (after a cancel, or an edge with no exit). Their yield lets the reaper go
+   on. *)
 and reap t =
   if Atomic.compare_and_set t.reaping false true then (
     match Net.attempt t.pidfd "Process.wait" (fun os -> Op.Wait_child os) with
@@ -67,20 +66,26 @@ and reap t =
     | Error e ->
         Atomic.set t.reaping false ;
         raise (Error (e, "Process.wait")) )
-  else Event.sync (Ivar.read t.status)
+  else (
+    Event.yield () ;
+    Event.sync (exited_ev ~clear:false t) )
 
 let exited t = exited_ev ~clear:false t
 
 let wait t = Event.sync (exited t)
 
-(* A child that exited gets no signal. *)
+(* A child that exited gets no signal. A reap on another domain can come between
+   the read of the status and the send. Then the error of the send (ESRCH, or
+   EBADF after the close of the pidfd) is not an error. *)
 let kill t s =
-  match Ivar.peek t.status with
-  | Some _ ->
-      ()
-  | None -> (
+  let reaped () = Atomic.get t.reaping || Option.is_some (Ivar.peek t.status) in
+  if Option.is_none (Ivar.peek t.status) then
     match Net.attempt t.pidfd "Process.kill" (fun os -> Op.Kill (os, s)) with
     | Ok () ->
         ()
+    | Error _ when reaped () ->
+        ()
     | Error e ->
-        raise (Error (e, "Process.kill")) )
+        raise (Error (e, "Process.kill"))
+    | exception Error (Op.Bad_fd, _) when reaped () ->
+        ()
