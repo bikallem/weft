@@ -7,8 +7,8 @@
    "count": SIGINT comes, domain 0 reads it, and no fiber takes it. The unwatch
    gives it its action.
 
-   "pending": SIGINT comes just before the unwatch, and the unwatch gives it its
-   action.
+   "pending": SIGINT is pending in the kernel at the unwatch, because domain 0
+   did not read the signalfd yet. The unblock gives it its action.
 
    "busy": after the unwatch, the program writes "ready", and a fiber computes
    for 5 s with no switch. The test sends SIGINT.
