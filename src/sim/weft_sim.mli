@@ -127,14 +127,38 @@ val socket_pair : t -> Weft.Net.t * Weft.Net.t
 (** [socket_pair t] gives the two sides of a TCP connection, as a connect and an
     accept give them, but with no listener. The connection is established at
     once. It has the latency and the faults of each TCP connection. [Net.reset]
-    acts on it as on a connection of [connect]. The first socket has the address
-    [Tcp ("client", p)], and the second [Tcp ("server", q)], with [p] and [q]
-    from the counter of ports (as for [Net.local_addr]). The peer of each socket
-    is the address of the other socket.
+    and {!fault} act on it as on a connection of [connect]. The first socket has
+    the address [Tcp ("client", p)], and the second [Tcp ("server", q)], with
+    [p] and [q] from the counter of ports (as for [Net.local_addr]). The peer of
+    each socket is the address of the other socket.
 
     @raise Weft.Net.Error
       with [No_resources "EMFILE"] if the two fds are more than the limit of
       {!set_fd_limit}. *)
+
+val fault : t -> Weft.Net.t -> Weft.Net.error -> unit
+(** [fault t s e] breaks the connection of [s] at the side of [s]. The next
+    operation of [s] gets [Error (e, _)] one time: the next write, or the next
+    read after the data that [s] already has. This is the order of the error of
+    a socket on Linux. Then [s] has the end of the stream and no peer: later
+    reads give 0, and writes give [Broken_pipe]. A fiber that waits on [s]
+    wakes. Nothing that the peer sends after the fault comes to [s]: no data, no
+    end of the stream and no reset.
+
+    With [e = Reset], the fault is a reset of the two sides, as from a
+    middlebox. The peer gets the reset after the delay, after the data that [s]
+    sent before, as from [Net.reset]. On a Unix socket, the writes of [s] give
+    [Broken_pipe] and its next read gives [Reset], as after a reset of a Unix
+    socket. With another error, the peer gets nothing, as after a lost link: it
+    can wait until its own timeout.
+
+    The fault occurs at the call, and the delay of a reset comes from the seed,
+    as each delay. Thus a seed gives the same run.
+
+    @raise Invalid_argument
+      if [e] is [Would_block] or [Bad_fd], or if [s] is not a connected TCP or
+      Unix socket.
+    @raise Weft.Net.Error with [Bad_fd] if [s] is closed. *)
 
 val set_blocking_cost : t -> Weft.Span.t -> unit
 (** [set_blocking_cost t limit]: each [Blocking] operation (a [File], [Dir] or

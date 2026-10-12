@@ -1015,6 +1015,141 @@ let pair_faults () =
   done ;
   at_least int ~than:1 !resets
 
+(* [Sim.fault] with an error that is not a reset: the next operation gets the
+   error one time, then the side has the end of the stream and no peer. The peer
+   gets nothing. *)
+let fault_error () =
+  Sim.run (fun sim ->
+      let a, b = Sim.socket_pair sim in
+      let timeout = Net.Other "ETIMEDOUT" in
+      Net.write a "sent" ;
+      Sim.fault sim a timeout ;
+      equal string "ETIMEDOUT" (error_of (fun () -> Net.write a "x")) ;
+      equal string "EPIPE" (error_of (fun () -> Net.write a "x")) ;
+      equal string "" (read_all a) ;
+      (* The peer gets the data from before the fault, and its own data is
+         lost. *)
+      equal string "sent" (read_n b 4) ;
+      Net.write b "lost" ;
+      Sim.settle sim ;
+      is_true (Net.read_now b (Bytes.create 4) 0 4 = None) ;
+      (* A reset of the peer does not come to [a]. *)
+      Net.reset b ;
+      Sim.settle sim ;
+      equal int 0 (Net.read a (Bytes.create 1) 0 1) ;
+      Net.close a )
+
+(* A read gets the error after the data that the side already has. *)
+let fault_read_after_data () =
+  Sim.run (fun sim ->
+      let a, b = Sim.socket_pair sim in
+      Net.write b "data" ;
+      Sim.settle sim ;
+      Sim.fault sim a Net.Broken_pipe ;
+      equal string "data" (read_n a 4) ;
+      equal string "EPIPE" (error_of (fun () -> Net.read a (Bytes.create 1) 0 1)) ;
+      equal int 0 (Net.read a (Bytes.create 1) 0 1) ;
+      Net.close a ;
+      Net.close b )
+
+(* A fiber that waits on the side of the fault wakes with the error. *)
+let fault_wakes_reader () =
+  Sim.run ~domains:2 (fun sim ->
+      let a, b = Sim.socket_pair sim in
+      Fiber.scope (fun s ->
+          let r =
+            Fiber.fork_promise s (fun () ->
+                error_of (fun () -> Net.read a (Bytes.create 1) 0 1) )
+          in
+          Time.sleep Mono (Span.ms 10) ;
+          Sim.fault sim a (Net.No_resources "ENOBUFS") ;
+          equal string "ENOBUFS" (Promise.await r) ) ;
+      Net.close a ;
+      Net.close b )
+
+(* A [Reset] fault resets the two sides. The side of the fault gets ECONNRESET
+   at once. The peer reads the data from before the fault, then gets the reset
+   after the latency, as from [Net.reset]. *)
+let fault_reset () =
+  Sim.run (fun sim ->
+      Sim.set_latency sim (Span.ms 5) ;
+      let a, b = Sim.socket_pair sim in
+      Net.write a "last" ;
+      let t0 = Time.now Mono in
+      Sim.fault sim a Net.Reset ;
+      equal string "ECONNRESET" (error_of (fun () -> Net.write a "x")) ;
+      equal string "EPIPE" (error_of (fun () -> Net.write a "x")) ;
+      equal string "" (read_all a) ;
+      equal string "last" (read_n b 4) ;
+      equal string "ECONNRESET"
+        (error_of (fun () -> Net.read b (Bytes.create 1) 0 1)) ;
+      equal int 5 (ms_since t0) ;
+      equal string "" (read_all b) ;
+      equal string "EPIPE" (error_of (fun () -> Net.write b "x")) ;
+      Net.close a ;
+      Net.close b )
+
+(* A [Reset] fault on a TCP connection of [connect], at the side of the server,
+   and on a Unix connection. On a Unix socket, a write gives EPIPE and does not
+   clear the reset, as after the reset of a Unix socket. *)
+let fault_reset_connect () =
+  Sim.run (fun sim ->
+      List.iter
+        (fun name ->
+          let addr = Sim.addr sim name in
+          let l = Net.listen addr in
+          let c = Net.connect addr in
+          let s, _ = Net.accept l in
+          Sim.fault sim s Net.Reset ;
+          equal string "ECONNRESET"
+            (error_of (fun () -> Net.read c (Bytes.create 1) 0 1)) ;
+          ( match addr with
+          | Net.Unix _ ->
+              equal string "EPIPE" (error_of (fun () -> Net.write s "x")) ;
+              equal string "ECONNRESET"
+                (error_of (fun () -> Net.read s (Bytes.create 1) 0 1))
+          | Net.Tcp _ ->
+              equal string "ECONNRESET" (error_of (fun () -> Net.write s "x")) ;
+              equal int 0 (Net.read s (Bytes.create 1) 0 1) ) ;
+          List.iter Net.close [c; s; l] )
+        ["server:40"; "unix:/run/fault"] ;
+      equal int 0 (Sim.open_fds sim) )
+
+(* [Sim.fault] refuses an error that is not an error of a connection, a socket
+   that is not connected, and a closed socket. *)
+let fault_bad_args () =
+  Sim.run (fun sim ->
+      let a, b = Sim.socket_pair sim in
+      raises_match invalid (fun () -> Sim.fault sim a Net.Would_block) ;
+      raises_match invalid (fun () -> Sim.fault sim a Net.Bad_fd) ;
+      let l = Net.listen (Sim.addr sim "server:41") in
+      raises_match invalid (fun () -> Sim.fault sim l Net.Reset) ;
+      let u = Net.udp ("client", 0) in
+      raises_match invalid (fun () -> Sim.fault sim u Net.Reset) ;
+      List.iter Net.close [a; b; l; u] ;
+      raises
+        (Net.Error (Bad_fd, "Sim.fault"))
+        (fun () -> Sim.fault sim a Net.Reset) )
+
+(* A seed gives the same run with a fault and the jitter. *)
+let fault_deterministic () =
+  let trace seed =
+    Sim.run ~seed (fun sim ->
+        Sim.net_faults sim {Sim.no_faults with jitter= Span.ms 10} ;
+        let a, b = Sim.socket_pair sim in
+        let t0 = Time.now Mono in
+        Net.write a "x" ;
+        Sim.fault sim a Net.Reset ;
+        let got = read_n b 1 in
+        let e = error_of (fun () -> Net.read b (Bytes.create 1) 0 1) in
+        Net.close a ;
+        Net.close b ;
+        (got, e, ms_since t0) )
+  in
+  for seed = 1 to 10 do
+    is_true (trace seed = trace seed)
+  done
+
 let tests =
   [ group "net"
       [ slow "echo: the client gets hello back, with 1000 seeds" echo_1000_seeds
@@ -1065,6 +1200,15 @@ let tests =
       ; test "a reset of one side goes to the other side" pair_reset
       ; test "the pair counts 2 fds against the limit" pair_fd_limit
       ; test "the pair has the faults of the network" pair_faults ]
+  ; group "fault of one connection"
+      [ test "the next write gets the error, then EPIPE" fault_error
+      ; test "a read gets the error after the data" fault_read_after_data
+      ; test "a fiber that waits on the socket gets the error"
+          fault_wakes_reader
+      ; test "a reset goes to the peer after the latency" fault_reset
+      ; test "a reset of a TCP and of a Unix connection" fault_reset_connect
+      ; test "Sim.fault refuses bad arguments" fault_bad_args
+      ; test "a seed gives the same run with a fault" fault_deterministic ]
   ; group "udp"
       [ test "udp_loss loses about one datagram in 8" udp_loss
       ; test "the jitter can reorder datagrams" udp_order
