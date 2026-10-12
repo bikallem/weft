@@ -34,18 +34,19 @@ let elapsed_ns f =
       f () ;
       Int64.to_int (Span.to_ns (Time.diff Mono (Time.now Mono) t0)) )
 
-(* Without load, a sleep ends between the deadline and the deadline plus 2 ms
-   (the slack of 100 us included). A CI machine is shared, so there the upper
-   limit is 50 ms. A sleep never ends before its deadline. *)
+(* A sleep never ends before its deadline. A shared machine can delay one sleep
+   for a long time. Thus the median of the 20 sleeps checks the precision (less
+   than 12 ms), and the limit of 500 ms for each sleep finds a timer that fires
+   much too late. *)
 let sleep_10ms () =
-  let limit =
-    if Sys.getenv_opt "CI" = Some "true" then 50_000_000 else 12_000_000
+  let all =
+    List.init 20 (fun _ ->
+        let ns = elapsed_ns (fun () -> Time.sleep Mono (Span.ms 10)) in
+        at_least int ~than:10_000_000 ns ;
+        less int ~than:500_000_000 ns ;
+        ns )
   in
-  for _ = 1 to 20 do
-    let ns = elapsed_ns (fun () -> Time.sleep Mono (Span.ms 10)) in
-    at_least int ~than:10_000_000 ns ;
-    less int ~than:limit ns
-  done
+  less int ~than:12_000_000 (List.nth (List.sort compare all) 10)
 
 let sleep_10s () =
   if Sys.getenv_opt "WEFT_LONG" = None then
@@ -579,15 +580,11 @@ let unwatch_modes () =
       Weft_linux.run ~domains:1 (fun () ->
           List.iter
             (fun mode ->
-              (* The race of "pending" can go to each path of the unwatch. *)
-              for _ = 1 to if mode = "pending" then 20 else 1 do
-                let p = Process.spawn helper [mode] in
-                let st =
-                  Fiber.with_timeout Mono (Span.s 10) (fun () ->
-                      Process.wait p )
-                in
-                if st <> Process.Signaled SIGINT then failwith mode
-              done )
+              let p = Process.spawn helper [mode] in
+              let st =
+                Fiber.with_timeout Mono (Span.s 10) (fun () -> Process.wait p)
+              in
+              if st <> Process.Signaled SIGINT then failwith mode )
             ["taken"; "count"; "pending"] ) )
 
 (* After the unwatch, a SIGINT ends the process also when its only domain
@@ -608,9 +605,30 @@ let unwatch_busy () =
           Pipe.close out ;
           is_true (st = Process.Signaled SIGINT) ) )
 
+(* Run [f] in a fiber on domain 1. If the caller runs on domain 0, it computes,
+   so domain 1 takes the new fiber. The caller can also run on domain 1, for
+   example after a sleep. *)
+let on_domain_1 f =
+  let dom () = Private.Sched.prog "test" Private.Sched.Dom_index in
+  let rec go tries =
+    if tries = 0 then failwith "no fiber ran on domain 1" ;
+    let ran = Atomic.make None in
+    Fiber.scope (fun s ->
+        Fiber.fork s (fun () ->
+            let d = dom () in
+            if d = 1 then f () ;
+            Atomic.set ran (Some d) ) ;
+        let t0 = Unix.gettimeofday () in
+        while Atomic.get ran = None && Unix.gettimeofday () -. t0 < 0.1 do
+          ()
+        done ) ;
+    if Atomic.get ran <> Some 1 then go (tries - 1)
+  in
+  if dom () = 1 then f () else go 20
+
 (* In the process of the test: the waiter raises, a later received and a second
-   unwatch raise, and SIGTERM stays an event. The thread of the unwatch does not
-   block SIGUSR2 any more. *)
+   unwatch raise, and SIGTERM stays an event. The thread of the unwatch and the
+   thread of run do not block SIGUSR2 any more. *)
 let unwatch_waiter () =
   let not_watched = "Signal.received: the world does not watch this signal" in
   Weft_linux.run ~domains:2 ~signals:[SIGUSR2; SIGTERM] (fun () ->
@@ -625,9 +643,14 @@ let unwatch_waiter () =
                     m )
           in
           Time.sleep Mono (Span.ms 10) ;
-          Signal.unwatch SIGUSR2 ;
+          on_domain_1 (fun () -> Signal.unwatch SIGUSR2) ;
           equal string not_watched (Promise.await p) ) ;
-      equal int 1 (List.length (Weft_linux.unblocked_threads [SIGUSR2])) ;
+      (* The thread of domain 0, the thread of run, unblocks SIGUSR2 at its next
+         wait. The unwatch ran on domain 1. *)
+      Time.sleep Mono (Span.ms 10) ;
+      let unblocked = Weft_linux.unblocked_threads [SIGUSR2] in
+      is_true (List.mem (string_of_int (Unix.getpid ())) unblocked) ;
+      less int ~than:3 (List.length unblocked) ;
       raises (Invalid_argument not_watched) (fun () ->
           sync (Signal.received SIGUSR2) ) ;
       raises

@@ -360,6 +360,8 @@ let processes =
               let p = Process.spawn "p" [] in
               Process.kill p SIGTSTP ;
               Process.kill p (Other_signal 0) ;
+              (* SIGTTOU on Linux. *)
+              Process.kill p (Other_signal 22) ;
               Time.sleep Mono (Span.ms 1) ;
               is_true
                 (sync
@@ -545,7 +547,7 @@ let unwatch =
                 Sim.signal sim SIGTERM ;
                 equal int 1 (sync (Signal.received SIGTERM)) )
           done )
-    ; test "SIGWINCH and SIGPIPE do nothing after the unwatch" (fun () ->
+    ; test "SIGWINCH, SIGPIPE, SIGTTIN and SIGURG do nothing" (fun () ->
           Sim.run ~signals:[SIGWINCH; SIGPIPE] (fun sim ->
               Sim.signal sim SIGWINCH ;
               Time.sleep Mono (Span.ms 1) ;
@@ -553,6 +555,9 @@ let unwatch =
               Signal.unwatch SIGPIPE ;
               Sim.signal sim SIGWINCH ;
               Sim.signal sim SIGPIPE ;
+              (* SIGTTIN and SIGURG on Linux. *)
+              Sim.signal sim (Other_signal 21) ;
+              Sim.signal sim (Other_signal 23) ;
               Time.sleep Mono (Span.ms 1) ) )
     ; test "an unwatch of a signal that is not watched raises" (fun () ->
           Sim.run (fun _ ->

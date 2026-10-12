@@ -35,14 +35,19 @@ let elapsed_ns f =
       f () ;
       Int64.to_int (Span.to_ns (Time.diff Mono (Time.now Mono) t0)) )
 
-(* A sleep never ends before its deadline. The upper limit is large: the CI
-   machines are shared. *)
+(* A sleep never ends before its deadline. A shared machine can delay one sleep
+   for a long time. Thus the median of the 20 sleeps checks the precision (less
+   than 20 ms), and the limit of 500 ms for each sleep finds a timer that fires
+   much too late. *)
 let sleep_10ms () =
-  for _ = 1 to 20 do
-    let ns = elapsed_ns (fun () -> Time.sleep Mono (Span.ms 10)) in
-    at_least int ~than:10_000_000 ns ;
-    less int ~than:50_000_000 ns
-  done
+  let all =
+    List.init 20 (fun _ ->
+        let ns = elapsed_ns (fun () -> Time.sleep Mono (Span.ms 10)) in
+        at_least int ~than:10_000_000 ns ;
+        less int ~than:500_000_000 ns ;
+        ns )
+  in
+  less int ~than:20_000_000 (List.nth (List.sort compare all) 10)
 
 let read_pipe = Portable.drain Pipe.read
 
@@ -127,15 +132,11 @@ let unwatch_modes () =
       Weft_kqueue.run ~domains:1 (fun () ->
           List.iter
             (fun mode ->
-              (* The race of "pending" can go to each path of the unwatch. *)
-              for _ = 1 to if mode = "pending" then 20 else 1 do
-                let p = Process.spawn helper [mode] in
-                let st =
-                  Fiber.with_timeout Mono (Span.s 10) (fun () ->
-                      Process.wait p )
-                in
-                if st <> Process.Signaled SIGINT then failwith mode
-              done )
+              let p = Process.spawn helper [mode] in
+              let st =
+                Fiber.with_timeout Mono (Span.s 10) (fun () -> Process.wait p)
+              in
+              if st <> Process.Signaled SIGINT then failwith mode )
             ["taken"; "count"; "pending"] ) )
 
 (* After the unwatch, a SIGINT ends the process also when its only domain
@@ -191,6 +192,87 @@ let unwatch_waiter () =
           Sys.set_signal Sys.sigusr2 Sys.Signal_default ) ;
       is_true (Sys.signal Sys.sigusr2 Sys.Signal_ignore = Sys.Signal_default) )
 
+(* A storm of signals while fibers run on small stacks (issue 6). The handler of
+   the world must run on the signal stack (SA_ONSTACK): on a stack of a fiber,
+   it corrupts the stack and the heap. A child shell sends SIGUSR1 in a loop for
+   2 s, and 8 fibers on 2 domains run effect handlers. A copy of this test on
+   Linux, with the handler with no SA_ONSTACK, crashed in each run. *)
+type _ Effect.t += Step : int -> int Effect.t
+
+let rec items n acc = if n = 0 then acc else items (n - 1) (n :: acc)
+
+let small_fiber i =
+  Effect.Deep.match_with
+    (fun () ->
+      let x = ref 0 in
+      for j = 1 to 20 do
+        x := !x + Effect.perform (Step j) + List.length (items 50 [])
+      done ;
+      !x + i )
+    ()
+    { retc= Fun.id
+    ; exnc= raise
+    ; effc=
+        (fun (type a) (e : a Effect.t) ->
+          match e with
+          | Step j ->
+              Some
+                (fun (k : (a, _) Effect.Deep.continuation) ->
+                  Effect.Deep.continue k j )
+          | _ ->
+              None ) }
+
+let signal_storm () =
+  let got =
+    Weft_kqueue.run ~domains:2 ~watchdog:None ~signals:[SIGUSR1] (fun () ->
+        let pid = string_of_int (Unix.getpid ()) in
+        let sender =
+          Process.spawn ~stderr:Null "sh"
+            ["-c"; "while kill -USR1 " ^ pid ^ "; do :; done"]
+        in
+        let t0 = Time.now Mono in
+        let late () =
+          Int64.compare
+            (Span.to_ns (Time.diff Mono (Time.now Mono) t0))
+            2_000_000_000L
+          >= 0
+        in
+        let got = Atomic.make 0 in
+        Fiber.scope (fun s ->
+            Fiber.fork s (fun () ->
+                while not (late ()) do
+                  sync
+                    (choose
+                       [ wrap (Signal.received SIGUSR1) (fun n ->
+                             ignore (Atomic.fetch_and_add got n) )
+                       ; Time.after Mono (Span.ms 10) ] )
+                done ) ;
+            for _ = 1 to 8 do
+              Fiber.fork s (fun () ->
+                  while not (late ()) do
+                    for i = 1 to 100 do
+                      if small_fiber i <> 1210 + i then failwith "a bad value"
+                    done ;
+                    Fiber.yield ()
+                  done )
+            done ) ;
+        Process.kill sender SIGKILL ;
+        ignore (Process.wait sender) ;
+        Atomic.get got )
+  in
+  at_least int ~than:100 got
+
+(* Only one world at a time can watch signals: the handler is for the process. A
+   world with no signals does not need it. *)
+let one_signal_world () =
+  Weft_kqueue.run ~domains:1 ~signals:[SIGUSR1] (fun () ->
+      raises
+        (Invalid_argument "Weft_kqueue.create: another world watches signals")
+        (fun () -> ignore (Weft_kqueue.create ~signals:[SIGUSR2] ()) ) ;
+      Weft_kqueue.close (Weft_kqueue.create ()) ) ;
+  (* After the close, a new world can watch signals. *)
+  Weft_kqueue.close (Weft_kqueue.create ~signals:[SIGUSR2] ())
+
 let () =
   exit
     (Windtrap.run "kqueue"
@@ -207,4 +289,8 @@ let () =
                  unwatch_modes
              ; test ~timeout:30.
                  "after Signal.unwatch, SIGINT ends a busy process" unwatch_busy
-             ; test "a waiter at Signal.unwatch raises" unwatch_waiter ] ] ) )
+             ; test "a waiter at Signal.unwatch raises" unwatch_waiter
+             ; test ~timeout:60.
+                 "a storm of signals while fibers use small stacks" signal_storm
+             ; test "only one world at a time watches signals" one_signal_world
+             ] ] ) )

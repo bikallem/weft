@@ -178,20 +178,21 @@ sem fail   cancel   FALSE  TRUE      FALSE  FALSE
 sem fail   choose   FALSE  FALSE     TRUE   FALSE
 sem fail   cancel   FALSE  FALSE     FALSE  TRUE
 
-sig() { want Signal || return 0 # expect scenario dropAfterMark noCountTake waiterStays leafNoCheck takeWatched
+sig() { want Signal || return 0 # expect scenario dropAfterMark noCountTake waiterStays leafNoCheck takeWatched noMainUnblock
   run Signal "$1" "Conserved NoEarlyAction EndState" \
     "Scenario=\"$2\"" BugDropAfterMark="$3" BugNoCountTake="$4" BugWaiterStays="$5" \
-    BugLeafNoCheck="$6" BugTakeWatched="$7"
+    BugLeafNoCheck="$6" BugTakeWatched="$7" BugNoMainUnblock="$8"
 }
-#   expect scenario drop  count waiter leaf  watched
-sig pass   linux    FALSE FALSE FALSE  FALSE FALSE
-sig pass   kqueue   FALSE FALSE FALSE  FALSE FALSE
-sig fail   linux    TRUE  FALSE FALSE  FALSE FALSE
-sig fail   kqueue   TRUE  FALSE FALSE  FALSE FALSE
-sig fail   linux    FALSE TRUE  FALSE  FALSE FALSE
-sig fail   linux    FALSE FALSE TRUE   FALSE FALSE
-sig fail   kqueue   FALSE FALSE FALSE  TRUE  FALSE
-sig fail   kqueue   FALSE FALSE FALSE  FALSE TRUE
+#   expect scenario drop  count waiter leaf  watched main
+sig pass   linux    FALSE FALSE FALSE  FALSE FALSE   FALSE
+sig pass   kqueue   FALSE FALSE FALSE  FALSE FALSE   FALSE
+sig fail   linux    TRUE  FALSE FALSE  FALSE FALSE   FALSE
+sig fail   kqueue   TRUE  FALSE FALSE  FALSE FALSE   FALSE
+sig fail   linux    FALSE TRUE  FALSE  FALSE FALSE   FALSE
+sig fail   linux    FALSE FALSE TRUE   FALSE FALSE   FALSE
+sig fail   kqueue   FALSE FALSE FALSE  TRUE  FALSE   FALSE
+sig fail   kqueue   FALSE FALSE FALSE  FALSE TRUE    FALSE
+sig fail   linux    FALSE FALSE FALSE  FALSE FALSE   TRUE
 
 # Run the cases. The slow cases come first, so that they start early.
 export -f runone

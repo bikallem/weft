@@ -1,11 +1,12 @@
 (* The fork rule (issue 8, design section 2.8): [Weft_sim.run] starts no OS
    domain and no OS thread, for each value of [~domains]. A run that uses each
    part of the simulator comes first: the virtual domains, the jobs of [File],
-   [Dir] and [Dns] with a time cost, [Process.spawn], the timers, the network
-   and the faults. Then the process forks. OCaml 5 refuses [Unix.fork] after a
-   [Domain.spawn], so the fork tells that no domain started. On Linux, the test
-   also counts the threads of the process. The last step is the control: after a
-   [Domain.spawn], the fork must fail. It prints "ok" at the end. *)
+   [Dir] and [Dns] with a time cost, [Process.spawn], the timers, the network,
+   [Sim.socket_pair], the faults, [Sim.fault] and a watched signal. Then the
+   process forks. OCaml 5 refuses [Unix.fork] after a [Domain.spawn], so the
+   fork tells that no domain started. On Linux, the test also counts the threads
+   of the process. The last step is the control: after a [Domain.spawn], the
+   fork must fail. It prints "ok" at the end. *)
 
 open Weft
 module Sim = Weft_sim
@@ -22,7 +23,7 @@ let check name b = if not b then failwith name
 
 (* A run with each part of the simulator. *)
 let busy domains =
-  Sim.run ~seed:domains ~domains (fun sim ->
+  Sim.run ~seed:domains ~domains ~signals:[Signal.SIGUSR1] (fun sim ->
       Sim.set_latency sim (Span.ms 1) ;
       (* Each fault, with no [no_faults]: a new fault breaks the build, and it
          must come in this run. *)
@@ -39,6 +40,20 @@ let busy domains =
       let a = Sim.addr sim "server:80" in
       let l = Net.listen a in
       Fiber.scope (fun s ->
+          let got =
+            Fiber.fork_promise s (fun () -> sync (Signal.received SIGUSR1))
+          in
+          Fiber.fork s (fun () ->
+              let x, y = Sim.socket_pair sim in
+              Net.write x "pair" ;
+              Sim.fault sim y Net.Reset ;
+              ( try ignore (Net.read x (Bytes.create 8) 0 8)
+                with Net.Error _ -> () ) ;
+              Net.close x ; Net.close y ) ;
+          Fiber.fork s (fun () ->
+              Time.sleep Mono (Span.ms 1) ;
+              Sim.signal sim SIGUSR1 ;
+              check "signal" (Promise.await got >= 1) ) ;
           Fiber.fork_daemon s (fun () ->
               while true do
                 let c, _ = Net.accept l in

@@ -84,6 +84,10 @@ type conn =
   ; mutable err: Op.error option
         (** [Sim.fault]: the next read with no data, or the next write, gives
             this error one time. *)
+  ; mutable lost: bool
+        (** [Sim.fault] with an error that is not [Reset]: the link is lost. The
+            data of the peer stays in flight, and a read of this side frees no
+            space, so the window of the peer stays full. *)
   ; mutable established: bool
   ; mutable refused: bool
   ; mutable cfd: int  (** [-1] until the server side is accepted. *)
@@ -148,6 +152,8 @@ type net =
   ; mutable next_fd: int
   ; names: (string, int) Hashtbl.t  (** The listeners, by address. *)
   ; udp_names: (string, int) Hashtbl.t  (** The UDP sockets, by address. *)
+  ; client_ports: (int, int) Hashtbl.t
+        (** The ports of the TCP clients that are not closed, with their fds. *)
   ; opts: (int, opts) Hashtbl.t
         (** The options of each socket, after its first [Set_option] or
             [Get_option]. *)
@@ -440,7 +446,10 @@ let perform : type a. t -> a Op.blocking -> (raw, Op.error) result option =
   | Op.Mkdir (path, perm) ->
       unit (Sim_fs.mkdir fs path perm ~now)
   | Op.Readdir path ->
-      Some (Result.map (fun l -> R_names l) (Sim_fs.readdir fs path))
+      (* opendir uses an fd. *)
+      Some
+        (let* () = room n 1 in
+         Result.map (fun l -> R_names l) (Sim_fs.readdir fs path) )
   | Op.Rename (src, dst) ->
       unit (Sim_fs.rename fs src dst)
   | Op.Unlink path ->
@@ -565,6 +574,9 @@ let read_conn t c buf off len =
     let k = part t (Int.min a len) in
     Buffer.blit c.inbox c.rpos buf off k ;
     c.rpos <- c.rpos + k ;
+    (* After a lost link, the space stays in use: the peer gets no
+       acknowledgment, so its window stays full. *)
+    if c.lost then c.inflight <- c.inflight + k ;
     if c.rpos = Buffer.length c.inbox then (
       Buffer.clear c.inbox ;
       c.rpos <- 0 ) ;
@@ -665,8 +677,10 @@ let write_conn t c buf off len =
           let k = if atomic then len else part t (Int.min len space) in
           let data = Bytes.sub_string buf off k in
           p.inflight <- p.inflight + k ;
+          (* After a lost link, the data never comes, and the peer gets no space
+             again, as when no acknowledgment comes. *)
           deliver t c p (fun () ->
-              p.inflight <- p.inflight - k ;
+              if not p.lost then p.inflight <- p.inflight - k ;
               if Option.is_some p.peer then (
                 Buffer.add_string p.inbox data ;
                 edge n p.cfd ~read:true ~write:false ) ) ;
@@ -823,6 +837,7 @@ let new_pipe n =
     ; reset= false
     ; abort= false
     ; err= None
+    ; lost= false
     ; established= true
     ; refused= false
     ; cfd= new_fd n
@@ -848,6 +863,7 @@ let new_sock ~tcp ~local remote =
   ; reset= false
   ; abort= false
   ; err= None
+  ; lost= false
   ; established= false
   ; refused= false
   ; cfd= -1
@@ -918,25 +934,28 @@ let spawn t (sp : Op.spawn) =
         ; from_stdout= fd from_stdout
         ; from_stderr= fd from_stderr }
 
-(* A signal to the program itself (design section 2.8, Signals). Domain 0 gets a
-   watched signal at its next [Wait]. Each other signal gets the default action,
-   and the world ignores SIGPIPE. Only these signals do not end the process: the
-   simulator has no stop of a process. *)
+(* The signals with a default action that does not end the process: a stop, a
+   continue or an ignore. 21, 22 and 23 are SIGTTIN, SIGTTOU and SIGURG on
+   Linux. The simulator has no stop of a process. The signal 0 only tells that
+   the process exists. *)
+let no_end = function
+  | Op.SIGSTOP
+  | SIGTSTP
+  | SIGCONT
+  | SIGCHLD
+  | SIGWINCH
+  | Other_signal (0 | 21 | 22 | 23) ->
+      true
+  | _ ->
+      false
+
+(* A signal to the program itself (design section 2.7, The end of a watch).
+   Domain 0 gets a watched signal at its next [Wait]. Each other signal gets the
+   default action, and the world ignores SIGPIPE. *)
 let send_self t sg =
   if List.mem sg t.watched then
     t.net.edges <- (0, World.Ready.Signal (sg, 1)) :: t.net.edges
-  else
-    match sg with
-    | Op.SIGPIPE
-    | SIGCHLD
-    | SIGWINCH
-    | SIGCONT
-    | SIGSTOP
-    | SIGTSTP
-    | Other_signal 0 ->
-        ()
-    | _ ->
-        t.killed <- Some sg
+  else if not (sg = Op.SIGPIPE || no_end sg) then t.killed <- Some sg
 
 let submit : type a. t -> a Op.t -> (a, Op.error) result =
  fun t op ->
@@ -990,12 +1009,18 @@ let submit : type a. t -> a Op.t -> (a, Op.error) result =
           refused ()
       | Some lfd -> (
         match Hashtbl.find_opt n.fds lfd with
+        | Some (Lsn {ltcp= true; _})
+          when Hashtbl.length n.client_ports > 65535 - 40000 ->
+            (* Each port of the counter has an open client, as Linux gives
+               EADDRNOTAVAIL when it has no free port. *)
+            Error (Op.Other "EADDRNOTAVAIL")
         | Some (Lsn l) when Queue.length l.backlog + l.pending < l.limit ->
             l.pending <- l.pending + 1 ;
-            (* The client has the host "client" and a port from the counter. A
-               Unix client has no path. *)
+            (* The client has the host "client" and a port from the counter that
+               no open client has. A Unix client has no path. *)
             let client =
-              if l.ltcp then Op.Tcp ("client", fresh_port n (fun _ -> false))
+              if l.ltcp then
+                Op.Tcp ("client", fresh_port n (Hashtbl.mem n.client_ports))
               else Op.Unix ""
             in
             let c = new_sock ~tcp:l.ltcp ~local:client addr
@@ -1005,6 +1030,11 @@ let submit : type a. t -> a Op.t -> (a, Op.error) result =
             s.established <- true ;
             c.cfd <- new_fd n ;
             Hashtbl.replace n.fds c.cfd (Conn c) ;
+            ( match client with
+            | Op.Tcp (_, p) ->
+                Hashtbl.replace n.client_ports p c.cfd
+            | Op.Unix _ ->
+                () ) ;
             later t (fun () ->
                 l.pending <- l.pending - 1 ;
                 match Hashtbl.find_opt n.fds lfd with
@@ -1080,11 +1110,7 @@ let submit : type a. t -> a Op.t -> (a, Op.error) result =
         else port
       in
       let k = key port in
-      if
-        (port < 0) [@mutate off "the port 0 got a free port before this check"]
-        || port > 65535
-      then Error (Op.Other "EINVAL")
-      else if Hashtbl.mem n.udp_names k then Error Op.In_use
+      if Hashtbl.mem n.udp_names k then Error Op.In_use
       else
         let fd = new_fd n in
         Hashtbl.replace n.fds fd
@@ -1144,11 +1170,7 @@ let submit : type a. t -> a Op.t -> (a, Op.error) result =
         ( match (p.status, sg) with
         | Some _, _ ->
             ()
-        | None, (Op.SIGSTOP | SIGTSTP | SIGCONT | SIGCHLD | SIGWINCH) ->
-            (* The default action of these signals does not end the process, and
-               signal 0 only tells that the process exists. *)
-            ()
-        | None, Op.Other_signal 0 ->
+        | None, _ when no_end sg ->
             ()
         | None, _ when sg <> Op.SIGKILL && List.mem sg p.prog.ignores ->
             ()
@@ -1224,6 +1246,12 @@ let submit : type a. t -> a Op.t -> (a, Op.error) result =
           Hashtbl.remove n.opts fd ;
           ( match sfd with
           | Conn c ->
+              ( match c.local with
+              | Op.Tcp (_, p) when Hashtbl.find_opt n.client_ports p = Some fd
+                ->
+                  Hashtbl.remove n.client_ports p
+              | Op.Tcp _ | Op.Unix _ ->
+                  () ) ;
               (* Linux also sends a reset at the close of a TCP or Unix stream
                  socket with unread data. *)
               if c.abort || (c.role = Sock && avail c > 0) then reset_conn t c
@@ -1235,14 +1263,15 @@ let submit : type a. t -> a Op.t -> (a, Op.error) result =
               Queue.iter
                 (fun s ->
                   match s.peer with
-                  | Some c ->
+                  | Some c when Option.is_some c.peer ->
                       (* The connection is established: it gets a reset, as from
                          [reset_conn]. *)
                       c.reset <- true ;
                       c.eof <- true ;
                       c.peer <- None ;
                       edge n c.cfd ~read:true ~write:true
-                  | None ->
+                  | _ ->
+                      (* The client has no peer after a [Sim.fault]. *)
                       () )
                 l.backlog
           | Fil _ | Pfd _ ->
@@ -1608,6 +1637,7 @@ let run ?(seed = 0) ?(domains = 1) ?(auto = true) ?(signals = [])
         ; next_fd= 3
         ; names= Hashtbl.create ~random:false 8
         ; udp_names= Hashtbl.create ~random:false 8
+        ; client_ports= Hashtbl.create ~random:false 8
         ; opts= Hashtbl.create ~random:false 8
         ; regs= Hashtbl.create ~random:false 16
         ; edges= []
@@ -1811,14 +1841,14 @@ let socket_pair t =
    The connection breaks at the side of [fd]: its next read with no data, or its
    next write, gives [e] one time, as the error of a socket on Linux. Then it
    has the end of the stream and no peer. A [Reset] also goes to the peer after
-   the delay, as from a middlebox. After another error, the peer gets nothing,
-   as after a lost link. *)
+   the delay, as from a middlebox. After another error, the link is lost: the
+   peer gets nothing, and its window stays full. *)
 let fault t (fd : Net.t) e =
   ( match e with
-  | Op.Would_block | Op.Bad_fd ->
-      invalid_arg "Sim.fault: the error is not an error of a connection"
+  | Op.Reset | Broken_pipe | Refused | No_resources _ | Other _ ->
+      ()
   | _ ->
-      () ) ;
+      invalid_arg "Sim.fault: the error is not an error of a connection" ) ;
   if not (Sched.Rc.acquire fd) then raise (Net.Error (Op.Bad_fd, "Sim.fault")) ;
   Fun.protect
     ~finally:(fun () -> Sched.Rc.release fd)
@@ -1826,7 +1856,16 @@ let fault t (fd : Net.t) e =
       let n = t.net in
       match Hashtbl.find_opt n.fds fd.os with
       | Some (Conn ({role= Sock; _} as c)) ->
-          (match e with Op.Reset -> c.reset <- true | e -> c.err <- Some e) ;
+          (* The socket has one slot for its error, as on Linux: the fault
+             replaces an error that the socket did not give. *)
+          ( match e with
+          | Op.Reset ->
+              c.err <- None ;
+              c.reset <- true
+          | e ->
+              c.reset <- false ;
+              c.err <- Some e ;
+              c.lost <- true ) ;
           ( match c.peer with
           | Some p ->
               c.peer <- None ;

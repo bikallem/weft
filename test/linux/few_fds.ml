@@ -31,6 +31,7 @@ let () =
       emfile "Net.accept" (fun () -> Net.accept l) ;
       emfile "Pipe.create" Pipe.create ;
       emfile "File.openfile" (fun () -> File.openfile [Read] "/dev/null") ;
+      emfile "Dir.readdir" (fun () -> Dir.readdir "/") ;
       emfile "Process.spawn" (fun () -> Process.spawn ~stdout:Piped "true" []) ;
       match spare with
       | u :: v :: rest ->

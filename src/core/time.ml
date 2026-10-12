@@ -92,7 +92,7 @@ let civil_from_days z =
   let y = yoe + (era * 400) in
   ((if m <= 2 then y + 1 else y), m, d)
 
-(* The floor of [a / b] and the matching remainder, for [b > 0]. *)
+(* The floor of [a / b], for [b > 0]. *)
 let fdiv a b = if a >= 0 then a / b else ((a + 1) / b) - 1
 
 let to_utc t =
