@@ -29,6 +29,7 @@ end
 
 module Promise = Promise
 module Ivar = Ivar
+module Var = Var
 module Net = Net
 module Chan = Chan
 module File = Fs.File
