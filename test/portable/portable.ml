@@ -2235,14 +2235,15 @@ let fiber_ids w =
                         Fiber.fork_promise s (fun () -> Fiber.self ()) )
                   in
                   List.iter (fun p -> Ids.replace ids (Promise.await p) ()) ps ;
-                  let pinned = Atomic.make None and daemon = Atomic.make None in
+                  (* The body waits for each id, so the daemon runs before the
+                     scope cancels it. *)
+                  let pinned = Ivar.create () and daemon = Ivar.create () in
                   Fiber.fork ~pinned:true s (fun () ->
-                      Atomic.set pinned (Some (Fiber.self ())) ) ;
+                      Ivar.fill pinned (Fiber.self ()) ) ;
                   Fiber.fork_daemon s (fun () ->
-                      Atomic.set daemon (Some (Fiber.self ())) ) ;
-                  Time.sleep Mono (Span.ms 1) ;
+                      Ivar.fill daemon (Fiber.self ()) ) ;
                   List.iter
-                    (fun a -> Ids.replace ids (Option.get (Atomic.get a)) ())
+                    (fun iv -> Ids.replace ids (sync (Ivar.read iv)) ())
                     [pinned; daemon] ) ;
               (* main, 10 promises, the pinned fiber and the daemon *)
               equal int 13 (Ids.length ids) ) )
