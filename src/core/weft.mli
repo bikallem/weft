@@ -316,11 +316,16 @@ end
     Design sections 2.3 and 2.7. *)
 
 module Net : sig
+  (** A port out of the range 0 to 65535 gives [Error (Other "EINVAL", _)]. A
+      NUL byte in a host or a path gives
+      [Error (Other "EINVAL: a NUL byte in a string", _)], as for each path,
+      name and argument of [File], [Dir], [Dns] and [Process.spawn]. *)
   type addr = Private.Net.addr =
     | Tcp of string * int
-    | Unix of string
-        (** In the simulator, the host of [Tcp] is a name, for example
+        (** A host and a port. [local_addr] also gives the address of a UDP
+            socket as [Tcp]. In the simulator, the host is a name, for example
             ["server"]. *)
+    | Unix of string  (** The path of a Unix domain socket. *)
 
   (** A socket. *)
   type t = Private.Net.t
@@ -445,10 +450,11 @@ module Net : sig
 
   val udp : string * int -> t
   (** [udp (host, port)] gives a UDP socket, bound to the host and the port. The
-      port 0 gives a free port. In the simulator, the host is a name, for
-      example ["client"]. [close] closes the socket. [read] takes one datagram
-      with no address, and 0 is then an empty datagram, not the end of a stream.
-      [write] raises [Error (Other "EDESTADDRREQ", _)]. *)
+      port 0 gives a free port, and [local_addr] gives it as [Tcp (host, port)].
+      In the simulator, the host is a name, for example ["client"]. [close]
+      closes the socket. [read] takes one datagram with no address, and 0 is
+      then an empty datagram, not the end of a stream. [write] raises
+      [Error (Other "EDESTADDRREQ", _)]. *)
 
   val sendto : t -> bytes -> int -> int -> string * int -> unit
   (** [sendto t buf off len (host, port)] sends one datagram with the bytes of

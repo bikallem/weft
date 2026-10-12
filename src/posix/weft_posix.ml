@@ -311,11 +311,6 @@ let args_of : type a. int -> int -> a Op.blocking -> job_args =
   | Op.Resolve host | Op.Reverse host ->
       {base with s1= host}
 
-(* The C side reads each string up to its first NUL byte. *)
-let has_nul = List.exists (fun s -> String.contains s '\000')
-
-let nul_error = Error (Op.Other "EINVAL: a NUL byte in a string")
-
 let kind_of_int = function
   | 0 ->
       Op.Regular
@@ -450,12 +445,6 @@ let spawn_args (sp : Op.spawn) =
   , Option.value ~default:"" sp.cwd
   , [|kind sp.stdin; kind sp.stdout; kind sp.stderr|] )
 
-let spawn_has_nul (sp : Op.spawn) =
-  has_nul
-    ( (sp.prog :: sp.argv)
-    @ Option.value ~default:[] sp.env
-    @ Option.to_list sp.cwd )
-
 (* The result of [spawn_child]: (pid or -errno, the pidfd, stdin, stdout,
    stderr), with -1 for no pipe. *)
 let spawned_of (pid, pidfd, i, o, e) =
@@ -564,14 +553,12 @@ let submit : type a. pool -> a Op.t -> (a, Op.error) result option =
   | Op.Start (dom, op) ->
       let id = Atomic.fetch_and_add p.next_job 1 in
       let args = args_of id dom op in
-      if has_nul [args.s1; args.s2] then Some nul_error
-      else
-        (* The lock covers the start, so the job is in the table before its
-           completion can come. *)
-        Some
-          (Mutex.protect p.lock (fun () ->
-               Hashtbl.replace p.jobs id (job_start p.mbx args) ;
-               Ok id ) )
+      (* The lock covers the start, so the job is in the table before its
+         completion can come. *)
+      Some
+        (Mutex.protect p.lock (fun () ->
+             Hashtbl.replace p.jobs id (job_start p.mbx args) ;
+             Ok id ) )
   | Op.Finish (id, op) -> (
     match take_job p id with
     | Some j ->
