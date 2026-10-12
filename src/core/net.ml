@@ -137,3 +137,45 @@ let write = write_all write_sub
 
 let shutdown fd =
   ok "Net.shutdown" (attempt fd "Net.shutdown" (fun os -> Op.Shutdown os))
+
+(* UDP (design section 2.3, The I/O modules). A datagram moves in one operation,
+   or not at all. *)
+let udp (host, port) =
+  Fdtab.alloc (ok "Net.udp" (submit "Net.udp" (Op.Udp (host, port))))
+
+let sendto fd buf off len (host, port) =
+  check_range ~read:false "Net.sendto" buf off len ;
+  ignore
+    (retry ~write:true fd "Net.sendto" (fun os ->
+         Op.Sendto (os, buf, off, len, host, port) ) )
+
+let recvfrom fd buf off len =
+  check_range ~read:true "Net.recvfrom" buf off len ;
+  let n, host, port =
+    retry ~write:false fd "Net.recvfrom" (fun os ->
+        Op.Recvfrom (os, buf, off, len) )
+  in
+  (after_read fd n, (host, port))
+
+(* Socket options. *)
+type 'a sockopt = 'a Op.sockopt =
+  | No_delay : bool sockopt
+  | Keep_alive : bool sockopt
+  | Broadcast : bool sockopt
+  | Recv_buffer : int sockopt
+  | Send_buffer : int sockopt
+
+let set_option (type a) fd (opt : a sockopt) (v : a) =
+  ( match opt with
+  | Recv_buffer ->
+      if v < 1 then invalid_arg "Net.set_option: the size is not positive"
+  | Send_buffer ->
+      if v < 1 then invalid_arg "Net.set_option: the size is not positive"
+  | No_delay | Keep_alive | Broadcast ->
+      () ) ;
+  ok "Net.set_option"
+    (attempt fd "Net.set_option" (fun os -> Op.Set_option (os, opt, v)))
+
+let get_option fd opt =
+  ok "Net.get_option"
+    (attempt fd "Net.get_option" (fun os -> Op.Get_option (os, opt)))

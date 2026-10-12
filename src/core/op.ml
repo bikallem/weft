@@ -86,6 +86,13 @@ type _ blocking =
   | Resolve : string -> string list blocking
   | Reverse : string -> string blocking
 
+type _ sockopt =
+  | No_delay : bool sockopt
+  | Keep_alive : bool sockopt
+  | Broadcast : bool sockopt
+  | Recv_buffer : int sockopt
+  | Send_buffer : int sockopt
+
 type _ t =
   | Listen : addr * int -> fd t
   | Accept : fd -> (fd * addr) t
@@ -94,6 +101,11 @@ type _ t =
   | Read : fd * bytes * int * int -> int t
   | Write : fd * bytes * int * int -> int t
   | Shutdown : fd -> unit t
+  | Udp : string * int -> fd t
+  | Sendto : fd * bytes * int * int * string * int -> int t
+  | Recvfrom : fd * bytes * int * int -> (int * string * int) t
+  | Set_option : fd * 'a sockopt * 'a -> unit t
+  | Get_option : fd * 'a sockopt -> 'a t
   | Pipe : (fd * fd) t
   | Fd_read : fd * bytes * int * int -> int t
   | Fd_write : fd * bytes * int * int -> int t

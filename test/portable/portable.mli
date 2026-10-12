@@ -6,6 +6,8 @@ type world =
   ; run: 'a. (unit -> 'a) -> 'a  (** Runs a program in the world. *)
   ; listen: unit -> Weft.Net.t * Weft.Net.addr
         (** A new listener, and the address that a client connects to. *)
+  ; udp: unit -> Weft.Net.t * (string * int)
+        (** A new UDP socket, and the address that a peer sends to. *)
   ; tmp: unit -> string
         (** A new empty directory, in fiber code: [run] calls it. *) }
 

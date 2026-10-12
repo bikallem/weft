@@ -78,14 +78,28 @@ type conn =
   ; mutable established: bool
   ; mutable refused: bool
   ; mutable cfd: int  (** [-1] until the server side is accepted. *)
-  ; remote: Op.addr }
+  ; remote: Op.addr
+  ; tcp: bool  (** A TCP socket, not a Unix socket or a pipe. *) }
 
 (* [pending] counts the connections that the latency still holds, so that they
    count against the limit of the backlog. A full backlog refuses the connect at
    once. On Linux, a TCP connect retries the SYN instead, and a Unix connect
    gives EAGAIN. *)
 type listener =
-  {key: string; backlog: conn Queue.t; limit: int; mutable pending: int}
+  { key: string
+  ; backlog: conn Queue.t
+  ; limit: int
+  ; mutable pending: int
+  ; ltcp: bool }
+
+(* A UDP socket: its address, and the datagrams that came, with their senders.
+   [bytes] counts the bytes of the queue, against [capacity]. A datagram that
+   does not fit is lost, as on Linux. *)
+type dgram =
+  { host: string
+  ; port: int
+  ; queue: (string * string * int) Queue.t
+  ; mutable bytes: int }
 
 (* A fake program: the test scripts it (design section 2.8). *)
 type program =
@@ -101,12 +115,29 @@ type proc =
   ; mutable reaped: bool
   ; mutable child_ends: conn list  (** The ends of its pipes. *) }
 
-type sfd = Lsn of listener | Conn of conn | Fil of Sim_fs.handle | Pfd of proc
+type sfd =
+  | Lsn of listener
+  | Conn of conn
+  | Dgm of dgram
+  | Fil of Sim_fs.handle
+  | Pfd of proc
+
+(* The socket options of an fd. The sizes follow Linux with its default limits:
+   a set keeps two times the value, from 2304 to 425984 bytes. *)
+type opts =
+  { mutable no_delay: bool
+  ; mutable keep_alive: bool
+  ; mutable broadcast: bool
+  ; mutable rcvbuf: int
+  ; mutable sndbuf: int }
 
 type net =
   { fds: (int, sfd) Hashtbl.t
   ; mutable next_fd: int
   ; names: (string, int) Hashtbl.t  (** The listeners, by address. *)
+  ; udp_names: (string, int) Hashtbl.t  (** The UDP sockets, by address. *)
+  ; opts: (int, opts) Hashtbl.t
+        (** The options of each socket, after the first [Set_option]. *)
   ; regs: (int, (int * int) list) Hashtbl.t
         (** The registrations of each fd: the domain and the token. *)
   ; mutable edges: (int * World.Ready.t) list
@@ -115,6 +146,7 @@ type net =
   ; mutable jitter: int64  (** The limit of a random delay more. *)
   ; mutable short_io: bool
   ; mutable extra_edges: bool
+  ; mutable udp_loss: bool
   ; mutable next_port: int }
 
 (* The result of a job, before [Finish] gives it with its type. *)
@@ -183,6 +215,8 @@ let readable n fd =
       not (Queue.is_empty l.backlog)
   | Some (Conn c) ->
       avail c > 0 || c.eof || c.refused
+  | Some (Dgm g) ->
+      not (Queue.is_empty g.queue)
   | Some (Pfd p) ->
       Option.is_some p.status
   | Some (Fil _) | None ->
@@ -211,6 +245,8 @@ let writable n fd =
                off
                  "a wrong result here gives a spurious edge: the write gets \
                   EAGAIN and waits again"] )
+  | Some (Dgm _) ->
+      true
   | Some (Lsn _ | Fil _ | Pfd _) | None ->
       false
 
@@ -308,7 +344,7 @@ let handle_of n fd =
   match Hashtbl.find_opt n.fds fd with
   | Some (Fil h) ->
       Ok h
-  | Some (Lsn _ | Conn _ | Pfd _) ->
+  | Some (Lsn _ | Conn _ | Dgm _ | Pfd _) ->
       Error (Op.Other "ESPIPE")
   | None ->
       Error Op.Bad_fd
@@ -537,6 +573,125 @@ let close_conn t c =
   | None ->
       ()
 
+(* The largest datagram of UDP over IPv4. *)
+let max_datagram = 65507
+
+(* A datagram goes after the delay, with no order: the jitter can reorder
+   datagrams. With [udp_loss], one datagram in 8 is lost. At the arrival, a
+   datagram to a closed socket or to a full queue is lost. *)
+let send_dgram t g data host port =
+  let n = t.net in
+  let len = String.length data in
+  if len > max_datagram then Error (Op.Other "EMSGSIZE")
+  else (
+    if not (n.udp_loss && Prng.int t.prng 8 = 0) then
+      later t (fun () ->
+          match
+            Hashtbl.find_opt n.udp_names (Printf.sprintf "%s:%d" host port)
+          with
+          | Some fd -> (
+            match Hashtbl.find_opt n.fds fd with
+            | Some (Dgm d) when d.bytes + len <= capacity ->
+                Queue.push (data, g.host, g.port) d.queue ;
+                d.bytes <- d.bytes + len ;
+                edge n fd ~read:true ~write:false
+            | _ ->
+                () )
+          | None ->
+              () ) ;
+    Ok len )
+
+(* One datagram: the bytes that do not fit in the range are lost. *)
+let recv_dgram g buf off len =
+  match Queue.take_opt g.queue with
+  | Some (data, host, port) ->
+      g.bytes <- g.bytes - String.length data ;
+      let k = Int.min len (String.length data) in
+      Bytes.blit_string data 0 buf off k ;
+      Ok (k, host, port)
+  | None ->
+      Error Op.Would_block
+
+let default_opts tcp =
+  { no_delay= false
+  ; keep_alive= false
+  ; broadcast= false
+  ; rcvbuf= (if tcp then 131072 else 212992)
+  ; sndbuf= (if tcp then 16384 else 212992) }
+
+let copy_opts o =
+  { no_delay= o.no_delay
+  ; keep_alive= o.keep_alive
+  ; broadcast= o.broadcast
+  ; rcvbuf= o.rcvbuf
+  ; sndbuf= o.sndbuf }
+
+let size v = Int.max 2304 (Int.min (2 * v) 425984)
+
+let set_opt : type a. opts -> a Op.sockopt -> a -> unit =
+ fun o opt v ->
+  match opt with
+  | Op.No_delay ->
+      o.no_delay <- v
+  | Op.Keep_alive ->
+      o.keep_alive <- v
+  | Op.Broadcast ->
+      o.broadcast <- v
+  | Op.Recv_buffer ->
+      o.rcvbuf <- size v
+  | Op.Send_buffer ->
+      o.sndbuf <- size v
+
+let get_opt : type a. opts -> a Op.sockopt -> a =
+ fun o opt ->
+  match opt with
+  | Op.No_delay ->
+      o.no_delay
+  | Op.Keep_alive ->
+      o.keep_alive
+  | Op.Broadcast ->
+      o.broadcast
+  | Op.Recv_buffer ->
+      o.rcvbuf
+  | Op.Send_buffer ->
+      o.sndbuf
+
+(* The options of a socket. [TCP_NODELAY] is only for TCP: Linux gives
+   EOPNOTSUPP for a Unix socket and ENOPROTOOPT for UDP. *)
+let with_opts : type a b.
+    t -> int -> a Op.sockopt -> (opts -> b) -> (b, Op.error) result =
+ fun t fd opt f ->
+  let n = t.net in
+  let socket tcp =
+    match (opt, tcp) with
+    | Op.No_delay, Some false ->
+        Error (Op.Other "EOPNOTSUPP")
+    | Op.No_delay, None ->
+        Error (Op.Other "ENOPROTOOPT")
+    | _ ->
+        let o =
+          match Hashtbl.find_opt n.opts fd with
+          | Some o ->
+              o
+          | None ->
+              let o = default_opts (tcp = Some true) in
+              Hashtbl.replace n.opts fd o ;
+              o
+        in
+        Ok (f o)
+  in
+  match Hashtbl.find_opt n.fds fd with
+  | Some (Conn {role= Sock; tcp; _}) ->
+      socket (Some tcp)
+  | Some (Lsn l) ->
+      socket (Some l.ltcp)
+  | Some (Dgm _) ->
+      socket None
+  | Some (Conn _ | Fil _ | Pfd _) ->
+      Error (Op.Other "ENOTSOCK")
+  | None ->
+      Error Op.Bad_fd
+
 let new_pipe n =
   let mk role =
     { role
@@ -550,7 +705,8 @@ let new_pipe n =
     ; established= true
     ; refused= false
     ; cfd= new_fd n
-    ; remote= Op.Unix "" }
+    ; remote= Op.Unix ""
+    ; tcp= false }
   in
   let r = mk Rd_end and w = mk Wr_end in
   r.peer <- Some w ;
@@ -619,7 +775,7 @@ let submit : type a. t -> a Op.t -> (a, Op.error) result =
         Error (Op.Other "ENOTSOCK")
     | Some (Conn c) ->
         k c
-    | Some (Lsn _) ->
+    | Some (Lsn _ | Dgm _) ->
         Error (Op.Other "ENOTCONN")
     | Some (Fil _ | Pfd _) ->
         Error (Op.Other "ENOTSOCK")
@@ -632,8 +788,11 @@ let submit : type a. t -> a Op.t -> (a, Op.error) result =
       if Hashtbl.mem n.names k then Error Op.In_use
       else
         let fd = new_fd n in
+        let ltcp = match addr with Op.Tcp _ -> true | Op.Unix _ -> false in
         Hashtbl.replace n.fds fd
-          (Lsn {key= k; backlog= Queue.create (); limit= backlog; pending= 0}) ;
+          (Lsn
+             {key= k; backlog= Queue.create (); limit= backlog; pending= 0; ltcp}
+          ) ;
         Hashtbl.replace n.names k fd ;
         Ok fd
   | Op.Connect addr -> (
@@ -660,7 +819,8 @@ let submit : type a. t -> a Op.t -> (a, Op.error) result =
               ; established= false
               ; refused= false
               ; cfd= -1
-              ; remote }
+              ; remote
+              ; tcp= l.ltcp }
             in
             let c = mk addr and s = mk (Op.Tcp ("client", port)) in
             c.peer <- Some s ;
@@ -695,17 +855,73 @@ let submit : type a. t -> a Op.t -> (a, Op.error) result =
       | Some s ->
           s.cfd <- new_fd n ;
           Hashtbl.replace n.fds s.cfd (Conn s) ;
+          (* An accepted socket gets the options of its listener. *)
+          Option.iter
+            (fun o -> Hashtbl.replace n.opts s.cfd (copy_opts o))
+            (Hashtbl.find_opt n.opts lfd) ;
           Ok (s.cfd, s.remote)
       | None ->
           Error Op.Would_block )
+    | Some (Dgm _) ->
+        Error (Op.Other "EOPNOTSUPP")
     | Some (Conn _ | Fil _ | Pfd _) ->
         Error (Op.Other "EINVAL")
     | None ->
         Error Op.Bad_fd )
-  | Op.Read (fd, buf, off, len) ->
-      conn fd (fun c -> read_conn t c buf off len)
-  | Op.Write (fd, buf, off, len) ->
-      conn fd (fun c -> write_conn t c buf off len)
+  | Op.Read (fd, buf, off, len) -> (
+    match Hashtbl.find_opt n.fds fd with
+    | Some (Dgm g) ->
+        Result.map (fun (k, _, _) -> k) (recv_dgram g buf off len)
+    | _ ->
+        conn fd (fun c -> read_conn t c buf off len) )
+  | Op.Write (fd, buf, off, len) -> (
+    match Hashtbl.find_opt n.fds fd with
+    | Some (Dgm _) ->
+        Error (Op.Other "EDESTADDRREQ")
+    | _ ->
+        conn fd (fun c -> write_conn t c buf off len) )
+  | Op.Udp (host, port) ->
+      let port =
+        if port = 0 then (
+          let p = n.next_port in
+          n.next_port <-
+            (p + 1) [@mutate off "a counter that goes down is unique too"] ;
+          p )
+        else port
+      in
+      let k = Printf.sprintf "%s:%d" host port in
+      if port < 0 || port > 65535 then Error (Op.Other "EINVAL")
+      else if Hashtbl.mem n.udp_names k then Error Op.In_use
+      else
+        let fd = new_fd n in
+        Hashtbl.replace n.fds fd
+          (Dgm {host; port; queue= Queue.create (); bytes= 0}) ;
+        Hashtbl.replace n.udp_names k fd ;
+        Ok fd
+  | Op.Sendto (fd, buf, off, len, host, port) -> (
+    match Hashtbl.find_opt n.fds fd with
+    | Some (Dgm g) ->
+        send_dgram t g (Bytes.sub_string buf off len) host port
+    | Some (Conn _ | Lsn _) ->
+        Error (Op.Other "EISCONN")
+    | Some (Fil _ | Pfd _) ->
+        Error (Op.Other "ENOTSOCK")
+    | None ->
+        Error Op.Bad_fd )
+  | Op.Recvfrom (fd, buf, off, len) -> (
+    match Hashtbl.find_opt n.fds fd with
+    | Some (Dgm g) ->
+        recv_dgram g buf off len
+    | Some (Conn _ | Lsn _) ->
+        Error (Op.Other "EOPNOTSUPP")
+    | Some (Fil _ | Pfd _) ->
+        Error (Op.Other "ENOTSOCK")
+    | None ->
+        Error Op.Bad_fd )
+  | Op.Set_option (fd, opt, v) ->
+      with_opts t fd opt (fun o -> set_opt o opt v)
+  | Op.Get_option (fd, opt) ->
+      with_opts t fd opt (fun o -> get_opt o opt)
   | Op.Pipe ->
       let r, w = new_pipe n in
       Hashtbl.replace n.fds r.cfd (Conn r) ;
@@ -758,7 +974,7 @@ let submit : type a. t -> a Op.t -> (a, Op.error) result =
         read_conn t c buf off len
     | Some (Conn {role= Wr_end; _}) | None ->
         Error Op.Bad_fd
-    | Some (Lsn _ | Fil _ | Pfd _) ->
+    | Some (Lsn _ | Dgm _ | Fil _ | Pfd _) ->
         Error (Op.Other "EINVAL") )
   | Op.Fd_write (fd, buf, off, len) -> (
     match Hashtbl.find_opt n.fds fd with
@@ -766,7 +982,7 @@ let submit : type a. t -> a Op.t -> (a, Op.error) result =
         write_conn t c buf off len
     | Some (Conn {role= Rd_end; _}) | None ->
         Error Op.Bad_fd
-    | Some (Lsn _ | Fil _ | Pfd _) ->
+    | Some (Lsn _ | Dgm _ | Fil _ | Pfd _) ->
         Error (Op.Other "EINVAL") )
   | Op.Shutdown fd ->
       conn fd (fun c ->
@@ -793,9 +1009,12 @@ let submit : type a. t -> a Op.t -> (a, Op.error) result =
           Error Op.Bad_fd
       | Some sfd ->
           Hashtbl.remove n.fds fd ;
+          Hashtbl.remove n.opts fd ;
           ( match sfd with
           | Conn c ->
               close_conn t c
+          | Dgm g ->
+              Hashtbl.remove n.udp_names (Printf.sprintf "%s:%d" g.host g.port)
           | Lsn l ->
               Hashtbl.remove n.names l.key ;
               Queue.iter
@@ -1164,12 +1383,15 @@ let run ?(seed = 0) ?(domains = 1) ?(auto = true) ?(signals = [])
         { fds= Hashtbl.create ~random:false 16
         ; next_fd= 3
         ; names= Hashtbl.create ~random:false 8
+        ; udp_names= Hashtbl.create ~random:false 8
+        ; opts= Hashtbl.create ~random:false 8
         ; regs= Hashtbl.create ~random:false 16
         ; edges= []
         ; latency= 0L
         ; jitter= 0L
         ; short_io= false
         ; extra_edges= false
+        ; udp_loss= false
         ; next_port= 40000 }
     ; agenda= []
     ; next_id= 0
@@ -1289,16 +1511,19 @@ let set_posix t p =
     (fun d _ -> t.net.edges <- (d, World.Ready.Posix_alarm) :: t.net.edges)
     (sched t).doms
 
-type net_faults = {jitter: Weft.Span.t; short_io: bool; extra_edges: bool}
+type net_faults =
+  {jitter: Weft.Span.t; short_io: bool; extra_edges: bool; udp_loss: bool}
 
-let no_faults = {jitter= Weft.Span.zero; short_io= false; extra_edges= false}
+let no_faults =
+  {jitter= Weft.Span.zero; short_io= false; extra_edges= false; udp_loss= false}
 
 let net_faults t (f : net_faults) =
   if Int64.compare (Weft.Span.to_ns f.jitter) 0L < 0 then
     invalid_arg "Sim.net_faults: the jitter is negative" ;
   t.net.jitter <- Weft.Span.to_ns f.jitter ;
   t.net.short_io <- f.short_io ;
-  t.net.extra_edges <- f.extra_edges
+  t.net.extra_edges <- f.extra_edges ;
+  t.net.udp_loss <- f.udp_loss
 
 let set_blocking_cost t span =
   if Int64.compare (Weft.Span.to_ns span) 0L < 0 then

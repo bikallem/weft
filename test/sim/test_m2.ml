@@ -22,6 +22,11 @@ let seeds_200 =
         incr n ;
         let a = Net.Tcp ("m2", !n) in
         (Net.listen a, a) )
+  ; udp=
+      (fun () ->
+        incr n ;
+        let a = ("m2", !n) in
+        (Net.udp a, a) )
   ; tmp=
       (let n = ref 0 in
        fun () ->
@@ -423,7 +428,10 @@ let faults_world =
           let v =
             Sim.run ~seed ~domains:4 (fun sim ->
                 Sim.net_faults sim
-                  {jitter= Span.ms 2; short_io= true; extra_edges= true} ;
+                  { jitter= Span.ms 2
+                  ; short_io= true
+                  ; extra_edges= true
+                  ; udp_loss= true } ;
                 Sim.set_blocking_cost sim (Span.ms 1) ;
                 f () )
           in
@@ -435,6 +443,11 @@ let faults_world =
         incr n ;
         let a = Net.Tcp ("faults", !n) in
         (Net.listen a, a) )
+  ; udp=
+      (fun () ->
+        incr n ;
+        let a = ("faults", !n) in
+        (Net.udp a, a) )
   ; tmp=
       (let n = ref 0 in
        fun () ->

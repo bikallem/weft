@@ -116,6 +116,14 @@ type _ blocking =
   | Reverse : string -> string blocking
       (** [getnameinfo]: the name of an address. *)
 
+(** A socket option. *)
+type _ sockopt =
+  | No_delay : bool sockopt  (** [TCP_NODELAY]. Only for TCP. *)
+  | Keep_alive : bool sockopt  (** [SO_KEEPALIVE]. *)
+  | Broadcast : bool sockopt  (** [SO_BROADCAST]. *)
+  | Recv_buffer : int sockopt  (** [SO_RCVBUF], in bytes. *)
+  | Send_buffer : int sockopt  (** [SO_SNDBUF], in bytes. *)
+
 type _ t =
   | Listen : addr * int -> fd t
       (** A stream socket that listens, with a backlog. *)
@@ -127,6 +135,17 @@ type _ t =
   | Read : fd * bytes * int * int -> int t  (** 0 at the end of the stream. *)
   | Write : fd * bytes * int * int -> int t
   | Shutdown : fd -> unit t  (** Ends the send side. *)
+  | Udp : string * int -> fd t
+      (** A UDP socket, bound to a host and a port. The port 0 gives a free
+          port. *)
+  | Sendto : fd * bytes * int * int * string * int -> int t
+      (** Sends one datagram from the range of the buffer to a host and a port.
+      *)
+  | Recvfrom : fd * bytes * int * int -> (int * string * int) t
+      (** Takes one datagram: its length in the buffer, and the host and the
+          port of the sender. The world drops the bytes that do not fit. *)
+  | Set_option : fd * 'a sockopt * 'a -> unit t
+  | Get_option : fd * 'a sockopt -> 'a t
   | Pipe : (fd * fd) t
       (** A pipe: the read end and the write end. The two are non-blocking. *)
   | Fd_read : fd * bytes * int * int -> int t

@@ -945,6 +945,11 @@ let portable_world =
         incr n ;
         let a = Net.Tcp ("portable", !n) in
         (Net.listen a, a) )
+  ; udp=
+      (fun () ->
+        incr n ;
+        let a = ("portable", !n) in
+        (Net.udp a, a) )
   ; tmp=
       (let n = ref 0 in
        fun () ->
@@ -966,6 +971,11 @@ let portable_world_4 =
         incr n ;
         let a = Net.Tcp ("portable4", !n) in
         (Net.listen a, a) )
+  ; udp=
+      (fun () ->
+        incr n ;
+        let a = ("portable4", !n) in
+        (Net.udp a, a) )
   ; tmp=
       (let n = ref 0 in
        fun () ->

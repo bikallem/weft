@@ -69,7 +69,8 @@ val set_posix : t -> Weft.Clock.posix -> unit
 
 (** The faults of the network. They come from the seed, and they are off by
     default. A TCP stream keeps its order and loses no data, so the loss and the
-    reordering of packets show only as delays: [jitter]. *)
+    reordering of packets show only as delays: [jitter]. A UDP datagram can come
+    in a different order ([jitter]) or not at all ([udp_loss]). *)
 type net_faults =
   { jitter: Weft.Span.t
         (** Each delivery takes a random delay more, from 0 to [jitter]. The
@@ -79,7 +80,8 @@ type net_faults =
             bytes, at least one. *)
   ; extra_edges: bool
         (** A wait of a domain gets an edge with no change, one time in 8, for
-            one of its registrations. *) }
+            one of its registrations. *)
+  ; udp_loss: bool  (** One UDP datagram in 8 is lost. *) }
 
 val no_faults : net_faults
 

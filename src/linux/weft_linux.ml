@@ -42,6 +42,18 @@ external send : int -> bytes -> int -> int -> int = "weft_send"
 
 external shutdown_send : int -> int = "weft_shutdown_send"
 
+external udp : string -> int -> int = "weft_udp"
+
+external sendto : int -> bytes -> int -> int -> string * int -> int
+  = "weft_sendto"
+
+external recvfrom : int -> bytes -> int -> int -> int * string * int
+  = "weft_recvfrom"
+
+external setsockopt : int -> int -> int -> int = "weft_setsockopt"
+
+external getsockopt : int -> int -> int = "weft_getsockopt"
+
 external pipe : unit -> int * int = "weft_pipe"
 
 external fd_read : int -> bytes -> int -> int -> int = "weft_read"
@@ -485,6 +497,47 @@ module World = struct
     Weft.Clock.of_ns line
       (match line with Mono -> mono_ns () | Posix -> posix_ns ())
 
+  (* The code of an option for the stubs: the order of [Op.sockopt]. *)
+  let option_code : type a. a Op.sockopt -> int = function
+    | Op.No_delay ->
+        0
+    | Op.Keep_alive ->
+        1
+    | Op.Broadcast ->
+        2
+    | Op.Recv_buffer ->
+        3
+    | Op.Send_buffer ->
+        4
+
+  let option_int : type a. a Op.sockopt -> a -> int =
+   fun opt v ->
+    match opt with
+    | Op.No_delay ->
+        Bool.to_int v
+    | Op.Keep_alive ->
+        Bool.to_int v
+    | Op.Broadcast ->
+        Bool.to_int v
+    | Op.Recv_buffer ->
+        v
+    | Op.Send_buffer ->
+        v
+
+  let option_value : type a. a Op.sockopt -> int -> a =
+   fun opt x ->
+    match opt with
+    | Op.No_delay ->
+        x <> 0
+    | Op.Keep_alive ->
+        x <> 0
+    | Op.Broadcast ->
+        x <> 0
+    | Op.Recv_buffer ->
+        x
+    | Op.Send_buffer ->
+        x
+
   let host_port = function
     | Op.Tcp (h, p) ->
         (0, h, p)
@@ -517,6 +570,17 @@ module World = struct
         result (send fd buf off len)
     | Op.Shutdown fd ->
         unit (shutdown_send fd)
+    | Op.Udp (host, port) ->
+        result (udp host port)
+    | Op.Sendto (fd, buf, off, len, host, port) ->
+        result (sendto fd buf off len (host, port))
+    | Op.Recvfrom (fd, buf, off, len) ->
+        let n, host, port = recvfrom fd buf off len in
+        Result.map (fun n -> (n, host, port)) (result n)
+    | Op.Set_option (fd, opt, v) ->
+        unit (setsockopt fd (option_code opt) (option_int opt v))
+    | Op.Get_option (fd, opt) ->
+        Result.map (option_value opt) (result (getsockopt fd (option_code opt)))
     | Op.Pipe ->
         let r, w = pipe () in
         Result.map (fun r -> (r, w)) (result r)

@@ -512,6 +512,116 @@ let backlog_counts_in_flight () =
           Fiber.yield () ;
           equal string "ECONNREFUSED" (error_of (fun () -> Net.connect a)) ) )
 
+(* UDP in the simulator. *)
+
+let send u dst msg =
+  Net.sendto u (Bytes.of_string msg) 0 (String.length msg) dst
+
+(* The datagrams that came, after a wait of 10 ms. *)
+let received u =
+  Time.sleep Mono (Span.ms 10) ;
+  let buf = Bytes.create 70_000 in
+  let rec loop acc =
+    match
+      Fiber.with_timeout Mono (Span.ms 1) (fun () ->
+          let k, _ = Net.recvfrom u buf 0 (Bytes.length buf) in
+          Bytes.sub_string buf 0 k )
+    with
+    | d ->
+        loop (d :: acc)
+    | exception Fiber.Timeout ->
+        List.rev acc
+  in
+  loop []
+
+let udp_pair () = (Net.udp ("a", 1), ("a", 1), Net.udp ("b", 1))
+
+let udp_loss () =
+  Sim.run ~seed:7 (fun sim ->
+      Sim.net_faults sim {Sim.no_faults with udp_loss= true} ;
+      let a, a_addr, b = udp_pair () in
+      for i = 1 to 800 do
+        send b a_addr (string_of_int i)
+      done ;
+      let n = List.length (received a) in
+      (* 700 on average. *)
+      at_least int ~than:600 n ; less int ~than:780 n )
+
+let udp_order () =
+  let order faults =
+    Sim.run ~seed:3 (fun sim ->
+        Sim.net_faults sim faults ;
+        let a, a_addr, b = udp_pair () in
+        for i = 1 to 50 do
+          send b a_addr (string_of_int i)
+        done ;
+        List.map int_of_string (received a) )
+  in
+  let sent = List.init 50 (fun i -> i + 1) in
+  equal (list int) sent (order Sim.no_faults) ;
+  let late = order {Sim.no_faults with jitter= Span.ms 2} in
+  equal (list int) sent (List.sort compare late) ;
+  is_false (late = sent)
+
+(* A queue of more than 65536 bytes loses the datagrams that do not fit. *)
+let udp_full_queue () =
+  Sim.run (fun _ ->
+      let a, a_addr, b = udp_pair () in
+      for _ = 1 to 100 do
+        send b a_addr (String.make 1000 'x')
+      done ;
+      equal int 65 (List.length (received a)) )
+
+let udp_size () =
+  Sim.run (fun _ ->
+      let a, a_addr, b = udp_pair () in
+      send b a_addr (String.make 65507 'x') ;
+      equal (list int) [65507] (List.map String.length (received a)) ;
+      raises_match
+        (function Net.Error (Other "EMSGSIZE", _) -> true | _ -> false)
+        (fun () -> send b a_addr (String.make 65508 'x')) )
+
+let udp_latency () =
+  Sim.run (fun sim ->
+      Sim.set_latency sim (Span.ms 5) ;
+      let a, a_addr, b = udp_pair () in
+      let t0 = Time.now Mono in
+      send b a_addr "x" ;
+      let buf = Bytes.create 1 in
+      let k, from = Net.recvfrom a buf 0 1 in
+      equal int 1 k ;
+      is_true (from = ("b", 1)) ;
+      equal int 5 (ms_since t0) )
+
+let udp_free_ports () =
+  Sim.run (fun _ ->
+      let a = Net.udp ("h", 0) and b = Net.udp ("h", 0) in
+      let buf = Bytes.create 1 in
+      send a ("h", 40000) "x" ;
+      let _, from = Net.recvfrom a buf 0 1 in
+      (* [a] sent to itself, at the first free port. *)
+      is_true (from = ("h", 40000)) ;
+      send b ("h", 40000) "y" ;
+      let _, from = Net.recvfrom a buf 0 1 in
+      is_true (from = ("h", 40001)) )
+
+(* The sizes follow Linux with its default limits. *)
+let option_sizes () =
+  Sim.run (fun _ ->
+      let u = Net.udp ("h", 1) in
+      equal int 212992 (Net.get_option u Recv_buffer) ;
+      Net.set_option u Recv_buffer 1000 ;
+      equal int 2304 (Net.get_option u Recv_buffer) ;
+      Net.set_option u Recv_buffer 100_000 ;
+      equal int 200_000 (Net.get_option u Recv_buffer) ;
+      Net.set_option u Send_buffer 1_000_000 ;
+      equal int 425984 (Net.get_option u Send_buffer) ;
+      equal string "ENOPROTOOPT"
+        (Portable.error_of (fun () -> Net.set_option u No_delay true)) ;
+      let l = Net.listen (Net.Unix "/s") in
+      equal string "EOPNOTSUPP"
+        (Portable.error_of (fun () -> Net.set_option l No_delay true)) )
+
 let tests =
   [ group "net"
       [ slow "echo: the client gets hello back, with 1000 seeds" echo_1000_seeds
@@ -541,6 +651,14 @@ let tests =
       ; test "a listener that closes refuses a connect in flight"
           refused_while_connecting
       ; slow "10,000 connections use the fd slots again" many_connections ]
+  ; group "udp"
+      [ test "udp_loss loses about one datagram in 8" udp_loss
+      ; test "the jitter can reorder datagrams" udp_order
+      ; test "a full queue loses the datagrams that do not fit" udp_full_queue
+      ; test "a datagram of more than 65507 bytes gives EMSGSIZE" udp_size
+      ; test "the latency delays a datagram" udp_latency
+      ; test "the port 0 gives a free port" udp_free_ports
+      ; test "the sizes of the buffers follow Linux" option_sizes ]
   ; group "sim"
       [ test "settle waits until the others are quiescent" settle_runs_others
       ; test "manual mode: advance_until moves the time" manual_mode

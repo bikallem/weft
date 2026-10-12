@@ -897,7 +897,8 @@ module Sim : sig
   val set_posix : t -> Clock.posix -> unit
 
   (* Milestone M2 *)
-  type net_faults = { jitter : Span.t; short_io : bool; extra_edges : bool }
+  type net_faults =
+    { jitter : Span.t; short_io : bool; extra_edges : bool; udp_loss : bool }
   val net_faults : t -> net_faults -> unit
   val set_blocking_cost : t -> Span.t -> unit  (* open question 2 *)
   val set_dns : t -> string -> dns_answer -> unit
@@ -1217,7 +1218,12 @@ The sections of this document mark each part that does not come in M0 with its m
 - **The faults of the network** (`Sim.net_faults`): a jitter, short reads and writes, and an edge with no change one time in 8. A write of at most 4096 bytes (`PIPE_BUF`) to a pipe is atomic, as on Linux. A TCP stream loses no data and keeps its order, so the loss and the reordering of packets show only as delays. The partitions need the host of each side of a connection, and the simulator does not record it. Thus the partitions are not done. With the faults, the tests found that the echo server of the tests dropped the rest of a short write.
 - **One exception for all I/O.** `File.Error`, `Dir.Error`, `Pipe.Error`, `Process.Error` and `Dns.Error` are the same exception as `Net.Error`. The error type has five more constructors: `No_entry`, `Exists`, `Not_dir`, `Is_dir` and `Not_empty`. A top-level `Weft.Error` would hide the `Error` constructor of `result` after `open Weft`.
 - **The mutation run** kills each mutant that a test reaches, or a comment with `[@mutate off]` gives the reason. Two tests of Linux start one domain only, because the mutation run forks a child for each mutant, and OCaml refuses a fork after a domain started. With `short_io`, a write of a file can be short too.
-- **Not in M2:** UDP, `sendto`, `recvfrom` and the socket options of `Net` (section 2.3, The I/O modules), and the `Poll` world.
+- **Not in M2:** the `Poll` world.
+- **UDP and the socket options** came after M3. `Net.udp (host, port)` gives a UDP socket. `Net.sendto` sends one datagram, and `Net.recvfrom` takes one datagram with the address of its sender. The bytes of a datagram that do not fit in the buffer are lost. `Net.set_option` and `Net.get_option` take a GADT of options: `No_delay`, `Keep_alive`, `Broadcast`, `Recv_buffer` and `Send_buffer`. The simulator copies these facts of Linux, and a Linux test examines each one:
+  - A datagram to an address with no socket is lost, with no error. A datagram that does not fit in the queue of its socket (65536 bytes in the simulator) is lost.
+  - A datagram of more than 65507 bytes gives `EMSGSIZE`.
+  - The jitter can reorder datagrams, and `udp_loss` of `Sim.net_faults` loses one datagram in 8. The tests of the faults world send again after a timeout.
+  - A size option keeps two times the value, from 2304 bytes up to the default limit of Linux (425984). `No_delay` gives `EOPNOTSUPP` on a Unix socket and `ENOPROTOOPT` on a UDP socket. An accepted socket gets the options of its listener.
 
 ### M3: the tuning
 

@@ -24,6 +24,10 @@ let world =
       (fun () ->
         let l = Net.listen (Net.Tcp ("127.0.0.1", 0)) in
         (l, Net.Tcp ("127.0.0.1", Weft_linux.local_port l)) )
+  ; udp=
+      (fun () ->
+        let s = Net.udp ("127.0.0.1", 0) in
+        (s, ("127.0.0.1", Weft_linux.local_port s)) )
   ; tmp }
 
 (* Timers on many domains end after their deadlines. *)

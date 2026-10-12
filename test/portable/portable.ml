@@ -6,6 +6,7 @@ type world =
   ; domains: int
   ; run: 'a. (unit -> 'a) -> 'a
   ; listen: unit -> Net.t * Net.addr
+  ; udp: unit -> Net.t * (string * int)
   ; tmp: unit -> string }
 
 exception Boom of string
@@ -433,6 +434,152 @@ let net w =
                   Net.write c data ;
                   is_true (String.equal data (Promise.await r)) ;
                   Net.close c ) ) ) ]
+
+(* UDP and the socket options. A world can lose datagrams (the faults world), so
+   a test sends again after a timeout. *)
+
+(* Send [msg] to [dst] until [f] accepts a datagram that comes back, at most 100
+   times. *)
+let until_answer s dst msg f =
+  let buf = Bytes.create 64 in
+  let rec go n =
+    if n = 0 then fail "no answer after 100 datagrams" ;
+    Net.sendto s (Bytes.of_string msg) 0 (String.length msg) dst ;
+    match
+      Fiber.with_timeout Mono (Span.ms 50) (fun () ->
+          let k, from = Net.recvfrom s buf 0 (Bytes.length buf) in
+          f (Bytes.sub_string buf 0 k) from )
+    with
+    | true ->
+        ()
+    | false | (exception Fiber.Timeout) ->
+        go (n - 1)
+  in
+  go 100
+
+let is_error f = not (String.equal "no error" (error_of f))
+
+let udp w =
+  group "udp"
+    [ test "a datagram gets its answer, with the addresses of the two sides"
+        (fun () ->
+          w.run (fun () ->
+              let srv, srv_addr = w.udp () and cli, cli_addr = w.udp () in
+              Fiber.scope (fun s ->
+                  Fiber.fork_daemon s (fun () ->
+                      let buf = Bytes.create 64 in
+                      while true do
+                        let k, from = Net.recvfrom srv buf 0 64 in
+                        is_true (from = cli_addr) ;
+                        let r = Bytes.uppercase_ascii (Bytes.sub buf 0 k) in
+                        Net.sendto srv r 0 k from
+                      done ) ;
+                  until_answer cli srv_addr "ping" (fun data from ->
+                      is_true (from = srv_addr) ;
+                      String.equal data "PING" ) ) ;
+              Net.close srv ;
+              Net.close cli ) )
+    ; test "a datagram longer than the buffer loses its other bytes" (fun () ->
+          w.run (fun () ->
+              let a, a_addr = w.udp () and b, _ = w.udp () in
+              let buf = Bytes.create 4 in
+              let recv () =
+                Fiber.with_timeout Mono (Span.ms 50) (fun () ->
+                    let k, _ = Net.recvfrom a buf 0 4 in
+                    Bytes.sub_string buf 0 k )
+              in
+              let rec first n =
+                if n = 0 then fail "no datagram" ;
+                Net.sendto b (Bytes.of_string "0123456789") 0 10 a_addr ;
+                match recv () with
+                | r ->
+                    equal string "0123" r
+                | exception Fiber.Timeout ->
+                    first (n - 1)
+              in
+              first 100 ;
+              (* A late copy of the first datagram can come, but never its other
+                 bytes. *)
+              let rec next n =
+                if n = 0 then fail "no second datagram" ;
+                Net.sendto b (Bytes.of_string "ab") 0 2 a_addr ;
+                match recv () with
+                | "ab" ->
+                    ()
+                | r ->
+                    equal string "0123" r ;
+                    next (n - 1)
+                | exception Fiber.Timeout ->
+                    next (n - 1)
+              in
+              next 100 ; Net.close a ; Net.close b ) )
+    ; test "a datagram to a closed socket is lost, with no error" (fun () ->
+          w.run (fun () ->
+              let a, a_addr = w.udp () and b, _ = w.udp () in
+              Net.close a ;
+              Net.sendto b (Bytes.of_string "x") 0 1 a_addr ;
+              Net.close b ) )
+    ; test "a UDP socket on an address in use gives EADDRINUSE" (fun () ->
+          w.run (fun () ->
+              let a, a_addr = w.udp () in
+              equal string "EADDRINUSE" (error_of (fun () -> Net.udp a_addr)) ;
+              Net.close a ) )
+    ; test "a closed UDP socket gives EBADF" (fun () ->
+          w.run (fun () ->
+              let a, a_addr = w.udp () in
+              Net.close a ;
+              equal string "EBADF"
+                (error_of (fun () ->
+                     Net.sendto a (Bytes.of_string "x") 0 1 a_addr ) ) ;
+              equal string "EBADF"
+                (error_of (fun () -> Net.recvfrom a (Bytes.create 1) 0 1)) ) )
+    ; test "Net.write on a UDP socket with no peer gives an error" (fun () ->
+          w.run (fun () ->
+              let a, _ = w.udp () in
+              is_true (is_error (fun () -> Net.write a "x")) ;
+              Net.close a ) )
+    ; test "the options of a TCP socket and of a UDP socket" (fun () ->
+          w.run (fun () ->
+              let l, a = w.listen () in
+              Fiber.scope (fun s ->
+                  let p = Fiber.fork_promise s (fun () -> fst (Net.accept l)) in
+                  let c = Net.connect a in
+                  let srv = Promise.await p in
+                  is_false (Net.get_option c No_delay) ;
+                  Net.set_option c No_delay true ;
+                  is_true (Net.get_option c No_delay) ;
+                  Net.set_option c Keep_alive true ;
+                  is_true (Net.get_option c Keep_alive) ;
+                  Net.set_option c Recv_buffer 100_000 ;
+                  at_least int ~than:100_000 (Net.get_option c Recv_buffer) ;
+                  Net.set_option c Send_buffer 100_000 ;
+                  at_least int ~than:100_000 (Net.get_option c Send_buffer) ;
+                  raises_match
+                    (function Invalid_argument _ -> true | _ -> false)
+                    (fun () -> Net.set_option c Recv_buffer 0) ;
+                  Net.close c ;
+                  Net.close srv ) ;
+              Net.close l ;
+              let u, _ = w.udp () in
+              Net.set_option u Broadcast true ;
+              is_true (Net.get_option u Broadcast) ;
+              is_true (is_error (fun () -> Net.set_option u No_delay true)) ;
+              Net.close u ;
+              equal string "EBADF"
+                (error_of (fun () -> Net.get_option u Broadcast)) ) )
+    ; test "an accepted socket gets the options of its listener" (fun () ->
+          w.run (fun () ->
+              let l, a = w.listen () in
+              Net.set_option l Keep_alive true ;
+              Fiber.scope (fun s ->
+                  let p = Fiber.fork_promise s (fun () -> fst (Net.accept l)) in
+                  let c = Net.connect a in
+                  let srv = Promise.await p in
+                  is_true (Net.get_option srv Keep_alive) ;
+                  is_false (Net.get_option c Keep_alive) ;
+                  Net.close c ;
+                  Net.close srv ) ;
+              Net.close l ) ) ]
 
 (* The fiber layer of milestone M2: the handlers of a scope, fork_isolated,
    Promise.cancel, and the locks for fiber code. *)
@@ -1010,6 +1157,7 @@ let tests w =
         ; chans w
         ; scopes w
         ; net w
+        ; udp w
         ; overflow_runs w
         ; layers w
         ; files w

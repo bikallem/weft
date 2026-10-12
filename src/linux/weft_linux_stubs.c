@@ -263,6 +263,86 @@ value weft_accept(value lfd) {
   CAMLreturn(result);
 }
 
+/* UDP */
+
+/* A UDP socket, bound to the host and the port. */
+value weft_udp(value host, value port) {
+  struct sockaddr_storage sa;
+  socklen_t len;
+  int family = make_addr(0, host, Int_val(port), &sa, &len);
+  if (family < 0) return Val_int(family);
+  int fd = socket(family, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+  if (fd < 0) return Val_int(ERR);
+  if (bind(fd, (struct sockaddr *)&sa, len) < 0) {
+    int e = ERR;
+    close(fd);
+    return Val_int(e);
+  }
+  return Val_int(fd);
+}
+
+/* [dst] is (host, port). The runtime lock stays held, so the GC cannot move
+   the buffer. */
+value weft_sendto(value fd, value buf, value off, value len, value dst) {
+  struct sockaddr_storage sa;
+  socklen_t alen;
+  int family = make_addr(0, Field(dst, 0), Int_val(Field(dst, 1)), &sa, &alen);
+  if (family < 0) return Val_long(family);
+  ssize_t n = sendto(Int_val(fd), Bytes_val(buf) + Long_val(off), Long_val(len),
+                     MSG_DONTWAIT | MSG_NOSIGNAL, (struct sockaddr *)&sa, alen);
+  return Val_long(n < 0 ? ERR : n);
+}
+
+/* (n or -errno, host, port). The recv comes before each allocation, so the
+   buffer does not move. */
+value weft_recvfrom(value fd, value buf, value off, value len) {
+  CAMLparam4(fd, buf, off, len);
+  CAMLlocal2(result, host);
+  struct sockaddr_storage sa;
+  socklen_t alen = sizeof sa;
+  char text[INET6_ADDRSTRLEN] = "";
+  int port = 0;
+  ssize_t n = recvfrom(Int_val(fd), Bytes_val(buf) + Long_val(off), Long_val(len),
+                       MSG_DONTWAIT, (struct sockaddr *)&sa, &alen);
+  if (n < 0) {
+    n = ERR;
+  } else if (sa.ss_family == AF_INET) {
+    inet_ntop(AF_INET, &((struct sockaddr_in *)&sa)->sin_addr, text, sizeof text);
+    port = ntohs(((struct sockaddr_in *)&sa)->sin_port);
+  } else if (sa.ss_family == AF_INET6) {
+    inet_ntop(AF_INET6, &((struct sockaddr_in6 *)&sa)->sin6_addr, text, sizeof text);
+    port = ntohs(((struct sockaddr_in6 *)&sa)->sin6_port);
+  }
+  host = caml_copy_string(text);
+  result = caml_alloc_tuple(3);
+  Store_field(result, 0, Val_long(n));
+  Store_field(result, 1, host);
+  Store_field(result, 2, Val_int(port));
+  CAMLreturn(result);
+}
+
+/* Socket options. The codes are the order of [Op.sockopt]: 0 TCP_NODELAY,
+   1 SO_KEEPALIVE, 2 SO_BROADCAST, 3 SO_RCVBUF and 4 SO_SNDBUF. */
+static void sockopt_of(int code, int *level, int *name) {
+  static const int names[] = {TCP_NODELAY, SO_KEEPALIVE, SO_BROADCAST, SO_RCVBUF, SO_SNDBUF};
+  *level = code == 0 ? IPPROTO_TCP : SOL_SOCKET;
+  *name = names[code];
+}
+
+value weft_setsockopt(value fd, value code, value v) {
+  int level, name, x = Int_val(v);
+  sockopt_of(Int_val(code), &level, &name);
+  return Val_int(setsockopt(Int_val(fd), level, name, &x, sizeof x) < 0 ? ERR : 0);
+}
+
+/* The value, or -errno. Each value is 0 or more. */
+value weft_getsockopt(value fd, value code) {
+  int level, name, x = 0;
+  socklen_t l = sizeof x;
+  sockopt_of(Int_val(code), &level, &name);
+  return Val_int(getsockopt(Int_val(fd), level, name, &x, &l) < 0 ? ERR : x);
+}
+
 /* recv and send with MSG_DONTWAIT: the flag applies to the call, so another
    process that clears O_NONBLOCK cannot make them block (section 2.3). The
    runtime lock stays held, so the GC cannot move the buffer. */

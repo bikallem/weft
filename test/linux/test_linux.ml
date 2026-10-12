@@ -22,6 +22,10 @@ let world =
       (fun () ->
         let l = Net.listen (Net.Tcp ("127.0.0.1", 0)) in
         (l, Net.Tcp ("127.0.0.1", Weft_linux.local_port l)) )
+  ; udp=
+      (fun () ->
+        let s = Net.udp ("127.0.0.1", 0) in
+        (s, ("127.0.0.1", Weft_linux.local_port s)) )
   ; tmp }
 
 let elapsed_ns f =
@@ -370,6 +374,43 @@ let full_warning () =
      jobs that run 0\n"
     text
 
+(* UDP on Linux: IPv6, the size limit, and the sizes of the buffers, which the
+   simulator copies. *)
+let udp_ipv6 () =
+  Weft_linux.run ~domains:1 (fun () ->
+      let a = Net.udp ("::1", 0) and b = Net.udp ("::1", 0) in
+      let a_addr = ("::1", Weft_linux.local_port a) in
+      Net.sendto b (Bytes.of_string "hi") 0 2 a_addr ;
+      let buf = Bytes.create 8 in
+      let k, from = Net.recvfrom a buf 0 8 in
+      equal string "hi" (Bytes.sub_string buf 0 k) ;
+      is_true (from = ("::1", Weft_linux.local_port b)) ;
+      Net.close a ;
+      Net.close b )
+
+let udp_size_limit () =
+  Weft_linux.run ~domains:1 (fun () ->
+      let a = Net.udp ("127.0.0.1", 0) in
+      let a_addr = ("127.0.0.1", Weft_linux.local_port a) in
+      Net.set_option a Recv_buffer 100_000 ;
+      Net.sendto a (Bytes.make 65507 'x') 0 65507 a_addr ;
+      let buf = Bytes.create 70_000 in
+      equal int 65507 (fst (Net.recvfrom a buf 0 70_000)) ;
+      is_true
+        ( Portable.error_of (fun () ->
+              Net.sendto a (Bytes.make 65508 'x') 0 65508 a_addr )
+        <> "no error" ) ;
+      Net.close a )
+
+let option_sizes () =
+  Weft_linux.run ~domains:1 (fun () ->
+      let u = Net.udp ("127.0.0.1", 0) in
+      Net.set_option u Recv_buffer 1000 ;
+      equal int 2304 (Net.get_option u Recv_buffer) ;
+      Net.set_option u Recv_buffer 100_000 ;
+      equal int 200_000 (Net.get_option u Recv_buffer) ;
+      Net.close u )
+
 (* Processes and signals (milestone M2). *)
 
 let read_pipe = Portable.drain Pipe.read
@@ -595,6 +636,9 @@ let linux =
     ; test "a fiber detaches from an open that blocks" detach_from_open
     ; test "1,000 files open and close with no fd leak" no_file_leak
     ; test "C4: a job that blocks does not stop the next job" blocked_job
+    ; test "UDP on IPv6" udp_ipv6
+    ; test "a datagram of more than 65507 bytes gives an error" udp_size_limit
+    ; test "the sizes of the buffers, as in the simulator" option_sizes
     ; test "a detach of a job in the queue removes it" detach_queued
     ; test "each detached job that runs gives one more thread, up to the limit"
         detached_threads

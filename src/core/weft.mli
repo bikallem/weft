@@ -361,6 +361,44 @@ module Net : sig
 
   val writable : t -> unit event
   (** As [readable], for a write. *)
+
+  (** {2 UDP} *)
+
+  val udp : string * int -> t
+  (** [udp (host, port)] gives a UDP socket, bound to the host and the port. The
+      port 0 gives a free port. In the simulator, the host is a name, for
+      example ["client"]. [close] closes the socket. *)
+
+  val sendto : t -> bytes -> int -> int -> string * int -> unit
+  (** [sendto t buf off len (host, port)] sends one datagram with the bytes of
+      the range. A datagram to an address with no socket is lost, with no error.
+
+      @raise Invalid_argument if the range is not in [buf]. *)
+
+  val recvfrom : t -> bytes -> int -> int -> int * (string * int)
+  (** [recvfrom t buf off len] waits for one datagram. It gives the number of
+      bytes in [buf], and the host and the port of the sender. If the datagram
+      has more than [len] bytes, the other bytes are lost.
+
+      @raise Invalid_argument if [len < 1] or the range is not in [buf]. *)
+
+  (** {2 Socket options} *)
+
+  type 'a sockopt = 'a Private.Op.sockopt =
+    | No_delay : bool sockopt  (** [TCP_NODELAY]. Only for TCP. *)
+    | Keep_alive : bool sockopt  (** [SO_KEEPALIVE]. *)
+    | Broadcast : bool sockopt  (** [SO_BROADCAST]. *)
+    | Recv_buffer : int sockopt  (** [SO_RCVBUF], in bytes. *)
+    | Send_buffer : int sockopt  (** [SO_SNDBUF], in bytes. *)
+
+  val set_option : t -> 'a sockopt -> 'a -> unit
+  (** [set_option t opt v] sets an option of the socket. The OS can change a
+      size: Linux keeps two times the value. Thus [get_option] can give a
+      different value.
+
+      @raise Invalid_argument if a size is not positive. *)
+
+  val get_option : t -> 'a sockopt -> 'a
 end
 
 (** {1 Files and directories} (design section 2.3, The I/O modules)
