@@ -170,17 +170,27 @@ value weft_connect(value kind, value host, value port) {
   return Val_int(fd);
 }
 
-/* The result of a connect. SO_ERROR is 0 also while the connect continues,
-   so a connected socket is one with a peer. */
-value weft_connect_result(value fd) {
+static int socket_error(int fd) {
   int e = 0;
   socklen_t l = sizeof e;
-  if (getsockopt(Int_val(fd), SOL_SOCKET, SO_ERROR, &e, &l) < 0) return Val_int(ERR);
-  if (e != 0) return Val_int(-e);
+  if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &e, &l) < 0) return ERR;
+  return -e;
+}
+
+/* The result of a connect. SO_ERROR is 0 also while the connect continues,
+   so a connected socket is one with a peer. The error of the connect can
+   come after the first read of SO_ERROR: then getpeername fails (EINVAL on
+   macOS), and a second read of SO_ERROR gives the error. */
+value weft_connect_result(value fd) {
+  int e = socket_error(Int_val(fd));
+  if (e != 0) return Val_int(e);
   struct sockaddr_storage sa;
   socklen_t len = sizeof sa;
   if (getpeername(Int_val(fd), (struct sockaddr *)&sa, &len) == 0) return Val_int(0);
-  return Val_int(errno == ENOTCONN ? -EAGAIN : ERR);
+  int pe = errno;
+  e = socket_error(Int_val(fd));
+  if (e != 0) return Val_int(e);
+  return Val_int(pe == ENOTCONN ? -EAGAIN : -pe);
 }
 
 /* [weft_accept fd] gives (fd or -errno, host, port, unix). [unix] tells that
