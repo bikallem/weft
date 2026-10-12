@@ -1627,6 +1627,10 @@ let semaphores w =
               Sem.release s ;
               raises above (fun () -> Sem.release s) ;
               all_free s 2 ;
+              (* A semaphore with no permit never gives one. *)
+              let z = Sem.create 0 in
+              equal bool false (try_acquire z) ;
+              raises above (fun () -> Sem.release z) ;
               raises
                 (Invalid_argument
                    "Fiber.Semaphore.create: the count is negative" ) (fun () ->

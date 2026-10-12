@@ -224,7 +224,7 @@ module Fiber : sig
     (** An event that takes one permit. The sync gets the permit only if it
         commits to this branch. If the [choose] commits to another branch, or a
         cancel ends the sync, the permit goes to the next waiter. The waiters
-        get the permits in the order of their syncs (FIFO). *)
+        get the permits in the order in which they started to wait (FIFO). *)
 
     val release : t -> unit
     (** Gives one permit back: to the oldest waiter, or to the free permits.
