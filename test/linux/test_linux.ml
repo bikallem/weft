@@ -273,6 +273,103 @@ let no_file_leak () =
   equal int before (open_fds ()) ;
   equal int 1000 (Array.length (Sys.readdir d))
 
+(* The limit of detached jobs (design section 2.3). The file pool has 16 threads
+   for the live jobs, and 8 more for the detached jobs that run. An open of a
+   FIFO holds a thread until a writer comes. *)
+let pool_max = 16
+
+let pool_limit = 8
+
+(* A writer opens the FIFO, and each open that blocks on it ends. *)
+let release fifo = Unix.close (Unix.openfile fifo [O_WRONLY; O_NONBLOCK] 0)
+
+(* [n] fibers that each hold a thread of the pool. *)
+let hold s fifo n =
+  let l =
+    List.init n (fun _ ->
+        Fiber.fork_promise s (fun () -> File.openfile [Read] fifo) )
+  in
+  Time.sleep Mono (Span.ms 50) ;
+  l
+
+let new_fifo () =
+  let fifo = Filename.concat (tmp ()) "fifo" in
+  Unix.mkfifo fifo 0o600 ; fifo
+
+(* A detach of a job in the queue removes it: the open never creates the
+   file. *)
+let detach_queued () =
+  let fifo = new_fifo () in
+  let file = Filename.concat (Filename.dirname fifo) "never" in
+  Weft_linux.run ~domains:1 (fun () ->
+      Fiber.scope (fun s ->
+          let held = hold s fifo pool_max in
+          raises Fiber.Timeout (fun () ->
+              Fiber.with_timeout Mono (Span.ms 50) (fun () ->
+                  File.openfile [Write; Create] file ) ) ;
+          release fifo ;
+          List.iter (fun p -> File.close (Promise.await p)) held ;
+          (* The pool has threads again: the job would run now. *)
+          ignore (File.stat "/") ;
+          Time.sleep Mono (Span.ms 20) ) ) ;
+  is_false (Sys.file_exists file)
+
+(* Each detached job that runs gives one more thread, up to the limit. *)
+let detached_threads () =
+  let fifo = new_fifo () in
+  let before = open_fds () in
+  Weft_linux.run ~domains:1 (fun () ->
+      Fiber.scope (fun s ->
+          for _ = 1 to pool_max do
+            Fiber.fork s (fun () ->
+                raises Fiber.Timeout (fun () ->
+                    Fiber.with_timeout Mono (Span.ms 30) (fun () ->
+                        File.openfile [Read] fifo ) ) )
+          done ) ;
+      (* All threads of the live jobs hold a detached job. *)
+      ignore (Fiber.with_timeout Mono (Span.s 1) (fun () -> File.stat "/")) ;
+      Fiber.scope (fun s ->
+          let held = hold s fifo (pool_limit - 1) in
+          (* The last thread of the limit. *)
+          ignore (Fiber.with_timeout Mono (Span.s 1) (fun () -> File.stat "/")) ;
+          let held = held @ hold s fifo 1 in
+          raises Fiber.Timeout (fun () ->
+              Fiber.with_timeout Mono (Span.ms 50) (fun () -> File.stat "/") ) ;
+          release fifo ;
+          List.iter (fun p -> File.close (Promise.await p)) held ) ) ;
+  (* The pool closes the fds of the detached opens. *)
+  fds_back_to before ;
+  equal int before (open_fds ())
+
+(* A pool that is full for more than 1 s writes one warning to stderr. *)
+let full_warning () =
+  let fifo = new_fifo () in
+  let log = Filename.concat (Filename.dirname fifo) "stderr" in
+  let fd = Unix.openfile log [O_WRONLY; O_CREAT] 0o600 in
+  let saved = Unix.dup Unix.stderr in
+  let w0 = Weft_linux.pool_warnings () in
+  Unix.dup2 fd Unix.stderr ;
+  Fun.protect
+    ~finally:(fun () ->
+      Unix.dup2 saved Unix.stderr ;
+      Unix.close saved )
+    (fun () ->
+      Weft_linux.run ~domains:1 (fun () ->
+          Fiber.scope (fun s ->
+              let held = hold s fifo pool_max in
+              raises Fiber.Timeout (fun () ->
+                  Fiber.with_timeout Mono (Span.ms 1300) (fun () ->
+                      File.stat "/" ) ) ;
+              release fifo ;
+              List.iter (fun p -> File.close (Promise.await p)) held ) ) ) ;
+  Unix.close fd ;
+  equal int (w0 + 1) (Weft_linux.pool_warnings ()) ;
+  let text = In_channel.with_open_text log In_channel.input_all in
+  equal string
+    "weft: the file pool was full for 1 s: queued jobs 1, threads 16, detached \
+     jobs that run 0\n"
+    text
+
 (* Processes and signals (milestone M2). *)
 
 let read_pipe = Portable.drain Pipe.read
@@ -498,6 +595,10 @@ let linux =
     ; test "a fiber detaches from an open that blocks" detach_from_open
     ; test "1,000 files open and close with no fd leak" no_file_leak
     ; test "C4: a job that blocks does not stop the next job" blocked_job
+    ; test "a detach of a job in the queue removes it" detach_queued
+    ; test "each detached job that runs gives one more thread, up to the limit"
+        detached_threads
+    ; test "a pool that is full for more than 1 s writes a warning" full_warning
     ; test "a child stops at SIGINT" child_sigint
     ; test "the pipes of a child" child_output
     ; test "SIGTERM to the process is an event" sigterm

@@ -691,6 +691,8 @@ external watchdog_stop : nativeint -> unit = "weft_watchdog_stop"
 
 external watchdog_reports : unit -> int = "weft_watchdog_reports"
 
+external pool_warnings : unit -> int = "weft_pool_warnings"
+
 (* The watchdog reads the beats of the scheduler. The pair keeps the Bigarray
    alive until the stop. *)
 let run ?slack ?domains ?signals ?(watchdog = Some (Weft.Span.ms 10)) main =

@@ -10,8 +10,16 @@
 
    The life of a job: the start makes it, and a worker runs it. Then the job
    is done. [weft_job_free] (after the result) or a detach frees a job that is
-   done. A detach before the end marks the job, and the worker frees it. The
-   pool mutex protects [done] and [detached]. */
+   done. A detach of a job in the queue removes it: the job never runs, and
+   its completion goes to the mailbox at once. A detach of a job that runs
+   marks the job, and the worker frees it. The pool mutex protects [started],
+   [done] and [detached].
+
+   The limit of detached jobs (design section 2.3): a detached job that runs
+   keeps its thread, and the pool can start one more thread for each such job,
+   up to [limit]. Thus the live jobs keep [max] threads. If jobs wait and the
+   pool can start no thread for more than 1 s, a monitor thread writes a
+   warning to stderr. */
 
 #define _GNU_SOURCE
 #include <arpa/inet.h>
@@ -25,7 +33,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <stdio.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 
 #include <caml/alloc.h>
@@ -82,7 +92,8 @@ struct job {
   int64_t res;
   int err; /* 0, an errno value, or -1 for a getaddrinfo error in buf. */
   struct stat st;
-  int done, detached;
+  int started, done, detached;
+  int counted; /* The job is in [running_detached]. */
 };
 
 struct pool {
@@ -90,12 +101,23 @@ struct pool {
   pthread_cond_t c;
   struct job *head, *tail;
   int queued, threads, idle, max;
+  int limit;            /* Of the detached jobs that get one more thread. */
+  int running_detached; /* The detached jobs that a worker runs. */
+  int64_t full_since;   /* In ns of CLOCK_MONOTONIC, or 0. */
+  int warned, monitor;  /* The warning of this full period, a monitor runs. */
+  pthread_cond_t mc;    /* The monitor waits on it. */
+  const char *name;
 };
 
-static struct pool file_pool = {PTHREAD_MUTEX_INITIALIZER,
-                                PTHREAD_COND_INITIALIZER, NULL, NULL, 0, 0, 0, 16};
-static struct pool dns_pool = {PTHREAD_MUTEX_INITIALIZER,
-                               PTHREAD_COND_INITIALIZER, NULL, NULL, 0, 0, 0, 8};
+#define POOL(max, name)                                                        \
+  {PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER, NULL, NULL, 0, 0, 0,  \
+   (max), (max) / 2, 0, 0, 0, 0, PTHREAD_COND_INITIALIZER, (name)}
+
+static struct pool file_pool = POOL(16, "file");
+static struct pool dns_pool = POOL(8, "name");
+
+/* The warnings of all pools, for the tests. */
+static intnat warnings = 0;
 
 static void unref(struct mbx *w) {
   if (__atomic_sub_fetch(&w->refs, 1, __ATOMIC_ACQ_REL) == 0) {
@@ -318,11 +340,81 @@ static void run(struct job *j) {
   j->err = r < 0 ? errno : 0;
 }
 
+static int64_t now_ns(void) {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (int64_t)ts.tv_sec * 1000000000 + ts.tv_nsec;
+}
+
+static int start_thread(void *(*f)(void *), struct pool *p);
+
+/* The threads that the pool can have at this time. */
+static int cap(struct pool *p) {
+  return p->max + (p->running_detached < p->limit ? p->running_detached : p->limit);
+}
+
+/* The monitor of a full period: it writes the warning after 1 s, and it ends
+   with the period. */
+static void *monitor(void *arg) {
+  struct pool *p = arg;
+  char msg[200];
+  pthread_mutex_lock(&p->m);
+  while (p->full_since != 0) {
+    if (p->warned) {
+      pthread_cond_wait(&p->mc, &p->m);
+      continue;
+    }
+    int64_t at = p->full_since + 1000000000;
+    if (now_ns() < at) {
+      struct timespec ts = {at / 1000000000, at % 1000000000};
+      pthread_cond_clockwait(&p->mc, &p->m, CLOCK_MONOTONIC, &ts);
+      continue;
+    }
+    p->warned = 1;
+    __atomic_add_fetch(&warnings, 1, __ATOMIC_RELAXED);
+    int n = snprintf(msg, sizeof msg,
+                     "weft: the %s pool was full for 1 s: queued jobs %d, threads "
+                     "%d, detached jobs that run %d\n",
+                     p->name, p->queued, p->threads, p->running_detached);
+    pthread_mutex_unlock(&p->m);
+    if (n > 0) {
+      ssize_t r = write(2, msg, (size_t)n < sizeof msg ? (size_t)n : sizeof msg - 1);
+      (void)r;
+    }
+    pthread_mutex_lock(&p->m);
+  }
+  p->monitor = 0;
+  pthread_mutex_unlock(&p->m);
+  return NULL;
+}
+
+/* The start and the end of a full period: jobs wait, and the pool can start no
+   thread. Under the pool mutex. */
+static void note(struct pool *p) {
+  int full = p->queued > p->idle && p->threads >= cap(p);
+  if (full && p->full_since == 0) {
+    p->full_since = now_ns();
+    p->warned = 0;
+    if (!p->monitor) p->monitor = start_thread(monitor, p);
+    else pthread_cond_signal(&p->mc);
+  } else if (!full && p->full_since != 0) {
+    p->full_since = 0;
+    pthread_cond_signal(&p->mc);
+  }
+}
+
 static void *worker(void *arg) {
   struct pool *p = arg;
   pthread_mutex_lock(&p->m);
   for (;;) {
     while (p->head == NULL) {
+      /* A thread over the cap ends: a detached job that took its place is
+         done. */
+      if (p->threads > cap(p)) {
+        p->threads--;
+        pthread_mutex_unlock(&p->m);
+        return NULL;
+      }
       p->idle++;
       pthread_cond_wait(&p->c, &p->m);
       p->idle--;
@@ -331,10 +423,21 @@ static void *worker(void *arg) {
     p->head = j->next;
     if (p->head == NULL) p->tail = NULL;
     p->queued--;
+    j->started = 1;
+    if (j->detached) {
+      j->counted = 1;
+      p->running_detached++;
+    }
+    note(p);
     pthread_mutex_unlock(&p->m);
     run(j);
     pthread_mutex_lock(&p->m);
     j->done = 1;
+    if (j->counted) {
+      p->running_detached--;
+      /* The idle threads over the cap end. */
+      if (p->threads > cap(p)) pthread_cond_broadcast(&p->c);
+    }
     /* After the unlock, a detach can free the job. */
     struct mbx *w = j->mbx;
     int dom = j->dom;
@@ -348,13 +451,14 @@ static void *worker(void *arg) {
     }
     if (detached) free_job(j);
     pthread_mutex_lock(&p->m);
+    note(p);
   }
   return NULL;
 }
 
 /* A new thread copies the signal mask of its creator. Thus the creator blocks
    all signals for the time of the create. */
-static int spawn(struct pool *p) {
+static int start_thread(void *(*f)(void *), struct pool *p) {
   sigset_t all, old;
   pthread_attr_t attr;
   pthread_t t;
@@ -362,11 +466,23 @@ static int spawn(struct pool *p) {
   pthread_sigmask(SIG_SETMASK, &all, &old);
   pthread_attr_init(&attr);
   pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
-  int ok = pthread_create(&t, &attr, worker, p) == 0;
-  if (ok) p->threads++;
+  int ok = pthread_create(&t, &attr, f, p) == 0;
   pthread_attr_destroy(&attr);
   pthread_sigmask(SIG_SETMASK, &old, NULL);
   return ok;
+}
+
+static int spawn(struct pool *p) {
+  int ok = start_thread(worker, p);
+  if (ok) p->threads++;
+  return ok;
+}
+
+
+/* One new thread if no idle thread can take a job: a job that blocks does not
+   stop the jobs after it, up to [cap]. Under the pool mutex. */
+static void grow(struct pool *p) {
+  if (p->queued > p->idle && p->threads < cap(p)) spawn(p);
 }
 
 /* With no worker, the queued jobs complete with EAGAIN. Under the pool
@@ -406,8 +522,11 @@ static void parent(void) {
 static void reset(struct pool *p) {
   pthread_mutex_init(&p->m, NULL);
   pthread_cond_init(&p->c, NULL);
+  pthread_cond_init(&p->mc, NULL);
   p->head = p->tail = NULL;
   p->queued = p->threads = p->idle = 0;
+  p->running_detached = p->warned = p->monitor = 0;
+  p->full_since = 0;
 }
 
 static void child(void) {
@@ -428,11 +547,10 @@ static void submit(struct job *j) {
   else p->head = j;
   p->tail = j;
   p->queued++;
-  /* A new thread for each job that no idle thread can take: a job that blocks
-     does not stop the jobs after it, up to the maximum. */
-  if (p->queued > p->idle && p->threads < p->max && !spawn(p) && p->threads == 0)
-    fail_all(p);
+  grow(p);
+  if (p->threads == 0) fail_all(p);
   else pthread_cond_signal(&p->c);
+  note(p);
   pthread_mutex_unlock(&p->m);
 }
 
@@ -571,18 +689,50 @@ value weft_job_free(value job) {
   return Val_unit;
 }
 
-/* A job that nobody waits for. If it is done, drop its result now. If not,
-   the worker drops it. */
+/* Remove a job from the queue. Under the pool mutex. */
+static void unqueue(struct pool *p, struct job *j) {
+  struct job **q = &p->head, *prev = NULL;
+  while (*q != j) {
+    prev = *q;
+    q = &(*q)->next;
+  }
+  *q = j->next;
+  if (p->tail == j) p->tail = prev;
+  p->queued--;
+}
+
+/* A job that nobody waits for. If it is done, drop its result now. If it is
+   in the queue, remove it, and post its completion: thus the domain releases
+   the fd of the job. If it runs, the worker drops it, and the pool can start
+   one more thread. */
 value weft_job_detach(value job) {
   struct job *j = Job_val(job);
   struct pool *p = j->pool;
   pthread_mutex_lock(&p->m);
-  int done = j->done;
-  if (!done) j->detached = 1;
+  int done = j->done, queued = !j->started;
+  if (queued) unqueue(p, j);
+  else if (!done) {
+    j->detached = 1;
+    j->counted = 1;
+    p->running_detached++;
+    grow(p);
+  }
+  note(p);
   pthread_mutex_unlock(&p->m);
-  if (done) {
+  if (queued) {
+    if (j->mbx != NULL) {
+      post(j->mbx, j->dom, j->id);
+      unref(j->mbx);
+    }
+    free_job(j);
+  } else if (done) {
     drop(j);
     free_job(j);
   }
   return Val_unit;
+}
+
+value weft_pool_warnings(value unit) {
+  (void)unit;
+  return Val_long(__atomic_load_n(&warnings, __ATOMIC_RELAXED));
 }
