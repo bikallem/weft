@@ -173,10 +173,8 @@ module World = struct
    fun t op ->
     match op with
     | Op.Spawn sp ->
-        if spawn_has_nul sp then nul_error
-        else
-          (* The world ignores only SIGPIPE: it blocks the watched signals. *)
-          spawned_of (spawn_child (spawn_args sp) [|number_of Op.SIGPIPE|])
+        (* The world ignores only SIGPIPE: it blocks the watched signals. *)
+        spawned_of (spawn_child (spawn_args sp) [|number_of Op.SIGPIPE|])
     | Op.Wait_child fd ->
         status_of (wait_child fd)
     | Op.Kill (fd, s) ->

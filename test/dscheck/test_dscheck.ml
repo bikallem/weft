@@ -682,7 +682,20 @@ let acquire_scan dom t s continued () =
   if not (S.is_done s) then base_leaf (Sem.acquire t) dom s 0 ;
   match C.park s.S.word with `Done _ -> Atomic.incr continued | `Parked -> ()
 
-let release dom t () = List.iter (S.resume dom) (Sem.give t)
+let release dom t () =
+  List.iter (S.resume dom) (Option.value ~default:[] (Sem.give t))
+
+(* The resumes of a sync in a next slot: a partner of a channel resumes it
+   there. *)
+let in_next (t : S.t) s =
+  Array.fold_left
+    (fun n d ->
+      match Atomic.get d.S.next with
+      | Some r when r.S.rfiber == s.S.owner ->
+          n + 1
+      | _ ->
+          n )
+    0 t.S.doms
 
 (* An acquire with no free permit while a holder releases on another domain. The
    waiter gets the permit: the release finds its offer, or the scan finds the
@@ -773,20 +786,9 @@ let sem_lost_choose () =
           | `Parked ->
               () ) ;
       fun () ->
-        (* A partner of a channel resumes [x] in its next slot. *)
-        let in_next =
-          Array.fold_left
-            (fun n d ->
-              match Atomic.get d.S.next with
-              | Some r when r.S.rfiber == x.S.owner ->
-                  n + 1
-              | _ ->
-                  n )
-            0 t.S.doms
-        in
         got x 0 + Atomic.get p.Sem.free = 1
         && got x 0 + got y 0 = 1
-        && queued t x + in_next = 1 )
+        && queued t x + in_next t x = 1 )
 
 (* Two releases on two domains and one parked waiter. The waiter gets one
    permit, and the other one is free. *)
@@ -801,6 +803,60 @@ let sem_two_releases () =
       spawn_in w (release d0 p) ;
       spawn_in w (release d1 p) ;
       fun () -> got x 0 = 1 && Atomic.get p.Sem.free = 1 && queued t x = 1 )
+
+(* One sync with two acquire branches of one semaphore, in its scan on domain 0,
+   and two releases on domain 1. The sync gets one permit. The second release
+   meets the stale offer of the other branch, and it makes the permit free. *)
+let sem_two_branches () =
+  trace (fun () ->
+      let t = S.create ~domains:2 () in
+      let w = world () in
+      let d0 = t.S.doms.(0) and d1 = t.S.doms.(1) in
+      let p = sem 0 and x = new_sync (scope_node ()) in
+      let continued = Atomic.make 0 in
+      spawn_in w (fun () ->
+          List.iter
+            (fun i -> if not (S.is_done x) then base_leaf (Sem.acquire p) d0 x i)
+            [0; 1] ;
+          match C.park x.S.word with
+          | `Done _ ->
+              Atomic.incr continued
+          | `Parked ->
+              () ) ;
+      spawn_in w (fun () -> release d1 p () ; release d1 p ()) ;
+      fun () ->
+        got x 0 + got x 1 = 1
+        && Atomic.get p.Sem.free = 1
+        && Atomic.get continued + queued t x = 1
+        && Chan.offers p.Sem.waiters = [] )
+
+(* The acquire leaf with a free permit meets its own word as Claimed: the sync
+   has an offer on a channel, and a send on domain 1 claims it. The sync takes
+   the permit only if it commits to the acquire. *)
+let sem_self_commit_claimed () =
+  trace (fun () ->
+      let t = S.create ~domains:2 () in
+      let w = world () in
+      let d0 = t.S.doms.(0) and d1 = t.S.doms.(1) in
+      let p = sem 1 and c = Chan.create () in
+      let x = new_sync ~id:0 (scope_node ())
+      and y = new_sync ~id:1 (scope_node ()) in
+      base_leaf (Chan.recv c) d0 x 1 ;
+      let continued = Atomic.make 0 in
+      spawn_in w (fun () ->
+          if not (S.is_done x) then base_leaf (Sem.acquire p) d0 x 0 ;
+          match C.park x.S.word with
+          | `Done _ ->
+              Atomic.incr continued
+          | `Parked ->
+              () ) ;
+      spawn_in w (fun () ->
+          base_leaf (Chan.send c 7) d1 y 0 ;
+          ignore (C.park y.S.word) ) ;
+      fun () ->
+        got x 0 + Atomic.get p.Sem.free = 1
+        && got x 0 + got y 0 = 1
+        && Atomic.get continued + queued t x + in_next t x = 1 )
 
 (* The variable (design section 2.4, A variable). [var_sync dom t seen x got] is
    the sync of [x] on [changed t seen] on [dom]: the guard, the leaf and the end
@@ -952,6 +1008,10 @@ let () =
   case "semaphore: a release while a send commits the other branch"
     sem_lost_choose ;
   case "semaphore: two releases and one waiter" sem_two_releases ;
+  case "semaphore: one sync with two acquire branches, and two releases"
+    sem_two_branches ;
+  case "semaphore: a free permit while a send claims the sync"
+    sem_self_commit_claimed ;
   case "variable: a set and a sync on changed at the same time" var_set_changed ;
   case "variable: two sets and a waiter on the first value" var_two_sets ;
   case "variable: a set and a set back during a sync" var_set_back ;

@@ -889,6 +889,44 @@ let local_addr w =
               Net.close a ;
               Net.close b ;
               Net.close u ) )
+    ; test "a port out of range or a NUL byte gives EINVAL" (fun () ->
+          w.run (fun () ->
+              let host = host_of w in
+              let einval f = equal string "EINVAL" (error_of f) in
+              let nul f =
+                equal string "EINVAL: a NUL byte in a string" (error_of f)
+              in
+              (* A port of more than 32 bits is not cut to its low bits. *)
+              let big = 1 lsl 32 in
+              let l = Net.listen (Net.Tcp (host, 0)) in
+              let p =
+                match Net.local_addr l with Net.Tcp (_, p) -> p | _ -> 0
+              in
+              List.iter
+                (fun port ->
+                  einval (fun () -> Net.listen (Net.Tcp (host, port))) ;
+                  einval (fun () -> Net.connect (Net.Tcp (host, port))) ;
+                  einval (fun () -> Net.udp (host, port)) )
+                [65536; -1; big] ;
+              einval (fun () -> Net.connect (Net.Tcp (host, big + p))) ;
+              nul (fun () -> Net.listen (Net.Tcp (host ^ "\000x", 0))) ;
+              nul (fun () -> Net.connect (Net.Tcp (host ^ "\000x", p))) ;
+              let path = Filename.concat (w.tmp ()) "s" in
+              nul (fun () -> Net.listen (Net.Unix (path ^ "\000x"))) ;
+              nul (fun () -> Net.connect (Net.Unix (path ^ "\000x"))) ;
+              nul (fun () -> Net.udp (host ^ "\000x", 0)) ;
+              let u, (_, up) = w.udp () and b = Bytes.of_string "x" in
+              einval (fun () -> Net.sendto u b 0 1 (host, 65536)) ;
+              einval (fun () -> Net.sendto u b 0 1 (host, big + up)) ;
+              nul (fun () -> Net.sendto u b 0 1 (host ^ "\000x", up)) ;
+              (* The core checks the address before it uses the socket. Thus a
+                 closed socket with a bad address gives EINVAL, not EBADF. *)
+              Net.close u ;
+              einval (fun () -> Net.sendto u b 0 1 (host, 65536)) ;
+              nul (fun () -> Net.sendto u b 0 1 (host ^ "\000x", up)) ;
+              equal string "EBADF"
+                (error_of (fun () -> Net.sendto u b 0 1 (host, up))) ;
+              Net.close l ) )
     ; test "a closed socket gives EBADF" (fun () ->
           w.run (fun () ->
               let l, _ = w.listen () and u, _ = w.udp () in
@@ -1443,7 +1481,7 @@ module Sem = Fiber.Semaphore
 
 (* [true] if [s] gives a permit in 1 ms. A free permit commits during the scan,
    before the timer is ready. *)
-let try_acquire s =
+let acquire_in_1ms s =
   sync
     (choose
        [ wrap (Sem.acquire s) (fun () -> true)
@@ -1459,12 +1497,39 @@ let holders n =
   (body, fun () -> Atomic.get over)
 
 (* Take [n] permits, then make sure that no other permit is free. Thus no permit
-   was lost or doubled. A lost permit makes the acquire wait forever. *)
+   was lost or doubled. The tries do not wait, so a lost permit gives a failure
+   and not a hang. *)
 let all_free s n =
   for _ = 1 to n do
-    sync (Sem.acquire s)
+    is_true (Sem.try_acquire s)
   done ;
-  equal bool false (try_acquire s)
+  equal bool false (Sem.try_acquire s)
+
+module S = Private.Sched
+
+(* Fork [f] in a promise, and wait until its fiber is parked in a sync. *)
+let fork_parked sc f =
+  let me = Atomic.make None in
+  let p =
+    Fiber.fork_promise sc (fun () ->
+        Atomic.set me (Some (S.prog "test" S.Self)) ;
+        f () )
+  in
+  let parked () =
+    match Atomic.get me with
+    | Some fb -> (
+      match Atomic.get fb.S.current with
+      | Some s ->
+          S.C.state s.S.word = S.C.Parked
+      | None ->
+          false )
+    | None ->
+        false
+  in
+  while not (parked ()) do
+    Fiber.yield ()
+  done ;
+  p
 
 let semaphores w =
   group "semaphores"
@@ -1484,35 +1549,31 @@ let semaphores w =
     ; test "an acquire that loses a choose does not take the permit" (fun () ->
           w.run (fun () ->
               let s = Sem.create 1 in
-              sync (Sem.acquire s) ;
-              equal bool false (try_acquire s) ;
+              is_true (Sem.try_acquire s) ;
+              equal bool false (acquire_in_1ms s) ;
               Sem.release s ;
               all_free s 1 ) )
     ; test "the waiters get the permits in FIFO order" (fun () ->
           w.run (fun () ->
               let s = Sem.create 1 and log = Log.create () in
-              sync (Sem.acquire s) ;
+              is_true (Sem.try_acquire s) ;
               Fiber.scope (fun sc ->
-                  for i = 1 to 5 do
-                    Fiber.fork sc (fun () ->
-                        Sem.use s (fun () -> Log.add log i) ) ;
-                    Time.sleep Mono (Span.ms 1)
-                  done ;
-                  Sem.release s ) ;
+                  let ps =
+                    List.init 5 (fun i ->
+                        fork_parked sc (fun () ->
+                            Sem.use s (fun () -> Log.add log (i + 1)) ) )
+                  in
+                  Sem.release s ; List.iter Promise.await ps ) ;
               equal (list int) [1; 2; 3; 4; 5] (Log.get log) ;
               all_free s 1 ) )
     ; test "a cancel of a waiter gives the permit to the next waiter" (fun () ->
           w.run (fun () ->
               let s = Sem.create 1 and log = Log.create () in
-              sync (Sem.acquire s) ;
+              is_true (Sem.try_acquire s) ;
               Fiber.scope (fun sc ->
                   let wait i =
-                    let p =
-                      Fiber.fork_promise sc (fun () ->
-                          Sem.use s (fun () -> Log.add log i) )
-                    in
-                    Time.sleep Mono (Span.ms 1) ;
-                    p
+                    fork_parked sc (fun () ->
+                        Sem.use s (fun () -> Log.add log i) )
                   in
                   let p1 = wait 1 in
                   let p2 = wait 2 in
@@ -1535,7 +1596,7 @@ let semaphores w =
               in
               (* The end comes first: the lock stays with its holder. *)
               let s = Sem.create 1 and closed = Ivar.create () in
-              sync (Sem.acquire s) ;
+              is_true (Sem.try_acquire s) ;
               Fiber.scope (fun sc ->
                   let p = Fiber.fork_promise sc (fun () -> close s closed) in
                   Time.sleep Mono (Span.ms 1) ;
@@ -1545,7 +1606,7 @@ let semaphores w =
               all_free s 1 ;
               (* The lock comes first. *)
               let s = Sem.create 1 and closed = Ivar.create () in
-              sync (Sem.acquire s) ;
+              is_true (Sem.try_acquire s) ;
               Fiber.scope (fun sc ->
                   let p =
                     Fiber.fork_promise sc (fun () ->
@@ -1563,7 +1624,7 @@ let semaphores w =
               let s = Sem.create 1 in
               for _ = 1 to 20 do
                 let closed = Ivar.create () in
-                sync (Sem.acquire s) ;
+                is_true (Sem.try_acquire s) ;
                 Fiber.scope (fun sc ->
                     Fiber.fork sc (fun () ->
                         match
@@ -1615,26 +1676,94 @@ let semaphores w =
                   done ) ;
               equal bool false (over ()) ;
               all_free s n ) )
-    ; test "release above the initial count raises Invalid_argument" (fun () ->
+    ; test "release above the maximum raises Invalid_argument" (fun () ->
           w.run (fun () ->
               let s = Sem.create 2 in
               let above =
                 Invalid_argument
-                  "Fiber.Semaphore.release: the count is at its initial value"
+                  "Fiber.Semaphore.release: the free permits are at the maximum"
               in
               raises above (fun () -> Sem.release s) ;
-              sync (Sem.acquire s) ;
+              is_true (Sem.try_acquire s) ;
               Sem.release s ;
               raises above (fun () -> Sem.release s) ;
               all_free s 2 ;
               (* A semaphore with no permit never gives one. *)
               let z = Sem.create 0 in
-              equal bool false (try_acquire z) ;
+              equal bool false (acquire_in_1ms z) ;
               raises above (fun () -> Sem.release z) ;
+              (* A count that starts at 0 and grows to its maximum. *)
+              let g = Sem.create ~max:2 0 in
+              equal bool false (Sem.try_acquire g) ;
+              Sem.release g ;
+              Sem.release g ;
+              raises above (fun () -> Sem.release g) ;
+              all_free g 2 ;
+              raises
+                (Invalid_argument
+                   "Fiber.Semaphore.create: the maximum is less than the count"
+                ) (fun () -> Sem.create ~max:1 2 ) ;
               raises
                 (Invalid_argument
                    "Fiber.Semaphore.create: the count is negative" ) (fun () ->
                   Sem.create (-1) ) ) )
+    ; test "use releases the permit when f raises, with no poison" (fun () ->
+          w.run (fun () ->
+              let s = Sem.create 1 in
+              raises Exit (fun () -> Sem.use s (fun () -> raise Exit)) ;
+              all_free s 1 ;
+              Sem.release s ;
+              equal int 3 (Sem.use s (fun () -> 3)) ;
+              all_free s 1 ) )
+    ; test
+        "try_release gives false at the maximum, and a waiter gets its permit"
+        (fun () ->
+          w.run (fun () ->
+              (* A rate limit: the refill of a full bucket does nothing. *)
+              let s = Sem.create ~max:2 0 in
+              is_true (Sem.try_release s) ;
+              is_true (Sem.try_release s) ;
+              equal bool false (Sem.try_release s) ;
+              all_free s 2 ;
+              (* A parked waiter gets the permit of try_release. *)
+              Fiber.scope (fun sc ->
+                  let p = fork_parked sc (fun () -> sync (Sem.acquire s)) in
+                  is_true (Sem.try_release s) ;
+                  equal bool false (Sem.try_acquire s) ;
+                  Promise.await p ) ;
+              (* The test and the waiter each hold one permit. *)
+              Sem.release s ;
+              Sem.release s ;
+              all_free s 2 ;
+              (* A count with no limit. *)
+              let u = Sem.create ~max:max_int 0 in
+              for _ = 1 to 1000 do
+                Sem.release u
+              done ;
+              all_free u 1000 ) )
+    ; test "try_acquire takes only a free permit" (fun () ->
+          w.run (fun () ->
+              let s = Sem.create 2 in
+              is_true (Sem.try_acquire s) ;
+              is_true (Sem.try_acquire s) ;
+              equal bool false (Sem.try_acquire s) ;
+              Sem.release s ;
+              is_true (Sem.try_acquire s) ;
+              Sem.release s ;
+              Sem.release s ;
+              all_free s 2 ) )
+    ; test "a release gives the permit to a parked waiter, not to a new try"
+        (fun () ->
+          w.run (fun () ->
+              let s = Sem.create 1 in
+              is_true (Sem.try_acquire s) ;
+              Fiber.scope (fun sc ->
+                  let p = fork_parked sc (fun () -> sync (Sem.acquire s)) in
+                  Sem.release s ;
+                  equal bool false (Sem.try_acquire s) ;
+                  Promise.await p ;
+                  Sem.release s ) ;
+              all_free s 1 ) )
     ; test "acquire is a cancellation point when a permit is free" (fun () ->
           w.run (fun () ->
               let s = Sem.create 1 in
@@ -1955,6 +2084,30 @@ let files w =
               Dir.rename (p "dir/sub") (p "empty") ;
               equal (list string) [] (Dir.readdir (p "dir")) ;
               is_true ((File.stat (p "empty")).kind = File.Directory) ) )
+    ; test "a NUL byte in a path, a name or an argument gives EINVAL" (fun () ->
+          w.run (fun () ->
+              let p = Filename.concat (w.tmp ()) in
+              let bad = p "a\000b" in
+              Dir.mkdir (p "a") ;
+              let nul f =
+                equal string "EINVAL: a NUL byte in a string" (fs_error f)
+              in
+              nul (fun () -> File.openfile [Write; Create] bad) ;
+              nul (fun () -> File.stat bad) ;
+              nul (fun () -> Dir.mkdir bad) ;
+              nul (fun () -> Dir.readdir bad) ;
+              nul (fun () -> Dir.rename (p "a") bad) ;
+              nul (fun () -> Dir.rename bad (p "c")) ;
+              nul (fun () -> Dir.unlink bad) ;
+              nul (fun () -> Dir.rmdir bad) ;
+              nul (fun () -> Dns.resolve "localhost\000x") ;
+              nul (fun () -> Dns.reverse "127.0.0.1\000x") ;
+              nul (fun () -> Process.spawn "sh\000x" []) ;
+              nul (fun () -> Process.spawn "sh" ["-c\000x"]) ;
+              nul (fun () -> Process.spawn ~env:["A=\000"] "sh" []) ;
+              nul (fun () -> Process.spawn ~cwd:bad "sh" []) ;
+              (* Nothing changed. *)
+              equal (list string) [] (Dir.readdir (p "a")) ) )
     ; test "pread and pwrite at offset 0 do not move the offset" (fun () ->
           w.run (fun () ->
               let path = Filename.concat (w.tmp ()) "o" in
