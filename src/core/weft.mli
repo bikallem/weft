@@ -344,11 +344,12 @@ module Net : sig
     | Not_empty  (** [ENOTEMPTY]. *)
     | No_resources of string
         (** The OS has no resource for the operation at this time: [EMFILE],
-            [ENFILE], [ENOBUFS] or [ENOMEM]. A spawn, and a [File], [Dir] or
-            [Dns] operation when the thread pool cannot start a thread, give
-            [EAGAIN]. The string is the name of the errno, for example
-            ["EMFILE"]. A program can pause, then try again. The simulator gives
-            ["EMFILE"] at the limit of [Weft_sim.set_fd_limit]. *)
+            [ENFILE], [ENOBUFS] or [ENOMEM]. A spawn gives [EAGAIN] at the limit
+            of processes. A [File], [Dir] or [Dns] operation gives [EAGAIN] when
+            the thread pool cannot start a thread. The string is the name of the
+            errno, for example ["EMFILE"]. A program can pause, then try again.
+            The simulator gives ["EMFILE"] at the limit of
+            [Weft_sim.set_fd_limit]. *)
     | Other of string
 
   (** The error, and the name of the function. It is [Private.Net.Error]. *)
@@ -359,14 +360,18 @@ module Net : sig
   val accept : t -> t * addr
   (** Waits for a connection, and gives its socket and the address of the
       client. A connection that the client reset before the accept gives no
-      error. Linux and the simulator give the connection, and its first read
-      gets [Error (Reset, _)]. On macOS and FreeBSD, the OS gives
-      [ECONNABORTED], and [accept] takes the next connection.
+      error. On FreeBSD, the OS gives [ECONNABORTED], and [accept] takes the
+      next connection. Linux, macOS and the simulator give the connection. On
+      Linux and in the simulator, its first read gets [Error (Reset, _)]. On
+      macOS, its address is [Tcp ("", 0)].
 
       @raise Error
-        with [No_resources] if the process or the system has no free fd. The
-        connection stays in the backlog, and the next [accept] can get it. Thus
-        an accept loop pauses, then calls [accept] again. *)
+        with [No_resources] if the process or the system has no free fd or no
+        memory. On Linux, FreeBSD and the simulator, the connection stays in the
+        backlog, and the next [accept] can get it. macOS closes it. Thus an
+        accept loop pauses, then calls [accept] again. The facts about macOS and
+        the backlog of FreeBSD come from a read of their source, not from a
+        test. *)
 
   val connect : addr -> t
 
