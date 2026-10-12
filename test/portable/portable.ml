@@ -862,20 +862,34 @@ let local_addr w =
           w.run (fun () ->
               let host = host_of w in
               let einval f = equal string "EINVAL" (error_of f) in
-              einval (fun () -> Net.listen (Net.Tcp (host, 65536))) ;
-              einval (fun () -> Net.listen (Net.Tcp (host, -1))) ;
-              einval (fun () -> Net.listen (Net.Tcp (host ^ "\000x", 0))) ;
-              einval (fun () -> Net.connect (Net.Tcp (host, 65536))) ;
-              einval (fun () -> Net.connect (Net.Tcp (host ^ "\000x", 1))) ;
+              let nul f =
+                equal string "EINVAL: a NUL byte in a string" (error_of f)
+              in
+              (* A port of more than 32 bits is not cut to its low bits. *)
+              let big = 1 lsl 32 in
+              let l = Net.listen (Net.Tcp (host, 0)) in
+              let p =
+                match Net.local_addr l with Net.Tcp (_, p) -> p | _ -> 0
+              in
+              List.iter
+                (fun port ->
+                  einval (fun () -> Net.listen (Net.Tcp (host, port))) ;
+                  einval (fun () -> Net.connect (Net.Tcp (host, port))) ;
+                  einval (fun () -> Net.udp (host, port)) )
+                [65536; -1; big] ;
+              einval (fun () -> Net.connect (Net.Tcp (host, big + p))) ;
+              nul (fun () -> Net.listen (Net.Tcp (host ^ "\000x", 0))) ;
+              nul (fun () -> Net.connect (Net.Tcp (host ^ "\000x", p))) ;
               let path = Filename.concat (w.tmp ()) "s" in
-              einval (fun () -> Net.listen (Net.Unix (path ^ "\000x"))) ;
-              einval (fun () -> Net.connect (Net.Unix (path ^ "\000x"))) ;
-              einval (fun () -> Net.udp (host, 65536)) ;
-              einval (fun () -> Net.udp (host ^ "\000x", 0)) ;
-              let u, _ = w.udp () and b = Bytes.of_string "x" in
+              nul (fun () -> Net.listen (Net.Unix (path ^ "\000x"))) ;
+              nul (fun () -> Net.connect (Net.Unix (path ^ "\000x"))) ;
+              nul (fun () -> Net.udp (host ^ "\000x", 0)) ;
+              let u, (_, up) = w.udp () and b = Bytes.of_string "x" in
               einval (fun () -> Net.sendto u b 0 1 (host, 65536)) ;
-              einval (fun () -> Net.sendto u b 0 1 (host ^ "\000x", 1)) ;
-              Net.close u ) )
+              einval (fun () -> Net.sendto u b 0 1 (host, big + up)) ;
+              nul (fun () -> Net.sendto u b 0 1 (host ^ "\000x", up)) ;
+              Net.close u ;
+              Net.close l ) )
     ; test "a closed socket gives EBADF" (fun () ->
           w.run (fun () ->
               let l, _ = w.listen () and u, _ = w.udp () in

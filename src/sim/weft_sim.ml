@@ -218,15 +218,19 @@ let open_fds t = Hashtbl.length t.net.fds
 
 let key addr = Format.asprintf "%a" Op.pp_addr addr
 
-(* The checks of [make_addr] in the POSIX worlds: a NUL byte in a host or a
-   path, or a port out of range, gives EINVAL. *)
-let bad_host_port h p = String.contains h '\000' || p < 0 || p > 65535
+(* The checks of an address in the POSIX worlds ([with_addr]): a NUL byte in a
+   host or a path, or a port out of range, gives EINVAL. *)
+let addr_error h p =
+  if String.contains h '\000' then
+    Some (Op.Other "EINVAL: a NUL byte in a string")
+  else if p < 0 || p > 65535 then Some (Op.Other "EINVAL")
+  else None
 
-let bad_addr = function
+let addr_error_of = function
   | Op.Tcp (h, p) ->
-      bad_host_port h p
+      addr_error h p
   | Op.Unix path ->
-      String.contains path '\000'
+      addr_error path 0
 
 let avail c = Buffer.length c.inbox - c.rpos
 
@@ -862,7 +866,7 @@ let spawn t (sp : Op.spawn) =
         ; from_stdout= fd from_stdout
         ; from_stderr= fd from_stderr }
 
-let submit : type a. t -> a Op.t -> (a, Op.error) result =
+let submit_op : type a. t -> a Op.t -> (a, Op.error) result =
  fun t op ->
   let n = t.net in
   let conn fd k =
@@ -879,8 +883,6 @@ let submit : type a. t -> a Op.t -> (a, Op.error) result =
         Error Op.Bad_fd
   in
   match op with
-  | Op.Listen (addr, _) when bad_addr addr ->
-      Error (Op.Other "EINVAL")
   | Op.Listen (addr, backlog) ->
       (* A listen on port 0 gets a free port, as on Linux. *)
       let addr =
@@ -906,8 +908,6 @@ let submit : type a. t -> a Op.t -> (a, Op.error) result =
              ; laddr= addr } ) ;
         Hashtbl.replace n.names k fd ;
         Ok fd
-  | Op.Connect addr when bad_addr addr ->
-      Error (Op.Other "EINVAL")
   | Op.Connect addr -> (
       let refused () = Error Op.Refused in
       match Hashtbl.find_opt n.names (key addr) with
@@ -915,6 +915,11 @@ let submit : type a. t -> a Op.t -> (a, Op.error) result =
           refused ()
       | Some lfd -> (
         match Hashtbl.find_opt n.fds lfd with
+        | Some (Lsn {ltcp= true; _})
+          when Hashtbl.length n.client_ports > 65535 - 40000 ->
+            (* Each port of the counter has an open client, as Linux gives
+               EADDRNOTAVAIL when it has no free port. *)
+            Error (Op.Other "EADDRNOTAVAIL")
         | Some (Lsn l) when Queue.length l.backlog + l.pending < l.limit ->
             l.pending <- l.pending + 1 ;
             (* The client has the host "client" and a port from the counter that
@@ -1017,8 +1022,6 @@ let submit : type a. t -> a Op.t -> (a, Op.error) result =
         Error (Op.Other "EDESTADDRREQ")
     | _ ->
         conn fd (fun c -> write_conn t c buf off len) )
-  | Op.Udp (host, port) when bad_host_port host port ->
-      Error (Op.Other "EINVAL")
   | Op.Udp (host, port) ->
       let key p = Printf.sprintf "%s:%d" host p in
       let port =
@@ -1035,8 +1038,6 @@ let submit : type a. t -> a Op.t -> (a, Op.error) result =
         Ok fd
   | Op.Sendto (fd, buf, off, len, host, port) -> (
     match Hashtbl.find_opt n.fds fd with
-    | Some (Dgm _) when bad_host_port host port ->
-        Error (Op.Other "EINVAL")
     | Some (Dgm g) ->
         send_dgram t g (Bytes.sub_string buf off len) host port
     | Some (Conn _ | Lsn _) ->
@@ -1234,6 +1235,23 @@ let submit : type a. t -> a Op.t -> (a, Op.error) result =
     | _ ->
         model_error
           "Deregister of fd %d on domain %d, which has no registration" fd d )
+
+let submit : type a. t -> a Op.t -> (a, Op.error) result =
+ fun t op ->
+  let checked =
+    match op with
+    | Op.Listen (addr, _) ->
+        addr_error_of addr
+    | Op.Connect addr ->
+        addr_error_of addr
+    | Op.Udp (h, p) ->
+        addr_error h p
+    | Op.Sendto (_, _, _, _, h, p) ->
+        addr_error h p
+    | _ ->
+        None
+  in
+  match checked with Some e -> Error e | None -> submit_op t op
 
 (* The edges of domain [d], the oldest first. *)
 let take_edges t d =

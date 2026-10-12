@@ -419,6 +419,15 @@ let host_port = function
   | Op.Unix path ->
       (1, path, 0)
 
+(* The checks of an address before the C side, as in the simulator. The C side
+   reads a string up to its first NUL byte, and [Int_val] to an [int] of C cuts
+   a large port. Thus without these checks, the socket can use a different
+   address. *)
+let with_addr h port k =
+  if String.contains h '\000' then nul_error
+  else if port < 0 || port > 65535 then Error (Op.Other "EINVAL")
+  else k ()
+
 (* [spawn_child args defaults] (weft_spawn.c). [defaults] are the signals that
    get the default action in the child. *)
 external spawn_child :
@@ -475,7 +484,7 @@ let submit : type a. pool -> a Op.t -> (a, Op.error) result option =
   match op with
   | Op.Listen (addr, backlog) ->
       let kind, h, port = host_port addr in
-      Some (result (listen kind h port backlog))
+      Some (with_addr h port (fun () -> result (listen kind h port backlog)))
   | Op.Accept fd ->
       let r, host, port, unix = accept fd in
       Some
@@ -484,11 +493,13 @@ let submit : type a. pool -> a Op.t -> (a, Op.error) result option =
            (result r) )
   | Op.Connect addr ->
       let kind, h, port = host_port addr in
-      let r = connect kind h port in
-      (* A Unix socket gives EAGAIN when the backlog of the listener is full.
-         This is not a connect that continues. *)
-      if r = -eagain then Some (Error (Op.Other "EAGAIN: the backlog is full"))
-      else Some (result r)
+      Some
+        (with_addr h port (fun () ->
+             let r = connect kind h port in
+             (* A Unix socket gives EAGAIN when the backlog of the listener is
+                full. This is not a connect that continues. *)
+             if r = -eagain then Error (Op.Other "EAGAIN: the backlog is full")
+             else result r ) )
   | Op.Connect_result fd ->
       Some (unit (connect_result fd))
   | Op.Local_addr fd ->
@@ -506,9 +517,11 @@ let submit : type a. pool -> a Op.t -> (a, Op.error) result option =
   | Op.Reset_on_close fd ->
       Some (unit (reset_on_close fd))
   | Op.Udp (host, port) ->
-      Some (result (udp host port))
+      Some (with_addr host port (fun () -> result (udp host port)))
   | Op.Sendto (fd, buf, off, len, host, port) ->
-      Some (result (sendto fd buf off len (host, port)))
+      Some
+        (with_addr host port (fun () ->
+             result (sendto fd buf off len (host, port)) ) )
   | Op.Recvfrom (fd, buf, off, len) ->
       let n, host, port = recvfrom fd buf off len in
       Some (Result.map (fun n -> (n, host, port)) (result n))
