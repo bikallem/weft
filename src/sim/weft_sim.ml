@@ -86,8 +86,8 @@ type conn =
             this error one time. *)
   ; mutable lost: bool
         (** [Sim.fault] with an error that is not [Reset]: the link is lost. The
-            data of the peer stays in flight, so the window of the peer stays
-            full. *)
+            data of the peer stays in flight, and a read of this side frees no
+            space, so the window of the peer stays full. *)
   ; mutable established: bool
   ; mutable refused: bool
   ; mutable cfd: int  (** [-1] until the server side is accepted. *)
@@ -569,6 +569,9 @@ let read_conn t c buf off len =
     let k = part t (Int.min a len) in
     Buffer.blit c.inbox c.rpos buf off k ;
     c.rpos <- c.rpos + k ;
+    (* After a lost link, the space stays in use: the peer gets no
+       acknowledgment, so its window stays full. *)
+    if c.lost then c.inflight <- c.inflight + k ;
     if c.rpos = Buffer.length c.inbox then (
       Buffer.clear c.inbox ;
       c.rpos <- 0 ) ;

@@ -1188,6 +1188,38 @@ let fault_lost_window () =
           Net.close b ) )
     [0; 5]
 
+(* After a lost link, the reads of the side of the fault do not free the window
+   of the peer. A writer of the peer fills the window and waits. The side of the
+   fault reads its data, then gets its error, and the writer still waits: the
+   simulator finds no lost wakeup, and [write_now] gives None. *)
+let fault_lost_reads () =
+  Sim.run (fun sim ->
+      Sim.set_latency sim (Span.ms 1) ;
+      let a, b = Sim.socket_pair sim in
+      let chunk = Bytes.make 65536 'x' in
+      Fiber.scope (fun s ->
+          Fiber.fork_daemon s (fun () ->
+              try
+                while true do
+                  ignore (Net.write_sub b chunk 0 65536)
+                done
+              with Net.Error _ -> () ) ;
+          Time.sleep Mono (Span.ms 10) ;
+          Sim.fault sim a (Net.Other "ETIMEDOUT") ;
+          let buf = Bytes.create 65536 in
+          let rec drain total =
+            match Net.read a buf 0 65536 with
+            | k ->
+                drain (total + k)
+            | exception Net.Error (Other "ETIMEDOUT", _) ->
+                total
+          in
+          equal int 65536 (drain 0) ;
+          Time.sleep Mono (Span.s 1) ;
+          is_true (Net.write_now b chunk 0 65536 = None) ) ;
+      Net.close a ;
+      Net.close b )
+
 (* A fiber that waits in a write, with a full window, wakes at the fault. *)
 let fault_wakes_writer () =
   Sim.run ~domains:2 (fun sim ->
@@ -1303,6 +1335,8 @@ let tests =
       ; test "a seed gives the same run with a fault" fault_deterministic
       ; test "after a lost link, the window of the peer stays full"
           fault_lost_window
+      ; test "after a lost link, the reads do not free the window of the peer"
+          fault_lost_reads
       ; test "a fiber that waits in a write gets the error" fault_wakes_writer
       ; test "a second fault replaces the error" fault_one_slot
       ; test "the close of a listener gives no reset after a fault"
