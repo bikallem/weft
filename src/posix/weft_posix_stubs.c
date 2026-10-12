@@ -319,6 +319,13 @@ value weft_shutdown_send(value fd) {
   return Val_int(shutdown(Int_val(fd), SHUT_WR) < 0 ? ERR : 0);
 }
 
+/* SO_LINGER on with a time of 0: close(2) then sends a reset (RST) and does
+   not block. */
+value weft_reset_on_close(value fd) {
+  struct linger l = {1, 0};
+  return Val_int(setsockopt(Int_val(fd), SOL_SOCKET, SO_LINGER, &l, sizeof l) < 0 ? ERR : 0);
+}
+
 /* Pipes and fds */
 
 /* A pipe with O_NONBLOCK on the two ends. (r, w), or (-errno, -1). */

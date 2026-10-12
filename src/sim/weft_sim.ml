@@ -75,6 +75,10 @@ type conn =
   ; mutable peer: conn option  (** [None] after the peer closed. *)
   ; mutable eof: bool  (** The peer ended its send side. *)
   ; mutable shut: bool  (** This side ended its send side. *)
+  ; mutable reset: bool
+        (** A reset came: the next read with no data, or on TCP the next write,
+            gives [Reset]. *)
+  ; mutable abort: bool  (** [Reset_on_close]: the close sends a reset. *)
   ; mutable established: bool
   ; mutable refused: bool
   ; mutable cfd: int  (** [-1] until the server side is accepted. *)
@@ -149,6 +153,7 @@ type net =
   ; mutable short_io: bool
   ; mutable extra_edges: bool
   ; mutable udp_loss: bool
+  ; mutable resets: bool
   ; mutable next_port: int }
 
 (* The result of a job, before [Finish] gives it with its type. *)
@@ -540,19 +545,67 @@ let read_conn t c buf off len =
     | None ->
         () ) ;
     Ok k )
+  else if c.reset then (
+    c.reset <- false ;
+    Error Op.Reset )
   else if c.eof then Ok 0
   else if c.refused then Error Op.Reset
   else Error Op.Would_block
 
+(* The close of a socket or of an end of a pipe: the peer reads the end of the
+   stream, and a write of the peer gives EPIPE. *)
+let close_conn t c =
+  match c.peer with
+  | Some p ->
+      c.peer <- None ;
+      deliver t c p (fun () ->
+          p.eof <- true ;
+          p.peer <- None ;
+          edge t.net p.cfd ~read:true ~write:true )
+  | None ->
+      ()
+
+(* A reset from [c] to its peer, as on Linux. The peer reads the data that came
+   before the reset. Then its next read with no data gives ECONNRESET, and later
+   reads give the end of the stream. On TCP (an RST), the next write also gives
+   ECONNRESET, and clears it. After a [Shutdown] of [c], a TCP peer gets the end
+   of the stream and EPIPE. A Unix stream socket gives a reset only if [c] has
+   unread data, also after a [Shutdown], and a write of the peer gives EPIPE.
+   The other cases are a normal close. *)
+let reset_conn t c =
+  let reset = if c.tcp then not c.shut else c.role = Sock && avail c > 0 in
+  match c.peer with
+  | Some p when reset ->
+      c.peer <- None ;
+      deliver t c p (fun () ->
+          p.reset <- true ;
+          p.eof <- true ;
+          p.peer <- None ;
+          edge t.net p.cfd ~read:true ~write:true )
+  | _ ->
+      close_conn t c
+
 (* A write of a socket or of the write end of a pipe. The data of a pipe arrives
-   at once, and the data of a socket after the latency. *)
+   at once, and the data of a socket after the latency. Data that arrives after
+   the close or the reset of the peer is lost. With [resets], one write of a TCP
+   socket in 64 resets the connection: this side gets ECONNRESET at once, and
+   the peer gets the reset after the delay. *)
 let write_conn t c buf off len =
   let n = t.net in
-  if c.shut then Error Op.Broken_pipe
+  if c.reset && c.tcp then (
+    c.reset <- false ;
+    Error Op.Reset )
+  else if c.shut then Error Op.Broken_pipe
   else
     match c.peer with
     | None ->
         Error Op.Broken_pipe
+    | Some _ when c.tcp && n.resets && Prng.int t.prng 64 = 0 ->
+        reset_conn t c ;
+        c.eof <- true ;
+        (* A fiber that waits on this side reads the end of the stream. *)
+        edge n c.cfd ~read:true ~write:true ;
+        Error Op.Reset
     | Some p ->
         let space = capacity - avail p - p.inflight in
         (* A write of at most PIPE_BUF bytes to a pipe is atomic. *)
@@ -569,22 +622,10 @@ let write_conn t c buf off len =
           p.inflight <- p.inflight + k ;
           deliver t c p (fun () ->
               p.inflight <- p.inflight - k ;
-              Buffer.add_string p.inbox data ;
-              edge n p.cfd ~read:true ~write:false ) ;
+              if Option.is_some p.peer then (
+                Buffer.add_string p.inbox data ;
+                edge n p.cfd ~read:true ~write:false ) ) ;
           Ok k
-
-(* The close of a socket or of an end of a pipe: the peer reads the end of the
-   stream, and a write of the peer gives EPIPE. *)
-let close_conn t c =
-  match c.peer with
-  | Some p ->
-      c.peer <- None ;
-      deliver t c p (fun () ->
-          p.eof <- true ;
-          p.peer <- None ;
-          edge t.net p.cfd ~read:true ~write:true )
-  | None ->
-      ()
 
 (* The largest datagram of UDP over IPv4. *)
 let max_datagram = 65507
@@ -734,6 +775,8 @@ let new_pipe n =
     ; peer= None
     ; eof= false
     ; shut= false
+    ; reset= false
+    ; abort= false
     ; established= true
     ; refused= false
     ; cfd= new_fd n
@@ -846,6 +889,8 @@ let submit : type a. t -> a Op.t -> (a, Op.error) result =
               ; peer= None
               ; eof= false
               ; shut= false
+              ; reset= false
+              ; abort= false
               ; established= false
               ; refused= false
               ; cfd= -1
@@ -1025,6 +1070,17 @@ let submit : type a. t -> a Op.t -> (a, Op.error) result =
           | None ->
               () ) ;
           Ok () )
+  | Op.Reset_on_close fd -> (
+    match Hashtbl.find_opt n.fds fd with
+    | Some (Conn {role= Rd_end | Wr_end; _} | Fil _ | Pfd _) ->
+        Error (Op.Other "ENOTSOCK")
+    | Some (Conn c) ->
+        c.abort <- true ;
+        Ok ()
+    | Some (Lsn _ | Dgm _) ->
+        Ok ()
+    | None ->
+        Error Op.Bad_fd )
   | Op.Close fd -> (
       if Hashtbl.mem n.regs fd then
         model_error "close(2) of fd %d before the Deregister of each domain" fd ;
@@ -1042,7 +1098,10 @@ let submit : type a. t -> a Op.t -> (a, Op.error) result =
           Hashtbl.remove n.opts fd ;
           ( match sfd with
           | Conn c ->
-              close_conn t c
+              (* Linux also sends a reset at the close of a TCP or Unix stream
+                 socket with unread data. *)
+              if c.abort || (c.role = Sock && avail c > 0) then reset_conn t c
+              else close_conn t c
           | Dgm g ->
               Hashtbl.remove n.udp_names g.dkey
           | Lsn l ->
@@ -1051,7 +1110,10 @@ let submit : type a. t -> a Op.t -> (a, Op.error) result =
                 (fun s ->
                   match s.peer with
                   | Some c ->
-                      c.refused <- true ;
+                      (* The connection is established: it gets a reset, as from
+                         [reset_conn]. *)
+                      c.reset <- true ;
+                      c.eof <- true ;
                       c.peer <- None ;
                       edge n c.cfd ~read:true ~write:true
                   | None ->
@@ -1422,6 +1484,7 @@ let run ?(seed = 0) ?(domains = 1) ?(auto = true) ?(signals = [])
         ; short_io= false
         ; extra_edges= false
         ; udp_loss= false
+        ; resets= false
         ; next_port= 40000 }
     ; agenda= []
     ; next_id= 0
@@ -1552,10 +1615,18 @@ let set_posix t p =
     (sched t).doms
 
 type net_faults =
-  {jitter: Weft.Span.t; short_io: bool; extra_edges: bool; udp_loss: bool}
+  { jitter: Weft.Span.t
+  ; short_io: bool
+  ; extra_edges: bool
+  ; udp_loss: bool
+  ; resets: bool }
 
 let no_faults =
-  {jitter= Weft.Span.zero; short_io= false; extra_edges= false; udp_loss= false}
+  { jitter= Weft.Span.zero
+  ; short_io= false
+  ; extra_edges= false
+  ; udp_loss= false
+  ; resets= false }
 
 let net_faults t (f : net_faults) =
   if Int64.compare (Weft.Span.to_ns f.jitter) 0L < 0 then
@@ -1563,7 +1634,8 @@ let net_faults t (f : net_faults) =
   t.net.jitter <- Weft.Span.to_ns f.jitter ;
   t.net.short_io <- f.short_io ;
   t.net.extra_edges <- f.extra_edges ;
-  t.net.udp_loss <- f.udp_loss
+  t.net.udp_loss <- f.udp_loss ;
+  t.net.resets <- f.resets
 
 let set_blocking_cost t span =
   if Int64.compare (Weft.Span.to_ns span) 0L < 0 then

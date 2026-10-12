@@ -135,6 +135,10 @@ type _ t =
   | Read : fd * bytes * int * int -> int t  (** 0 at the end of the stream. *)
   | Write : fd * bytes * int * int -> int t
   | Shutdown : fd -> unit t  (** Ends the send side. *)
+  | Reset_on_close : fd -> unit t
+      (** Sets [SO_LINGER] to on with a time of 0. Then the close(2) of the fd
+          sends a reset (RST), not the end of the stream, and it does not block.
+      *)
   | Udp : string * int -> fd t
       (** A UDP socket, bound to a host and a port. The port 0 gives a free
           port. *)

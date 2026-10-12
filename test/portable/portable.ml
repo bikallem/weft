@@ -435,6 +435,327 @@ let net w =
                   is_true (String.equal data (Promise.await r)) ;
                   Net.close c ) ) ) ]
 
+(* [read_now], [write_now] and [reset]. *)
+
+(* Read with [readable] and [read_now] until the end of the stream. The limit of
+   the stale events stops a loop that spins: in the simulator, the time does not
+   move while a fiber spins. *)
+let read_now_all c =
+  let b = Buffer.create 64 and buf = Bytes.create 4096 and stale = ref 0 in
+  let rec loop () =
+    sync (Net.readable c) ;
+    match Net.read_now c buf 0 4096 with
+    | None ->
+        incr stale ;
+        if !stale > 1000 then failwith "the loop spins" ;
+        loop ()
+    | Some 0 ->
+        Buffer.contents b
+    | Some k ->
+        Buffer.add_subbytes b buf 0 k ;
+        loop ()
+  in
+  loop ()
+
+let read_error c = error_of (fun () -> Net.read c (Bytes.create 16) 0 16)
+
+(* Write until a write gives an error, at most 100 times: the reset of the peer
+   can come later. Then give the text of the error. *)
+let first_write_error c =
+  let rec go n =
+    if n = 0 then "no error"
+    else
+      match Net.write c "x" with
+      | () ->
+          Time.sleep Mono (Span.ms 1) ;
+          go (n - 1)
+      | exception Net.Error (e, _) ->
+          Format.asprintf "%a" Private.Op.pp_error e
+  in
+  go 100
+
+(* A connection, and a server fiber that runs [f] on the accepted socket. The
+   server starts only after [connect] gave the socket: if the reset came during
+   the connect, [connect] would raise ECONNRESET. The client starts only after
+   [accept] gave the socket: on FreeBSD, an accept of a connection that the
+   client reset in the backlog gives ECONNABORTED. *)
+let with_conn w f client =
+  let l, a = w.listen () in
+  let connected = Ivar.create () and accepted = Ivar.create () in
+  Fiber.scope (fun s ->
+      Fiber.fork s (fun () ->
+          let c, _ = Net.accept l in
+          Ivar.fill accepted () ;
+          sync (Ivar.read connected) ;
+          f c ) ;
+      let c = Net.connect a in
+      Ivar.fill connected () ;
+      sync (Ivar.read accepted) ;
+      client c ;
+      Net.close c ) ;
+  Net.close l
+
+let now_and_reset w =
+  group "read_now, write_now and reset"
+    [ test "read_now gives None, then the data, then the end of the stream"
+        (fun () ->
+          w.run (fun () ->
+              let go = Ivar.create () in
+              with_conn w
+                (fun c ->
+                  sync (Ivar.read go) ;
+                  Net.write c "hello" ;
+                  Net.close c )
+                (fun c ->
+                  equal (option int) None (Net.read_now c (Bytes.create 4) 0 4) ;
+                  Ivar.fill go () ;
+                  equal string "hello" (read_now_all c) ) ) )
+    ; test "a loop of readable and read_now waits for a new edge" (fun () ->
+          w.run (fun () ->
+              let go = Ivar.create () in
+              with_conn w
+                (fun c ->
+                  sync (Ivar.read go) ;
+                  Net.write c "x" ;
+                  ignore (read_all c) ;
+                  Net.close c )
+                (fun c ->
+                  (* The read of another fiber takes the data with no EAGAIN, so
+                     the read flag of its domain stays set. The worlds with one
+                     domain find a loop that spins. On more domains, the other
+                     fiber can run on another domain, and the test then proves
+                     less. *)
+                  Fiber.scope (fun s ->
+                      let b = Fiber.fork_promise s (fun () -> read_n c 1) in
+                      Fiber.yield () ;
+                      Ivar.fill go () ;
+                      equal string "x" (Promise.await b) ) ;
+                  let stop =
+                    Option.get (Time.add Mono (Time.now Mono) (Span.ms 20))
+                  in
+                  let buf = Bytes.create 1 in
+                  (* Without a clear of the flag after None, the loop spins
+                     until the limit. *)
+                  let rec loop n =
+                    if n >= 1000 then n
+                    else
+                      match
+                        sync
+                          (choose
+                             [ wrap (Net.readable c) (fun () -> `Input)
+                             ; wrap (Time.at Mono stop) (fun () -> `Stop) ] )
+                      with
+                      | `Stop ->
+                          n
+                      | `Input -> (
+                        match Net.read_now c buf 0 1 with
+                        | None ->
+                            loop (n + 1)
+                        | Some k ->
+                            failwith (Printf.sprintf "read_now gave %d" k) )
+                  in
+                  less int ~than:50 (loop 0) ) ) )
+    ; test "write_now gives None when the socket is full" (fun () ->
+          w.run (fun () ->
+              let go = Ivar.create () and got = Ivar.create () in
+              with_conn w
+                (fun c ->
+                  sync (Ivar.read go) ;
+                  Ivar.fill got (String.length (read_all c)) ;
+                  Net.close c )
+                (fun c ->
+                  let chunk = Bytes.make 65536 'x' in
+                  let rec fill total =
+                    match Net.write_now c chunk 0 65536 with
+                    | Some k ->
+                        fill (total + k)
+                    | None ->
+                        total
+                  in
+                  let total = fill 0 in
+                  at_least int ~than:1 total ;
+                  Ivar.fill go () ;
+                  (* After None, [writable] waits until the reader takes
+                     data. *)
+                  sync (Net.writable c) ;
+                  Net.shutdown c ;
+                  equal int total (sync (Ivar.read got)) ) ) )
+    ; test "reset gives ECONNRESET to the peer, then the end of the stream"
+        (fun () ->
+          w.run (fun () ->
+              with_conn w Net.reset (fun c ->
+                  equal string "ECONNRESET" (read_error c) ;
+                  equal string "" (read_all c) ) ) )
+    ; test "a write after a reset of the peer gives an error" (fun () ->
+          w.run (fun () ->
+              with_conn w Net.reset (fun c ->
+                  (* Linux gives ECONNRESET, and FreeBSD can give EPIPE. *)
+                  mem string (first_write_error c) ["ECONNRESET"; "EPIPE"] ) ) )
+    ; test "reset gives EBADF to a fiber that waits, and RST to the peer"
+        (fun () ->
+          w.run (fun () ->
+              let peer = Ivar.create () in
+              with_conn w
+                (fun c ->
+                  Ivar.fill peer (read_error c) ;
+                  Net.close c )
+                (fun c ->
+                  Fiber.scope (fun s ->
+                      let p = Fiber.fork_promise s (fun () -> read_error c) in
+                      Fiber.yield () ;
+                      Net.reset c ;
+                      equal string "EBADF" (Promise.await p) ) ;
+                  equal string "ECONNRESET" (sync (Ivar.read peer)) ) ) )
+    ; test "a reset after the peer closed, and a second reset, raise nothing"
+        (fun () ->
+          w.run (fun () ->
+              with_conn w Net.close (fun c ->
+                  equal string "" (read_all c) ;
+                  Net.reset c ;
+                  Net.reset c ;
+                  equal string "EBADF" (read_error c) ) ) )
+    ; test "a reset of a listener closes it" (fun () ->
+          w.run (fun () ->
+              let l, _ = w.listen () in
+              Net.reset l ;
+              equal string "EBADF" (error_of (fun () -> Net.accept l)) ) ) ]
+
+(* A Unix connection. The client writes data that the server does not read, then
+   the server runs [close] on its socket. Then the client runs [client]. *)
+let unix_unread w close client =
+  let a = Net.Unix (Filename.concat (w.tmp ()) "u") in
+  let l = Net.listen a in
+  let sent = Ivar.create () and closed = Ivar.create () in
+  Fiber.scope (fun s ->
+      Fiber.fork s (fun () ->
+          let c, _ = Net.accept l in
+          sync (Ivar.read sent) ;
+          close c ;
+          Ivar.fill closed () ) ;
+      let c = Net.connect a in
+      Net.write c "unread" ;
+      Ivar.fill sent () ;
+      sync (Ivar.read closed) ;
+      Time.sleep Mono (Span.ms 10) ;
+      client c ;
+      Net.close c ) ;
+  Net.close l
+
+(* The details of a reset that follow Linux. The simulator and the Linux world
+   run them. *)
+let reset_details w =
+  let pause () = Time.sleep Mono (Span.ms 10) in
+  group
+    (w.name ^ ": reset, as on Linux")
+    [ test "the peer reads the data before the reset" (fun () ->
+          w.run (fun () ->
+              with_conn w
+                (fun c -> Net.write c "data" ; pause () ; Net.reset c)
+                (fun c ->
+                  equal string "data" (read_n c 4) ;
+                  equal string "ECONNRESET" (read_error c) ;
+                  equal string "" (read_all c) ) ) )
+    ; test "a write after the reset gives ECONNRESET, then EPIPE" (fun () ->
+          w.run (fun () ->
+              with_conn w Net.reset (fun c ->
+                  equal string "ECONNRESET" (first_write_error c) ;
+                  equal string "EPIPE" (error_of (fun () -> Net.write c "x")) ;
+                  equal string "" (read_all c) ) ) )
+    ; test "a reset after shutdown gives the end of the stream and EPIPE"
+        (fun () ->
+          w.run (fun () ->
+              let reset = Ivar.create () in
+              with_conn w
+                (fun c ->
+                  Net.shutdown c ; pause () ; Net.reset c ; Ivar.fill reset () )
+                (fun c ->
+                  equal string "" (read_all c) ;
+                  sync (Ivar.read reset) ;
+                  pause () ;
+                  equal string "EPIPE" (error_of (fun () -> Net.write c "x")) ) ) )
+    ; test "a close with unread data sends a reset" (fun () ->
+          w.run (fun () ->
+              let sent = Ivar.create () in
+              with_conn w
+                (fun c ->
+                  sync (Ivar.read sent) ;
+                  pause () ;
+                  Net.close c )
+                (fun c ->
+                  Net.write c "unread" ;
+                  Ivar.fill sent () ;
+                  equal string "ECONNRESET" (read_error c) ;
+                  equal string "" (read_all c) ) ) )
+    ; test "a reset of a Unix socket gives the end of the stream" (fun () ->
+          w.run (fun () ->
+              let a = Net.Unix (Filename.concat (w.tmp ()) "s") in
+              let l = Net.listen a in
+              Fiber.scope (fun s ->
+                  Fiber.fork s (fun () ->
+                      let c, _ = Net.accept l in
+                      Net.reset c ) ;
+                  let c = Net.connect a in
+                  equal string "" (read_all c) ;
+                  Net.close c ) ;
+              Net.close l ) )
+    ; test "a Unix socket with unread data: a close resets the reads only"
+        (fun () ->
+          w.run (fun () ->
+              unix_unread w
+                (fun c -> Net.close c)
+                (fun c ->
+                  (* A write gives EPIPE and leaves the error for the read. *)
+                  let write () = error_of (fun () -> Net.write c "x") in
+                  equal string "EPIPE" (write ()) ;
+                  equal string "EPIPE" (write ()) ;
+                  equal string "ECONNRESET" (read_error c) ;
+                  equal string "" (read_all c) ) ) )
+    ; test "a close of a listener resets the TCP connections of its backlog"
+        (fun () ->
+          w.run (fun () ->
+              let read_first c =
+                equal string "ECONNRESET" (read_error c) ;
+                equal string "" (read_all c)
+              and write_first c =
+                let write () = error_of (fun () -> Net.write c "x") in
+                equal string "ECONNRESET" (write ()) ;
+                equal string "EPIPE" (write ()) ;
+                equal string "" (read_all c)
+              in
+              List.iter
+                (fun client ->
+                  let l, a = w.listen () in
+                  let c = Net.connect a in
+                  Net.close l ; pause () ; client c ; Net.close c )
+                [read_first; write_first] ) )
+    ; test "a close of a listener resets the Unix connections of its backlog"
+        (fun () ->
+          w.run (fun () ->
+              let dir = w.tmp () in
+              List.iteri
+                (fun i client ->
+                  let a = Net.Unix (Filename.concat dir (string_of_int i)) in
+                  let l = Net.listen a in
+                  let c = Net.connect a in
+                  Net.close l ; pause () ; client c ; Net.close c )
+                [ (fun c ->
+                    equal string "ECONNRESET" (read_error c) ;
+                    equal string "" (read_all c) )
+                ; (fun c ->
+                    (* A write gives EPIPE and leaves the error for the read. *)
+                    let write () = error_of (fun () -> Net.write c "x") in
+                    equal string "EPIPE" (write ()) ;
+                    equal string "EPIPE" (write ()) ;
+                    equal string "ECONNRESET" (read_error c) ;
+                    equal string "" (read_all c) ) ] ) )
+    ; test "a Unix socket with unread data: a reset after shutdown" (fun () ->
+          w.run (fun () ->
+              unix_unread w
+                (fun c -> Net.shutdown c ; Net.reset c)
+                (fun c ->
+                  equal string "ECONNRESET" (read_error c) ;
+                  equal string "" (read_all c) ) ) ) ]
+
 (* UDP and the socket options. A world can lose datagrams (the faults world), so
    a test sends again after a timeout. *)
 
@@ -1227,6 +1548,7 @@ let tests w =
         ; chans w
         ; scopes w
         ; net w
+        ; now_and_reset w
         ; udp w
         ; overflow_runs w
         ; layers w

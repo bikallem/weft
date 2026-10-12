@@ -19,6 +19,10 @@ val layers : world -> Windtrap.test
 val files : world -> Windtrap.test
 (** The tests of [File] and [Dir] (milestone M2), also in [tests]. *)
 
+val reset_details : world -> Windtrap.test
+(** The details of [Net.reset] that follow Linux. The simulator and the Linux
+    world run them. They are not in [tests]. *)
+
 (**/**)
 
 val echo_server : Weft.Net.t -> unit

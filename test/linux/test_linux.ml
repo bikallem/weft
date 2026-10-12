@@ -693,4 +693,7 @@ let linux =
         pinned_yield
     ; test "a signal that run does not watch is not an event" unwatched ]
 
-let () = exit (Windtrap.run "linux" (Portable.tests world @ [linux]))
+let () =
+  exit
+    (Windtrap.run "linux"
+       (Portable.tests world @ [Portable.reset_details world; linux]) )

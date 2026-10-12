@@ -25,6 +25,8 @@ external send : int -> bytes -> int -> int -> int = "weft_send"
 
 external shutdown_send : int -> int = "weft_shutdown_send"
 
+external reset_on_close : int -> int = "weft_reset_on_close"
+
 external udp : string -> int -> int = "weft_udp"
 
 external sendto : int -> bytes -> int -> int -> string * int -> int
@@ -495,6 +497,8 @@ let submit : type a. pool -> a Op.t -> (a, Op.error) result option =
       Some (result (send fd buf off len))
   | Op.Shutdown fd ->
       Some (unit (shutdown_send fd))
+  | Op.Reset_on_close fd ->
+      Some (unit (reset_on_close fd))
   | Op.Udp (host, port) ->
       Some (result (udp host port))
   | Op.Sendto (fd, buf, off, len, host, port) ->

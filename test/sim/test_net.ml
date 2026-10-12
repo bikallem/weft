@@ -666,6 +666,145 @@ let udp_port_range () =
       Net.close (Net.udp ("h", 65535)) ;
       Net.close (Net.udp ("h", 1)) )
 
+(* A loop of [readable] and [read_now] on a quiet connection. With
+   [extra_edges], an edge with no data comes: [read_now] gives None and clears
+   the flag, so the next [readable] waits for a new edge. *)
+let read_now_no_spin () =
+  for seed = 1 to 50 do
+    Sim.run ~seed ~domains:2 (fun sim ->
+        Sim.net_faults sim {Sim.no_faults with extra_edges= true} ;
+        let a = Net.Tcp ("now", 1) in
+        let l = Net.listen a in
+        Fiber.scope (fun s ->
+            Fiber.fork s (fun () ->
+                let c, _ = Net.accept l in
+                Time.sleep Mono (Span.ms 100) ;
+                Net.write c "late" ;
+                Net.close c ) ;
+            let c = Net.connect a in
+            let buf = Bytes.create 16 and stale = ref 0 in
+            let rec loop acc =
+              sync (Net.readable c) ;
+              match Net.read_now c buf 0 16 with
+              | None ->
+                  incr stale ;
+                  if !stale > 1000 then failwith "the loop spins" ;
+                  loop acc
+              | Some 0 ->
+                  acc
+              | Some k ->
+                  loop (acc ^ Bytes.sub_string buf 0 k)
+            in
+            equal string "late" (loop "") ;
+            less int ~than:20 !stale ;
+            Net.close c ) ;
+        Net.close l )
+  done
+
+(* The reset comes to the peer after the latency, as the data does. *)
+let reset_latency () =
+  Sim.run (fun sim ->
+      Sim.set_latency sim (Span.ms 5) ;
+      let a = Sim.addr sim "server:9" in
+      let l = Net.listen a in
+      Fiber.scope (fun s ->
+          Fiber.fork s (fun () ->
+              let c, _ = Net.accept l in
+              Time.sleep Mono (Span.ms 20) ;
+              Net.reset c ) ;
+          let c = Net.connect a in
+          let t0 = Time.now Mono in
+          raises
+            (Net.Error (Reset, "Net.read"))
+            (fun () -> ignore (Net.read c (Bytes.create 1) 0 1)) ;
+          (* The server accepted at 5 ms and reset at 25 ms, and the reset came
+             5 ms later. *)
+          equal int 25 (ms_since t0) ;
+          Net.close c ) ;
+      Net.close l ;
+      equal int 0 (Sim.open_fds sim) )
+
+(* With [resets], a reset at the write of one fiber wakes a reader fiber on the
+   same socket. *)
+let reset_wakes_reader () =
+  for seed = 1 to 20 do
+    Sim.run ~seed (fun sim ->
+        Sim.net_faults sim {Sim.no_faults with resets= true} ;
+        let a = Net.Tcp ("resets", 2) in
+        let l = Net.listen a in
+        Fiber.scope (fun s ->
+            (* The server reads all and writes nothing. *)
+            Fiber.fork s (fun () ->
+                let c, _ = Net.accept l in
+                ( try ignore (read_all c)
+                  with Net.Error ((Reset | Broken_pipe), _) -> () ) ;
+                Net.close c ) ;
+            let c = Net.connect a in
+            let reader =
+              Fiber.fork_promise s (fun () ->
+                  try read_all c with Net.Error (Reset, _) -> "reset" )
+            in
+            (* The reader waits before the first write. *)
+            Fiber.yield () ;
+            ( try
+                while true do
+                  Net.write c "x"
+                done
+              with Net.Error (Reset, _) -> () ) ;
+            (* The writer took the reset, so the reader gets the end of the
+               stream. *)
+            equal string "" (Promise.await reader) ;
+            Net.close c ) ;
+        Net.close l )
+  done
+
+(* With [resets], some connections end with ECONNRESET, and the others echo all
+   of their data. *)
+let random_resets () =
+  let resets = ref 0 and complete = ref 0 in
+  for seed = 1 to 20 do
+    Sim.run ~seed (fun sim ->
+        Sim.net_faults sim {Sim.no_faults with resets= true} ;
+        let a = Net.Tcp ("resets", 1) in
+        let l = Net.listen a in
+        Fiber.scope (fun s ->
+            Fiber.fork_daemon s (fun () ->
+                Fiber.scope (fun conns ->
+                    while true do
+                      let c, _ = Net.accept l in
+                      Fiber.fork conns (fun () ->
+                          let buf = Bytes.create 4 in
+                          ( try
+                              while true do
+                                let k = Net.read c buf 0 4 in
+                                if k = 0 then raise Exit ;
+                                Net.write c (Bytes.sub_string buf 0 k)
+                              done
+                            with
+                            | Exit | Net.Error ((Reset | Broken_pipe), _) ->
+                              () ) ;
+                          Net.close c )
+                    done ) ) ;
+            for _ = 1 to 10 do
+              let c = Net.connect a in
+              ( match
+                  for _ = 1 to 20 do
+                    Net.write c "ping" ;
+                    equal string "ping" (read_n c 4)
+                  done
+                with
+              | () ->
+                  incr complete
+              | exception Net.Error (Reset, _) ->
+                  incr resets ) ;
+              Net.close c
+            done ) ;
+        Net.close l )
+  done ;
+  (* Each connection has 40 writes: about half of them get a reset. *)
+  at_least int ~than:20 !resets ;
+  at_least int ~than:20 !complete
+
 let tests =
   [ group "net"
       [ slow "echo: the client gets hello back, with 1000 seeds" echo_1000_seeds
@@ -694,6 +833,13 @@ let tests =
           reset_by_listener
       ; test "a listener that closes refuses a connect in flight"
           refused_while_connecting
+      ; test "a loop of readable and read_now does not spin with extra edges"
+          read_now_no_spin
+      ; test "a reset comes to the peer after the latency" reset_latency
+      ; test "the fault resets ends some connections with ECONNRESET"
+          random_resets
+      ; test "a reset of the fault wakes a reader on the same socket"
+          reset_wakes_reader
       ; slow "10,000 connections use the fd slots again" many_connections ]
   ; group "udp"
       [ test "udp_loss loses about one datagram in 8" udp_loss
