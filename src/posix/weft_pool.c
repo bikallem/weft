@@ -28,6 +28,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <netdb.h>
+#include <netinet/in.h>
 #include <pthread.h>
 #include <signal.h>
 #include <stdint.h>
@@ -255,9 +256,15 @@ static void reverse(struct job *j) {
   if (inet_pton(AF_INET, j->s1, &v4->sin_addr) == 1) {
     v4->sin_family = AF_INET;
     sl = sizeof *v4;
+#if defined(__APPLE__) || defined(__FreeBSD__)
+    v4->sin_len = sl;
+#endif
   } else if (inet_pton(AF_INET6, j->s1, &v6->sin6_addr) == 1) {
     v6->sin6_family = AF_INET6;
     sl = sizeof *v6;
+#if defined(__APPLE__) || defined(__FreeBSD__)
+    v6->sin6_len = sl;
+#endif
   } else {
     j->err = EINVAL;
     j->res = -1;

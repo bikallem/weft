@@ -52,14 +52,14 @@ value weft_mono_ns(value unit) { return clock_ns(CLOCK_MONOTONIC); }
 value weft_posix_ns(value unit) { return clock_ns(CLOCK_REALTIME); }
 
 /* The flags of a new fd on a system that cannot set them at the create. */
-static inline int set_flags(int fd) {
+__attribute__((unused)) static int set_flags(int fd) {
   int fl = fcntl(fd, F_GETFL);
   if (fl < 0 || fcntl(fd, F_SETFL, fl | O_NONBLOCK) < 0) return -1;
   return fcntl(fd, F_SETFD, FD_CLOEXEC) < 0 ? -1 : 0;
 }
 
 /* A new fd that failed its flags: close it, and keep errno. */
-static inline int drop_fd(int fd) {
+__attribute__((unused)) static int drop_fd(int fd) {
   int e = errno;
   close(fd);
   errno = e;
