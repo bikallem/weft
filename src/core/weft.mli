@@ -344,11 +344,16 @@ end
     Design sections 2.3 and 2.7. *)
 
 module Net : sig
+  (** A port out of the range 0 to 65535 gives [Error (Other "EINVAL", _)]. A
+      NUL byte in a host or a path gives
+      [Error (Other "EINVAL: a NUL byte in a string", _)], as for each path,
+      name and argument of [File], [Dir], [Dns] and [Process.spawn]. *)
   type addr = Private.Net.addr =
     | Tcp of string * int
-    | Unix of string
-        (** In the simulator, the host of [Tcp] is a name, for example
+        (** A host and a port. [local_addr] also gives the address of a UDP
+            socket as [Tcp]. In the simulator, the host is a name, for example
             ["server"]. *)
+    | Unix of string  (** The path of a Unix domain socket. *)
 
   (** A socket. *)
   type t = Private.Net.t
@@ -367,11 +372,12 @@ module Net : sig
     | Not_empty  (** [ENOTEMPTY]. *)
     | No_resources of string
         (** The OS has no resource for the operation at this time: [EMFILE],
-            [ENFILE], [ENOBUFS] or [ENOMEM]. A spawn, and a [File], [Dir] or
-            [Dns] operation when the thread pool cannot start a thread, give
-            [EAGAIN]. The string is the name of the errno, for example
-            ["EMFILE"]. A program can pause, then try again. The simulator gives
-            ["EMFILE"] at the limit of [Weft_sim.set_fd_limit]. *)
+            [ENFILE], [ENOBUFS] or [ENOMEM]. A spawn gives [EAGAIN] at the limit
+            of processes. A [File], [Dir] or [Dns] operation gives [EAGAIN] when
+            the thread pool cannot start a thread. The string is the name of the
+            errno, for example ["EMFILE"]. A program can pause, then try again.
+            The simulator gives ["EMFILE"] at the limit of
+            [Weft_sim.set_fd_limit]. *)
     | Other of string
 
   (** The error, and the name of the function. It is [Private.Net.Error]. *)
@@ -382,14 +388,18 @@ module Net : sig
   val accept : t -> t * addr
   (** Waits for a connection, and gives its socket and the address of the
       client. A connection that the client reset before the accept gives no
-      error. Linux and the simulator give the connection, and its first read
-      gets [Error (Reset, _)]. On macOS and FreeBSD, the OS gives
-      [ECONNABORTED], and [accept] takes the next connection.
+      error. On FreeBSD, the OS gives [ECONNABORTED], and [accept] takes the
+      next connection. Linux, macOS and the simulator give the connection. On
+      Linux and in the simulator, its first read gets [Error (Reset, _)]. On
+      macOS, its address is [Tcp ("", 0)].
 
       @raise Error
-        with [No_resources] if the process or the system has no free fd. The
-        connection stays in the backlog, and the next [accept] can get it. Thus
-        an accept loop pauses, then calls [accept] again. *)
+        with [No_resources] if the process or the system has no free fd or no
+        memory. On Linux, FreeBSD and the simulator, the connection stays in the
+        backlog, and the next [accept] can get it. macOS closes it. Thus an
+        accept loop pauses, then calls [accept] again. The facts about macOS and
+        the backlog of FreeBSD come from a read of their source, not from a
+        test. *)
 
   val connect : addr -> t
 
@@ -473,10 +483,11 @@ module Net : sig
 
   val udp : string * int -> t
   (** [udp (host, port)] gives a UDP socket, bound to the host and the port. The
-      port 0 gives a free port. In the simulator, the host is a name, for
-      example ["client"]. [close] closes the socket. [read] takes one datagram
-      with no address, and 0 is then an empty datagram, not the end of a stream.
-      [write] raises [Error (Other "EDESTADDRREQ", _)]. *)
+      port 0 gives a free port, and [local_addr] gives it as [Tcp (host, port)].
+      In the simulator, the host is a name, for example ["client"]. [close]
+      closes the socket. [read] takes one datagram with no address, and 0 is
+      then an empty datagram, not the end of a stream. [write] raises
+      [Error (Other "EDESTADDRREQ", _)]. *)
 
   val sendto : t -> bytes -> int -> int -> string * int -> unit
   (** [sendto t buf off len (host, port)] sends one datagram with the bytes of

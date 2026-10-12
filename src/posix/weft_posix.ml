@@ -180,8 +180,11 @@ let error_of e =
 
 (* [EAGAIN] of an operation that makes a process or a thread: the OS has no
    resource for it. It is not an fd that is not ready. *)
-let resource_error e =
-  if e = eagain then Op.No_resources "EAGAIN" else error_of e
+let eagain_resource = function
+  | Op.Would_block ->
+      Op.No_resources "EAGAIN"
+  | e ->
+      e
 
 let result r = if r >= 0 then Ok r else Error (error_of (-r))
 
@@ -311,11 +314,6 @@ let args_of : type a. int -> int -> a Op.blocking -> job_args =
   | Op.Resolve host | Op.Reverse host ->
       {base with s1= host}
 
-(* The C side reads each string up to its first NUL byte. *)
-let has_nul = List.exists (fun s -> String.contains s '\000')
-
-let nul_error = Error (Op.Other "EINVAL: a NUL byte in a string")
-
 let kind_of_int = function
   | 0 ->
       Op.Regular
@@ -344,7 +342,7 @@ let finish : type a. nativeint -> a Op.blocking -> (a, Op.error) result =
   let res, err, data = job_result j in
   let r : (a, Op.error) result =
     if err = -1 then Error (Op.Other data)
-    else if err <> 0 then Error (resource_error err)
+    else if err <> 0 then Error (eagain_resource (error_of err))
     else
       match op with
       | Op.Open _ ->
@@ -450,12 +448,6 @@ let spawn_args (sp : Op.spawn) =
   , Option.value ~default:"" sp.cwd
   , [|kind sp.stdin; kind sp.stdout; kind sp.stderr|] )
 
-let spawn_has_nul (sp : Op.spawn) =
-  has_nul
-    ( (sp.prog :: sp.argv)
-    @ Option.value ~default:[] sp.env
-    @ Option.to_list sp.cwd )
-
 (* The result of [spawn_child]: (pid or -errno, the pidfd, stdin, stdout,
    stderr), with -1 for no pipe. *)
 let spawned_of (pid, pidfd, i, o, e) =
@@ -466,9 +458,7 @@ let spawned_of (pid, pidfd, i, o, e) =
   Result.map
     (fun pid ->
       {Op.pid; pidfd; to_stdin= fd i; from_stdout= fd o; from_stderr= fd e} )
-    ( if (pid < 0) [@mutate off "a spawn in a test never gives the pid 0"] then
-        Error (resource_error (-pid))
-      else Ok pid )
+    (Result.map_error eagain_resource (result pid))
 
 (* The result of a wait stub: (kind, code). The kind is 0 while the child runs,
    1 if it exited with the code, 2 if the signal in code ended it, or -errno. *)
@@ -492,18 +482,14 @@ let submit : type a. pool -> a Op.t -> (a, Op.error) result option =
       let kind, h, port = host_port addr in
       Some (result (listen kind h port backlog))
   | Op.Accept fd ->
-      (* macOS and FreeBSD give ECONNABORTED for a connection that the client
-         reset before the accept. Linux gives the connection. Thus the world
-         takes the next connection, as Go and libuv do. Each ECONNABORTED
-         removes one connection from the backlog, so the loop ends. *)
+      (* FreeBSD gives ECONNABORTED for a connection that the client reset
+         before the accept. Linux gives the connection, and a read of the source
+         of macOS shows that macOS also gives it. Thus the world takes the next
+         connection, as Go and libuv do. Each ECONNABORTED removes one
+         connection from the backlog, so the loop ends. *)
       let rec take () =
         let ((r, _, _, _) as a) = accept fd in
-        if
-          ( r = -econnaborted )
-          [@mutate
-            off "Linux gives no ECONNABORTED; the CI of FreeBSD tests it"]
-        then take ()
-        else a
+        if r = -econnaborted then take () else a
       in
       let r, host, port, unix = take () in
       Some
@@ -564,14 +550,12 @@ let submit : type a. pool -> a Op.t -> (a, Op.error) result option =
   | Op.Start (dom, op) ->
       let id = Atomic.fetch_and_add p.next_job 1 in
       let args = args_of id dom op in
-      if has_nul [args.s1; args.s2] then Some nul_error
-      else
-        (* The lock covers the start, so the job is in the table before its
-           completion can come. *)
-        Some
-          (Mutex.protect p.lock (fun () ->
-               Hashtbl.replace p.jobs id (job_start p.mbx args) ;
-               Ok id ) )
+      (* The lock covers the start, so the job is in the table before its
+         completion can come. *)
+      Some
+        (Mutex.protect p.lock (fun () ->
+             Hashtbl.replace p.jobs id (job_start p.mbx args) ;
+             Ok id ) )
   | Op.Finish (id, op) -> (
     match take_job p id with
     | Some j ->
