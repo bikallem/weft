@@ -15,7 +15,9 @@ external kq_add_in : int -> int -> int -> int = "weft_kq_add_in"
 
 external kq_del : int -> int -> int = "weft_kq_del"
 
-external sig_wake : int -> unit = "weft_kq_sig_wake"
+external sig_claim : int -> bool = "weft_kq_sig_claim"
+
+external sig_release : unit -> unit = "weft_kq_sig_release"
 
 external sig_catch : int -> bytes = "weft_kq_sig_catch"
 
@@ -84,15 +86,16 @@ let close_dom d =
   ignore (close_fd d.kq)
 
 (* A watched signal gets the handler of the world (weft_kqueue_stubs.c), which
-   counts it and wakes domain 0. After an error, [create] closes what it made
-   and restores the actions that it changed. *)
+   counts it and wakes domain 0. Only one world at a time can hold the handler.
+   After an error, [create] closes what it made and restores the actions that it
+   changed. *)
 let create ?(domains = 1) ?(signals = []) () =
   Sys.set_signal Sys.sigpipe Sys.Signal_ignore ;
   let nums = List.sort_uniq compare (List.map number_of signals) in
-  let doms = ref [] and old_actions = ref [] in
+  let doms = ref [] and old_actions = ref [] and claimed = ref false in
   let undo () =
     List.iter (fun (n, a) -> sig_restore n a) !old_actions ;
-    if nums <> [] then sig_wake (-1) ;
+    if !claimed then sig_release () ;
     List.iter close_dom !doms
   in
   match
@@ -100,7 +103,10 @@ let create ?(domains = 1) ?(signals = []) () =
       doms := make_dom () :: !doms
     done ;
     let doms = Array.of_list (List.rev !doms) in
-    if nums <> [] then sig_wake doms.(0).wake_w ;
+    if nums <> [] then (
+      if not (sig_claim doms.(0).wake_w) then
+        invalid_arg "Weft_kqueue.create: another world watches signals" ;
+      claimed := true ) ;
     List.iter (fun n -> old_actions := (n, sig_catch n) :: !old_actions) nums ;
     (doms, create_pool (Array.map (fun d -> d.wake_w) doms))
   with
@@ -119,14 +125,14 @@ let create ?(domains = 1) ?(signals = []) () =
       ; procs= Hashtbl.create ~random:false 8
       ; pids= Hashtbl.create ~random:false 8 }
 
-(* The actions come back first. A handler that started before can still write
-   the wake pipe, so the pipe closes after the stop of the pools. *)
+(* The actions come back first. Then the release waits until no handler can
+   write the wake pipe, and the pipe can close. *)
 let close t =
   let watched = List.map number_of (Atomic.get t.watched) in
   List.iter
     (fun (n, a) -> if List.mem n watched then sig_restore n a)
     t.old_actions ;
-  if t.old_actions <> [] then sig_wake (-1) ;
+  if t.old_actions <> [] then sig_release () ;
   close_pool t.pool ;
   Hashtbl.iter
     (fun _ p ->

@@ -13,8 +13,11 @@ val create : ?domains:int -> ?signals:Weft.Signal.t list -> unit -> t
     [~signals] (none by default) are the signals that [Signal.received] can wait
     for. Each of them gets a handler of the world, which counts it and wakes
     domain 0, so the process does not end. [Signal.unwatch] and [close] restore
-    the actions. Only one world at a time can have [~signals]. SIGPIPE is
-    ignored, so a write with no reader gives EPIPE.
+    the actions. SIGPIPE is ignored, so a write with no reader gives EPIPE.
+
+    @raise Invalid_argument
+      if [~signals] is not empty and another world of the process holds signals:
+      only one world at a time can watch signals.
 
     A [Posix] timer can end up to 1 s late after a step of the wall clock: the
     world examines the clock again at least each second. *)
