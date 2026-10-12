@@ -1059,6 +1059,7 @@ module Sim : sig
   val set_blocking_cost : t -> Span.t -> unit  (* open question 2 *)
   val open_fds : t -> int                      (* issue 3 *)
   val set_fd_limit : t -> int option -> unit
+  val socket_pair : t -> Net.t * Net.t        (* issue 8 *)
   val set_dns : t -> string -> dns_answer -> unit
   val add_program : t -> string -> (string list -> program) -> unit
   val signal : t -> Signal.t -> unit
@@ -1098,6 +1099,16 @@ The simulator finds errors in the order of events between domains, at the level 
 Thus a process can call `Unix.fork` before, between and after runs. A tool for mutation tests needs this rule, because it forks one process for each mutant. OCaml 5 refuses `Unix.fork` after a `Domain.spawn`, also after its `Domain.join`. A test on OCaml 5.5.0 verified this. Thus other code of the process must not start a domain, for example `Weft_linux.run` with more than one domain.
 
 The test `test/sim_fork` makes sure of the rule. It does a run with each part of the simulator on 1, 2, 4, 8 and 16 domains, and it forks after each run. On Linux, it also counts the threads of the process in `/proc/self/task`. Its control spawns a domain at the end, and then the fork must fail. The build of the test refuses the `threads` library (`forbidden_libraries`), so `weft` and `weft.sim` cannot start a thread. The only `Domain.spawn` of the library is in `run_world` of the core, and only the production worlds call it.
+
+### A socket pair (issue 8)
+
+`Sim.socket_pair sim` gives the two sides of a TCP connection with no listener. A test of a protocol thus needs no listener, no fiber for the accept and no connect. The pair is a connection of the in-memory network, as after a connect and an accept. Thus it has the latency, the faults of `Sim.net_faults` and the reset of `Net.reset`. It is established at once, with no latency for the connect.
+
+The first side has the address `Tcp ("client", p)`, and the second side has `Tcp ("server", q)`. The ports `p` and `q` come from the counter of ports (section The model of the fds, below). The pair makes 2 fds, so `Sim.set_fd_limit` counts it as a pipe.
+
+The pair is only in the simulator, not in the core `Net` (decision 28). Linux has `socketpair(2)`, but it gives Unix sockets, not TCP sockets. A Unix socket has no `TCP_NODELAY`, and its reset and its address are different.
+
+A pair of TCP sockets on loopback in production needs a listen on port 0, a connect, an accept and a close. Another process of the host can connect to the port first, so the code must compare the peer of the accept with `Net.local_addr` of the client. Portable code can do this with the API of today, so a core function adds no power. But it adds an operation of the world, code in three worlds and tests in each of them, for a function that only tests use.
 
 ### The model of the fds
 
@@ -1226,7 +1237,7 @@ The cost of an effect is a perform and a handler call for each world operation. 
 
 ## 2.12 Decisions
 
-Decisions 1 to 6 were made on 2026-10-09, decisions 7 to 9 on 2026-10-10, decisions 10 and 11 on 2026-10-12 (issue 1), decision 12 on 2026-10-12 (issue 2), decisions 13 and 14 on 2026-10-12 (issue 3), decisions 15 to 17 on 2026-10-12 (issue 4), decisions 18 to 20 on 2026-10-12 (issue 5), decisions 21 to 25 on 2026-10-13 (issue 6), and decision 26 on 2026-10-13 (issue 7).
+Decisions 1 to 6 were made on 2026-10-09, decisions 7 to 9 on 2026-10-10, decisions 10 and 11 on 2026-10-12 (issue 1), decision 12 on 2026-10-12 (issue 2), decisions 13 and 14 on 2026-10-12 (issue 3), decisions 15 to 17 on 2026-10-12 (issue 4), decisions 18 to 20 on 2026-10-12 (issue 5), decisions 21 to 25 on 2026-10-13 (issue 6), decision 26 on 2026-10-13 (issue 7), and decisions 27 and 28 on 2026-10-13 (issue 8).
 
 | No. | Question | Decision |
 |---|---|---|
@@ -1256,6 +1267,8 @@ Decisions 1 to 6 were made on 2026-10-09, decisions 7 to 9 on 2026-10-10, decisi
 | 24 | A waiter at the end of a watch | Its `sync` raises `Invalid_argument`, as a later `received` does. A waiter that waits forever hides the error, and the close of an fd also ends its waiters with an error. |
 | 25 | The action of a signal in the simulator | The run ends with `Sim.Killed s` at an action that ends the process, so a test can examine it. `Sim.signal` of a signal that the program does not watch gives the default action, as on Linux, and not a `Model_error`. |
 | 26 | The UTC date of a `Clock.posix` | `Time.to_utc` and `Time.of_utc` in the core, with a record with no fraction of a second, as the issue proposes (section 2.6). A date of the full range of `Clock.posix` fits in an `int`. The code is the algorithm of Hinnant, not a table or a loop on years, and the Linux tests compare it with `Unix.gmtime`. |
+| 27 | Threads in the simulator | None. `Sim.run` starts no OS domain and no OS thread (section 2.8, The fork rule). A tool for mutation tests forks after a run, and OCaml 5 refuses a fork after a `Domain.spawn`. A pool of threads for the jobs also gives completions in an order that the seed does not control. `test/sim_fork` makes sure of the rule. |
+| 28 | The place of a socket pair | `Sim.socket_pair`, only in the simulator (section 2.8, A socket pair). `socketpair(2)` gives Unix sockets. Thus a core function gives TCP in the simulator and Unix in production, or Unix sockets in the two, with no TCP behavior for the tests. A TCP pair on loopback needs a listener, and another process can connect to it first. Portable code can make it with `listen`, `connect` and `accept`. |
 
 Also on 2026-10-10, the user accepted the milestone plan of section 2.14. Decisions 4, 7 and 8 stay, and they come in milestone M1. Milestone M0 has one domain.
 

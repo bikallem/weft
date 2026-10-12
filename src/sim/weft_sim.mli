@@ -123,6 +123,19 @@ val set_fd_limit : t -> int option -> unit
 
     @raise Invalid_argument if [n] is negative. *)
 
+val socket_pair : t -> Weft.Net.t * Weft.Net.t
+(** [socket_pair t] gives the two sides of a TCP connection, as a connect and an
+    accept give them, but with no listener. The connection is established at
+    once. It has the latency and the faults of each TCP connection. [Net.reset]
+    acts on it as on a connection of [connect]. The first socket has the address
+    [Tcp ("client", p)], and the second [Tcp ("server", q)], with [p] and [q]
+    from the counter of ports (as for [Net.local_addr]). The peer of each socket
+    is the address of the other socket.
+
+    @raise Weft.Net.Error
+      with [No_resources "EMFILE"] if the two fds are more than the limit of
+      {!set_fd_limit}. *)
+
 val set_blocking_cost : t -> Weft.Span.t -> unit
 (** [set_blocking_cost t limit]: each [Blocking] operation (a [File], [Dir] or
     [Dns] operation) takes a time cost from the seed, in the range 0 to [limit].

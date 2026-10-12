@@ -815,6 +815,25 @@ let new_pipe n =
   w.peer <- Some r ;
   (r, w)
 
+(* One side of a connection, before the connect completes. *)
+let new_sock ~tcp ~local remote =
+  { role= Sock
+  ; inbox= Buffer.create 64
+  ; rpos= 0
+  ; inflight= 0
+  ; last_at= 0L
+  ; peer= None
+  ; eof= false
+  ; shut= false
+  ; reset= false
+  ; abort= false
+  ; established= false
+  ; refused= false
+  ; cfd= -1
+  ; remote
+  ; local
+  ; tcp }
+
 (* The exit of a fake process: it closes the ends of its pipes, and its pidfd
    becomes readable. *)
 let exit_proc t pidfd p status =
@@ -958,25 +977,8 @@ let submit : type a. t -> a Op.t -> (a, Op.error) result =
               if l.ltcp then Op.Tcp ("client", fresh_port n (fun _ -> false))
               else Op.Unix ""
             in
-            let mk ~local remote =
-              { role= Sock
-              ; inbox= Buffer.create 64
-              ; rpos= 0
-              ; inflight= 0
-              ; last_at= 0L
-              ; peer= None
-              ; eof= false
-              ; shut= false
-              ; reset= false
-              ; abort= false
-              ; established= false
-              ; refused= false
-              ; cfd= -1
-              ; remote
-              ; local
-              ; tcp= l.ltcp }
-            in
-            let c = mk ~local:client addr and s = mk ~local:l.laddr client in
+            let c = new_sock ~tcp:l.ltcp ~local:client addr
+            and s = new_sock ~tcp:l.ltcp ~local:l.laddr client in
             c.peer <- Some s ;
             s.peer <- Some c ;
             s.established <- true ;
@@ -1755,6 +1757,34 @@ let set_fd_limit t limit =
   | _ ->
       () ) ;
   t.net.fd_limit <- limit
+
+(* A connection with no listener, as after a connect and an accept (design
+   section 2.8, A socket pair). It has no latency for the connect, and it counts
+   2 fds against the limit. The pair is not a world effect: the simulator runs
+   one virtual domain at a time, so the change of the network has no race. *)
+let socket_pair t =
+  let n = t.net in
+  ( match room n 2 with
+  | Error e ->
+      raise (Net.Error (e, "Sim.socket_pair"))
+  | Ok () ->
+      () ) ;
+  let client = Op.Tcp ("client", fresh_port n (fun _ -> false)) in
+  let server =
+    let used p = Hashtbl.mem n.names (key (Op.Tcp ("server", p))) in
+    Op.Tcp ("server", fresh_port n used)
+  in
+  let c = new_sock ~tcp:true ~local:client server
+  and s = new_sock ~tcp:true ~local:server client in
+  c.peer <- Some s ;
+  s.peer <- Some c ;
+  List.iter
+    (fun x ->
+      x.established <- true ;
+      x.cfd <- new_fd n ;
+      Hashtbl.replace n.fds x.cfd (Conn x) )
+    [c; s] ;
+  (Sched.Fdtab.alloc c.cfd, Sched.Fdtab.alloc s.cfd)
 
 let set_blocking_cost t span =
   if Int64.compare (Weft.Span.to_ns span) 0L < 0 then

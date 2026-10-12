@@ -931,6 +931,90 @@ let accept_loop_pauses () =
       equal int 150 (ms_since t1) ;
       Net.close c )
 
+(* A socket pair (issue 8) is a TCP connection with no listener: the data goes
+   in the two directions, and each side has its address. *)
+let pair_echo () =
+  Sim.run (fun sim ->
+      let fds = Sim.open_fds sim in
+      let a, b = Sim.socket_pair sim in
+      equal int (fds + 2) (Sim.open_fds sim) ;
+      is_true (Net.local_addr a = Net.Tcp ("client", 40000)) ;
+      is_true (Net.local_addr b = Net.Tcp ("server", 40001)) ;
+      Net.write a "ping" ;
+      equal string "ping" (read_n b 4) ;
+      Net.write b "pong" ;
+      equal string "pong" (read_n a 4) ;
+      Net.shutdown a ;
+      equal string "" (read_all b) ;
+      Net.close a ;
+      Net.close b ;
+      equal int fds (Sim.open_fds sim) )
+
+(* The pair has the latency of the network. *)
+let pair_latency () =
+  Sim.run (fun sim ->
+      Sim.set_latency sim (Span.ms 5) ;
+      let a, b = Sim.socket_pair sim in
+      let t0 = Time.now Mono in
+      Net.write a "x" ;
+      equal string "x" (read_n b 1) ;
+      equal int 5 (ms_since t0) ;
+      Net.close a ;
+      Net.close b )
+
+(* [Net.reset] of one side gives the reset to the other side, as on a connection
+   of [connect]. *)
+let pair_reset () =
+  Sim.run (fun sim ->
+      let a, b = Sim.socket_pair sim in
+      Net.write a "bye" ;
+      Net.reset a ;
+      equal string "bye" (read_n b 3) ;
+      equal string "ECONNRESET"
+        (error_of (fun () -> Net.read b (Bytes.create 1) 0 1)) ;
+      equal string "" (read_all b) ;
+      Net.close b )
+
+(* The pair counts 2 fds against the limit. *)
+let pair_fd_limit () =
+  Sim.run (fun sim ->
+      Sim.set_fd_limit sim (Some (Sim.open_fds sim + 1)) ;
+      equal string "EMFILE" (error_of (fun () -> Sim.socket_pair sim)) ;
+      equal int 0 (Sim.open_fds sim) ;
+      Sim.set_fd_limit sim (Some 2) ;
+      let a, b = Sim.socket_pair sim in
+      Net.close a ; Net.close b )
+
+(* The pair has the faults of the network: with [short_io] and [jitter], the
+   data comes complete and in order, and with [resets], a write can reset the
+   connection. *)
+let pair_faults () =
+  let resets = ref 0 in
+  for seed = 1 to 20 do
+    Sim.run ~seed ~domains:2 (fun sim ->
+        Sim.net_faults sim
+          {Sim.no_faults with jitter= Span.ms 3; short_io= true; resets= true} ;
+        let a, b = Sim.socket_pair sim in
+        Fiber.scope (fun s ->
+            let got = Fiber.fork_promise s (fun () -> read_all b) in
+            ( try
+                for i = 1 to 50 do
+                  Net.write a (Printf.sprintf "%02d" i)
+                done ;
+                Net.close a
+              with Net.Error (Reset, _) -> incr resets ; Net.close a ) ;
+            match Promise.await got with
+            | data ->
+                equal string
+                  (String.concat ""
+                     (List.init 50 (fun i -> Printf.sprintf "%02d" (i + 1))) )
+                  data
+            | exception Net.Error (Reset, _) ->
+                () ) ;
+        Net.close b )
+  done ;
+  at_least int ~than:1 !resets
+
 let tests =
   [ group "net"
       [ slow "echo: the client gets hello back, with 1000 seeds" echo_1000_seeds
@@ -975,6 +1059,12 @@ let tests =
       ; test "each operation that makes an fd gives EMFILE" fd_limit_each_op
       ; test "an accept loop pauses on EMFILE, and a timeout ends the pause"
           accept_loop_pauses ]
+  ; group "socket pair"
+      [ test "the data goes in the two directions" pair_echo
+      ; test "the pair has the latency of the network" pair_latency
+      ; test "a reset of one side goes to the other side" pair_reset
+      ; test "the pair counts 2 fds against the limit" pair_fd_limit
+      ; test "the pair has the faults of the network" pair_faults ]
   ; group "udp"
       [ test "udp_loss loses about one datagram in 8" udp_loss
       ; test "the jitter can reorder datagrams" udp_order
