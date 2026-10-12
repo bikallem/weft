@@ -84,6 +84,10 @@ type conn =
   ; mutable err: Op.error option
         (** [Sim.fault]: the next read with no data, or the next write, gives
             this error one time. *)
+  ; mutable lost: bool
+        (** [Sim.fault] with an error that is not [Reset]: the link is lost. The
+            data of the peer stays in flight, so the window of the peer stays
+            full. *)
   ; mutable established: bool
   ; mutable refused: bool
   ; mutable cfd: int  (** [-1] until the server side is accepted. *)
@@ -665,8 +669,10 @@ let write_conn t c buf off len =
           let k = if atomic then len else part t (Int.min len space) in
           let data = Bytes.sub_string buf off k in
           p.inflight <- p.inflight + k ;
+          (* After a lost link, the data never comes, and the peer gets no space
+             again, as when no acknowledgment comes. *)
           deliver t c p (fun () ->
-              p.inflight <- p.inflight - k ;
+              if not p.lost then p.inflight <- p.inflight - k ;
               if Option.is_some p.peer then (
                 Buffer.add_string p.inbox data ;
                 edge n p.cfd ~read:true ~write:false ) ) ;
@@ -823,6 +829,7 @@ let new_pipe n =
     ; reset= false
     ; abort= false
     ; err= None
+    ; lost= false
     ; established= true
     ; refused= false
     ; cfd= new_fd n
@@ -848,6 +855,7 @@ let new_sock ~tcp ~local remote =
   ; reset= false
   ; abort= false
   ; err= None
+  ; lost= false
   ; established= false
   ; refused= false
   ; cfd= -1
@@ -1235,14 +1243,15 @@ let submit : type a. t -> a Op.t -> (a, Op.error) result =
               Queue.iter
                 (fun s ->
                   match s.peer with
-                  | Some c ->
+                  | Some c when Option.is_some c.peer ->
                       (* The connection is established: it gets a reset, as from
                          [reset_conn]. *)
                       c.reset <- true ;
                       c.eof <- true ;
                       c.peer <- None ;
                       edge n c.cfd ~read:true ~write:true
-                  | None ->
+                  | _ ->
+                      (* The client has no peer after a [Sim.fault]. *)
                       () )
                 l.backlog
           | Fil _ | Pfd _ ->
@@ -1811,14 +1820,14 @@ let socket_pair t =
    The connection breaks at the side of [fd]: its next read with no data, or its
    next write, gives [e] one time, as the error of a socket on Linux. Then it
    has the end of the stream and no peer. A [Reset] also goes to the peer after
-   the delay, as from a middlebox. After another error, the peer gets nothing,
-   as after a lost link. *)
+   the delay, as from a middlebox. After another error, the link is lost: the
+   peer gets nothing, and its window stays full. *)
 let fault t (fd : Net.t) e =
   ( match e with
-  | Op.Would_block | Op.Bad_fd ->
-      invalid_arg "Sim.fault: the error is not an error of a connection"
+  | Op.Reset | Broken_pipe | Refused | No_resources _ | Other _ ->
+      ()
   | _ ->
-      () ) ;
+      invalid_arg "Sim.fault: the error is not an error of a connection" ) ;
   if not (Sched.Rc.acquire fd) then raise (Net.Error (Op.Bad_fd, "Sim.fault")) ;
   Fun.protect
     ~finally:(fun () -> Sched.Rc.release fd)
@@ -1826,7 +1835,16 @@ let fault t (fd : Net.t) e =
       let n = t.net in
       match Hashtbl.find_opt n.fds fd.os with
       | Some (Conn ({role= Sock; _} as c)) ->
-          (match e with Op.Reset -> c.reset <- true | e -> c.err <- Some e) ;
+          (* The socket has one slot for its error, as on Linux: the fault
+             replaces an error that the socket did not give. *)
+          ( match e with
+          | Op.Reset ->
+              c.err <- None ;
+              c.reset <- true
+          | e ->
+              c.reset <- false ;
+              c.err <- Some e ;
+              c.lost <- true ) ;
           ( match c.peer with
           | Some p ->
               c.peer <- None ;

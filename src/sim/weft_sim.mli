@@ -33,13 +33,14 @@ val run :
     time moves only at a quiescence.
 
     The fork rule: [run] starts no OS domain and no OS thread, for each value of
-    [~domains]. The virtual domains, the jobs of [File], [Dir] and [Dns], the
-    fake processes of [Process.spawn], the timers and the faults all run on the
-    thread that calls [run]. Thus a process can call [Unix.fork] before, between
-    and after runs, for example a tool that forks one process for each mutant.
-    OCaml 5 refuses [Unix.fork] after a [Domain.spawn], also after its
-    [Domain.join], so other code of the process must not start a domain, for
-    example [Weft_linux.run] with more than one domain.
+    [~domains]. The virtual domains run on the thread that calls [run]. The jobs
+    of [File], [Dir] and [Dns], the fake processes of [Process.spawn], the
+    timers and the faults also run on this thread. Thus a process can call
+    [Unix.fork] before, between and after runs, for example a tool that forks
+    one process for each mutant. OCaml 5 refuses [Unix.fork] after a
+    [Domain.spawn], also after its [Domain.join], so other code of the process
+    must not start a domain, for example [Weft_linux.run] with more than one
+    domain.
 
     @raise Livelock
       with the fibers that are not parked. A long stream of data is progress, so
@@ -138,26 +139,30 @@ val socket_pair : t -> Weft.Net.t * Weft.Net.t
 
 val fault : t -> Weft.Net.t -> Weft.Net.error -> unit
 (** [fault t s e] breaks the connection of [s] at the side of [s]. The next
-    operation of [s] gets [Error (e, _)] one time: the next write, or the next
-    read after the data that [s] already has. This is the order of the error of
-    a socket on Linux. Then [s] has the end of the stream and no peer: later
-    reads give 0, and writes give [Broken_pipe]. A fiber that waits on [s]
-    wakes. Nothing that the peer sends after the fault comes to [s]: no data, no
-    end of the stream and no reset.
+    operation of [s] raises [Weft.Net.Error (e, _)] one time: the next write, or
+    the next read after the data that [s] already has. This is the order of the
+    error of a socket on Linux. Then [s] has the end of the stream and no peer:
+    later reads give 0, and writes give [Broken_pipe]. A fiber that waits on [s]
+    wakes. After the fault, no data, no end of the stream and no reset of the
+    peer comes to [s].
+
+    The socket has one slot for its error, as on Linux. Thus a second fault
+    replaces an error that [s] did not give, also the reset of a peer.
 
     With [e = Reset], the fault is a reset of the two sides, as from a
     middlebox. The peer gets the reset after the delay, after the data that [s]
     sent before, as from [Net.reset]. On a Unix socket, the writes of [s] give
     [Broken_pipe] and its next read gives [Reset], as after a reset of a Unix
-    socket. With another error, the peer gets nothing, as after a lost link: it
-    can wait until its own timeout.
+    socket. With another error, the link is lost. The peer gets nothing, and its
+    data stays in flight, so its writes fill the window and then wait. The peer
+    can thus wait until its own timeout.
 
     The fault occurs at the call, and the delay of a reset comes from the seed,
     as each delay. Thus a seed gives the same run.
 
     @raise Invalid_argument
-      if [e] is [Would_block] or [Bad_fd], or if [s] is not a connected TCP or
-      Unix socket.
+      if [e] is not [Reset], [Broken_pipe], [Refused], [No_resources _] or
+      [Other _], or if [s] is not a socket of a TCP or Unix stream connection.
     @raise Weft.Net.Error with [Bad_fd] if [s] is closed. *)
 
 val set_blocking_cost : t -> Weft.Span.t -> unit
