@@ -141,12 +141,12 @@ let shutdown fd =
 (* UDP (design section 2.3, The I/O modules). A datagram moves in one operation,
    or not at all. *)
 let udp (host, port) =
-  Fdtab.alloc ~udp:true (ok "Net.udp" (submit "Net.udp" (Op.Udp (host, port))))
+  Fdtab.alloc ~kind:Udp (ok "Net.udp" (submit "Net.udp" (Op.Udp (host, port))))
 
 (* On Linux, a sendto on a TCP socket ignores the address, and it can send a
    part. Thus the two worlds refuse it before the submit. *)
 let check_udp name fd =
-  if not fd.udp then invalid_arg (name ^ ": not a UDP socket")
+  if fd.fkind <> Udp then invalid_arg (name ^ ": not a UDP socket")
 
 let sendto fd buf off len (host, port) =
   check_range ~read:false "Net.sendto" buf off len ;

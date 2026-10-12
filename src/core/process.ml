@@ -21,12 +21,12 @@ let spawn ?env ?cwd ?(stdin = Inherit) ?(stdout = Inherit) ?(stderr = Inherit)
     prog args =
   let sp = {Op.prog; argv= prog :: args; env; cwd; stdin; stdout; stderr} in
   let r = Net.ok "Process.spawn" (Net.submit "Process.spawn" (Op.Spawn sp)) in
-  let alloc = Option.map Sched.Fdtab.alloc in
+  let alloc kind = Option.map (Sched.Fdtab.alloc ~kind) in
   { pid= r.pid
   ; pidfd= Sched.Fdtab.alloc r.pidfd
-  ; stdin= alloc r.to_stdin
-  ; stdout= alloc r.from_stdout
-  ; stderr= alloc r.from_stderr
+  ; stdin= alloc Write_end r.to_stdin
+  ; stdout= alloc Read_end r.from_stdout
+  ; stderr= alloc Read_end r.from_stderr
   ; status= Ivar.create ()
   ; reaping= Atomic.make false }
 

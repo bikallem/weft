@@ -239,7 +239,7 @@ let new_fdrec () =
   ; rc= Atomic.make (S.Open 0)
   ; doms= Atomic.make 0
   ; streak= 0
-  ; udp= false }
+  ; fkind= S.Any }
 
 (* The ring: a push by the owner, and a steal by two thieves. Each item is taken
    exactly one time. *)

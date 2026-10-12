@@ -120,7 +120,12 @@ and fdrec =
   ; mutable streak: int
         (** The bytes of the reads with no wait in sequence (M3). Only a hint,
             so a race between two domains does no harm. *)
-  ; udp: bool  (** A UDP socket: only it takes [sendto] and [recvfrom]. *) }
+  ; fkind: fd_kind }
+
+(* The operations that an fd takes. Only a UDP socket takes [sendto] and
+   [recvfrom]. An end of a pipe has one direction, also on FreeBSD, where a pipe
+   goes in the two directions. *)
+and fd_kind = Any | Udp | Read_end | Write_end
 
 (* The state machine of Eio's [Rcfd]. A registration holds a user. *)
 and rc = Open of int | Closing of int | Closed
@@ -474,7 +479,7 @@ module Fdtab = struct
 
   let next = ref 0
 
-  let alloc ?(udp = false) os =
+  let alloc ?(kind = Any) os =
     Mutex.protect lock (fun () ->
         let slot =
           match !free with
@@ -501,7 +506,7 @@ module Fdtab = struct
         ; rc= Atomic.make (Open 0)
         ; doms= Atomic.make 0
         ; streak= 0
-        ; udp } )
+        ; fkind= kind } )
 
   let release r = Mutex.protect lock (fun () -> free := r.slot :: !free)
 
