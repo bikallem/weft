@@ -38,7 +38,7 @@ let elapsed_ns f =
 (* A sleep never ends before its deadline. Without load, it ends in less than 50
    ms. A CI runner is shared, and the load can stop the process: on macOS, a
    sleep took 89.6 ms. Thus on CI the upper limit is 500 ms, as on Linux. It
-   finds a timer that does not fire, not a small delay. *)
+   finds a timer that fires much too late, not a small delay. *)
 let sleep_10ms () =
   let limit =
     if Sys.getenv_opt "CI" = Some "true" then 500_000_000 else 50_000_000
