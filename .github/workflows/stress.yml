@@ -50,6 +50,7 @@ jobs:
             set -e
             if [ $s -ne 0 ]; then
               echo "run $i failed with status $s"
+              grep -A60 "FAIL" kq.log | head -300 || true
               tail -30 kq.log
               for c in /cores/core.*; do
                 [ -e "$c" ] || continue
@@ -60,3 +61,10 @@ jobs:
             fi
             echo "run $i passed"
           done
+      - name: Keep the log of the last run
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kq-log
+          path: kq.log
+          if-no-files-found: ignore
