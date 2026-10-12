@@ -241,6 +241,7 @@ The base events:
 | `Ivar.read v` | The value is set | Add to the waiters of `v` with a CAS on its state (The atomic register, below) |
 | `Process.exit pid` | The table of the world | A world interest |
 | `Signal.received s` | The count of `s` since the last commit of a `received s` event | A world interest (section 2.7, Signals) |
+| `Fiber.Semaphore.acquire s` | A free permit of `s` | Add an offer at the tail of the queue of `s` (section 2.5, Locks for fiber code) |
 
 Each base event has a poll and a block, as in affect. A base event needs no nack. When a `sync` commits to one branch, the sync word of its other offers is `Done`, and the owners of these offers drop them when they meet them (sections 2.5 and 2.7). Thus a timer that loses a `choose` stays in its heap as a stale entry until its owner drops it.
 
@@ -292,6 +293,7 @@ At the end of the scan, the fiber changes its word from `Waiting` to `Parked` wi
 - An `Ivar`, the join of a scope and a nack event have one atomic state: `Empty of waiters` or `Full of value`. A waiter registers with a CAS on `Empty`. A fill changes the state to `Full` with a CAS, then it commits each waiter. affect's `cell.ml` uses the same form.
 - A `Chan` has a short spin lock. The fiber holds the lock only while it looks for a partner, registers its offer or claims the words. It never holds two of these locks, and it never holds one across a world effect. A fiber that holds a sync word never waits for such a lock, so the order of section "Why there is no deadlock" still holds. Parallel CML uses a lock for each channel in the same way.
 - `Signal.received` takes the count only after it holds the word. If the count is 0, it restores the word (milestone M2).
+- A `Fiber.Semaphore` has a short spin lock, as a `Chan` has. Under the lock, an acquire takes a free permit with a self-commit, or it adds its offer to the queue. A release commits the oldest offer under the same lock (section 2.5, Locks for fiber code). The holder of this lock waits only for a word that is `Claimed`, and a claimer never waits for this lock.
 
 **Atomic locations.** Each location in this protocol, and in each Dekker pair of section 2.5, is an `Atomic.t`. It is written with `Atomic.set`, `Atomic.exchange` or a CAS. OCaml gives sequential consistency only among atomic locations. A plain field write and an `Atomic.get` compile to two plain `mov` instructions on amd64, so the CPU can change their order. `Atomic.Backoff` is not in the stdlib (5.5.1). The library has its own module, as affect has (`affect__base.ml`).
 
@@ -691,7 +693,7 @@ A pinned fiber always blocks on domain 0, so its registrations are on domain 0. 
 
 ### Locks for fiber code (M2)
 
-The library gives `Fiber.Mutex` and `Fiber.Condition`. They suspend the fiber, not the domain.
+The library gives `Fiber.Mutex`, `Fiber.Condition` and `Fiber.Semaphore`. They suspend the fiber, not the domain.
 
 `Fiber.Mutex.use_rw ~protect m f` locks `m`, runs `f` and unlocks `m`. If `f` raises, the protected data can be in an incorrect state. Thus the mutex becomes poisoned, and each later `lock` raises `Fiber.Mutex.Poisoned`. `Cancelled` also poisons it. Thus:
 
@@ -712,6 +714,41 @@ Fiber code must not hold a stdlib `Mutex` across a `sync` or a world effect, for
 `Fiber.Condition.wait` must lock the mutex again before it returns, also when the fiber is cancelled. That lock is a `sync`, so `Condition.wait` does it in a shield. Without the shield, the lock raises `Cancelled`, and the caller continues without the mutex. This shield has no time limit. It is an exception to the rule of the shield: the lock waits only for the other holders of the mutex, and each of them must unlock it.
 
 For the same reason as the stdlib `Mutex`, fiber code must not use a spin loop that waits for another domain. In the simulator, no other virtual domain runs between two switch points, so the loop never ends.
+
+**A semaphore (issue 4).** `Fiber.Semaphore` is a counting semaphore:
+
+```ocaml
+module Semaphore : sig
+  type t
+  val create : int -> t               (* the free permits at the start *)
+  val acquire : t -> unit event
+  val release : t -> unit
+  val use : t -> (unit -> 'a) -> 'a
+end
+```
+
+A lock is `create 1`. The acquire is an event, so a `choose` can wait for a permit and for other events. For example, the close of a WebSocket in caravan waits for the reader lock or for the end of the connection, the first of the two. `use t f` acquires a permit, runs `f` and releases the permit, also if `f` raises. A semaphore protects a count, not data, so an exception does not poison it. The acquire is a cancellation point, also when a permit is free.
+
+**The acquire is a base event.** It uses the protocol of a `Chan` (section 2.4, The atomic register):
+
+1. The leaf of `acquire` holds the short lock of the semaphore. If a permit is free, the sync commits itself to the branch with a CAS on its word (the self-commit). The leaf takes the permit only if this CAS succeeds. If no permit is free, the leaf adds an offer (the sync and the branch) at the tail of the queue.
+2. `release` holds the same lock. It takes the offer at the head of the queue and commits the word of its sync with a one-word commit. If the commit succeeds, the permit goes to that sync, and the release resumes the fiber if it is parked. If the word is `Done`, the sync lost its `choose`, or a cancel ended it. Then the release removes the offer and takes the next one. If no offer stays, the permit becomes free.
+
+Thus one CAS on the sync word commits the sync and gives the permit. A sync that commits to another branch never has the permit, so no fiber must give it back. A permit is free only when the queue has no live offer. Thus a new acquire never takes a permit before an older waiter, and the order is FIFO, as for `Fiber.Mutex`. The offers of the syncs that lost stay in the queue until a release meets them or the queue drops its stale offers, as a side of a `Chan` does.
+
+**Why not a guard and a nack.** caravan proposed a composition: a `guard` adds a waiter `Ivar` to a queue, a release fills the first waiter, and a `with_nack` removes a waiter that lost. If a release filled that waiter before the `choose` ended, the nack must give the permit to the next waiter. We did not select this form, for three reasons:
+
+- The nack is an event. Only a fiber that syncs on it can give the permit back. Thus each acquire needs a fiber, or the semaphore needs a server fiber. That fiber is in a scope, and a cancel of the scope loses the permit.
+- Between the fill and the nack, the permit is in the `Ivar` of a fiber that does not use it. The next waiter waits until the fiber that lost runs again.
+- The native form needs no `Ivar`, no nack and no fiber.
+
+The native form is the only form in which the commit and the transfer of the permit are one atomic step. `Semaphore.tla` (section 2.16) has the planted bug of the composition without its nack: a release that gives the permit to the head of the queue with no commit. TLC finds the lost permit.
+
+**A release above the start count.** `release` raises `Invalid_argument` if the free permits are already the count of `create`. A second release of one permit is a bug of the program, and a free increase hides it: a lock then lets two fibers in. The check does not find each such bug: while other fibers hold permits, a second release looks correct. A program that needs a count that starts at 0 creates the semaphore with the maximum count, and it acquires the permits at the start.
+
+**The place and the code.** The module is `Fiber.Semaphore`, next to `Fiber.Mutex`, not a top-level `Semaphore`. With `open Weft`, a top-level module hides `Stdlib.Semaphore`, and a program that uses the stdlib semaphore between domains then gets the fiber semaphore. `Fiber.Mutex` keeps its own code. A mutex has a poison state, a shield node for `Condition.wait` and a `lock` that is not an event. A mutex on top of the semaphore needs all of these parts, so it is not simpler.
+
+**The tests.** The simulator never runs a release between the leaf and its self-commit, so it cannot reach the case where a cancel or a partner commits the sync in this time. Five `dscheck` tests examine the races between domains: an acquire and a release, an acquire with a free permit and a cancel, a release and a cancel of the first waiter, a release while a `Chan` partner commits the other branch, and two releases with one waiter. The tests of the public API run in the simulator, also with 200 seeds on 4 virtual domains, and in the Linux world.
 
 ### Fiber code with no handler
 
@@ -1085,7 +1122,7 @@ The cost of an effect is a perform and a handler call for each world operation. 
 
 ## 2.12 Decisions
 
-Decisions 1 to 6 were made on 2026-10-09, decisions 7 to 9 on 2026-10-10, decisions 10 and 11 on 2026-10-12 (issue 1), decision 12 on 2026-10-12 (issue 2), and decisions 13 and 14 on 2026-10-12 (issue 3).
+Decisions 1 to 6 were made on 2026-10-09, decisions 7 to 9 on 2026-10-10, decisions 10 and 11 on 2026-10-12 (issue 1), decision 12 on 2026-10-12 (issue 2), decisions 13 and 14 on 2026-10-12 (issue 3), and decisions 15 to 17 on 2026-10-12 (issue 4).
 
 | No. | Question | Decision |
 |---|---|---|
@@ -1103,6 +1140,9 @@ Decisions 1 to 6 were made on 2026-10-09, decisions 7 to 9 on 2026-10-10, decisi
 | 12 | The local address | `Net.local_addr` in the core, not a function of each world, so that code for all worlds and the simulator can use it (sections 2.7 and 2.8). `Weft_linux.local_port` and `Weft_kqueue.local_port` go, because `local_addr` gives the same port. A UDP socket gives `Tcp (host, port)`. A `Udp` constructor in `addr` adds a case that `listen` and `connect` must refuse, and a separate function for UDP adds a second API for one task. |
 | 13 | Resource errors | One constructor, `No_resources of string`, for `EMFILE`, `ENFILE`, `ENOBUFS` and `ENOMEM`, and for the `EAGAIN` of a spawn or of a pool with no thread (section 2.7). A program does the same for each of them: it pauses, then tries again. One constructor for each errno makes each handler match four cases. The string keeps the errno for a log. The simulator gives the error at a limit of fds (`Sim.set_fd_limit`), not as a random fault (section 2.8). |
 | 14 | `ECONNABORTED` of `accept` | The POSIX worlds take the next connection, as Go and libuv do (section 2.7). A typed error makes each accept loop catch an error that Linux and the simulator never give, and the loop can do nothing with the connection. |
+| 15 | The acquire of a semaphore in a `choose` | `Fiber.Semaphore.acquire` is a base event with the commit protocol, as `Chan.recv` is (section 2.5, Locks for fiber code). A release commits the word of the oldest waiter, so the commit and the transfer of the permit are one atomic step. A composition of `guard` and `with_nack` needs a fiber that waits for the nack, and a cancel of that fiber loses the permit. |
+| 16 | The place of the semaphore | `Fiber.Semaphore`, next to `Fiber.Mutex`. A top-level `Semaphore` hides `Stdlib.Semaphore` after `open Weft`. `Fiber.Mutex` keeps its own code, because a semaphore has no poison state and no shield node for `Condition.wait`. |
+| 17 | A release above the start count | `Invalid_argument`, as for `Fiber.Mutex.unlock` of a mutex that is not locked. A free increase hides a second release, and a lock then lets two fibers in. |
 
 Also on 2026-10-10, the user accepted the milestone plan of section 2.14. Decisions 4, 7 and 8 stay, and they come in milestone M1. Milestone M0 has one domain.
 
@@ -1316,7 +1356,7 @@ It has three problems:
 
 The protocols that run on many domains at the same time have models in PlusCal, in `spec/tla`. The TLC model checker examines each order of their steps. Each model has the protocol of this design, and a set of planted bugs. Each planted bug must give a failure. Thus the model can find the errors that matter, and it is not only a model that always passes. Some models also have simplifications (constants with the prefix `Simp`). A simplification must pass, and section 2.5 uses the ones that passed.
 
-Run all of the models with `nix develop -c spec/tla/check.sh`. `MODELS="Ivar Fd"` selects some of them. The script runs `JOBS` cases at the same time (default 4), each one with `-lncheck final`, so that TLC checks the liveness property one time at the end. The 44 cases take about 17 minutes on a machine with 16 CPUs. The slowest case, `Wake.tla` with no bug and 15.3 million states, takes about 11 minutes, and it is the lower limit of the run time. The flake of the repository gives the TLA+ tools.
+Run all of the models with `nix develop -c spec/tla/check.sh`. `MODELS="Ivar Fd"` selects some of them. The script runs `JOBS` cases at the same time (default 4), each one with `-lncheck final`, so that TLC checks the liveness property one time at the end. The 51 cases take about 17 minutes on a machine with 16 CPUs. The slowest case, `Wake.tla` with no bug and 15.3 million states, takes about 11 minutes, and it is the lower limit of the run time. The flake of the repository gives the TLA+ tools.
 
 | Model | Protocol (section) | Properties | Planted bugs that fail |
 |---|---|---|---|
@@ -1325,6 +1365,7 @@ Run all of the models with `nix develop -c spec/tla/check.sh`. `MODELS="Ivar Fd"
 | `Ivar.tla` | The atomic register of an `Ivar`, and `Ivar.fill_from_outside` (2.4, 2.5) | At most one resume, one fill, no waiters after the fill, a correct end state, termination | A finaliser that commits the waiters itself, a register that is not atomic |
 | `Wake.tla` | The loop of a domain: idle and wake, steal, next slot, pinned queue, injection queue (2.5) | Each item runs, a pinned item runs only on domain 0, no lost wakeup | The decrease of `searching` after the second check, no second check, a pinned push that wakes any domain. Simplifications that pass: no steal of a next slot, no search limit, no last wake, no `searching` count. |
 | `Fd.tla` | The fd record: `Rcfd`, the registrations, the close notices, the removal (2.7) | One `close(2)`, no `close(2)` of another file, no use after `close(2)`, no `EPOLL_CTL_DEL` of a new file, `EPOLL_CTL_DEL` before `close(2)`, termination | A count and a closed bit, a Register that reads the state first, a registration with no user. A simplification that passes: no CAS on the domain bit. |
+| `Semaphore.tla` | `Fiber.Semaphore`: the acquire in a `choose`, the release, a timer and a cancel (2.5, issue 4). Three scenarios: a `choose` with a timer, a cancel of the first waiter, and two permits with two holders. | No permit is lost or doubled, a holder got its permit from its acquire, at most one resume, no free permit while a live offer waits, FIFO, a correct end state, termination | An acquire with no lock, a take of the permit before the commit, a release that gives the permit to the head with no commit (the composition with no nack), a release to any offer |
 
 **What the models showed about the design:**
 
