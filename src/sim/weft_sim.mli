@@ -105,12 +105,13 @@ val set_fd_limit : t -> int option -> unit
 (** [set_fd_limit t (Some n)] limits the open fds to [n], as [RLIMIT_NOFILE]. An
     operation that makes [k] fds raises [Error (No_resources "EMFILE", _)] if
     {!open_fds} plus [k] is more than [n]: [Net.listen], [Net.connect],
-    [Net.accept], [Net.udp], [File.openfile] (1 fd), [Pipe.create] (2 fds) and
-    [Process.spawn] (1 fd, and 2 fds for each [Piped]). As on Linux, [accept]
-    gives the error also with an empty backlog, it leaves the connection in the
-    backlog, and the listener gets no new edge. [None] (the default) removes the
-    limit. A limit below {!open_fds} closes no fd. To make the next [accept]
-    fail, set the limit to {!open_fds}.
+    [Net.accept], [Net.udp], [File.openfile], [Dir.readdir] (1 fd),
+    [Pipe.create] (2 fds) and [Process.spawn] (1 fd, and 2 fds for each
+    [Piped]). [Dir.readdir] closes its fd at the end, as [opendir] on Linux. As
+    on Linux, [accept] gives the error also with an empty backlog, it leaves the
+    connection in the backlog, and the listener gets no new edge. [None] (the
+    default) removes the limit. A limit below {!open_fds} closes no fd. To make
+    the next [accept] fail, set the limit to {!open_fds}.
 
     @raise Invalid_argument if [n] is negative. *)
 

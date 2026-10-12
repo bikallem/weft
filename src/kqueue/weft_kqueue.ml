@@ -249,7 +249,7 @@ module World = struct
    fun t op ->
     match op with
     | Op.Spawn sp ->
-        if spawn_has_nul sp then nul_error else spawn t sp
+        spawn t sp
     | Op.Wait_child fd -> (
       match proc t fd with Some p -> wait_child t p | None -> Error Op.Bad_fd )
     | Op.Kill (fd, s) -> (
