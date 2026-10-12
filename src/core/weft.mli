@@ -286,8 +286,8 @@ end
 module Var : sig
   type 'a t
 
-  (** A view: the state of a variable that a fiber saw. Each set makes a new
-      state. *)
+  (** A view: a variable and the state of it that a fiber saw. Each set makes a
+      new state. *)
   type 'a view
 
   val create : 'a -> 'a t
@@ -307,29 +307,30 @@ module Var : sig
 
       @raise Fiber.Not_in_fiber outside a fiber. Then [t] does not change. *)
 
-  val changed : 'a t -> 'a view -> 'a view event
-  (** [changed t seen] is ready when the state of [t] is not [seen], a view of
-      [t]. The event gives the state of [t] when the fiber continues, which is
-      never [seen]. Thus a set between [view] and the sync is not lost: the
-      event is ready at once. Only the last value counts: a fiber can miss the
-      values between two of its syncs. The value can change again before the
-      fiber uses the result. Then the next [changed] is ready at once. For
-      example, a wait with a deadline that can change:
+  val changed : 'a view -> 'a view event
+  (** [changed seen] is ready when the state of the variable of [seen] is not
+      the state of [seen]. The event gives a view of the same variable, with its
+      state when the fiber continues. That state is never the state of [seen].
+      Thus a set between [view] and the sync is not lost: the event is ready at
+      once. Only the last value counts: a fiber can miss the values between two
+      of its syncs. The value can change again before the fiber uses the result.
+      Then the next [changed] is ready at once. For example, a wait with a
+      deadline that can change:
 
       {[
-      let rec wait d seen =
+      let rec wait seen =
         match
           sync
             (choose
-               [ wrap (Var.changed d seen) (fun v -> `Changed v)
+               [ wrap (Var.changed seen) (fun v -> `Changed v)
                ; wrap (Time.at Mono (Var.value seen)) (fun () -> `Timeout) ] )
         with
         | `Changed v ->
-            wait d v
+            wait v
         | `Timeout ->
             ()
       in
-      wait d (Var.view d)
+      wait (Var.view d)
       ]} *)
 end
 

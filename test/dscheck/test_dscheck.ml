@@ -858,13 +858,13 @@ let sem_self_commit_claimed () =
         && got x 0 + got y 0 = 1
         && Atomic.get continued + queued t x + in_next t x = 1 )
 
-(* The variable (design section 2.4, A variable). [var_sync dom t seen x got] is
-   the sync of [x] on [changed t seen] on [dom]: the leaf and the end of the
-   scan. [seen] gives the view at the start of the thread. [got] gets the result
-   of the event. *)
-let var_sync dom t seen x got continued () =
+(* The variable (design section 2.4, A variable). [var_sync dom seen x got] is
+   the sync of [x] on [changed seen] on [dom]: the leaf and the end of the scan.
+   [seen] gives the view at the start of the thread. [got] gets the result of
+   the event. *)
+let var_sync dom seen x got continued () =
   let seen = seen () in
-  let leaves, results, _ = Event.flatten (Var.changed t seen) in
+  let leaves, results, _ = Event.flatten (Var.changed seen) in
   got := Some (seen, results.(0)) ;
   leaves.(0) dom x 0 ;
   match C.park x.S.word with `Done _ -> Atomic.incr continued | `Parked -> ()
@@ -879,18 +879,20 @@ let var_result x got =
   | _ ->
       None
 
-(* The end of a sync of [x] on [changed t seen]. If the sync committed, it
+(* The end of a sync of [x] on [changed seen]. If the sync committed, it
    continued one time, and its view is not [seen] and has a value of [values].
    If not, [x] is parked, and the state of [t] is [seen]. Thus each state that a
    fiber waits on has a set that fills its Ivar. *)
 let var_end t v x got continued values =
   match (var_result x got, !got) with
   | Some r, Some (seen, _) ->
-      r != seen
+      r.Var.st != seen.Var.st
       && List.mem (Var.value r) values
       && Atomic.get continued + queued t x = 1
   | None, Some (seen, _) ->
-      C.state x.S.word = C.Parked && Var.view v == seen && queued t x = 0
+      C.state x.S.word = C.Parked
+      && Atomic.get v == seen.Var.st
+      && queued t x = 0
   | _, None ->
       false
 
@@ -904,7 +906,7 @@ let var_set_changed () =
       let v = Var.create 0 and x = new_sync (scope_node ()) in
       let s0 = Var.view v in
       let got = ref None and continued = Atomic.make 0 in
-      spawn_in w (var_sync t.S.doms.(0) v (fun () -> s0) x got continued) ;
+      spawn_in w (var_sync t.S.doms.(0) (fun () -> s0) x got continued) ;
       spawn_in w (var_set t.S.doms.(1) v 1) ;
       fun () -> var_end t v x got continued [1] && C.state x.S.word = C.Done 0 )
 
@@ -917,8 +919,7 @@ let var_two_sets () =
       let w = world () in
       let v = Var.create 0 and x = new_sync (scope_node ()) in
       let got = ref None and continued = Atomic.make 0 in
-      spawn_in w
-        (var_sync t.S.doms.(0) v (fun () -> Var.view v) x got continued) ;
+      spawn_in w (var_sync t.S.doms.(0) (fun () -> Var.view v) x got continued) ;
       spawn_in w (var_set t.S.doms.(1) v 1) ;
       spawn_in w (var_set t.S.doms.(2) v 2) ;
       fun () -> List.mem (Var.get v) [1; 2] && var_end t v x got continued [1; 2] )
@@ -932,7 +933,7 @@ let var_set_back () =
       let v = Var.create 0 and x = new_sync (scope_node ()) in
       let s0 = Var.view v in
       let got = ref None and continued = Atomic.make 0 in
-      spawn_in w (var_sync t.S.doms.(0) v (fun () -> s0) x got continued) ;
+      spawn_in w (var_sync t.S.doms.(0) (fun () -> s0) x got continued) ;
       spawn_in w (fun () ->
           var_set t.S.doms.(1) v 1 () ;
           var_set t.S.doms.(1) v 0 () ) ;
@@ -952,7 +953,7 @@ let var_old_view_cancel () =
       let s0 = Var.view v in
       ignore (Var.change v 1) ;
       let got = ref None and continued = Atomic.make 0 in
-      spawn_in w (var_sync t.S.doms.(0) v (fun () -> s0) x got continued) ;
+      spawn_in w (var_sync t.S.doms.(0) (fun () -> s0) x got continued) ;
       spawn_in w (fun () ->
           match C.notify x.S.word (-1) with
           | C.Resume ->
@@ -962,7 +963,7 @@ let var_old_view_cancel () =
       fun () ->
         ( match var_result x got with
           | Some r ->
-              r == Var.view v
+              r.Var.st == Atomic.get v
           | None ->
               C.state x.S.word = C.Done (-1) )
         && C.state x.S.word <> C.Parked
@@ -978,7 +979,7 @@ let var_set_cancel () =
       let v = Var.create 0 and x = new_sync (scope_node ()) in
       let s0 = Var.view v in
       let got = ref None and continued = Atomic.make 0 in
-      var_sync d0 v (fun () -> s0) x got continued () ;
+      var_sync d0 (fun () -> s0) x got continued () ;
       spawn_in w (var_set d0 v 1) ;
       spawn_in w (fun () ->
           match C.notify x.S.word (-1) with

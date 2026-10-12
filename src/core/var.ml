@@ -2,19 +2,20 @@
    variable). It is a composition of an Atomic and Ivar.read, with no protocol
    of its own. *)
 
-(* A state of a variable, and the view that a fiber saw. The set that replaces
-   this state fills [next]. *)
+(* A state of a variable. The set that replaces this state fills [next]. *)
 type 'a state = {value: 'a; next: unit Ivar.t}
-
-type 'a view = 'a state
 
 type 'a t = 'a state Atomic.t
 
+(* The view that a fiber saw: the variable and one of its states. A view holds
+   no later state. *)
+type 'a view = {var: 'a t; st: 'a state}
+
 let create v = Atomic.make {value= v; next= Ivar.create ()}
 
-let view t = Atomic.get t
+let view t = {var= t; st= Atomic.get t}
 
-let value st = st.value
+let value v = v.st.value
 
 let get t = (Atomic.get t).value
 
@@ -33,7 +34,8 @@ let set t v =
   ignore (Sched.self ()) ;
   Sched.enqueue (change t v)
 
-(* The Ivar of [seen] is full only after a set replaced [seen], and no set puts
-   [seen] again. Thus the state of [t] after the fill is never [seen]. No guard
-   is necessary: the fill of a set comes at once after its exchange. *)
-let changed t seen = Event.wrap (Ivar.read seen.next) (fun () -> Atomic.get t)
+(* The Ivar of [seen] is full only after a set replaced its state, and no set
+   puts that state again. Thus the state of the variable after the fill is never
+   the state of [seen]. No guard is necessary: the fill of a set comes at once
+   after its exchange. *)
+let changed seen = Event.wrap (Ivar.read seen.st.next) (fun () -> view seen.var)
