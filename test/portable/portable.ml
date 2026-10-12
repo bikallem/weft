@@ -1775,76 +1775,111 @@ let semaphores w =
 
 (* The variable (issue 5). *)
 
-(* [Some v] if [changed t seen] is ready in 1 ms. A ready event commits during
-   the scan, before the timer is ready. *)
+(* [Some v] if [changed t seen] is ready in 1 ms, with the value of its view. A
+   ready event commits during the scan, before the timer is ready. *)
 let try_changed t seen =
   sync
     (choose
-       [ wrap (Var.changed t seen) Option.some
+       [ wrap (Var.changed t seen) (fun v -> Some (Var.value v))
        ; wrap (Time.after Mono (Span.ms 1)) (fun () -> None) ] )
 
 (* The wait of a caravan connection: data, or the deadline in [d], the first of
    the two. A change of the deadline starts the wait again. *)
-let rec wait_data d data at =
-  let deadline = match at with Some t -> Time.at Mono t | None -> never in
+let rec wait_data d data seen =
+  let deadline =
+    match Var.value seen with Some t -> Time.at Mono t | None -> never
+  in
   match
     sync
       (choose
          [ wrap (Ivar.read data) (fun () -> `Data)
-         ; wrap (Var.changed d at) (fun at -> `Changed at)
+         ; wrap (Var.changed d seen) (fun v -> `Changed v)
          ; wrap deadline (fun () -> `Timeout) ] )
   with
-  | `Changed at ->
-      wait_data d data at
+  | `Changed v ->
+      wait_data d data v
   | (`Data | `Timeout) as r ->
       r
 
+(* A record of floats only: OCaml keeps it flat, and each read of [x] makes a
+   new box. *)
+type flat = {mutable x: float}
+
 let vars w =
   group "variables"
-    [ test "changed is ready when the value is not the value that the fiber saw"
+    [ test "changed is ready when the state is not the view that the fiber saw"
         (fun () ->
           w.run (fun () ->
               let t = Var.create 1 in
+              let s1 = Var.view t in
+              equal int 1 (Var.value s1) ;
               equal int 1 (Var.get t) ;
-              equal (option int) None (try_changed t 1) ;
+              equal (option int) None (try_changed t s1) ;
               Var.set t 2 ;
               equal int 2 (Var.get t) ;
-              (* A set between the get and the sync is not lost. *)
-              equal (option int) (Some 2) (try_changed t 1) ;
-              equal (option int) None (try_changed t 2) ;
-              (* The box of a float goes through get and changed. *)
-              let f = Var.create 1.5 in
-              let x = Var.get f in
-              is_true (try_changed f x = None) ) )
+              (* A set between the view and the sync is not lost. *)
+              equal (option int) (Some 2) (try_changed t s1) ;
+              equal (option int) None (try_changed t (Var.view t)) ) )
+    ; test
+        "an old view makes the event ready, and the event never gives the view"
+        (fun () ->
+          w.run (fun () ->
+              let t = Var.create 0 in
+              let s0 = Var.view t in
+              (* A change and a change back: the state is new. *)
+              Var.set t 1 ;
+              Var.set t 0 ;
+              (* No set while the fiber waits: the Ivar of [s0] is full. *)
+              let v = sync (Var.changed t s0) in
+              is_true (v != s0) ;
+              equal int 0 (Var.value v) ;
+              is_true (v == Var.view t) ) )
     ; test "a set wakes each waiter with the new value" (fun () ->
           w.run (fun () ->
               let t = Var.create 0 in
+              let s0 = Var.view t in
               Fiber.scope (fun sc ->
                   let ps =
                     List.init 5 (fun _ ->
                         Fiber.fork_promise sc (fun () ->
-                            sync (Var.changed t 0) ) )
+                            Var.value (sync (Var.changed t s0)) ) )
                   in
                   Time.sleep Mono (Span.ms 1) ;
                   Var.set t 7 ;
                   List.iter (fun p -> equal int 7 (Promise.await p)) ps ) ) )
-    ; test "a set of the same value is not a change" (fun () ->
+    ; test "a set of an equal value is a change" (fun () ->
           w.run (fun () ->
-              let a = ref 0 and b = ref 0 in
-              let t = Var.create a and woke = Atomic.make false in
+              let t = Var.create 5 in
+              let s = Var.view t in
               Fiber.scope (fun sc ->
                   let p =
                     Fiber.fork_promise sc (fun () ->
-                        let v = sync (Var.changed t a) in
-                        Atomic.set woke true ; v )
+                        Var.value (sync (Var.changed t s)) )
                   in
                   Time.sleep Mono (Span.ms 1) ;
-                  Var.set t a ;
-                  Time.sleep Mono (Span.ms 1) ;
-                  equal bool false (Atomic.get woke) ;
-                  (* A value that is only equal is a change. *)
-                  Var.set t b ;
-                  is_true (Promise.await p == b) ) ) )
+                  Var.set t 5 ;
+                  equal int 5 (Promise.await p) ) ) )
+    ; test "a float in a flat record or in a local ref gives no busy loop"
+        (fun () ->
+          w.run (fun () ->
+              let t = Var.create 1.5 in
+              (* Each read of these makes a new box of the float. The fiber
+                 keeps the view, so the boxes do not matter. *)
+              let r = {x= Var.get t} and f = ref (Var.get t) in
+              let seen = ref (Var.view t) and wakes = ref 0 in
+              for _ = 1 to 5 do
+                r.x <- r.x +. 0. ;
+                f := !f +. 0. ;
+                match try_changed t !seen with
+                | Some _ ->
+                    incr wakes ;
+                    seen := Var.view t
+                | None ->
+                    ()
+              done ;
+              equal int 0 !wakes ;
+              equal float_exact 1.5 r.x ;
+              equal float_exact 1.5 !f ) )
     ; test "the wait of caravan uses the last deadline" (fun () ->
           w.run (fun () ->
               let d = Var.create None in
@@ -1854,7 +1889,7 @@ let vars w =
               Fiber.scope (fun sc ->
                   let p =
                     Fiber.fork_promise sc (fun () ->
-                        wait_data d data (Var.get d) )
+                        wait_data d data (Var.view d) )
                   in
                   Time.sleep Mono (Span.ms 1) ;
                   Var.set d (after (Span.ms 5)) ;
@@ -1864,7 +1899,7 @@ let vars w =
               Fiber.scope (fun sc ->
                   let p =
                     Fiber.fork_promise sc (fun () ->
-                        wait_data d data (Var.get d) )
+                        wait_data d data (Var.view d) )
                   in
                   Time.sleep Mono (Span.ms 1) ;
                   Var.set d (after (Span.ms 20)) ;
@@ -1876,16 +1911,18 @@ let vars w =
         (fun () ->
           w.run (fun () ->
               let t = Var.create 0 in
+              let s0 = Var.view t in
               for _ = 1 to 20 do
-                equal (option int) None (try_changed t 0)
+                equal (option int) None (try_changed t s0)
               done ;
               Fiber.scope (fun sc ->
                   Fiber.cancel sc (Boom "stop") ;
                   raises (Fiber.Cancelled (Boom "stop")) (fun () ->
-                      sync (Var.changed t 0) ) ) ;
+                      sync (Var.changed t s0) ) ) ;
               Fiber.scope (fun sc ->
                   let wait () =
-                    Fiber.fork_promise sc (fun () -> sync (Var.changed t 0))
+                    Fiber.fork_promise sc (fun () ->
+                        Var.value (sync (Var.changed t s0)) )
                   in
                   let p = wait () and q = wait () in
                   Time.sleep Mono (Span.ms 1) ;
@@ -1897,17 +1934,17 @@ let vars w =
           w.run (fun () ->
               let last = 1_000_000 in
               let t = Var.create (-1) in
-              (* Each event gives a value that is not the value that the waiter
+              (* Each event gives a view that is not the view that the waiter
                  saw. A lost wake makes a waiter wait forever. *)
               let rec watch seen =
-                if seen <> last then (
+                if Var.value seen <> last then (
                   let v = sync (Var.changed t seen) in
-                  is_true (v <> seen) ;
+                  is_true (v != seen) ;
                   watch v )
               in
               Fiber.scope (fun sc ->
                   for _ = 1 to 8 do
-                    Fiber.fork sc (fun () -> watch (Var.get t))
+                    Fiber.fork sc (fun () -> watch (Var.view t))
                   done ;
                   Fiber.scope (fun setters ->
                       for i = 0 to 3 do
@@ -1922,10 +1959,12 @@ let vars w =
     ; test "a set outside a fiber raises Not_in_fiber and changes nothing"
         (fun () ->
           let t = Var.create 1 in
+          let s = Var.view t in
           raises_match
             (function Fiber.Not_in_fiber _ -> true | _ -> false)
             (fun () -> Var.set t 2) ;
-          equal int 1 (Var.get t) ) ]
+          equal int 1 (Var.get t) ;
+          is_true (Var.view t == s) ) ]
 
 (* Files and directories (milestone M2). *)
 

@@ -282,44 +282,54 @@ module Ivar : sig
 end
 
 (** A variable: a value that can change, with an event for its change (design
-    section 2.4, A variable). Physical equality ([==]) compares the values. *)
+    section 2.4, A variable). *)
 module Var : sig
   type 'a t
+
+  (** A view: the state of a variable that a fiber saw. Each set makes a new
+      state. *)
+  type 'a view
 
   val create : 'a -> 'a t
 
   val get : 'a t -> 'a
+  (** [get t] is [value (view t)]. *)
+
+  val view : 'a t -> 'a view
+
+  val value : 'a view -> 'a
 
   val set : 'a t -> 'a -> unit
-  (** [set t v] gives [t] the value [v], and it wakes the fibers that wait in
-      [changed]. If [v] is the value of [t] ([==]), the set does nothing: it is
-      not a change. A value that is only equal ([=]) is a change.
+  (** [set t v] gives [t] a new state with the value [v], and it wakes the
+      fibers that wait in [changed]. Each set is a change, also a set of an
+      equal value. A program that wants no wake for an equal value compares the
+      values before the set.
 
       @raise Fiber.Not_in_fiber outside a fiber. Then [t] does not change. *)
 
-  val changed : 'a t -> 'a -> 'a event
-  (** [changed t seen] is ready when the value of [t] is not [seen]. Give it the
-      value of [get], or the value of an earlier [changed]. The event gives the
-      new value: the value of [t] at the sync if it is not [seen], else the
-      value of the next change. Thus a set between [get] and the sync is not
-      lost: the event is ready at once. A later set can change the value again,
-      but the next [changed] then is ready at once. For example, a wait with a
-      deadline that can change:
+  val changed : 'a t -> 'a view -> 'a view event
+  (** [changed t seen] is ready when the state of [t] is not [seen], a view of
+      [t]. The event gives the state of [t] when the fiber continues, which is
+      never [seen]. Thus a set between [view] and the sync is not lost: the
+      event is ready at once. Only the last value counts: a fiber can miss the
+      values between two of its syncs. The value can change again before the
+      fiber uses the result. Then the next [changed] is ready at once. For
+      example, a wait with a deadline that can change:
 
       {[
-      let rec wait d at =
+      let rec wait d seen =
         match
           sync
             (choose
-               [ wrap (Var.changed d at) (fun at -> `Changed at)
-               ; wrap (Time.at Mono at) (fun () -> `Timeout) ] )
+               [ wrap (Var.changed d seen) (fun v -> `Changed v)
+               ; wrap (Time.at Mono (Var.value seen)) (fun () -> `Timeout) ] )
         with
-        | `Changed at ->
-            wait d at
+        | `Changed v ->
+            wait d v
         | `Timeout ->
             ()
       in
-      wait d (Var.get d)
+      wait d (Var.view d)
       ]} *)
 end
 
