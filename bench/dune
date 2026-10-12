@@ -1,7 +1,7 @@
 ; The measurements of the open questions of design section 2.13.
 
 (executables
- (names m1 m3)
+ (names m1 m3 q6)
  (enabled_if
   (= %{system} linux))
- (libraries weft weft.linux unix))
+ (libraries weft weft.linux unix runtime_events))
