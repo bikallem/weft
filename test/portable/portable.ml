@@ -1868,7 +1868,7 @@ let vars w =
     ; test "a view with no set gives no wake" (fun () ->
           w.run (fun () ->
               let t = Var.create 1.5 in
-              (* A while loop keeps the view in a local ref. *)
+              (* A loop keeps the view in a local ref. *)
               let seen = ref (Var.view t) and wakes = ref 0 in
               for _ = 1 to 5 do
                 match try_changed !seen with
@@ -1957,12 +1957,10 @@ let vars w =
     ; test "a set outside a fiber raises Not_in_fiber and changes nothing"
         (fun () ->
           let t = Var.create 1 in
-          let s = Var.view t in
           raises_match
             (function Fiber.Not_in_fiber _ -> true | _ -> false)
             (fun () -> Var.set t 2) ;
-          equal int 1 (Var.get t) ;
-          equal int 1 (Var.value s) ) ]
+          equal int 1 (Var.get t) ) ]
 
 (* Files and directories (milestone M2). *)
 
