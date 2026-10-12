@@ -101,6 +101,7 @@ type _ t =
   | Read : fd * bytes * int * int -> int t
   | Write : fd * bytes * int * int -> int t
   | Shutdown : fd -> unit t
+  | Reset_on_close : fd -> unit t
   | Udp : string * int -> fd t
   | Sendto : fd * bytes * int * int * string * int -> int t
   | Recvfrom : fd * bytes * int * int -> (int * string * int) t

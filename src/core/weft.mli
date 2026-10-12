@@ -360,6 +360,21 @@ module Net : sig
   val write_sub : t -> bytes -> int -> int -> int
   (** Writes at least one byte, and gives the number. *)
 
+  val read_now : t -> bytes -> int -> int -> int option
+  (** [read_now t buf off len] does one read with no wait. It gives [None] if no
+      byte is ready, [Some 0] at the end of the stream, and [Some n] if it read
+      [n] bytes. After [None], the next [readable] waits for new data. Use it
+      after [readable] in a [choose], so that a stale event does not block.
+
+      @raise Invalid_argument if [len < 1] or the range is not in [buf]. *)
+
+  val write_now : t -> bytes -> int -> int -> int option
+  (** [write_now t buf off len] does one write with no wait. It gives [None] if
+      the socket cannot take a byte, and [Some n] if it wrote [n] bytes. After
+      [None], the next [writable] waits for new space.
+
+      @raise Invalid_argument if the range is not in [buf]. *)
+
   val shutdown : t -> unit
   (** Ends the send side. The peer reads the end of the stream. *)
 
@@ -367,6 +382,18 @@ module Net : sig
   (** Closes the socket. A fiber that waits on it, and each later operation,
       gets [Error (Bad_fd, _)]. A second [close] does nothing. [close] never
       blocks, so a cancelled fiber can call it. *)
+
+  val reset : t -> unit
+  (** Closes a TCP socket with a reset (RST, [SO_LINGER] with a time of 0). The
+      peer reads the data that came before the reset. Then its next read or
+      write gets [Error (Reset, _)], and later reads give the end of the stream.
+      On macOS and FreeBSD, the write can get [Broken_pipe]. The OS drops the
+      data that the peer did not get. [reset] follows the protocol of [close],
+      and it never blocks.
+
+      A reset after [shutdown] gives the peer the end of the stream and [EPIPE],
+      as on Linux. If the peer already closed, or if [t] is closed, a listener,
+      a Unix socket or a UDP socket, [reset] is the same as [close]. *)
 
   val readable : t -> unit event
   (** Ready when the socket can be read. It is also ready after a [close]: the

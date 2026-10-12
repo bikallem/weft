@@ -191,7 +191,7 @@ Each operation is a constructor of the GADT `'a Op.t`, for example `Read : fd * 
 
 | Module | Operations | Production | Simulator |
 |---|---|---|---|
-| `Net` | Sockets: TCP, UDP, Unix domain. `listen`, `accept`, `connect`, `read`, `write`, `sendto`, `recvfrom`, `shutdown`, socket options | Non-blocking fds in the poller | The in-memory network |
+| `Net` | Sockets: TCP, UDP, Unix domain. `listen`, `accept`, `connect`, `read`, `write`, `read_now`, `write_now`, `sendto`, `recvfrom`, `shutdown`, `reset`, socket options | Non-blocking fds in the poller | The in-memory network |
 | `Pipe` | `pipe`, `read`, `write` | Non-blocking fds in the poller | In-memory buffers |
 | `File` | `open`, `read`, `write`, `pread`, `pwrite`, `fsync`, `stat`, `truncate` | `Blocking` operations on the thread pool | An in-memory file system |
 | `Dir` | `mkdir`, `readdir`, `rename`, `unlink`, `rmdir` | `Blocking` operations on the thread pool | The in-memory file system |
@@ -788,6 +788,7 @@ Each domain has its own poller (section 2.5). A fiber registers an fd in the pol
 - A later block on X on domain B needs no syscall.
 - The read flag, the write flag and the waiters are in the registration of B, and only B uses them. B sets a flag at an event and commits each waiter. A fiber on B that gets `EAGAIN` clears the flag of B. Thus no atomic readiness word is necessary.
 - A fiber reads or writes until the call gives `EAGAIN`. The I/O modules do this loop, so fiber code does not see it.
+- **A read with no wait (issue 1).** `Net.read_now` and `Net.write_now` do one attempt and give `None` on `EAGAIN`. A server uses them after `Net.readable` in a `choose` with a deadline and a stop, because a readable event can be stale: another fiber read the data, the OS gave an edge with no data, or a TLS layer got only a part of a record. After `EAGAIN`, the fiber clears the flag of its domain with a request to the scheduler (`Clear_ready`), as the wait of `read` does. Thus the next `readable` waits for a new edge, and a loop of `readable` and `read_now` does not spin. The domain takes its edges only between fibers, so no edge can come between the attempt and the clear. If the fiber moves to another domain before its next `readable`, the flag of that domain can be stale too. Then the loop does one more attempt, and that attempt clears that flag.
 - One busy socket can keep its fiber ready for a long time (M3). A read loop of the user can then run without a switch, because each read finds data. A write blocks when the buffer is full, so it cannot keep the fiber busy in the same way. M0 has no yield in the I/O modules. M3 adds a yield after a fixed number of bytes, in the place that a measurement shows. **Done in M3:** after 64 KiB of reads with no wait on one fd, a read yields, and this yield is not a cancellation point, because the read already took the bytes. Measured (`bench/m3.ml`, a reader of a full pipe that works 20 µs on each 64 KiB, and a timer of 1 ms on the same domain): with no yield, the timer was late by up to 1 s. With a yield each 64 KiB, by 0.57 ms on average and 1.2 ms at most, for a loss of about 7% of the throughput. With 256 KiB, by 4.9 ms on average. The rest of the lateness comes from the poll of a busy domain each 61 switches (open question 3).
 
 **An fd in many pollers (M1).** A fiber can block on X on domain A, move, and block on X on domain B later. Then X is in the two epoll sets, and A gets edges that nobody waits for. Linux gives a new edge for each arrival of data, also when the only fiber of the fd is busy and not blocked. Thus an edge with no live waiter is normal, also with one domain. A removes X from its set when an edge of X comes on A with no live waiter on A, and another domain also has a registration of X: then the fiber of X moved. The removal is an `EPOLL_CTL_DEL`, a change of the domain bit and the release of the user of the registration (see `close`, below). A close notice does the same steps. The two run on the thread of A, so they never interleave. If a fiber blocks on X on A again, A adds X again. Open question 4 has the measurements.
@@ -803,6 +804,8 @@ Each domain has its own poller (section 2.5). A fiber registers an fd in the pol
 - **Close notices (M1).** `close` sends a close notice with the slot index and the generation to the mailbox of each domain in the set, and it wakes these domains. A domain acts on a notice only if it holds a live registration for that pair. The removal of section "An fd in many pollers" also needs a live registration. The two run on the thread of the domain, one after the other, so only the first one finds the registration live. That one clears the domain bit, commits the waiters with `EBADF`, does `EPOLL_CTL_DEL` and removes the user of the registration. Thus a user is removed exactly one time, and `EPOLL_CTL_DEL` never names a reused fd number. The domain bit needs no CAS: only the owner sets and clears its bit, and the closer only reads the word to know which domains get a notice. But the bits of all domains share one word. Thus the owner changes its bit with `fetch_and_add` of plus or minus the bit, not with a read and a store. With a read and a store, two domains that register at the same time can lose the bit of one of them, and `close` then sends no notice to that domain. The TLA+ model of section 2.16 has a set that changes one element in one step, so it did not find this race. The review of M0 found it.
 - `close(2)` comes after each `EPOLL_CTL_DEL`. An epoll registration lives until all fds of its open file description close (epoll(7)). A review verified this: with a `dup` alive, the registration gave events after `close(2)`.
 - `close(2)` can block, for example on a socket with `SO_LINGER` and on an NFS or FUSE file. Thus the library gives the `close(2)` of a `File` fd, and of a socket with `SO_LINGER`, to the pool (milestone M2).
+- **`Net.reset` (issue 1).** `reset` sets `SO_LINGER` to on with a time of 0 (`Op.Reset_on_close`), then it calls `close`. The option is a use of the fd with a user, as a read, and `close` follows the protocol of this section. Thus the `close(2)` of the last user sends the reset (RST), also when fibers wait on the socket: they get `EBADF`, as after a `close`. With a time of 0, `close(2)` does not block, so it does not go to the pool. If the record is already `Closing`, or if the OS refuses the option, the close is a normal close. I think that macOS refuses an option on a connection that ended in the two directions (`EINVAL`), but I did not verify it. `Fd.tla` needs no change: the option is an acquire and a release of a user, the same as the late read of the model.
+- **What a reset gives on Linux.** A test on Linux 7.1 gave these results. The peer reads the data that came before the reset. Then its next read gives `ECONNRESET`, and the reads after it give the end of the stream. A write of the peer gives `ECONNRESET`, then `EPIPE`. After a `shutdown` of the side that resets, the peer gets the end of the stream and `EPIPE`, because its socket is in `CLOSE_WAIT`. A Unix socket ignores the option, and a listener sends a reset to the connections in its backlog also with a normal close.
 - **Close-on-exec.** The library makes each fd with this flag: `epoll_create1 (EPOLL_CLOEXEC)`, `EFD_CLOEXEC`, `TFD_CLOEXEC`, `SOCK_CLOEXEC` for `socket`, `socketpair` and `accept4`, `O_CLOEXEC` for `File.open`, `pipe2`, `MSG_CMSG_CLOEXEC` for fds that come with `SCM_RIGHTS`, and `F_DUPFD_CLOEXEC` or `dup3` for a copy. Thus a child from `Process.spawn` does not keep a copy. macOS has no `SOCK_CLOEXEC`, `accept4` and `pipe2`, so its fds get the flag with `fcntl` after the create. Another domain can spawn a child between the two calls. Thus each spawn on macOS uses `POSIX_SPAWN_CLOEXEC_DEFAULT`, and the child gets only the fds 0, 1 and 2.
 
 **Linux:**
@@ -902,7 +905,8 @@ module Sim : sig
 
   (* Milestone M2 *)
   type net_faults =
-    { jitter : Span.t; short_io : bool; extra_edges : bool; udp_loss : bool }
+    { jitter : Span.t; short_io : bool; extra_edges : bool; udp_loss : bool;
+      resets : bool }
   val net_faults : t -> net_faults -> unit
   val set_blocking_cost : t -> Span.t -> unit  (* open question 2 *)
   val set_dns : t -> string -> dns_answer -> unit
@@ -944,6 +948,8 @@ The simulator copies the edge-triggered behavior of Linux strictly. If it gave m
 - A Register of an fd that is ready gives one edge at once. A review verified this on Linux, also after an `EPOLL_CTL_DEL` and a new `EPOLL_CTL_ADD`.
 - By default, an edge comes when the state changes, for example when data arrives. A test can enable more edges from the seed with `Sim.net_faults`.
 - The end of a stream and `EPOLLRDHUP` give edges.
+- **A reset (issue 1).** The simulator copies the results of Linux in section 2.7, What a reset gives on Linux. The close of a socket with `Reset_on_close` sends a reset to the peer, after the latency and after the data. The reset sets a flag of the peer: its next read with no data, or its next write, gives `ECONNRESET` and clears the flag. Then the peer has the end of the stream and no peer, so a read gives 0 and a write gives `EPIPE`. A Unix socket and a socket after `Shutdown` get a normal close. Data that arrives after the close or the reset of the receiver is lost.
+- **The fault `resets` of `Sim.net_faults`.** One write of a TCP socket in 64 resets the connection, as a middlebox can. The write gives `ECONNRESET` at once, and the peer gets the reset after the delay. A test of a client or a server can thus reach its `Reset` paths. The faults world of the portable tests does not enable it, because a reset ends the exchange of a test.
 - The simulator checks the order of production: a `close(2)` must come after the Deregister of each domain in the set, and a Deregister or an event must never name a closed or reused pair of slot and generation.
 
 ### The `wait` steps
@@ -1058,7 +1064,7 @@ The cost of an effect is a perform and a handler call for each world operation. 
 
 ## 2.12 Decisions
 
-Decisions 1 to 6 were made on 2026-10-09, and decisions 7 to 9 on 2026-10-10.
+Decisions 1 to 6 were made on 2026-10-09, decisions 7 to 9 on 2026-10-10, and decisions 10 and 11 on 2026-10-12 (issue 1).
 
 | No. | Question | Decision |
 |---|---|---|
@@ -1071,6 +1077,8 @@ Decisions 1 to 6 were made on 2026-10-09, and decisions 7 to 9 on 2026-10-10.
 | 7 | Stealing | Full stealing, as in affect. A fiber that ran can move, but its registrations stay on the domain where it blocked. |
 | 8 | Fd registration | Edge-triggered, with one registration in each domain where a fiber blocks on the fd |
 | 9 | Tests | windtrap 0.2.0: property, stateful and expect tests, coverage and mutation testing (section 2.17) |
+| 10 | A read with no wait | `Net.read_now` and `Net.write_now`, which clear the flag of the domain after `EAGAIN` (section 2.7). A fiber for each read, or a cancel for the stop of a server, cost a fiber and a scope for each wait, and a cancel cannot stop only the idle connections. |
+| 11 | A close with a reset | `Net.reset`, not a `Linger` socket option. A linger time of more than 0 makes `close(2)` block, and the simulator models one reset more easily than all linger times. The simulator gives the reset to the peer, and the fault `resets` of `Sim.net_faults` resets a connection at random (section 2.8). |
 
 Also on 2026-10-10, the user accepted the milestone plan of section 2.14. Decisions 4, 7 and 8 stay, and they come in milestone M1. Milestone M0 has one domain.
 

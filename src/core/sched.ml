@@ -152,6 +152,9 @@ and _ req =
   | Enqueue : sync list -> unit req
   | Close_notices : fdrec -> unit req
       (** Send a close notice to each domain with a registration. *)
+  | Clear_ready : fdrec * bool -> unit req
+      (** An operation with no wait got [EAGAIN]: clear the read flag, or the
+          write flag with [true], of the registration of this domain. *)
   | Job : 'a Op.blocking * (unit -> unit) option -> (int, Op.error) result req
       (** Start a job of the pool for the domain that runs the fiber. The
           function runs at its completion. *)
@@ -1149,6 +1152,11 @@ let rec run_fiber : dom -> fiber -> step -> unit =
   | Suspended (Detach_job id, k) ->
       drop_external dom.sched id ;
       ignore (World.perform "job" (World.Submit (Op.Detach id))) ;
+      run_fiber dom fiber (Effect.Deep.continue k ())
+  | Suspended (Clear_ready (fdr, write), k) ->
+      Option.iter
+        (fun reg -> if write then reg.wflag <- false else reg.rflag <- false)
+        (live_reg dom fdr) ;
       run_fiber dom fiber (Effect.Deep.continue k ())
   | Suspended (Close_notices fdr, k) ->
       close_notices dom fdr ;

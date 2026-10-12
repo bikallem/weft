@@ -431,7 +431,10 @@ let faults_world =
                   { jitter= Span.ms 2
                   ; short_io= true
                   ; extra_edges= true
-                  ; udp_loss= true } ;
+                  ; udp_loss= true
+                  ; (* A reset ends the exchange of a test: test_net.ml has the
+                       tests of this fault. *)
+                    resets= false } ;
                 Sim.set_blocking_cost sim (Span.ms 1) ;
                 f () )
           in

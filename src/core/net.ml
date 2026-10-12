@@ -135,8 +135,45 @@ let write_sub fd buf off len =
 
 let write = write_all write_sub
 
+(* One attempt with no wait. On [EAGAIN], the flag of the domain is stale, as in
+   [retry]. Thus the next [readable] or [writable] waits for a new edge, and a
+   loop of [readable] and [read_now] does not spin. *)
+let now ~write fd name op =
+  match attempt fd name op with
+  | Ok v ->
+      Some v
+  | Error Op.Would_block ->
+      fd.streak <- 0 ;
+      prog name (Clear_ready (fd, write)) ;
+      None
+  | Error e ->
+      raise (Error (e, name))
+
+let read_now fd buf off len =
+  check_range ~read:true "Net.read_now" buf off len ;
+  Option.map (after_read fd)
+    (now ~write:false fd "Net.read_now" (fun os -> Op.Read (os, buf, off, len)))
+
+let write_now fd buf off len =
+  check_range ~read:false "Net.write_now" buf off len ;
+  now ~write:true fd "Net.write_now" (fun os -> Op.Write (os, buf, off, len))
+
 let shutdown fd =
   ok "Net.shutdown" (attempt fd "Net.shutdown" (fun os -> Op.Shutdown os))
+
+(* The mark of the reset is a use of the fd, as a read: it holds a user. Then
+   [close] does the close protocol, and the close(2) of the last user sends the
+   reset. If the record is already closing, or if the OS refuses the mark, the
+   close is a normal close. I think that macOS refuses an option on a connection
+   that ended in the two directions. *)
+let reset fd =
+  ignore (self ()) ;
+  ( match attempt fd "Net.reset" (fun os -> Op.Reset_on_close os) with
+  | _ ->
+      ()
+  | exception Error (Op.Bad_fd, _) ->
+      () ) ;
+  close fd
 
 (* UDP (design section 2.3, The I/O modules). A datagram moves in one operation,
    or not at all. *)
