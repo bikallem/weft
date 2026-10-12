@@ -143,6 +143,8 @@ type net =
   ; mutable next_fd: int
   ; names: (string, int) Hashtbl.t  (** The listeners, by address. *)
   ; udp_names: (string, int) Hashtbl.t  (** The UDP sockets, by address. *)
+  ; client_ports: (int, int) Hashtbl.t
+        (** The ports of the TCP clients that are not closed, with their fds. *)
   ; opts: (int, opts) Hashtbl.t
         (** The options of each socket, after its first [Set_option] or
             [Get_option]. *)
@@ -215,6 +217,16 @@ let sched t = Option.get t.sched
 let open_fds t = Hashtbl.length t.net.fds
 
 let key addr = Format.asprintf "%a" Op.pp_addr addr
+
+(* The checks of [make_addr] in the POSIX worlds: a NUL byte in a host or a
+   path, or a port out of range, gives EINVAL. *)
+let bad_host_port h p = String.contains h '\000' || p < 0 || p > 65535
+
+let bad_addr = function
+  | Op.Tcp (h, p) ->
+      bad_host_port h p
+  | Op.Unix path ->
+      String.contains path '\000'
 
 let avail c = Buffer.length c.inbox - c.rpos
 
@@ -867,6 +879,8 @@ let submit : type a. t -> a Op.t -> (a, Op.error) result =
         Error Op.Bad_fd
   in
   match op with
+  | Op.Listen (addr, _) when bad_addr addr ->
+      Error (Op.Other "EINVAL")
   | Op.Listen (addr, backlog) ->
       (* A listen on port 0 gets a free port, as on Linux. *)
       let addr =
@@ -892,6 +906,8 @@ let submit : type a. t -> a Op.t -> (a, Op.error) result =
              ; laddr= addr } ) ;
         Hashtbl.replace n.names k fd ;
         Ok fd
+  | Op.Connect addr when bad_addr addr ->
+      Error (Op.Other "EINVAL")
   | Op.Connect addr -> (
       let refused () = Error Op.Refused in
       match Hashtbl.find_opt n.names (key addr) with
@@ -901,10 +917,11 @@ let submit : type a. t -> a Op.t -> (a, Op.error) result =
         match Hashtbl.find_opt n.fds lfd with
         | Some (Lsn l) when Queue.length l.backlog + l.pending < l.limit ->
             l.pending <- l.pending + 1 ;
-            (* The client has the host "client" and a port from the counter. A
-               Unix client has no path. *)
+            (* The client has the host "client" and a port from the counter that
+               no open client has. A Unix client has no path. *)
             let client =
-              if l.ltcp then Op.Tcp ("client", fresh_port n (fun _ -> false))
+              if l.ltcp then
+                Op.Tcp ("client", fresh_port n (Hashtbl.mem n.client_ports))
               else Op.Unix ""
             in
             let mk ~local remote =
@@ -931,6 +948,11 @@ let submit : type a. t -> a Op.t -> (a, Op.error) result =
             s.established <- true ;
             c.cfd <- new_fd n ;
             Hashtbl.replace n.fds c.cfd (Conn c) ;
+            ( match client with
+            | Op.Tcp (_, p) ->
+                Hashtbl.replace n.client_ports p c.cfd
+            | Op.Unix _ ->
+                () ) ;
             later t (fun () ->
                 l.pending <- l.pending - 1 ;
                 match Hashtbl.find_opt n.fds lfd with
@@ -995,6 +1017,8 @@ let submit : type a. t -> a Op.t -> (a, Op.error) result =
         Error (Op.Other "EDESTADDRREQ")
     | _ ->
         conn fd (fun c -> write_conn t c buf off len) )
+  | Op.Udp (host, port) when bad_host_port host port ->
+      Error (Op.Other "EINVAL")
   | Op.Udp (host, port) ->
       let key p = Printf.sprintf "%s:%d" host p in
       let port =
@@ -1002,11 +1026,7 @@ let submit : type a. t -> a Op.t -> (a, Op.error) result =
         else port
       in
       let k = key port in
-      if
-        (port < 0) [@mutate off "the port 0 got a free port before this check"]
-        || port > 65535
-      then Error (Op.Other "EINVAL")
-      else if Hashtbl.mem n.udp_names k then Error Op.In_use
+      if Hashtbl.mem n.udp_names k then Error Op.In_use
       else
         let fd = new_fd n in
         Hashtbl.replace n.fds fd
@@ -1015,6 +1035,8 @@ let submit : type a. t -> a Op.t -> (a, Op.error) result =
         Ok fd
   | Op.Sendto (fd, buf, off, len, host, port) -> (
     match Hashtbl.find_opt n.fds fd with
+    | Some (Dgm _) when bad_host_port host port ->
+        Error (Op.Other "EINVAL")
     | Some (Dgm g) ->
         send_dgram t g (Bytes.sub_string buf off len) host port
     | Some (Conn _ | Lsn _) ->
@@ -1138,6 +1160,12 @@ let submit : type a. t -> a Op.t -> (a, Op.error) result =
           Hashtbl.remove n.opts fd ;
           ( match sfd with
           | Conn c ->
+              ( match c.local with
+              | Op.Tcp (_, p) when Hashtbl.find_opt n.client_ports p = Some fd
+                ->
+                  Hashtbl.remove n.client_ports p
+              | Op.Tcp _ | Op.Unix _ ->
+                  () ) ;
               (* Linux also sends a reset at the close of a TCP or Unix stream
                  socket with unread data. *)
               if c.abort || (c.role = Sock && avail c > 0) then reset_conn t c
@@ -1516,6 +1544,7 @@ let run ?(seed = 0) ?(domains = 1) ?(auto = true) ?(signals = [])
         ; next_fd= 3
         ; names= Hashtbl.create ~random:false 8
         ; udp_names= Hashtbl.create ~random:false 8
+        ; client_ports= Hashtbl.create ~random:false 8
         ; opts= Hashtbl.create ~random:false 8
         ; regs= Hashtbl.create ~random:false 16
         ; edges= []

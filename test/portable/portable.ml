@@ -858,6 +858,24 @@ let local_addr w =
               Net.close a ;
               Net.close b ;
               Net.close u ) )
+    ; test "a port out of range or a NUL byte gives EINVAL" (fun () ->
+          w.run (fun () ->
+              let host = host_of w in
+              let einval f = equal string "EINVAL" (error_of f) in
+              einval (fun () -> Net.listen (Net.Tcp (host, 65536))) ;
+              einval (fun () -> Net.listen (Net.Tcp (host, -1))) ;
+              einval (fun () -> Net.listen (Net.Tcp (host ^ "\000x", 0))) ;
+              einval (fun () -> Net.connect (Net.Tcp (host, 65536))) ;
+              einval (fun () -> Net.connect (Net.Tcp (host ^ "\000x", 1))) ;
+              let path = Filename.concat (w.tmp ()) "s" in
+              einval (fun () -> Net.listen (Net.Unix (path ^ "\000x"))) ;
+              einval (fun () -> Net.connect (Net.Unix (path ^ "\000x"))) ;
+              einval (fun () -> Net.udp (host, 65536)) ;
+              einval (fun () -> Net.udp (host ^ "\000x", 0)) ;
+              let u, _ = w.udp () and b = Bytes.of_string "x" in
+              einval (fun () -> Net.sendto u b 0 1 (host, 65536)) ;
+              einval (fun () -> Net.sendto u b 0 1 (host ^ "\000x", 1)) ;
+              Net.close u ) )
     ; test "a closed socket gives EBADF" (fun () ->
           w.run (fun () ->
               let l, _ = w.listen () and u, _ = w.udp () in
