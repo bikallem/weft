@@ -396,10 +396,6 @@ let udp_size_limit () =
       Net.sendto a (Bytes.make 65507 'x') 0 65507 a_addr ;
       let buf = Bytes.create 70_000 in
       equal int 65507 (fst (Net.recvfrom a buf 0 70_000)) ;
-      is_true
-        ( Portable.error_of (fun () ->
-              Net.sendto a (Bytes.make 65508 'x') 0 65508 a_addr )
-        <> "no error" ) ;
       Net.close a )
 
 let option_sizes () =
@@ -410,6 +406,29 @@ let option_sizes () =
       Net.set_option u Recv_buffer 100_000 ;
       equal int 200_000 (Net.get_option u Recv_buffer) ;
       Net.close u )
+
+(* A pool that cannot start a thread completes its jobs with EAGAIN. A detach
+   after that completion must not crash (the review of the limit of detached
+   jobs). The helper runs with a limit of one process. *)
+let no_threads () =
+  let helper =
+    match Sys.getenv_opt "WEFT_NO_THREADS" with
+    | Some c ->
+        if Filename.is_relative c then Filename.concat (Sys.getcwd ()) c else c
+    | None ->
+        skip ~reason:"WEFT_NO_THREADS is not set" ()
+  in
+  if Sys.command "command -v prlimit > /dev/null" <> 0 then
+    skip ~reason:"prlimit is not installed" () ;
+  if Unix.getuid () = 0 then skip ~reason:"root has no process limit" () ;
+  let out = Filename.concat (tmp ()) "out" in
+  let code =
+    Sys.command
+      (Printf.sprintf "prlimit --nproc=1:1 %s > %s 2>&1" (Filename.quote helper)
+         (Filename.quote out) )
+  in
+  equal int 0 code ;
+  equal string "ok\n" (In_channel.with_open_text out In_channel.input_all)
 
 (* Processes and signals (milestone M2). *)
 
@@ -636,8 +655,9 @@ let linux =
     ; test "a fiber detaches from an open that blocks" detach_from_open
     ; test "1,000 files open and close with no fd leak" no_file_leak
     ; test "C4: a job that blocks does not stop the next job" blocked_job
+    ; test "a detach after the completion of a pool with no thread" no_threads
     ; test "UDP on IPv6" udp_ipv6
-    ; test "a datagram of more than 65507 bytes gives an error" udp_size_limit
+    ; test "a datagram of 65507 bytes goes through" udp_size_limit
     ; test "the sizes of the buffers, as in the simulator" option_sizes
     ; test "a detach of a job in the queue removes it" detach_queued
     ; test "each detached job that runs gives one more thread, up to the limit"

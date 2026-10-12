@@ -141,16 +141,23 @@ let shutdown fd =
 (* UDP (design section 2.3, The I/O modules). A datagram moves in one operation,
    or not at all. *)
 let udp (host, port) =
-  Fdtab.alloc (ok "Net.udp" (submit "Net.udp" (Op.Udp (host, port))))
+  Fdtab.alloc ~udp:true (ok "Net.udp" (submit "Net.udp" (Op.Udp (host, port))))
+
+(* On Linux, a sendto on a TCP socket ignores the address, and it can send a
+   part. Thus the two worlds refuse it before the submit. *)
+let check_udp name fd =
+  if not fd.udp then invalid_arg (name ^ ": not a UDP socket")
 
 let sendto fd buf off len (host, port) =
   check_range ~read:false "Net.sendto" buf off len ;
+  check_udp "Net.sendto" fd ;
   ignore
     (retry ~write:true fd "Net.sendto" (fun os ->
          Op.Sendto (os, buf, off, len, host, port) ) )
 
 let recvfrom fd buf off len =
   check_range ~read:true "Net.recvfrom" buf off len ;
+  check_udp "Net.recvfrom" fd ;
   let n, host, port =
     retry ~write:false fd "Net.recvfrom" (fun os ->
         Op.Recvfrom (os, buf, off, len) )
@@ -165,14 +172,22 @@ type 'a sockopt = 'a Op.sockopt =
   | Recv_buffer : int sockopt
   | Send_buffer : int sockopt
 
+(* A size is an [int] of C: the limit keeps a large size large. The OS lowers it
+   to its own limit. *)
+let check_size v =
+  if v < 1 then invalid_arg "Net.set_option: the size is not positive" ;
+  Int.min v 0x7fff_ffff
+
 let set_option (type a) fd (opt : a sockopt) (v : a) =
-  ( match opt with
-  | Recv_buffer ->
-      if v < 1 then invalid_arg "Net.set_option: the size is not positive"
-  | Send_buffer ->
-      if v < 1 then invalid_arg "Net.set_option: the size is not positive"
-  | No_delay | Keep_alive | Broadcast ->
-      () ) ;
+  let v : a =
+    match opt with
+    | Recv_buffer ->
+        check_size v
+    | Send_buffer ->
+        check_size v
+    | No_delay | Keep_alive | Broadcast ->
+        v
+  in
   ok "Net.set_option"
     (attempt fd "Net.set_option" (fun os -> Op.Set_option (os, opt, v)))
 

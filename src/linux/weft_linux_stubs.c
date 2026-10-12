@@ -294,11 +294,13 @@ value weft_sendto(value fd, value buf, value off, value len, value dst) {
 }
 
 /* (n or -errno, host, port). The recv comes before each allocation, so the
-   buffer does not move. */
+   buffer does not move. A socket with no address of the sender gives
+   ("", 0). */
 value weft_recvfrom(value fd, value buf, value off, value len) {
   CAMLparam4(fd, buf, off, len);
   CAMLlocal2(result, host);
   struct sockaddr_storage sa;
+  memset(&sa, 0, sizeof sa);
   socklen_t alen = sizeof sa;
   char text[INET6_ADDRSTRLEN] = "";
   int port = 0;
@@ -418,3 +420,10 @@ value weft_errno_codes(value unit) {
 }
 
 value weft_strerror(value code) { return caml_copy_string(strerror(Int_val(code))); }
+
+/* The name of an errno value, for example "EMSGSIZE", as the simulator gives
+   it. glibc 2.32 has strerrorname_np. */
+value weft_errname(value code) {
+  const char *s = strerrorname_np(Int_val(code));
+  return caml_copy_string(s != NULL ? s : strerror(Int_val(code)));
+}

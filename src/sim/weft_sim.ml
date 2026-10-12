@@ -93,11 +93,12 @@ type listener =
   ; ltcp: bool }
 
 (* A UDP socket: its address, and the datagrams that came, with their senders.
-   [bytes] counts the bytes of the queue, against [capacity]. A datagram that
-   does not fit is lost, as on Linux. *)
+   [bytes] counts the cost of the queue, against the receive buffer. A datagram
+   that does not fit is lost, as on Linux. *)
 type dgram =
   { host: string
   ; port: int
+  ; dkey: string  (** ["host:port"], in [udp_names]. *)
   ; queue: (string * string * int) Queue.t
   ; mutable bytes: int }
 
@@ -137,7 +138,8 @@ type net =
   ; names: (string, int) Hashtbl.t  (** The listeners, by address. *)
   ; udp_names: (string, int) Hashtbl.t  (** The UDP sockets, by address. *)
   ; opts: (int, opts) Hashtbl.t
-        (** The options of each socket, after the first [Set_option]. *)
+        (** The options of each socket, after its first [Set_option] or
+            [Get_option]. *)
   ; regs: (int, (int * int) list) Hashtbl.t
         (** The registrations of each fd: the domain and the token. *)
   ; mutable edges: (int * World.Ready.t) list
@@ -324,6 +326,16 @@ let part t k =
   if t.net.short_io && (k > 1) [@mutate off "a part of 1 byte is 1 byte"] then
     1 + Prng.int t.prng k
   else k
+
+(* The next port from 40000 to 65535, then from 40000 again, that [used] does
+   not refuse. If all are in use, it gives one in use. *)
+let fresh_port n used =
+  let rec go tries =
+    let p = n.next_port in
+    n.next_port <- (if p >= 65535 then 40000 else p + 1) ;
+    if used p && tries > 0 then go (tries - 1) else p
+  in
+  go (65535 - 40000)
 
 let new_fd n =
   let fd = n.next_fd in
@@ -576,9 +588,19 @@ let close_conn t c =
 (* The largest datagram of UDP over IPv4. *)
 let max_datagram = 65507
 
+(* The receive buffer of a UDP socket with no option, as on Linux. *)
+let udp_rcvbuf = 212992
+
+(* The cost of a datagram in the receive buffer: its length and the overhead of
+   the kernel. Linux 7.1 on loopback keeps 92 datagrams of 1000 bytes with the
+   default buffer, 86 with a buffer of 200000 bytes, and 1 with the smallest
+   buffer (2304 bytes). The overhead 1304 gives 93, 87 and 1. *)
+let dgram_cost len = len + 1304
+
 (* A datagram goes after the delay, with no order: the jitter can reorder
    datagrams. With [udp_loss], one datagram in 8 is lost. At the arrival, a
-   datagram to a closed socket or to a full queue is lost. *)
+   datagram to a closed socket is lost. A queue takes a datagram while its cost
+   is less than the receive buffer, as on Linux. *)
 let send_dgram t g data host port =
   let n = t.net in
   let len = String.length data in
@@ -590,13 +612,20 @@ let send_dgram t g data host port =
             Hashtbl.find_opt n.udp_names (Printf.sprintf "%s:%d" host port)
           with
           | Some fd -> (
-            match Hashtbl.find_opt n.fds fd with
-            | Some (Dgm d) when d.bytes + len <= capacity ->
-                Queue.push (data, g.host, g.port) d.queue ;
-                d.bytes <- d.bytes + len ;
-                edge n fd ~read:true ~write:false
-            | _ ->
-                () )
+              let rcvbuf =
+                match Hashtbl.find_opt n.opts fd with
+                | Some o ->
+                    o.rcvbuf
+                | None ->
+                    udp_rcvbuf
+              in
+              match Hashtbl.find_opt n.fds fd with
+              | Some (Dgm d) when d.bytes < rcvbuf ->
+                  Queue.push (data, g.host, g.port) d.queue ;
+                  d.bytes <- d.bytes + dgram_cost len ;
+                  edge n fd ~read:true ~write:false
+              | _ ->
+                  () )
           | None ->
               () ) ;
     Ok len )
@@ -605,7 +634,7 @@ let send_dgram t g data host port =
 let recv_dgram g buf off len =
   match Queue.take_opt g.queue with
   | Some (data, host, port) ->
-      g.bytes <- g.bytes - String.length data ;
+      g.bytes <- g.bytes - dgram_cost (String.length data) ;
       let k = Int.min len (String.length data) in
       Bytes.blit_string data 0 buf off k ;
       Ok (k, host, port)
@@ -616,8 +645,8 @@ let default_opts tcp =
   { no_delay= false
   ; keep_alive= false
   ; broadcast= false
-  ; rcvbuf= (if tcp then 131072 else 212992)
-  ; sndbuf= (if tcp then 16384 else 212992) }
+  ; rcvbuf= (if tcp then 131072 else udp_rcvbuf)
+  ; sndbuf= (if tcp then 16384 else udp_rcvbuf) }
 
 let copy_opts o =
   { no_delay= o.no_delay
@@ -804,9 +833,7 @@ let submit : type a. t -> a Op.t -> (a, Op.error) result =
         match Hashtbl.find_opt n.fds lfd with
         | Some (Lsn l) when Queue.length l.backlog + l.pending < l.limit ->
             l.pending <- l.pending + 1 ;
-            let port = n.next_port in
-            n.next_port <-
-              (port + 1) [@mutate off "a counter that goes down is unique too"] ;
+            let port = fresh_port n (fun _ -> false) in
             let mk remote =
               { role= Sock
               ; inbox= Buffer.create 64
@@ -881,21 +908,18 @@ let submit : type a. t -> a Op.t -> (a, Op.error) result =
     | _ ->
         conn fd (fun c -> write_conn t c buf off len) )
   | Op.Udp (host, port) ->
+      let key p = Printf.sprintf "%s:%d" host p in
       let port =
-        if port = 0 then (
-          let p = n.next_port in
-          n.next_port <-
-            (p + 1) [@mutate off "a counter that goes down is unique too"] ;
-          p )
+        if port = 0 then fresh_port n (fun p -> Hashtbl.mem n.udp_names (key p))
         else port
       in
-      let k = Printf.sprintf "%s:%d" host port in
+      let k = key port in
       if port < 0 || port > 65535 then Error (Op.Other "EINVAL")
       else if Hashtbl.mem n.udp_names k then Error Op.In_use
       else
         let fd = new_fd n in
         Hashtbl.replace n.fds fd
-          (Dgm {host; port; queue= Queue.create (); bytes= 0}) ;
+          (Dgm {host; port; dkey= k; queue= Queue.create (); bytes= 0}) ;
         Hashtbl.replace n.udp_names k fd ;
         Ok fd
   | Op.Sendto (fd, buf, off, len, host, port) -> (
@@ -1014,7 +1038,7 @@ let submit : type a. t -> a Op.t -> (a, Op.error) result =
           | Conn c ->
               close_conn t c
           | Dgm g ->
-              Hashtbl.remove n.udp_names (Printf.sprintf "%s:%d" g.host g.port)
+              Hashtbl.remove n.udp_names g.dkey
           | Lsn l ->
               Hashtbl.remove n.names l.key ;
               Queue.iter

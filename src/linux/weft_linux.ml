@@ -68,6 +68,8 @@ external errno_codes : unit -> int array = "weft_errno_codes"
 
 external strerror : int -> string = "weft_strerror"
 
+external errname : int -> string = "weft_errname"
+
 (* The thread pools (weft_pool.c). *)
 
 (* The fields of a job, in the order of [weft_job_start]. Only the C side reads
@@ -184,7 +186,7 @@ let error_of e =
   else if e = enotdir then Op.Not_dir
   else if e = eisdir then Op.Is_dir
   else if e = enotempty then Op.Not_empty
-  else Op.Other (strerror e)
+  else Op.Other (errname e)
 
 let result r = if r >= 0 then Ok r else Error (error_of (-r))
 

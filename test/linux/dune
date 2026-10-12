@@ -5,17 +5,27 @@
  (modules echo_client)
  (libraries unix))
 
+(executable
+ (name no_threads)
+ (enabled_if
+  (= %{system} linux))
+ (modules no_threads)
+ (libraries weft weft.linux))
+
 (test
  (name test_linux)
  (enabled_if
   (= %{system} linux))
  (modules test_linux)
  (libraries weft weft.linux windtrap portable unix)
- (deps echo_client.exe)
+ (deps echo_client.exe no_threads.exe)
  (action
   (setenv
    WEFT_ECHO_CLIENT
    %{dep:echo_client.exe}
-   (progn
-    (run %{test} --corrected)
-    (diff? test_linux.ml test_linux.ml.corrected)))))
+   (setenv
+    WEFT_NO_THREADS
+    %{dep:no_threads.exe}
+    (progn
+     (run %{test} --corrected)
+     (diff? test_linux.ml test_linux.ml.corrected))))))

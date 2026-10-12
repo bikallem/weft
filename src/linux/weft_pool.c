@@ -8,18 +8,19 @@
    for the files and the directories. Thus a DNS server that does not answer
    cannot stop the file operations.
 
-   The life of a job: the start makes it, and a worker runs it. Then the job
-   is done. [weft_job_free] (after the result) or a detach frees a job that is
-   done. A detach of a job in the queue removes it: the job never runs, and
-   its completion goes to the mailbox at once. A detach of a job that runs
-   marks the job, and the worker frees it. The pool mutex protects [started],
-   [done] and [detached].
+   The life of a job: the start makes it (S_QUEUED), a worker runs it
+   (S_RUNNING), and then it is done (S_DONE). [weft_job_free] (after the
+   result) or a detach frees a job that is done. A detach of a job in the
+   queue removes it: the job never runs, and its completion goes to the
+   mailbox at once. A detach of a job that runs marks the job, and the worker
+   frees it. The pool mutex protects [state] and [detached].
 
-   The limit of detached jobs (design section 2.3): a detached job that runs
-   keeps its thread, and the pool can start one more thread for each such job,
-   up to [limit]. Thus the live jobs keep [max] threads. If jobs wait and the
-   pool can start no thread for more than 1 s, a monitor thread writes a
-   warning to stderr. */
+   The limit of detached jobs (design section 2.3): a job that a fiber
+   detached while it runs keeps its thread, and the pool can start one more
+   thread for each such job, up to [limit]. Thus the live jobs keep [max]
+   threads. A close of [weft_close_async] is detached from its start, and it
+   does not count in the limit. If jobs wait and the pool can start no thread
+   for more than 1 s, a monitor thread writes a warning to stderr. */
 
 #define _GNU_SOURCE
 #include <arpa/inet.h>
@@ -30,10 +31,10 @@
 #include <pthread.h>
 #include <signal.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
-#include <stdio.h>
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
@@ -92,9 +93,12 @@ struct job {
   int64_t res;
   int err; /* 0, an errno value, or -1 for a getaddrinfo error in buf. */
   struct stat st;
-  int started, done, detached;
-  int counted; /* The job is in [running_detached]. */
+  enum { S_QUEUED, S_RUNNING, S_DONE } state;
+  int detached;
 };
+
+/* A job that a fiber detached while it runs: it is in [running_detached]. */
+static int counted(struct job *j) { return j->detached && j->kind != J_CLOSE; }
 
 struct pool {
   pthread_mutex_t m;
@@ -109,12 +113,18 @@ struct pool {
   const char *name;
 };
 
-#define POOL(max, name)                                                        \
-  {PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER, NULL, NULL, 0, 0, 0,  \
-   (max), (max) / 2, 0, 0, 0, 0, PTHREAD_COND_INITIALIZER, (name)}
-
-static struct pool file_pool = POOL(16, "file");
-static struct pool dns_pool = POOL(8, "name");
+static struct pool file_pool = {.m = PTHREAD_MUTEX_INITIALIZER,
+                                .c = PTHREAD_COND_INITIALIZER,
+                                .mc = PTHREAD_COND_INITIALIZER,
+                                .max = 16,
+                                .limit = 8,
+                                .name = "file"};
+static struct pool dns_pool = {.m = PTHREAD_MUTEX_INITIALIZER,
+                               .c = PTHREAD_COND_INITIALIZER,
+                               .mc = PTHREAD_COND_INITIALIZER,
+                               .max = 8,
+                               .limit = 4,
+                               .name = "name"};
 
 /* The warnings of all pools, for the tests. */
 static intnat warnings = 0;
@@ -423,17 +433,13 @@ static void *worker(void *arg) {
     p->head = j->next;
     if (p->head == NULL) p->tail = NULL;
     p->queued--;
-    j->started = 1;
-    if (j->detached) {
-      j->counted = 1;
-      p->running_detached++;
-    }
+    j->state = S_RUNNING;
     note(p);
     pthread_mutex_unlock(&p->m);
     run(j);
     pthread_mutex_lock(&p->m);
-    j->done = 1;
-    if (j->counted) {
+    j->state = S_DONE;
+    if (counted(j)) {
       p->running_detached--;
       /* The idle threads over the cap end. */
       if (p->threads > cap(p)) pthread_cond_broadcast(&p->c);
@@ -478,7 +484,6 @@ static int spawn(struct pool *p) {
   return ok;
 }
 
-
 /* One new thread if no idle thread can take a job: a job that blocks does not
    stop the jobs after it, up to [cap]. Under the pool mutex. */
 static void grow(struct pool *p) {
@@ -495,7 +500,9 @@ static void fail_all(struct pool *p) {
     struct job *next = j->next;
     j->res = -1;
     j->err = EAGAIN;
-    j->done = 1;
+    j->state = S_DONE;
+    /* A close must not leak its fd. */
+    if (j->kind == J_CLOSE) close(j->fd);
     struct mbx *w = j->mbx;
     if (w != NULL) {
       post(w, j->dom, j->id);
@@ -689,13 +696,16 @@ value weft_job_free(value job) {
   return Val_unit;
 }
 
-/* Remove a job from the queue. Under the pool mutex. */
+/* Remove a job from the queue. Under the pool mutex. In the child of a fork,
+   the queue does not have the jobs of the parent: then the queue does not
+   change. */
 static void unqueue(struct pool *p, struct job *j) {
   struct job **q = &p->head, *prev = NULL;
-  while (*q != j) {
+  while (*q != NULL && *q != j) {
     prev = *q;
     q = &(*q)->next;
   }
+  if (*q == NULL) return;
   *q = j->next;
   if (p->tail == j) p->tail = prev;
   p->queued--;
@@ -709,11 +719,10 @@ value weft_job_detach(value job) {
   struct job *j = Job_val(job);
   struct pool *p = j->pool;
   pthread_mutex_lock(&p->m);
-  int done = j->done, queued = !j->started;
+  int done = j->state == S_DONE, queued = j->state == S_QUEUED;
   if (queued) unqueue(p, j);
   else if (!done) {
     j->detached = 1;
-    j->counted = 1;
     p->running_detached++;
     grow(p);
   }

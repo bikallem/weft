@@ -119,7 +119,8 @@ and fdrec =
             share the word. *)
   ; mutable streak: int
         (** The bytes of the reads with no wait in sequence (M3). Only a hint,
-            so a race between two domains does no harm. *) }
+            so a race between two domains does no harm. *)
+  ; udp: bool  (** A UDP socket: only it takes [sendto] and [recvfrom]. *) }
 
 (* The state machine of Eio's [Rcfd]. A registration holds a user. *)
 and rc = Open of int | Closing of int | Closed
@@ -470,7 +471,7 @@ module Fdtab = struct
 
   let next = ref 0
 
-  let alloc os =
+  let alloc ?(udp = false) os =
     Mutex.protect lock (fun () ->
         let slot =
           match !free with
@@ -491,7 +492,13 @@ module Fdtab = struct
           land 0xffff_ffff
         in
         !gens.(slot) <- gen ;
-        {slot; gen; os; rc= Atomic.make (Open 0); doms= Atomic.make 0; streak= 0} )
+        { slot
+        ; gen
+        ; os
+        ; rc= Atomic.make (Open 0)
+        ; doms= Atomic.make 0
+        ; streak= 0
+        ; udp } )
 
   let release r = Mutex.protect lock (fun () -> free := r.slot :: !free)
 

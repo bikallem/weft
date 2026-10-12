@@ -457,8 +457,6 @@ let until_answer s dst msg f =
   in
   go 100
 
-let is_error f = not (String.equal "no error" (error_of f))
-
 let udp w =
   group "udp"
     [ test "a datagram gets its answer, with the addresses of the two sides"
@@ -533,11 +531,60 @@ let udp w =
                      Net.sendto a (Bytes.of_string "x") 0 1 a_addr ) ) ;
               equal string "EBADF"
                 (error_of (fun () -> Net.recvfrom a (Bytes.create 1) 0 1)) ) )
-    ; test "Net.write on a UDP socket with no peer gives an error" (fun () ->
+    ; test "Net.write on a UDP socket with no peer gives EDESTADDRREQ"
+        (fun () ->
           w.run (fun () ->
               let a, _ = w.udp () in
-              is_true (is_error (fun () -> Net.write a "x")) ;
+              equal string "EDESTADDRREQ" (error_of (fun () -> Net.write a "x")) ;
               Net.close a ) )
+    ; test "a datagram of more than 65507 bytes gives EMSGSIZE" (fun () ->
+          w.run (fun () ->
+              let a, a_addr = w.udp () in
+              equal string "EMSGSIZE"
+                (error_of (fun () ->
+                     Net.sendto a (Bytes.create 65508) 0 65508 a_addr ) ) ;
+              Net.close a ) )
+    ; test "the smallest receive buffer keeps one datagram" (fun () ->
+          w.run (fun () ->
+              let a, a_addr = w.udp () and b, _ = w.udp () in
+              Net.set_option a Recv_buffer 1 ;
+              for _ = 1 to 10 do
+                Net.sendto b (Bytes.make 1000 'x') 0 1000 a_addr
+              done ;
+              Time.sleep Mono (Span.ms 20) ;
+              let buf = Bytes.create 1000 in
+              let rec count n =
+                match
+                  Fiber.with_timeout Mono (Span.ms 20) (fun () ->
+                      Net.recvfrom a buf 0 1000 )
+                with
+                | _ ->
+                    count (n + 1)
+                | exception Fiber.Timeout ->
+                    n
+              in
+              equal int 1 (count 0) ;
+              Net.close a ;
+              Net.close b ) )
+    ; test "sendto and recvfrom need a UDP socket" (fun () ->
+          w.run (fun () ->
+              let l, a = w.listen () in
+              Fiber.scope (fun s ->
+                  let p = Fiber.fork_promise s (fun () -> fst (Net.accept l)) in
+                  let c = Net.connect a in
+                  let invalid = function
+                    | Invalid_argument _ ->
+                        true
+                    | _ ->
+                        false
+                  in
+                  raises_match invalid (fun () ->
+                      Net.sendto c (Bytes.create 1) 0 1 ("x", 1) ) ;
+                  raises_match invalid (fun () ->
+                      Net.recvfrom c (Bytes.create 1) 0 1 ) ;
+                  Net.close c ;
+                  Net.close (Promise.await p) ) ;
+              Net.close l ) )
     ; test "the options of a TCP socket and of a UDP socket" (fun () ->
           w.run (fun () ->
               let l, a = w.listen () in
@@ -563,7 +610,8 @@ let udp w =
               let u, _ = w.udp () in
               Net.set_option u Broadcast true ;
               is_true (Net.get_option u Broadcast) ;
-              is_true (is_error (fun () -> Net.set_option u No_delay true)) ;
+              equal string "ENOPROTOOPT"
+                (error_of (fun () -> Net.set_option u No_delay true)) ;
               Net.close u ;
               equal string "EBADF"
                 (error_of (fun () -> Net.get_option u Broadcast)) ) )

@@ -379,20 +379,26 @@ module Net : sig
   val udp : string * int -> t
   (** [udp (host, port)] gives a UDP socket, bound to the host and the port. The
       port 0 gives a free port. In the simulator, the host is a name, for
-      example ["client"]. [close] closes the socket. *)
+      example ["client"]. [close] closes the socket. [read] takes one datagram
+      with no address, and 0 is then an empty datagram, not the end of a stream.
+      [write] raises [Error (Other "EDESTADDRREQ", _)]. *)
 
   val sendto : t -> bytes -> int -> int -> string * int -> unit
   (** [sendto t buf off len (host, port)] sends one datagram with the bytes of
       the range. A datagram to an address with no socket is lost, with no error.
+      A datagram of more than 65507 bytes raises [Error (Other "EMSGSIZE", _)].
 
-      @raise Invalid_argument if the range is not in [buf]. *)
+      @raise Invalid_argument
+        if the range is not in [buf], or if [t] is not a UDP socket. *)
 
   val recvfrom : t -> bytes -> int -> int -> int * (string * int)
   (** [recvfrom t buf off len] waits for one datagram. It gives the number of
       bytes in [buf], and the host and the port of the sender. If the datagram
       has more than [len] bytes, the other bytes are lost.
 
-      @raise Invalid_argument if [len < 1] or the range is not in [buf]. *)
+      @raise Invalid_argument
+        if [len < 1], if the range is not in [buf], or if [t] is not a UDP
+        socket. *)
 
   (** {2 Socket options} *)
 
@@ -411,6 +417,8 @@ module Net : sig
       @raise Invalid_argument if a size is not positive. *)
 
   val get_option : t -> 'a sockopt -> 'a
+  (** [get_option t opt] gives the value of an option of the socket. An accepted
+      socket has the options of its listener. *)
 end
 
 (** {1 Files and directories}

@@ -540,12 +540,17 @@ let udp_loss () =
   Sim.run ~seed:7 (fun sim ->
       Sim.net_faults sim {Sim.no_faults with udp_loss= true} ;
       let a, a_addr, b = udp_pair () in
-      for i = 1 to 800 do
-        send b a_addr (string_of_int i)
+      (* 8 groups of 100: the queue takes about 160 small datagrams. *)
+      let n = ref 0 in
+      for g = 0 to 7 do
+        for i = 1 to 100 do
+          send b a_addr (string_of_int ((100 * g) + i))
+        done ;
+        n := !n + List.length (received a)
       done ;
-      let n = List.length (received a) in
       (* 700 on average. *)
-      at_least int ~than:600 n ; less int ~than:780 n )
+      at_least int ~than:600 !n ;
+      less int ~than:780 !n )
 
 let udp_order () =
   let order faults =
@@ -563,14 +568,29 @@ let udp_order () =
   equal (list int) sent (List.sort compare late) ;
   is_false (late = sent)
 
-(* A queue of more than 65536 bytes loses the datagrams that do not fit. *)
+(* A full queue loses the datagrams that do not fit. The counts are near the
+   counts of Linux: 92, 86 and 1 (see [dgram_cost] in the simulator). *)
 let udp_full_queue () =
+  let kept rcvbuf =
+    Sim.run (fun _ ->
+        let a, a_addr, b = udp_pair () in
+        Option.iter (Net.set_option a Recv_buffer) rcvbuf ;
+        for _ = 1 to 300 do
+          send b a_addr (String.make 1000 'x')
+        done ;
+        List.length (received a) )
+  in
+  equal int 93 (kept None) ;
+  equal int 87 (kept (Some 100_000)) ;
+  equal int 1 (kept (Some 1000)) ;
+  (* A read frees the cost of its datagram. *)
   Sim.run (fun _ ->
       let a, a_addr, b = udp_pair () in
-      for _ = 1 to 100 do
-        send b a_addr (String.make 1000 'x')
-      done ;
-      equal int 65 (List.length (received a)) )
+      Net.set_option a Recv_buffer 1000 ;
+      for i = 1 to 3 do
+        send b a_addr (string_of_int i) ;
+        equal (list string) [string_of_int i] (received a)
+      done )
 
 let udp_size () =
   Sim.run (fun _ ->
