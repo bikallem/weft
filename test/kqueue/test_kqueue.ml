@@ -35,14 +35,18 @@ let elapsed_ns f =
       f () ;
       Int64.to_int (Span.to_ns (Time.diff Mono (Time.now Mono) t0)) )
 
-(* A sleep never ends before its deadline. The upper limit is large: the CI
-   machines are shared. *)
+(* A sleep never ends before its deadline. The limits are large: the CI machines
+   are shared. Each of the 20 sleeps must end in less than 50 ms, and the median
+   must be less than 20 ms. *)
 let sleep_10ms () =
-  for _ = 1 to 20 do
-    let ns = elapsed_ns (fun () -> Time.sleep Mono (Span.ms 10)) in
-    at_least int ~than:10_000_000 ns ;
-    less int ~than:50_000_000 ns
-  done
+  let all =
+    List.init 20 (fun _ ->
+        let ns = elapsed_ns (fun () -> Time.sleep Mono (Span.ms 10)) in
+        at_least int ~than:10_000_000 ns ;
+        less int ~than:50_000_000 ns ;
+        ns )
+  in
+  less int ~than:20_000_000 (List.nth (List.sort compare all) 10)
 
 let read_pipe = Portable.drain Pipe.read
 
