@@ -112,10 +112,35 @@ let ring_steal_full () =
   equal int (Ring.size / 2) (count r 0) ;
   equal (option int) None (Ring.steal ~from:r ~into)
 
+(* The slots of the items that left by a pop or a steal hold them no more when
+   the ring is empty, also after the indexes go around the ring. *)
+let ring_clears () =
+  let r = Ring.create () and into = Ring.create () in
+  let held r =
+    Array.fold_left
+      (fun n slot -> if Option.is_some (Atomic.get slot) then n + 1 else n)
+      0 r.Ring.buf
+  in
+  for round = 1 to 3 do
+    for i = 1 to 200 do
+      ignore (Ring.push r (round, i))
+    done ;
+    ignore (Ring.steal ~from:r ~into) ;
+    while Option.is_some (Ring.pop r) do
+      ()
+    done ;
+    equal ~msg:"the ring of the owner" int 0 (held r) ;
+    while Option.is_some (Ring.pop into) do
+      ()
+    done ;
+    equal ~msg:"the ring of the thief" int 0 (held into)
+  done
+
 let ring =
   group "ring"
     [ test "a full ring refuses a push and keeps the FIFO order" ring_full
-    ; test "a steal takes half of a full ring" ring_steal_full ]
+    ; test "a steal takes half of a full ring" ring_steal_full
+    ; test "an empty ring holds no item" ring_clears ]
 
 let domains_range () =
   let invalid = function Invalid_argument _ -> true | _ -> false in

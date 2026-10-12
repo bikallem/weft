@@ -411,7 +411,7 @@ let ivar_fill_register () =
       let r = new_sync (scope_node ()) in
       let continued = Atomic.make 0 in
       spawn_in w (fun () ->
-          S.Iv.register iv r 0 ;
+          S.Iv.register iv 0 r 0 ;
           match C.park r.S.word with
           | `Done _ ->
               Atomic.incr continued

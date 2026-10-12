@@ -220,8 +220,10 @@ module Ivar : sig
       touches no sync word and no lock: a domain does the fill at a safe point
       (design section 2.5, Fiber code with no handler). If the Ivar is full at
       that time, the fill does nothing. It gives [false] if no [run] is active.
-      One [run] at a time takes these fills. The simulator accepts them only
-      with [Sim.run ~outside_fills:true]. *)
+      One [run] at a time takes these fills. An Ivar belongs to the [run] that
+      created it or that last added a waiter to it: a fill of an Ivar of a
+      [run] that ended does nothing and gives [false]. The simulator accepts
+      fills only with [Sim.run ~outside_fills:true]. *)
 
   val read : 'a t -> 'a event
 

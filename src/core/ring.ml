@@ -8,12 +8,17 @@ let size = 256
 let mask = size - 1
 
 type 'a t =
-  {head: int Atomic.t; tail: int Atomic.t; buf: 'a option Atomic.t array}
+  { head: int Atomic.t
+  ; tail: int Atomic.t
+  ; buf: 'a option Atomic.t array
+  ; mutable clean: int
+        (** The owner only: the slots before this index hold no item. *) }
 
 let create () =
   { head= Atomic.make 0
   ; tail= Atomic.make 0
-  ; buf= Array.init size (fun _ -> Atomic.make None) }
+  ; buf= Array.init size (fun _ -> Atomic.make None)
+  ; clean= 0 }
 
 (* The owner only. It gives [false] if the ring is full. *)
 let push r x =
@@ -24,12 +29,24 @@ let push r x =
     Atomic.set r.tail (t + 1) ;
     true )
 
+(* The owner only, when the ring is empty: the slots of the items that left it,
+   by a pop or a steal, hold them no more. Thus the GC can free a fiber that
+   ended. A thief with an old head can read a cleared slot, but then its CAS on
+   the head fails. *)
+let clear r h =
+  for i = Int.max r.clean (h - size) to h - 1 do
+    Atomic.set r.buf.(i land mask) None
+  done ;
+  r.clean <- h
+
 (* The owner only. A thief can take the head at the same time, so the take is a
-   CAS on the head. The slot keeps the item until a push writes it again: a
-   clear costs a store on each pop (the review of M3). *)
+   CAS on the head. A slot keeps its item until the ring is empty: a clear on
+   each pop costs a store in the fast path (the review of M3). *)
 let rec pop r =
   let h = Atomic.get r.head in
-  if Atomic.get r.tail = h then None
+  if Atomic.get r.tail = h then (
+    if r.clean < h then clear r h ;
+    None )
   else
     let x = Atomic.get r.buf.(h land mask) in
     if Atomic.compare_and_set r.head h (h + 1) then x else pop r

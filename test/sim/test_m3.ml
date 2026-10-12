@@ -80,6 +80,40 @@ let refused () =
           ignore (Ivar.fill_from_outside iv ()) ;
           sync (Ivar.read iv) ) )
 
+(* An Ivar of a run that ended: a fill from outside in a later run gives false,
+   and the later run does not refuse it. *)
+let earlier_run () =
+  let iv = ref (Ivar.create ()) in
+  Sim.run (fun _ -> iv := Ivar.create ()) ;
+  Sim.run (fun _ -> is_false (Ivar.fill_from_outside !iv 1)) ;
+  is_true (Ivar.peek !iv = None)
+
+(* The waiter of a run that ended in Deadlock is dead: a later run does not
+   resume it. *)
+let dead_waiter () =
+  let iv = ref (Ivar.create ()) in
+  raises_match
+    (function Sim.Deadlock _ -> true | _ -> false)
+    (fun () ->
+      Sim.run (fun _ ->
+          iv := Ivar.create () ;
+          sync (Ivar.read !iv) ) ) ;
+  Sim.run ~outside_fills:true (fun _ ->
+      is_false (Ivar.fill_from_outside !iv 1) ;
+      Fiber.yield () )
+
+(* An Ivar belongs to the run of its last waiter: a fiber of a later run waits
+   for it, and a fill from outside reaches that fiber. *)
+let later_waiter () =
+  let iv = ref (Ivar.create ()) in
+  Sim.run (fun _ -> iv := Ivar.create ()) ;
+  Sim.run ~outside_fills:true (fun _ ->
+      Fiber.scope (fun s ->
+          let p = Fiber.fork_promise s (fun () -> sync (Ivar.read !iv)) in
+          Fiber.yield () ;
+          is_true (Ivar.fill_from_outside !iv 5) ;
+          equal int 5 (Promise.await p) ) )
+
 (* The deadline form of with_timeout: no fiber, and the entries that the caller
    ended go from the heap. The Timeout comes at exactly the deadline. *)
 let deadline_form () =
@@ -308,5 +342,9 @@ let tests =
       ; test "a step of the wall clock moves a Posix timer only" posix_timers
       ; test "a finaliser fills an Ivar" finaliser
       ; test "a fill from outside needs ~outside_fills" refused
+      ; test "a fill of an Ivar of a run that ended gives false" earlier_run
+      ; test "a later run does not resume a waiter of a run that ended"
+          dead_waiter
+      ; test "a fill reaches a waiter of a later run" later_waiter
       ; test "no run: fill_from_outside gives false" (fun () ->
             is_false (Ivar.fill_from_outside (Ivar.create ()) ()) ) ] ]

@@ -94,7 +94,11 @@ and scope_state =
 
 and 'a ivar = 'a ivar_state Atomic.t
 
-and 'a ivar_state = Empty of waiters | Full of 'a
+(* [Empty (run, waiters)]: [run] is the id of the run that created the Ivar or
+   that last added a waiter, or -1 (no run). A fill from outside a fiber uses it
+   to drop a fill of a run that ended (design section 2.5, A value from outside
+   a fiber). *)
+and 'a ivar_state = Empty of int * waiters | Full of 'a
 
 (* A list of waiters, the newest first. It drops the waiters whose sync is Done
    only when it has grown to twice its size after the last drop. Thus an add
@@ -405,18 +409,28 @@ module Heap = struct
     up h (h.size - 1)
 end
 
+(* The run that takes the fills from outside a fiber: its scheduler, and the
+   function that gives a request to it (design section 2.5, A value from outside
+   a fiber). [run] sets it. The simulator gives the requests to its own
+   queue. *)
+let outside : (t * ((dom -> unit) -> unit)) option Atomic.t = Atomic.make None
+
+let active_run () =
+  match Atomic.get outside with Some (t, _) -> t.run_id | None -> -1
+
 (* The atomic register of an Ivar (design section 2.4, spec/tla/Ivar.tla). *)
 module Iv = struct
-  let make () : 'a ivar = Atomic.make (Empty Waiters.empty)
+  let make () : 'a ivar = Atomic.make (Empty (active_run (), Waiters.empty))
 
-  (* The scan of a reader: a poll, then a register with a CAS on Empty. *)
-  let rec register (iv : 'a ivar) s i =
+  (* The scan of a reader of [run]: a poll, then a register with a CAS on
+     Empty. *)
+  let rec register (iv : 'a ivar) run s i =
     match Atomic.get iv with
     | Full _ ->
         ignore (C.self_commit s.word i)
-    | Empty w as old ->
-        if not (Atomic.compare_and_set iv old (Empty (Waiters.add s i w))) then
-          register iv s i
+    | Empty (_, w) as old ->
+        if not (Atomic.compare_and_set iv old (Empty (run, Waiters.add s i w)))
+        then register iv run s i
 
   (* [fill iv v] gives [Some resumed] with the syncs to resume, or [None] if the
      Ivar is full. *)
@@ -424,7 +438,7 @@ module Iv = struct
     match Atomic.get iv with
     | Full _ ->
         None
-    | Empty w as old ->
+    | Empty (_, w) as old ->
         if Atomic.compare_and_set iv old (Full v) then
           Some
             (List.filter_map
@@ -440,7 +454,7 @@ module Iv = struct
     | Empty _ ->
         invalid_arg "Ivar: the value is not set"
 
-  let leaf iv : leaf = fun _ s i -> register iv s i
+  let leaf iv : leaf = fun dom s i -> register iv dom.sched.run_id s i
 end
 
 (* The table of fd slots. A slot is used again with a new generation, so a token
@@ -1819,12 +1833,6 @@ let start t main =
   (* The value of [main], or its exception. *)
   fun () -> match !result with Some r -> r () | None -> assert false
 
-(* A value from outside a fiber (design section 2.5, Fiber code with no
-   handler). The run that takes these fills, and how it takes a request: in
-   production, a push to the injection queue and a wake; in the simulator, a
-   queue of the simulator. *)
-let outside : (t * ((dom -> unit) -> unit)) option Atomic.t = Atomic.make None
-
 (* A push to an atomic list with a CAS: no lock. A finaliser can do it. *)
 let rec push_list l x =
   let old = Atomic.get l in
@@ -1834,10 +1842,19 @@ let rec push_list l x =
 let inject t req = push_list t.inject req
 
 (* It touches no sync word, no waiter list and no lock: a domain does the fill
-   at a safe point. It gives [false] if no run takes the fill. *)
+   at a safe point. It gives [false] if no run takes the fill, or if the Ivar is
+   of a run that ended: the waiters of that run are dead, and no fiber of the
+   active run waits for it. *)
 let fill_from_outside iv v =
   match Atomic.get outside with
   | None ->
+      false
+  | Some (t, _)
+    when match Atomic.get iv with
+         | Empty (run, _) ->
+             run >= 0 && run <> t.run_id
+         | Full _ ->
+             false ->
       false
   | Some (_, deliver) ->
       deliver (fun dom ->

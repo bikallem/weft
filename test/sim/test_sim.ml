@@ -568,7 +568,7 @@ let ivar_waiters_bounded () =
                 ; wrap (Time.after Mono (Span.ms 1)) (fun () -> None) ] ) )
       done ;
       match Private.ivar_state iv with
-      | Private.Sched.Empty w ->
+      | Private.Sched.Empty (_, w) ->
           less int ~than:16 (List.length w.Private.Sched.ws)
       | Private.Sched.Full _ ->
           failwith "full" )
