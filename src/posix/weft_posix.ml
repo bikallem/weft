@@ -180,8 +180,11 @@ let error_of e =
 
 (* [EAGAIN] of an operation that makes a process or a thread: the OS has no
    resource for it. It is not an fd that is not ready. *)
-let resource_error e =
-  if e = eagain then Op.No_resources "EAGAIN" else error_of e
+let eagain_resource = function
+  | Op.Would_block ->
+      Op.No_resources "EAGAIN"
+  | e ->
+      e
 
 let result r = if r >= 0 then Ok r else Error (error_of (-r))
 
@@ -339,7 +342,7 @@ let finish : type a. nativeint -> a Op.blocking -> (a, Op.error) result =
   let res, err, data = job_result j in
   let r : (a, Op.error) result =
     if err = -1 then Error (Op.Other data)
-    else if err <> 0 then Error (resource_error err)
+    else if err <> 0 then Error (eagain_resource (error_of err))
     else
       match op with
       | Op.Open _ ->
@@ -455,9 +458,7 @@ let spawned_of (pid, pidfd, i, o, e) =
   Result.map
     (fun pid ->
       {Op.pid; pidfd; to_stdin= fd i; from_stdout= fd o; from_stderr= fd e} )
-    ( if (pid < 0) [@mutate off "a spawn in a test never gives the pid 0"] then
-        Error (resource_error (-pid))
-      else Ok pid )
+    (Result.map_error eagain_resource (result pid))
 
 (* The result of a wait stub: (kind, code). The kind is 0 while the child runs,
    1 if it exited with the code, 2 if the signal in code ended it, or -errno. *)
@@ -481,18 +482,14 @@ let submit : type a. pool -> a Op.t -> (a, Op.error) result option =
       let kind, h, port = host_port addr in
       Some (result (listen kind h port backlog))
   | Op.Accept fd ->
-      (* macOS and FreeBSD give ECONNABORTED for a connection that the client
-         reset before the accept. Linux gives the connection. Thus the world
-         takes the next connection, as Go and libuv do. Each ECONNABORTED
-         removes one connection from the backlog, so the loop ends. *)
+      (* FreeBSD gives ECONNABORTED for a connection that the client reset
+         before the accept. Linux gives the connection, and a read of the source
+         of macOS shows that macOS also gives it. Thus the world takes the next
+         connection, as Go and libuv do. Each ECONNABORTED removes one
+         connection from the backlog, so the loop ends. *)
       let rec take () =
         let ((r, _, _, _) as a) = accept fd in
-        if
-          ( r = -econnaborted )
-          [@mutate
-            off "Linux gives no ECONNABORTED; the CI of FreeBSD tests it"]
-        then take ()
-        else a
+        if r = -econnaborted then take () else a
       in
       let r, host, port, unix = take () in
       Some

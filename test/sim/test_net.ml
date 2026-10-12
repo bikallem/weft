@@ -912,6 +912,7 @@ let fd_limit_each_op () =
       emfile (fun () -> Net.udp ("a", 1)) ;
       emfile Pipe.create ;
       emfile (fun () -> File.openfile [Read] "/missing") ;
+      emfile (fun () -> Dir.readdir "/") ;
       emfile (fun () -> Process.spawn "missing" []) ;
       (* With one free fd, a pipe and a spawn with a pipe fail. *)
       Sim.set_fd_limit sim (Some (Sim.open_fds sim + 1)) ;

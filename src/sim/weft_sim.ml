@@ -433,7 +433,10 @@ let perform : type a. t -> a Op.blocking -> (raw, Op.error) result option =
   | Op.Mkdir (path, perm) ->
       unit (Sim_fs.mkdir fs path perm ~now)
   | Op.Readdir path ->
-      Some (Result.map (fun l -> R_names l) (Sim_fs.readdir fs path))
+      (* opendir uses an fd. *)
+      Some
+        (let* () = room n 1 in
+         Result.map (fun l -> R_names l) (Sim_fs.readdir fs path) )
   | Op.Rename (src, dst) ->
       unit (Sim_fs.rename fs src dst)
   | Op.Unlink path ->
