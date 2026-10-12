@@ -1110,7 +1110,10 @@ let submit : type a. t -> a Op.t -> (a, Op.error) result =
                 (fun s ->
                   match s.peer with
                   | Some c ->
-                      c.refused <- true ;
+                      (* The connection is established: it gets a reset, as from
+                         [reset_conn]. *)
+                      c.reset <- true ;
+                      c.eof <- true ;
                       c.peer <- None ;
                       edge n c.cfd ~read:true ~write:true
                   | None ->

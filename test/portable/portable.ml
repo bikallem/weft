@@ -704,6 +704,44 @@ let reset_details w =
                   equal string "EPIPE" (write ()) ;
                   equal string "ECONNRESET" (read_error c) ;
                   equal string "" (read_all c) ) ) )
+    ; test "a close of a listener resets the TCP connections of its backlog"
+        (fun () ->
+          w.run (fun () ->
+              let read_first c =
+                equal string "ECONNRESET" (read_error c) ;
+                equal string "" (read_all c)
+              and write_first c =
+                let write () = error_of (fun () -> Net.write c "x") in
+                equal string "ECONNRESET" (write ()) ;
+                equal string "EPIPE" (write ()) ;
+                equal string "" (read_all c)
+              in
+              List.iter
+                (fun client ->
+                  let l, a = w.listen () in
+                  let c = Net.connect a in
+                  Net.close l ; pause () ; client c ; Net.close c )
+                [read_first; write_first] ) )
+    ; test "a close of a listener resets the Unix connections of its backlog"
+        (fun () ->
+          w.run (fun () ->
+              let dir = w.tmp () in
+              List.iteri
+                (fun i client ->
+                  let a = Net.Unix (Filename.concat dir (string_of_int i)) in
+                  let l = Net.listen a in
+                  let c = Net.connect a in
+                  Net.close l ; pause () ; client c ; Net.close c )
+                [ (fun c ->
+                    equal string "ECONNRESET" (read_error c) ;
+                    equal string "" (read_all c) )
+                ; (fun c ->
+                    (* A write gives EPIPE and leaves the error for the read. *)
+                    let write () = error_of (fun () -> Net.write c "x") in
+                    equal string "EPIPE" (write ()) ;
+                    equal string "EPIPE" (write ()) ;
+                    equal string "ECONNRESET" (read_error c) ;
+                    equal string "" (read_all c) ) ] ) )
     ; test "a Unix socket with unread data: a reset after shutdown" (fun () ->
           w.run (fun () ->
               unix_unread w
