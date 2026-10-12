@@ -112,6 +112,85 @@ let signal_restored () =
   Weft_kqueue.run ~domains:1 ~signals:[SIGUSR1] ignore ;
   is_true (Sys.signal Sys.sigusr1 Sys.Signal_default = Sys.Signal_default)
 
+(* The end of a watch (issue 6), as in test/linux. The helper must end by SIGINT
+   in each mode. *)
+let unwatch_helper () =
+  match Sys.getenv_opt "WEFT_UNWATCH" with
+  | Some c ->
+      if Filename.is_relative c then Filename.concat (Sys.getcwd ()) c else c
+  | None ->
+      skip ~reason:"WEFT_UNWATCH is not set" ()
+
+let unwatch_modes () =
+  let helper = unwatch_helper () in
+  with_default_sigint (fun () ->
+      Weft_kqueue.run ~domains:1 (fun () ->
+          List.iter
+            (fun mode ->
+              (* The race of "pending" can go to each path of the unwatch. *)
+              for _ = 1 to if mode = "pending" then 20 else 1 do
+                let p = Process.spawn helper [mode] in
+                let st =
+                  Fiber.with_timeout Mono (Span.s 10) (fun () ->
+                      Process.wait p )
+                in
+                if st <> Process.Signaled SIGINT then failwith mode
+              done )
+            ["taken"; "count"; "pending"] ) )
+
+(* After the unwatch, a SIGINT ends the process also when its only domain
+   computes with no switch. *)
+let unwatch_busy () =
+  let helper = unwatch_helper () in
+  with_default_sigint (fun () ->
+      Weft_kqueue.run ~domains:1 (fun () ->
+          let p = Process.spawn ~stdout:Piped helper ["busy"] in
+          let out = Option.get (Process.stdout p) in
+          let buf = Bytes.create 6 in
+          equal int 6 (Pipe.read out buf 0 6) ;
+          equal string "ready\n" (Bytes.to_string buf) ;
+          Process.kill p SIGINT ;
+          let st =
+            Fiber.with_timeout Mono (Span.s 10) (fun () -> Process.wait p)
+          in
+          Pipe.close out ;
+          is_true (st = Process.Signaled SIGINT) ) )
+
+(* In the process of the test: the waiter raises, a later received and a second
+   unwatch raise, and SIGTERM stays an event. After the unwatch, SIGUSR2 has its
+   old action, and the end of the run does not change it. *)
+let unwatch_waiter () =
+  let not_watched = "Signal.received: the world does not watch this signal" in
+  let old = Sys.signal Sys.sigusr2 Sys.Signal_ignore in
+  Fun.protect
+    ~finally:(fun () -> Sys.set_signal Sys.sigusr2 old)
+    (fun () ->
+      Weft_kqueue.run ~domains:2 ~signals:[SIGUSR2; SIGTERM] (fun () ->
+          Fiber.scope (fun s ->
+              let p =
+                Fiber.fork_promise s (fun () ->
+                    match sync (Signal.received SIGUSR2) with
+                    | _ ->
+                        "no error"
+                    | exception Invalid_argument m ->
+                        m )
+              in
+              Time.sleep Mono (Span.ms 10) ;
+              Signal.unwatch SIGUSR2 ;
+              equal string not_watched (Promise.await p) ) ;
+          raises (Invalid_argument not_watched) (fun () ->
+              sync (Signal.received SIGUSR2) ) ;
+          raises
+            (Invalid_argument
+               "Signal.unwatch: the world does not watch this signal" )
+            (fun () -> Signal.unwatch SIGUSR2 ) ;
+          (* The old action ignores it. *)
+          Unix.kill (Unix.getpid ()) Sys.sigusr2 ;
+          Unix.kill (Unix.getpid ()) Sys.sigterm ;
+          at_least int ~than:1 (sync (Signal.received SIGTERM)) ;
+          Sys.set_signal Sys.sigusr2 Sys.Signal_default ) ;
+      is_true (Sys.signal Sys.sigusr2 Sys.Signal_ignore = Sys.Signal_default) )
+
 let () =
   exit
     (Windtrap.run "kqueue"
@@ -123,4 +202,9 @@ let () =
              ; test "a child that exits at once" child_fast_exit
              ; test "a child stops at SIGINT" child_kill
              ; test "SIGTERM to the process is an event" sigterm
-             ; test "run restores the action of a signal" signal_restored ] ] ) )
+             ; test "run restores the action of a signal" signal_restored
+             ; test ~timeout:60. "after Signal.unwatch, SIGINT ends the process"
+                 unwatch_modes
+             ; test ~timeout:30.
+                 "after Signal.unwatch, SIGINT ends a busy process" unwatch_busy
+             ; test "a waiter at Signal.unwatch raises" unwatch_waiter ] ] ) )
