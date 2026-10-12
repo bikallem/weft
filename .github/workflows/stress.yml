@@ -1,5 +1,6 @@
-# Run the kqueue suite many times on macOS, to find a test that fails or
-# hangs only sometimes. It runs only on request.
+# Run the kqueue suite many times on macOS, to find a test that fails, hangs
+# or crashes only sometimes. It runs only on request. At a failure, it gives
+# the exit status and, for a crash, the backtrace of each thread.
 name: Stress
 
 on:
@@ -23,11 +24,22 @@ jobs:
         run: nix develop -c dune build test/kqueue/test_kqueue.exe
       - name: Run the suite
         run: |
+          sudo chmod 1777 /cores
+          ulimit -c unlimited
+          exe=$PWD/_build/default/test/kqueue/test_kqueue.exe
           for i in $(seq 1 ${{ inputs.runs }}); do
-            if ! nix develop -c ./_build/default/test/kqueue/test_kqueue.exe > kq.log 2>&1; then
-              echo "run $i failed"
-              grep -E "FAIL|TIMEOUT|timed out|expected|actual|│" kq.log | head -60
-              tail -60 kq.log
+            set +e
+            "$exe" > kq.log 2>&1
+            s=$?
+            set -e
+            if [ $s -ne 0 ]; then
+              echo "run $i failed with status $s"
+              tail -30 kq.log
+              for c in /cores/core.*; do
+                [ -e "$c" ] || continue
+                echo "core $c"
+                lldb -c "$c" "$exe" --batch -o "thread backtrace all" | head -300
+              done
               exit 1
             fi
             echo "run $i passed"
