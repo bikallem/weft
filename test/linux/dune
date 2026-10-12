@@ -12,12 +12,20 @@
  (modules no_threads)
  (libraries weft weft.linux))
 
-(test
+; An executable and a rule, not a test stanza: on another system, dune
+; builds the executable of a test stanza also if its enabled_if is false.
+
+(executable
  (name test_linux)
  (enabled_if
   (= %{system} linux))
  (modules test_linux)
- (libraries weft weft.linux windtrap portable unix)
+ (libraries weft weft.linux windtrap portable unix))
+
+(rule
+ (alias runtest)
+ (enabled_if
+  (= %{system} linux))
  (deps echo_client.exe no_threads.exe)
  (action
   (setenv
@@ -27,5 +35,5 @@
     WEFT_NO_THREADS
     %{dep:no_threads.exe}
     (progn
-     (run %{test} --corrected)
+     (run %{exe:test_linux.exe} --corrected)
      (diff? test_linux.ml test_linux.ml.corrected))))))

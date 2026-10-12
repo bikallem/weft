@@ -544,7 +544,7 @@ let udp w =
                 (error_of (fun () ->
                      Net.sendto a (Bytes.create 65508) 0 65508 a_addr ) ) ;
               Net.close a ) )
-    ; test "the smallest receive buffer keeps one datagram" (fun () ->
+    ; test "the smallest receive buffer loses datagrams" (fun () ->
           w.run (fun () ->
               let a, a_addr = w.udp () and b, _ = w.udp () in
               Net.set_option a Recv_buffer 1 ;
@@ -563,7 +563,11 @@ let udp w =
                 | exception Fiber.Timeout ->
                     n
               in
-              equal int 1 (count 0) ;
+              (* Linux 7.1 keeps 1 of 10, and Linux 6.x 2: the cost of a
+                 datagram depends on the kernel. *)
+              let n = count 0 in
+              at_least int ~than:1 n ;
+              less int ~than:5 n ;
               Net.close a ;
               Net.close b ) )
     ; test "sendto and recvfrom need a UDP socket" (fun () ->

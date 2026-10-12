@@ -2,8 +2,17 @@
 ; suite of their own: a mutation run forks for each mutant, and OCaml refuses
 ; a fork after a domain started.
 
-(test
+; An executable and a rule, as in test/linux.
+
+(executable
  (name test_linux_md)
  (enabled_if
   (= %{system} linux))
  (libraries weft weft.linux windtrap portable unix))
+
+(rule
+ (alias runtest)
+ (enabled_if
+  (= %{system} linux))
+ (action
+  (run %{exe:test_linux_md.exe})))
