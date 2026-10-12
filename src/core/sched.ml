@@ -611,7 +611,14 @@ let push_pinned dom r =
   let t = dom.sched in
   Spin.with_lock t.pinned_lock (fun () -> Queue.push r t.pinned_q) ;
   Atomic.incr t.pinned_n ;
-  if dom.index <> 0 then dom.wake0 <- true
+  if
+    ( dom.index <> 0 )
+    [@mutate
+      off
+        "the dscheck test of a pinned push kills it; dscheck is not in the \
+         mutation run, and in the simulator the wake of a timer wakes domain 0 \
+         too"]
+  then dom.wake0 <- true
 
 let has_pinned dom = dom.index = 0 && Atomic.get dom.sched.pinned_n > 0
 
@@ -657,7 +664,8 @@ let flush_wake dom =
   if dom.wake0 then (
     dom.wake0 <- false ;
     if Idle.remove dom.sched 0 then (
-      dom.stats.wakes <- dom.stats.wakes + 1 ;
+      dom.stats.wakes <-
+        (dom.stats.wakes + 1) [@mutate off "a counter of the measurements"] ;
       World.perform "sched" (World.Wake 0) ) ) ;
   if dom.wake then (
     dom.wake <- false ;
@@ -1264,7 +1272,10 @@ let start_search (t : t) =
   let limit = Int.max 1 (Array.length t.doms / 2) in
   let rec inc () =
     let s = Atomic.get t.searching in
-    s < limit && (Atomic.compare_and_set t.searching s (s + 1) || inc ())
+    ( s < limit )
+    [@mutate
+      off "the limit gives only performance: Wake.tla passes with no limit"]
+    && (Atomic.compare_and_set t.searching s (s + 1) || inc ())
   in
   inc ()
 
@@ -1306,8 +1317,22 @@ let steal dom =
             next_of (i + 1)
     in
     let r = match try_ 0 with Some r -> Some r | None -> next_of 0 in
-    if Atomic.fetch_and_add t.searching (-1) = 1 && Option.is_some r then
-      if Atomic.get t.idle <> 0 then dom.wake <- true ;
+    if
+      ( Atomic.fetch_and_add t.searching (-1)
+      = 1 )
+      [@mutate
+        off
+          "the last wake gives only performance: Wake.tla passes with no last \
+           wake"]
+      && Option.is_some r
+    then
+      if
+        ( Atomic.get t.idle <> 0 )
+        [@mutate
+          off
+            "the last wake gives only performance: Wake.tla passes with no \
+             last wake"]
+      then dom.wake <- true ;
     r
 
 (* The next slot runs at most [next_limit] times in sequence. Then its fiber
@@ -1352,7 +1377,10 @@ let take_pinned dom =
     let r =
       Spin.with_lock t.pinned_lock (fun () -> Queue.take_opt t.pinned_q)
     in
-    if Option.is_some r then Atomic.decr t.pinned_n ;
+    if
+      Option.is_some r
+      [@mutate off "a take that finds no fiber corrects the count"]
+    then Atomic.decr t.pinned_n ;
     r
 
 (* Domain 0 takes the pinned queue first, but at most [next_limit] times in

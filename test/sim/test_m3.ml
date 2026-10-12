@@ -102,6 +102,8 @@ let livelock () =
     Sim.run ~livelock:100_000 (fun _ ->
         let t0 = Time.now Mono in
         Fiber.scope (fun s ->
+            Fiber.fork_daemon ~name:"parked" s (fun () ->
+                sync (Ivar.read (Ivar.create ())) ) ;
             Fiber.fork ~name:"waiter" s (fun () ->
                 while
                   Span.to_ns (Time.diff Mono (Time.now Mono) t0) < 1_000_000L
@@ -112,7 +114,8 @@ let livelock () =
   | () ->
       failwith "no livelock"
   | exception Sim.Livelock l ->
-      is_true (List.mem "waiter" l)
+      is_true (List.mem "waiter" l) ;
+      is_false (List.mem "parked" l)
 
 (* A long stream with no timer is progress, also with a small limit. *)
 let stream () =
@@ -225,6 +228,54 @@ let restore_report () =
   raises Exit (fun () -> Sim.run (fun _ -> raise Exit)) ;
   is_true (Atomic.get Private.promise_report == old)
 
+(* The steal of a next slot: F1 wakes F2 into its next slot, then F1 makes
+   switch points with no switch of fiber. Another domain takes F2. *)
+let next_steal seed =
+  Sim.run ~seed ~domains:4 (fun _ ->
+      let c = Chan.create ()
+      and ran = Atomic.make false
+      and early = Atomic.make false in
+      Fiber.scope (fun s ->
+          Fiber.fork s (fun () ->
+              sync (Chan.recv c) ;
+              Atomic.set ran true ) ;
+          Fiber.yield () ;
+          Fiber.fork s (fun () ->
+              (* F2 parks first, so the send claims F2. *)
+              Time.sleep Mono (Span.ms 1) ;
+              sync (Chan.send c ()) ;
+              let n = ref 0 in
+              while (not (Atomic.get ran)) && !n < 10_000 do
+                incr n ;
+                ignore (Time.now Mono)
+              done ;
+              (* F2 ran before the end of the loop of F1. *)
+              Atomic.set early (Atomic.get ran) ) ) ;
+      Atomic.get early )
+
+(* A pinned fiber that a fiber of another domain wakes while domain 0 sleeps. *)
+let pinned_wake seed =
+  Sim.run ~seed ~domains:4 (fun _ ->
+      let c = Chan.create () in
+      Fiber.scope (fun s ->
+          Fiber.fork ~pinned:true s (fun () -> sync (Chan.recv c)) ;
+          Fiber.fork s (fun () ->
+              Time.sleep Mono (Span.ms 1) ;
+              (* The send comes from another domain. *)
+              while dom () = 0 do
+                Fiber.yield ()
+              done ;
+              sync (Chan.send c ()) ) ) )
+
+(* The check of the queues at quiescence sees a fiber in a next slot. *)
+let lost_next () =
+  let t = S.create ~domains:1 () in
+  let f = S.new_fiber [] in
+  S.push_next t.S.doms.(0) f (fun () -> S.Finished) ;
+  is_true
+    (List.mem "the queue of domain 0 is not empty"
+       (Private.Sched_debug.lost t ~now:(Clock.of_ns Mono 0L)) )
+
 let tests =
   [ group "m3"
       [ test "pinned fibers run only on domain 0, with 200 seeds" (fun () ->
@@ -237,6 +288,15 @@ let tests =
             done ;
             greater int ~than:0 !other )
       ; test "B: a pinned fiber that yields does not starve" pinned_yield
+      ; test "a thief takes a next slot, with 50 seeds" (fun () ->
+            is_true
+              (List.exists Fun.id (List.init 50 (fun s -> next_steal (s + 1)))) )
+      ; test "a pinned fiber wakes while domain 0 sleeps, with 50 seeds"
+          (fun () ->
+            for seed = 1 to 50 do
+              pinned_wake seed
+            done )
+      ; test "the check of the queues sees a next slot" lost_next
       ; test "a fill from outside gives at once while the word is Claimed"
           fill_while_claimed
       ; test "the deadline form of with_timeout has no fiber" deadline_form

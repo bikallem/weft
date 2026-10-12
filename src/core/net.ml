@@ -119,7 +119,7 @@ let yield_bytes = ref (64 * 1024)
 
 let after_read fd n =
   fd.streak <- fd.streak + n ;
-  if fd.streak >= !yield_bytes then (
+  if (fd.streak >= !yield_bytes) [@mutate off "the limit or one byte more"] then (
     fd.streak <- 0 ;
     ignore (prog "Net.read" Yield) ) ;
   n

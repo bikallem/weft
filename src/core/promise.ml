@@ -104,8 +104,13 @@ let ready p =
       | Error (e, bt) ->
           (* The first fiber that gets the exception. A cancelled promise has no
              count. *)
-          if Atomic.compare_and_set p.awaited false true then
-            Option.iter Atomic.decr p.unawaited ;
+          if
+            Atomic.compare_and_set p.awaited false true
+            [@mutate
+              off
+                "the count only selects the GC at the end of Sim.run; the \
+                 finaliser reads the awaited cell"]
+          then Option.iter Atomic.decr p.unawaited ;
           Printexc.raise_with_backtrace e bt )
 
 let await p = Event.sync (ready p)

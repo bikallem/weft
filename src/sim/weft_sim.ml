@@ -991,8 +991,8 @@ let extra_edge t d =
    Livelock). *)
 let no_progress t =
   t.no_progress <- t.no_progress + 1 ;
-  if t.no_progress > t.livelock then
-    raise (Livelock (Sched_debug.active (sched t)))
+  if (t.no_progress > t.livelock) [@mutate off "the limit or one step less"]
+  then raise (Livelock (Sched_debug.active (sched t)))
 
 let progress t = t.no_progress <- 0
 
