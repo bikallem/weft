@@ -44,6 +44,13 @@
 #include <caml/memory.h>
 #include <caml/mlvalues.h>
 
+#include "weft_posix.h"
+
+/* macOS names the time fields of struct stat in another way. */
+#ifdef __APPLE__
+#define st_mtim st_mtimespec
+#endif
+
 enum {
   J_OPEN,
   J_PREAD,
@@ -350,11 +357,6 @@ static void run(struct job *j) {
   j->err = r < 0 ? errno : 0;
 }
 
-static int64_t now_ns(void) {
-  struct timespec ts;
-  clock_gettime(CLOCK_MONOTONIC, &ts);
-  return (int64_t)ts.tv_sec * 1000000000 + ts.tv_nsec;
-}
 
 static int start_thread(void *(*f)(void *), struct pool *p);
 
@@ -375,9 +377,8 @@ static void *monitor(void *arg) {
       continue;
     }
     int64_t at = p->full_since + 1000000000;
-    if (now_ns() < at) {
-      struct timespec ts = {at / 1000000000, at % 1000000000};
-      pthread_cond_clockwait(&p->mc, &p->m, CLOCK_MONOTONIC, &ts);
+    if (weft_now_ns() < at) {
+      weft_cond_wait_until(&p->mc, &p->m, at);
       continue;
     }
     p->warned = 1;
@@ -403,7 +404,7 @@ static void *monitor(void *arg) {
 static void note(struct pool *p) {
   int full = p->queued > p->idle && p->threads >= cap(p);
   if (full && p->full_since == 0) {
-    p->full_since = now_ns();
+    p->full_since = weft_now_ns();
     p->warned = 0;
     if (!p->monitor) p->monitor = start_thread(monitor, p);
     else pthread_cond_signal(&p->mc);
@@ -529,7 +530,7 @@ static void parent(void) {
 static void reset(struct pool *p) {
   pthread_mutex_init(&p->m, NULL);
   pthread_cond_init(&p->c, NULL);
-  pthread_cond_init(&p->mc, NULL);
+  weft_cond_init(&p->mc);
   p->head = p->tail = NULL;
   p->queued = p->threads = p->idle = 0;
   p->running_detached = p->warned = p->monitor = 0;
@@ -543,7 +544,12 @@ static void child(void) {
 
 static pthread_once_t once = PTHREAD_ONCE_INIT;
 
-static void init(void) { pthread_atfork(prepare, parent, child); }
+/* The monitors wait until a time of CLOCK_MONOTONIC. */
+static void init(void) {
+  weft_cond_init(&file_pool.mc);
+  weft_cond_init(&dns_pool.mc);
+  pthread_atfork(prepare, parent, child);
+}
 
 static void submit(struct job *j) {
   struct pool *p = j->pool;

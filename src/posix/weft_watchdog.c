@@ -20,6 +20,8 @@
 #include <caml/memory.h>
 #include <caml/mlvalues.h>
 
+#include "weft_posix.h"
+
 struct watchdog {
   pthread_t thread;
   pthread_mutex_t m;
@@ -33,11 +35,7 @@ struct watchdog {
 /* The reports of all watchdogs, for the tests. */
 static intnat reports = 0;
 
-static int64_t now_ns(void) {
-  struct timespec ts;
-  clock_gettime(CLOCK_MONOTONIC, &ts);
-  return (int64_t)ts.tv_sec * 1000000000 + ts.tv_nsec;
-}
+#define now_ns weft_now_ns
 
 static void *watch(void *arg) {
   struct watchdog *w = arg;
@@ -53,9 +51,7 @@ static void *watch(void *arg) {
   pthread_mutex_lock(&w->m);
   while (!w->stop) {
     /* A check each half of the limit. */
-    int64_t wake = now_ns() + w->limit_ns / 2;
-    struct timespec ts = {wake / 1000000000, wake % 1000000000};
-    pthread_cond_timedwait(&w->c, &w->m, &ts);
+    weft_cond_wait_until(&w->c, &w->m, now_ns() + w->limit_ns / 2);
     if (w->stop) break;
     t = now_ns();
     for (int d = 0; d < w->n; d++) {
@@ -93,11 +89,7 @@ value weft_watchdog_start(value beats, value limit_ns) {
   w->limit_ns = Int64_val(limit_ns);
   pthread_mutex_init(&w->m, NULL);
   /* The timed wait uses the clock of the deadlines. */
-  pthread_condattr_t ca;
-  pthread_condattr_init(&ca);
-  pthread_condattr_setclock(&ca, CLOCK_MONOTONIC);
-  pthread_cond_init(&w->c, &ca);
-  pthread_condattr_destroy(&ca);
+  weft_cond_init(&w->c);
   sigset_t all, old;
   sigfillset(&all);
   pthread_sigmask(SIG_SETMASK, &all, &old);

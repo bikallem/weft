@@ -24,22 +24,6 @@
 
 extern char **environ;
 
-/* The numbers of the signals, in the order of the constructors of
-   Op.signal. */
-static const int numbers[] = {SIGHUP,  SIGINT,  SIGQUIT, SIGILL,  SIGABRT,
-                              SIGFPE,  SIGKILL, SIGSEGV, SIGBUS,  SIGPIPE,
-                              SIGALRM, SIGTERM, SIGUSR1, SIGUSR2, SIGCHLD,
-                              SIGCONT, SIGSTOP, SIGTSTP, SIGWINCH};
-
-value weft_signal_numbers(value unit) {
-  CAMLparam0();
-  CAMLlocal1(r);
-  int n = sizeof numbers / sizeof numbers[0];
-  r = caml_alloc_tuple(n);
-  for (int i = 0; i < n; i++) Store_field(r, i, Val_int(numbers[i]));
-  CAMLreturn(r);
-}
-
 static void set_of(value sigs, sigset_t *set) {
   sigemptyset(set);
   for (mlsize_t i = 0; i < Wosize_val(sigs); i++) sigaddset(set, Int_val(Field(sigs, i)));

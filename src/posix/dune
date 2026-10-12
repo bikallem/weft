@@ -1,0 +1,23 @@
+; The parts that the POSIX worlds share: Linux, macOS and FreeBSD (design
+; section 2.7). The worlds add their poller.
+
+(library
+ (name weft_posix)
+ (public_name weft.posix)
+ (enabled_if
+  (or
+   (= %{system} linux)
+   (= %{system} macosx)
+   (= %{system} freebsd)))
+ (libraries weft)
+ (foreign_stubs
+  (language c)
+  (flags
+   (:standard -O2 -Wall -Wextra -Wno-unused-parameter))
+  (extra_deps weft_posix.h)
+  (names weft_posix_stubs weft_pool weft_watchdog))
+ (c_library_flags -lpthread)
+ (instrumentation
+  (backend ppx_windtrap.coverage))
+ (instrumentation
+  (backend ppx_windtrap.mutate)))
