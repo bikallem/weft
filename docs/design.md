@@ -1605,3 +1605,21 @@ Three subagents reviewed the code of M3 (correctness, conformance to the TLA+ mo
 | C4 | A long exchange on a channel gave a false `Livelock` | A resume is progress |
 | C5 | The watchdog accepted a limit of 0, and its thread then did not wait | `Invalid_argument` |
 | K1 to K13 | Two atomic operations and a lock on each take, a store on each pop, a finaliser for each promise, knobs that only the benchmark used, copies of the CAS push and of the `timerfd` stubs, and a log of the simulator that only one test read | Each one is simpler |
+
+## 3.10 The review of the work after M3, 2026-10-12
+
+Three subagents reviewed the limit of detached jobs and UDP with the socket options (correctness, conformance to the TLA+ models, and complexity). Each finding of this table is fixed. The crash has a regression test that fails when the old code is put back: `test/linux/no_threads.ml` runs with a limit of one process (`prlimit --nproc=1:1`), so that the pool cannot start a thread. The 44 cases of the TLA+ models pass, and `Fd.tla` needs no change: a job that the pool removes from its queue is an acquire and a release of a user with no use.
+
+| No. | Finding | Fix |
+|---|---|---|
+| 1 | `fail_all` set `done` but not `started`. A detach after it walked the queue to its end and dereferenced NULL: a segmentation fault | One state field for a job: queued, running or done. `unqueue` stops at the end of the queue, for the child of a fork |
+| 2 | A close job counted in the limit of detached jobs, and `fail_all` freed a close job with no close(2) | A close does not count, and `fail_all` closes its fd |
+| 3 | On Linux, `sendto` on a TCP socket ignores the address and can send a part. The simulator gave `EISCONN` | `sendto` and `recvfrom` need a UDP socket in the two worlds: the fd record holds the kind |
+| 4 | The datagram queue of the simulator used the fixed limit of TCP, and `Recv_buffer` changed nothing | The receive buffer, with an overhead for each datagram (section 2.14, the state of M2) |
+| 5 | The port 0 of the simulator did not skip the ports in use, and its counter did not go around | `fresh_port` |
+| 6 | The errors of Linux had the text of `strerror`, and the simulator had the names. A portable test could not compare them | The names on the two worlds, from one table |
+| 7 | A size option above the range of a C `int` became small. The smallest send buffer is 4608 bytes, not 2304 | A limit in `Net.set_option`, and 4608 in the simulator |
+| 8 | A reader of empty datagrams never yielded | An empty datagram counts as one byte |
+| K | The `counted` field, the positional initializers of the pools, the docs of `udp` and `get_option`, and a claim of this document that a Linux test examined each fact of UDP | Each one is simpler or correct |
+
+The CI found two more problems. On macOS, dune built the executable of a `test` stanza with a false `enabled_if`, so the Linux suites are now an executable and a `runtest` rule. The CI kernel kept 2 datagrams with the smallest receive buffer, and Linux 7.1 keeps 1: the cost of a datagram depends on the kernel, so the portable test examines only a loss.

@@ -563,11 +563,9 @@ let udp w =
                 | exception Fiber.Timeout ->
                     n
               in
-              (* Linux 7.1 keeps 1 of 10, and Linux 6.x 2: the cost of a
-                 datagram depends on the kernel. *)
-              let n = count 0 in
-              at_least int ~than:1 n ;
-              less int ~than:5 n ;
+              (* Linux 7.1 keeps 1 of 10, Linux 6.x keeps 2, and macOS keeps
+                 none: the cost of a datagram depends on the kernel. *)
+              less int ~than:5 (count 0) ;
               Net.close a ;
               Net.close b ) )
     ; test "sendto and recvfrom need a UDP socket" (fun () ->
@@ -614,8 +612,10 @@ let udp w =
               let u, _ = w.udp () in
               Net.set_option u Broadcast true ;
               is_true (Net.get_option u Broadcast) ;
-              equal string "ENOPROTOOPT"
-                (error_of (fun () -> Net.set_option u No_delay true)) ;
+              (* ENOPROTOOPT on Linux, EINVAL on macOS. *)
+              is_false
+                (String.equal "no error"
+                   (error_of (fun () -> Net.set_option u No_delay true)) ) ;
               Net.close u ;
               equal string "EBADF"
                 (error_of (fun () -> Net.get_option u Broadcast)) ) )
@@ -1123,7 +1123,7 @@ let files w =
               equal string "ENOTDIR" (err (fun () -> File.stat (p "f/"))) ;
               equal string "ENOTDIR" (err (fun () -> Dir.unlink (p "f/"))) ;
               equal string "EISDIR"
-                (err (fun () -> File.openfile [Read; Create] (p "dir"))) ;
+                (err (fun () -> File.openfile [Write; Create] (p "dir"))) ;
               equal string "ENOENT" (err (fun () -> File.openfile [Read] "")) ;
               equal string "other" (err (fun () -> Dir.rmdir (p "dir/."))) ;
               (* A directory cannot go into itself, and it can replace an empty

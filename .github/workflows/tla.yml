@@ -1,0 +1,23 @@
+# The TLA+ models of the design (spec/tla). They check the protocols, not the
+# code, so they run only when a spec changes, each Monday, and on request. The
+# code of each protocol has its dscheck and simulator tests in ci.yml.
+name: TLA+
+
+on:
+  push:
+    branches: [main]
+    paths: ["spec/tla/**"]
+  pull_request:
+    paths: ["spec/tla/**"]
+  schedule:
+    - cron: "0 5 * * 1"
+  workflow_dispatch:
+
+jobs:
+  tla:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: cachix/install-nix-action@v31
+      - name: Model check
+        run: nix develop -c spec/tla/check.sh

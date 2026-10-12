@@ -339,6 +339,15 @@ static void run(struct job *j) {
     break;
   case J_UNLINK:
     r = unlink(j->s1);
+#ifndef __linux__
+    /* POSIX gives EPERM for an unlink of a directory, and Linux gives EISDIR.
+       Dir.unlink promises Is_dir on each system. */
+    if (r < 0 && errno == EPERM) {
+      struct stat st;
+      if (lstat(j->s1, &st) == 0 && S_ISDIR(st.st_mode)) errno = EISDIR;
+      else errno = EPERM;
+    }
+#endif
     break;
   case J_RMDIR:
     r = rmdir(j->s1);

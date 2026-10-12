@@ -8,8 +8,8 @@ on:
   pull_request:
 
 jobs:
-  # Linux runs all suites. macOS runs the core, the simulator, the portable
-  # tests on the simulator and dscheck: the Linux world builds only on Linux.
+  # Linux runs the suites of the Linux world, and macOS those of the kqueue
+  # world. The two run the core, the simulator and dscheck.
   test:
     strategy:
       fail-fast: false
@@ -26,11 +26,24 @@ jobs:
       - name: Test
         run: nix develop -c dune runtest --force
 
-  # The TLA+ models of the design (spec/tla).
-  tla:
+  # FreeBSD in a VM. OCaml 5.5 and the test tools come from opam.
+  freebsd:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
-      - uses: cachix/install-nix-action@v31
-      - name: Model check
-        run: nix develop -c spec/tla/check.sh
+      - name: Test on FreeBSD
+        uses: vmactions/freebsd-vm@v1
+        with:
+          release: "14.3"
+          usesh: true
+          prepare: |
+            pkg install -y ocaml-opam gmake git bash pkgconf
+          run: |
+            set -e
+            export OPAMROOTISOK=1 OPAMYES=1
+            opam init --bare --disable-sandboxing
+            opam switch create 5.5.0
+            eval "$(opam env)"
+            opam install dune windtrap ppx_windtrap dscheck
+            dune build
+            dune runtest --force
