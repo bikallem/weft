@@ -359,9 +359,9 @@ module Net : sig
       [ECONNABORTED], and [accept] takes the next connection.
 
       @raise Error
-        with [No_resources] if the process has no free fd. The connection stays
-        in the backlog, and the next [accept] can get it. Thus an accept loop
-        pauses, then calls [accept] again. *)
+        with [No_resources] if the process or the system has no free fd. The
+        connection stays in the backlog, and the next [accept] can get it. Thus
+        an accept loop pauses, then calls [accept] again. *)
 
   val connect : addr -> t
 

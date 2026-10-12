@@ -466,7 +466,9 @@ let spawned_of (pid, pidfd, i, o, e) =
   Result.map
     (fun pid ->
       {Op.pid; pidfd; to_stdin= fd i; from_stdout= fd o; from_stderr= fd e} )
-    (if pid < 0 then Error (resource_error (-pid)) else Ok pid)
+    ( if (pid < 0) [@mutate off "a spawn in a test never gives the pid 0"] then
+        Error (resource_error (-pid))
+      else Ok pid )
 
 (* The result of a wait stub: (kind, code). The kind is 0 while the child runs,
    1 if it exited with the code, 2 if the signal in code ended it, or -errno. *)
