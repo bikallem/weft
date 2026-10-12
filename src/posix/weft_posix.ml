@@ -153,6 +153,9 @@ let eagain, ebadf, econnrefused, econnreset, epipe, eaddrinuse, ewouldblock =
 let enoent, eexist, enotdir, eisdir, enotempty =
   (codes.(7), codes.(8), codes.(9), codes.(10), codes.(11))
 
+let emfile, enfile, enobufs, enomem, econnaborted =
+  (codes.(12), codes.(13), codes.(14), codes.(15), codes.(16))
+
 let error_of e =
   if
     ( e = eagain || e = ewouldblock )
@@ -168,7 +171,14 @@ let error_of e =
   else if e = enotdir then Op.Not_dir
   else if e = eisdir then Op.Is_dir
   else if e = enotempty then Op.Not_empty
+  else if e = emfile || e = enfile || e = enobufs || e = enomem then
+    Op.No_resources (errname e)
   else Op.Other (errname e)
+
+(* [EAGAIN] of an operation that makes a process or a thread: the OS has no
+   resource for it. It is not an fd that is not ready. *)
+let resource_error e =
+  if e = eagain then Op.No_resources "EAGAIN" else error_of e
 
 let result r = if r >= 0 then Ok r else Error (error_of (-r))
 
@@ -331,7 +341,7 @@ let finish : type a. nativeint -> a Op.blocking -> (a, Op.error) result =
   let res, err, data = job_result j in
   let r : (a, Op.error) result =
     if err = -1 then Error (Op.Other data)
-    else if err <> 0 then Error (error_of err)
+    else if err <> 0 then Error (resource_error err)
     else
       match op with
       | Op.Open _ ->
@@ -453,7 +463,7 @@ let spawned_of (pid, pidfd, i, o, e) =
   Result.map
     (fun pid ->
       {Op.pid; pidfd; to_stdin= fd i; from_stdout= fd o; from_stderr= fd e} )
-    (result pid)
+    (if pid < 0 then Error (resource_error (-pid)) else Ok pid)
 
 (* The result of a wait stub: (kind, code). The kind is 0 while the child runs,
    1 if it exited with the code, 2 if the signal in code ended it, or -errno. *)
@@ -477,7 +487,15 @@ let submit : type a. pool -> a Op.t -> (a, Op.error) result option =
       let kind, h, port = host_port addr in
       Some (result (listen kind h port backlog))
   | Op.Accept fd ->
-      let r, host, port, unix = accept fd in
+      (* macOS and FreeBSD give ECONNABORTED for a connection that the client
+         reset before the accept. Linux gives the connection. Thus the world
+         takes the next connection, as Go and libuv do. Each ECONNABORTED
+         removes one connection from the backlog, so the loop ends. *)
+      let rec take () =
+        let ((r, _, _, _) as a) = accept fd in
+        if r = -econnaborted then take () else a
+      in
+      let r, host, port, unix = take () in
       Some
         (Result.map
            (fun fd -> (fd, if unix then Op.Unix "" else Op.Tcp (host, port)))

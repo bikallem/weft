@@ -94,6 +94,22 @@ val no_faults : net_faults
 
 val net_faults : t -> net_faults -> unit
 
+val open_fds : t -> int
+(** The number of open fds of the simulator: the sockets, the ends of the pipes,
+    the files and the children. The simulator has no fds 0, 1 and 2. *)
+
+val set_fd_limit : t -> int option -> unit
+(** [set_fd_limit t (Some n)] limits the open fds to [n], as [RLIMIT_NOFILE]. An
+    operation that makes [k] fds raises [Error (No_resources "EMFILE", _)] if
+    {!open_fds} plus [k] is more than [n]: [Net.listen], [Net.connect],
+    [Net.accept], [Net.udp], [File.openfile] (1 fd), [Pipe.create] (2 fds) and
+    [Process.spawn] (1 fd, and 2 fds for each [Piped]). As on Linux, [accept]
+    leaves the connection in the backlog, and the listener gets no new edge.
+    [None] (the default) removes the limit. A limit below {!open_fds} closes no
+    fd. To make the next [accept] fail, set the limit to {!open_fds}.
+
+    @raise Invalid_argument if [n] is negative. *)
+
 val set_blocking_cost : t -> Weft.Span.t -> unit
 (** [set_blocking_cost t limit]: each [Blocking] operation (a [File], [Dir] or
     [Dns] operation) takes a time cost from the seed, in the range 0 to [limit].
@@ -156,6 +172,3 @@ exception Unawaited of string list
 
 (* For the tests of the checks. *)
 val sched : t -> Weft.Private.Sched.t
-
-(* The number of open fds of the simulator. *)
-val open_fds : t -> int

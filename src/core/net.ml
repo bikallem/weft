@@ -19,6 +19,7 @@ type error = Op.error =
   | Not_dir
   | Is_dir
   | Not_empty
+  | No_resources of string
   | Other of string
 
 exception Error of error * string

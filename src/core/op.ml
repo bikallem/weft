@@ -14,6 +14,7 @@ type error =
   | Not_dir
   | Is_dir
   | Not_empty
+  | No_resources of string
   | Other of string
 
 type open_flag =
@@ -151,5 +152,7 @@ let pp_error ppf = function
       Format.pp_print_string ppf "EISDIR"
   | Not_empty ->
       Format.pp_print_string ppf "ENOTEMPTY"
+  | No_resources s ->
+      Format.pp_print_string ppf s
   | Other s ->
       Format.pp_print_string ppf s

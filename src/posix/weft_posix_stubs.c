@@ -428,7 +428,8 @@ value weft_errno_codes(value unit) {
   CAMLparam0();
   CAMLlocal1(r);
   int codes[] = {EAGAIN, EBADF,  ECONNREFUSED, ECONNRESET, EPIPE,  EADDRINUSE,
-                 EWOULDBLOCK, ENOENT, EEXIST, ENOTDIR, EISDIR, ENOTEMPTY};
+                 EWOULDBLOCK, ENOENT, EEXIST, ENOTDIR, EISDIR, ENOTEMPTY,
+                 EMFILE, ENFILE, ENOBUFS, ENOMEM, ECONNABORTED};
   int n = sizeof codes / sizeof codes[0];
   r = caml_alloc_tuple(n);
   for (int i = 0; i < n; i++) Store_field(r, i, Val_int(codes[i]));

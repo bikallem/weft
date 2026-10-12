@@ -458,6 +458,27 @@ let no_threads () =
   equal int 0 code ;
   equal string "ok\n" (In_channel.with_open_text out In_channel.input_all)
 
+(* The resource errors (issue 3). The helper runs with a limit of 64 fds
+   (prlimit --nofile=64:64). *)
+let few_fds () =
+  let helper =
+    match Sys.getenv_opt "WEFT_FEW_FDS" with
+    | Some c ->
+        if Filename.is_relative c then Filename.concat (Sys.getcwd ()) c else c
+    | None ->
+        skip ~reason:"WEFT_FEW_FDS is not set" ()
+  in
+  if Sys.command "command -v prlimit > /dev/null" <> 0 then
+    skip ~reason:"prlimit is not installed" () ;
+  let out = Filename.concat (tmp ()) "out" in
+  let code =
+    Sys.command
+      (Printf.sprintf "prlimit --nofile=64:64 %s > %s 2>&1"
+         (Filename.quote helper) (Filename.quote out) )
+  in
+  equal string "ok\n" (In_channel.with_open_text out In_channel.input_all) ;
+  equal int 0 code
+
 (* Processes and signals (milestone M2). *)
 
 let read_pipe = Portable.drain Pipe.read
@@ -692,6 +713,8 @@ let linux =
     ; test "1,000 files open and close with no fd leak" no_file_leak
     ; test "C4: a job that blocks does not stop the next job" blocked_job
     ; test "a detach after the completion of a pool with no thread" no_threads
+    ; test "with no free fd, each operation that makes an fd gives EMFILE"
+        few_fds
     ; test "UDP on IPv6" udp_ipv6
     ; test "local_addr gives IPv6 text, and 127.0.0.1 for localhost"
         local_addr_text

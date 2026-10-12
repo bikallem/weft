@@ -22,6 +22,10 @@ type error =
   | Not_dir  (** [ENOTDIR]. *)
   | Is_dir  (** [EISDIR]. *)
   | Not_empty  (** [ENOTEMPTY]. *)
+  | No_resources of string
+      (** The OS has no resource for the operation at this time: [EMFILE],
+          [ENFILE], [ENOBUFS] or [ENOMEM], or [EAGAIN] of a spawn or of a pool
+          with no thread. The string is the name of the errno. *)
   | Other of string
 
 (** The flags of [Open]. [O_read] and [O_write] together give [O_RDWR]. Each
