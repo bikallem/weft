@@ -8,9 +8,6 @@ let wait id =
   Event.sync
     (Event.Base (fun () -> {Event.leaf= external_leaf id; result= ignore}))
 
-(* Run [job]. With [~fd], the job holds a user of the fd until it completes,
-   also after a detach: thus the world never closes the fd while the pool uses
-   it. At the end of [run], a domain waits for such a job. *)
 (* The paths and the names that go to the OS. *)
 let strings : type a. a Op.blocking -> string list = function
   | Op.Open (path, _, _) ->
@@ -34,6 +31,9 @@ let strings : type a. a Op.blocking -> string list = function
   | Op.Pread _ | Op.Pwrite _ | Op.Fsync _ | Op.Fstat _ | Op.Ftruncate _ ->
       []
 
+(* Run [job]. With [~fd], the job holds a user of the fd until it completes,
+   also after a detach: thus the world never closes the fd while the pool uses
+   it. At the end of [run], a domain waits for such a job. *)
 let run ?fd name job =
   (* The fiber does not start a job in a cancelled context. *)
   check_cancel () ;
