@@ -1682,7 +1682,11 @@ let vars w =
               equal int 2 (Var.get t) ;
               (* A set between the get and the sync is not lost. *)
               equal (option int) (Some 2) (try_changed t 1) ;
-              equal (option int) None (try_changed t 2) ) )
+              equal (option int) None (try_changed t 2) ;
+              (* The box of a float goes through get and changed. *)
+              let f = Var.create 1.5 in
+              let x = Var.get f in
+              is_true (try_changed f x = None) ) )
     ; test "a set wakes each waiter with the new value" (fun () ->
           w.run (fun () ->
               let t = Var.create 0 in

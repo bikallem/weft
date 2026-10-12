@@ -342,7 +342,7 @@ let rec wait s d at =
   | ...
 ```
 
-**Physical equality.** `==` compares the values. It is not a function of the user, so it never raises, also for a closure or a cyclic value. An immediate value, for example an `int` or `None`, compares by its value. A value that is only equal (`=`) is a change. Thus a fiber gives to `changed` the value that `get` or an earlier `changed` gave, not a new copy. A new copy makes the event ready at once: the fiber wakes one time more, but it loses no change.
+**Physical equality.** `==` compares the values. It is not a function of the user, so it never raises, also for a closure or a cyclic value. An immediate value, for example an `int` or `None`, compares by its value. A value that is only equal (`=`) is a change. Thus a fiber gives to `changed` the value that `get` or an earlier `changed` gave, not a new copy. A new copy makes the event ready at once: the fiber wakes one time more, but it loses no change. The stdlib does not specify `==` for an immutable value. A test shows that OCaml 5.5 with no flambda keeps the box of a `float` through `get` and `changed`. I did not examine flambda. If the compiler gives a copy, a wait loop with this value does not stop: the event is ready at each sync.
 
 **A set of the same value is not a change.** If the value of `t` is `v` (`==`), `set t v` does nothing. A wake would give the waiters their own `seen` value. With this rule, two states in sequence never have the same value, so the event never gives `seen`. A variable keeps only the last value, as the watch channel of tokio does. Thus a fiber can miss the values between two of its syncs. For example, if the value goes from `a` to `b` and back to `a` before the guard reads it, a fiber that saw `a` continues to wait.
 
