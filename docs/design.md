@@ -816,10 +816,13 @@ Each domain has its own poller (section 2.5). A fiber registers an fd in the pol
 
 **BSD and macOS:**
 
-- One kqueue for each domain. `EV_CLEAR` gives the edge-triggered behavior. The alarm is an `EVFILT_TIMER` entry, `wake` uses `EVFILT_USER`, signals use `EVFILT_SIGNAL` on domain 0, and child processes use `EVFILT_PROC`.
-- The kqueue world always gives `EVFILT_TIMER` a relative span from `Now Mono`, not an absolute time. I think that an absolute `EVFILT_TIMER` uses the wall clock: `NOTE_ABSTIME` on FreeBSD, and `NOTE_ABSOLUTE` on macOS unless `NOTE_MACHTIME` is set. I did not verify this.
-- I think that macOS can combine near timers unless the entry has `NOTE_CRITICAL` or `NOTE_LEEWAY`, and that a relative timer does not count a system sleep while `CLOCK_MONOTONIC` on macOS does. I think that `EVFILT_PROC` on a child that already exited gives `ESRCH` on macOS, so the world then calls `waitpid` with `WNOHANG`. I did not verify these points, or `EVFILT_USER` on OpenBSD and NetBSD.
-- The kqueue world comes after the Linux world is measured (section 2.14).
+- One kqueue for each domain (`src/kqueue`, after M3). `EV_CLEAR` gives the edge-triggered behavior. Each filter of an fd goes in its own `kevent` call, because an end of a pipe can refuse one of them.
+- The alarm is the timeout of `kevent`, a relative span from `Now Mono`, and not an `EVFILT_TIMER` entry. Thus the open points about absolute timers (`NOTE_ABSTIME`, `NOTE_ABSOLUTE`) do not apply. A step of the wall clock does not end a wait, so a wait for a `Posix` deadline ends after 1 s at most.
+- `wake` writes a pipe of the domain, and not `EVFILT_USER`: a worker of a thread pool must write an fd after it posts a completion, and the pipe serves the two.
+- Signals use `EVFILT_SIGNAL` on domain 0, with the action `SIG_IGN` (but not for `SIGCHLD`). A test of macOS and FreeBSD in CI verifies that a `SIGTERM` to the process comes as an event.
+- A child has no pidfd. Its fd is a pipe, and domain 0 watches the child with `EVFILT_PROC` (`NOTE_EXIT`). At the exit, the world writes one byte to the pipe, so the fiber that waits gets a normal read edge. If `EVFILT_PROC` refuses the child because it already exited, the world writes the pipe at once. A test spawns 50 children that exit at once, on 2 domains. It does not show which of the two ways occurs.
+- The parts that the two POSIX worlds share are in `src/posix` (`weft.posix`): the sockets, pipes, thread pools, errors and the watchdog, with portable C. On macOS, a timed wait uses `pthread_cond_timedwait_relative_np`, because macOS has no `pthread_condattr_setclock`.
+- **Not verified:** a system sleep on macOS, the combination of near timeouts by macOS, and OpenBSD and NetBSD.
 
 **Poll:** a fallback for systems with neither epoll nor kqueue. It uses `poll(2)`, so it has no `FD_SETSIZE` limit, as `select` has. It uses a timeout in milliseconds and not an alarm. It cannot be edge-triggered, so it simulates the flags with a level-triggered poll. It comes only if a user needs it.
 
@@ -1204,7 +1207,7 @@ The sections of this document mark each part that does not come in M0 with its m
 - A user effect from a fiber of a nested scope reaches the handler of the outer scope.
 - All tests of M0 and M1 pass on macOS and on FreeBSD, and each kqueue fact in section 2.7 that has "I did not verify" is now verified or replaced.
 
-**The state of M2 (2026-10-11).** Each item of the "done" list has a test, except the last one. This machine has only Linux, so the kqueue world does not exist yet. The code settled these points:
+**The state of M2 (2026-10-11).** Each item of the "done" list has a test, except the last one. This machine has only Linux, so the kqueue world does not exist yet. After M3, the kqueue world came (section 2.7), and CI runs the portable tests on 1 and 4 domains on macOS and FreeBSD. The code settled these points:
 
 - **The jobs.** A `Blocking` operation is a job. `Op.Start (domain, op)` gives the job to the pool and gives its id. The completion comes to the `Wait` of that domain as `Ready.External id`, the same form as the end of `Sim.settle`. Then `Op.Finish (id, op)` gives the result with the type of `op`. On a cancel, the fiber sends `Op.Detach id` and raises at once.
 - **A job holds a user of its fd** until the job completes, also after a detach. Thus the close(2) of a file waits for each job that uses the fd, and the pool never uses a number that the kernel gave to a new file. The simulator checks this rule: a close(2) while a job uses the fd is a `Model_error`.
