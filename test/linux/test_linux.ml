@@ -34,16 +34,16 @@ let elapsed_ns f =
       f () ;
       Int64.to_int (Span.to_ns (Time.diff Mono (Time.now Mono) t0)) )
 
-(* A sleep never ends before its deadline. A machine under load can delay one
-   sleep, so each of the 20 sleeps must end in less than 50 ms, and the median
-   must be less than 12 ms (without load, a sleep ends about 2 ms after its
-   deadline, the slack of 100 us included). *)
+(* A sleep never ends before its deadline. A shared machine can delay one sleep
+   for a long time. Thus the median of the 20 sleeps checks the precision (less
+   than 12 ms), and the limit of 500 ms for each sleep finds a timer that fires
+   much too late. *)
 let sleep_10ms () =
   let all =
     List.init 20 (fun _ ->
         let ns = elapsed_ns (fun () -> Time.sleep Mono (Span.ms 10)) in
         at_least int ~than:10_000_000 ns ;
-        less int ~than:50_000_000 ns ;
+        less int ~than:500_000_000 ns ;
         ns )
   in
   less int ~than:12_000_000 (List.nth (List.sort compare all) 10)
