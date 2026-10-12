@@ -196,3 +196,88 @@ module Condition = struct
         m.wait_exn <- Some e ;
         Printexc.raise_with_backtrace e bt
 end
+
+(* A counting semaphore (design section 2.5, Locks for fiber code, and
+   spec/tla/Semaphore.tla). The acquire is a base event, as a channel is. The
+   short lock of the semaphore makes "take a free permit, else register an
+   offer" one atomic step. A release commits the word of the oldest waiter with
+   a one-word commit, under the same lock. That commit gives the permit: the
+   waiter gets it if the commit wins, and a waiter that lost its choose or got a
+   cancel has a word that is already [Done], so the permit goes to the next
+   waiter. Thus no step leaves a permit with a fiber that does not use it. *)
+module Semaphore = struct
+  type t =
+    { slock: Spin.t
+    ; initial: int
+    ; free: int Atomic.t
+          (** The free permits. Only a holder of [slock] changes it. It is an
+              atomic location only so that dscheck sees each access. *)
+    ; waiters: unit Chan.side
+          (** The offers of the acquires, the oldest first. When [free] is more
+              than 0, each offer is stale: a release gives a permit to a waiter
+              before it makes the permit free. *) }
+
+  (* The offers hold no value. *)
+  let no_cell : unit option ref = ref None
+
+  let create n =
+    if n < 0 then invalid_arg "Fiber.Semaphore.create: the count is negative" ;
+    {slock= Spin.make (); initial= n; free= Atomic.make n; waiters= Chan.side ()}
+
+  (* The leaf of [acquire]. A free permit goes to the sync only if the sync
+     commits to this branch. *)
+  let leaf t : leaf =
+   fun _ s i ->
+    Spin.with_lock t.slock (fun () ->
+        let n = Atomic.get t.free in
+        if n > 0 then
+          match C.self_commit s.word i with
+          | Ok () ->
+              Atomic.set t.free (n - 1)
+          | Error _ ->
+              ()
+        else Chan.add t.waiters {Chan.osync= s; obranch= i; cell= no_cell} )
+
+  let acquire t = Event.Base (fun () -> {Event.leaf= leaf t; result= ignore})
+
+  (* Give the permit to the oldest waiter that did not leave, or make it free.
+     The result is the syncs to resume. *)
+  let give t =
+    Spin.with_lock t.slock (fun () ->
+        let rec first = function
+          | [] ->
+              let n = Atomic.get t.free in
+              if n >= t.initial then
+                invalid_arg
+                  "Fiber.Semaphore.release: the count is at its initial value" ;
+              Atomic.set t.free (n + 1) ;
+              ([], [])
+          | (o : unit Chan.offer) :: rest -> (
+            match C.notify o.osync.word o.obranch with
+            | C.Resume ->
+                (rest, [o.osync])
+            | C.In_scan ->
+                (rest, [])
+            | C.Lost _ ->
+                first rest )
+        in
+        let rest, resumed = first (Chan.offers t.waiters) in
+        Atomic.set t.waiters.front rest ;
+        resumed )
+
+  (* [Self] first: outside a fiber, the release raises [Not_in_fiber] before it
+     gives the permit to a waiter that nobody would then resume. *)
+  let release t =
+    ignore (self ()) ;
+    enqueue (give t)
+
+  let use t f =
+    Event.sync (acquire t) ;
+    match f () with
+    | v ->
+        release t ; v
+    | exception e ->
+        let bt = Printexc.get_raw_backtrace () in
+        release t ;
+        Printexc.raise_with_backtrace e bt
+end

@@ -460,7 +460,9 @@ let faults_world =
 
 let tests =
   [ Windtrap.group "200 seeds"
-      [Portable.layers seeds_200; Portable.files seeds_200]
+      [ Portable.layers seeds_200
+      ; Portable.semaphores seeds_200
+      ; Portable.files seeds_200 ]
   ; jobs
   ; processes
   ; group "with faults" (Portable.tests faults_world)

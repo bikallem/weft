@@ -208,6 +208,34 @@ module Fiber : sig
     val broadcast : t -> unit
     (** Wakes all waiters. *)
   end
+
+  (** A counting semaphore for fiber code. The acquire is an event, so a
+      [choose] can wait for a permit and for other events (design section 2.5,
+      Locks for fiber code). A lock is [create 1]. *)
+  module Semaphore : sig
+    type t
+
+    val create : int -> t
+    (** [create n] is a semaphore with [n] free permits.
+
+        @raise Invalid_argument if [n < 0]. *)
+
+    val acquire : t -> unit event
+    (** An event that takes one permit. The sync gets the permit only if it
+        commits to this branch. If the [choose] commits to another branch, or a
+        cancel ends the sync, the permit goes to the next waiter. The waiters
+        get the permits in the order of their syncs (FIFO). *)
+
+    val release : t -> unit
+    (** Gives one permit back: to the oldest waiter, or to the free permits.
+
+        @raise Invalid_argument
+          if the free permits are already the [n] of [create n]. *)
+
+    val use : t -> (unit -> 'a) -> 'a
+    (** [use t f] acquires a permit, runs [f] and releases the permit, also if
+        [f] raises. The acquire is a cancellation point. *)
+  end
 end
 
 module Ivar : sig

@@ -1437,6 +1437,209 @@ let layers w =
               Fiber.Mutex.lock m ;
               Fiber.Mutex.unlock m ) ) ]
 
+(* The semaphore (issue 4). *)
+
+module Sem = Fiber.Semaphore
+
+(* [true] if [s] gives a permit in 1 ms. A free permit commits during the scan,
+   before the timer is ready. *)
+let try_acquire s =
+  sync
+    (choose
+       [ wrap (Sem.acquire s) (fun () -> true)
+       ; wrap (Time.after Mono (Span.ms 1)) (fun () -> false) ] )
+
+(* The fibers that hold a permit: at most [n] at a time. *)
+let holders n =
+  let inside = Atomic.make 0 and over = Atomic.make false in
+  let body () =
+    if Atomic.fetch_and_add inside 1 >= n then Atomic.set over true ;
+    Fun.protect ~finally:(fun () -> Atomic.decr inside) Fiber.yield
+  in
+  (body, fun () -> Atomic.get over)
+
+(* Take [n] permits, then make sure that no other permit is free. Thus no permit
+   was lost or doubled. A lost permit makes the acquire wait forever. *)
+let all_free s n =
+  for _ = 1 to n do
+    sync (Sem.acquire s)
+  done ;
+  equal bool false (try_acquire s)
+
+let semaphores w =
+  group "semaphores"
+    [ test "a semaphore lets at most n fibers in at a time" (fun () ->
+          w.run (fun () ->
+              let s = Sem.create 3 in
+              let body, over = holders 3 in
+              Fiber.scope (fun sc ->
+                  for _ = 1 to 20 do
+                    Fiber.fork sc (fun () ->
+                        for _ = 1 to 5 do
+                          Sem.use s body
+                        done )
+                  done ) ;
+              equal bool false (over ()) ;
+              all_free s 3 ) )
+    ; test "an acquire that loses a choose does not take the permit" (fun () ->
+          w.run (fun () ->
+              let s = Sem.create 1 in
+              sync (Sem.acquire s) ;
+              equal bool false (try_acquire s) ;
+              Sem.release s ;
+              all_free s 1 ) )
+    ; test "the waiters get the permits in FIFO order" (fun () ->
+          w.run (fun () ->
+              let s = Sem.create 1 and log = Log.create () in
+              sync (Sem.acquire s) ;
+              Fiber.scope (fun sc ->
+                  for i = 1 to 5 do
+                    Fiber.fork sc (fun () ->
+                        Sem.use s (fun () -> Log.add log i) ) ;
+                    Time.sleep Mono (Span.ms 1)
+                  done ;
+                  Sem.release s ) ;
+              equal (list int) [1; 2; 3; 4; 5] (Log.get log) ;
+              all_free s 1 ) )
+    ; test "a cancel of a waiter gives the permit to the next waiter" (fun () ->
+          w.run (fun () ->
+              let s = Sem.create 1 and log = Log.create () in
+              sync (Sem.acquire s) ;
+              Fiber.scope (fun sc ->
+                  let wait i =
+                    let p =
+                      Fiber.fork_promise sc (fun () ->
+                          Sem.use s (fun () -> Log.add log i) )
+                    in
+                    Time.sleep Mono (Span.ms 1) ;
+                    p
+                  in
+                  let p1 = wait 1 in
+                  let p2 = wait 2 in
+                  let p3 = wait 3 in
+                  Promise.cancel p2 ;
+                  raises Promise.Cancelled (fun () -> Promise.await p2) ;
+                  Sem.release s ;
+                  Promise.await p1 ;
+                  Promise.await p3 ) ;
+              equal (list int) [1; 3] (Log.get log) ;
+              all_free s 1 ) )
+    ; test "the close of a WebSocket: the end or the lock, the first of the two"
+        (fun () ->
+          w.run (fun () ->
+              let close s closed =
+                sync
+                  (choose
+                     [ wrap (Ivar.read closed) (fun () -> `Finished)
+                     ; wrap (Sem.acquire s) (fun () -> `Read) ] )
+              in
+              (* The end comes first: the lock stays with its holder. *)
+              let s = Sem.create 1 and closed = Ivar.create () in
+              sync (Sem.acquire s) ;
+              Fiber.scope (fun sc ->
+                  let p = Fiber.fork_promise sc (fun () -> close s closed) in
+                  Time.sleep Mono (Span.ms 1) ;
+                  Ivar.fill closed () ;
+                  is_true (Promise.await p = `Finished) ) ;
+              Sem.release s ;
+              all_free s 1 ;
+              (* The lock comes first. *)
+              let s = Sem.create 1 and closed = Ivar.create () in
+              sync (Sem.acquire s) ;
+              Fiber.scope (fun sc ->
+                  let p =
+                    Fiber.fork_promise sc (fun () ->
+                        let r = close s closed in
+                        if r = `Read then Sem.release s ;
+                        r )
+                  in
+                  Time.sleep Mono (Span.ms 1) ;
+                  Sem.release s ;
+                  is_true (Promise.await p = `Read) ) ;
+              all_free s 1 ) )
+    ; test "a release and the other branch at the same time lose no permit"
+        (fun () ->
+          w.run (fun () ->
+              let s = Sem.create 1 in
+              for _ = 1 to 20 do
+                let closed = Ivar.create () in
+                sync (Sem.acquire s) ;
+                Fiber.scope (fun sc ->
+                    Fiber.fork sc (fun () ->
+                        match
+                          sync
+                            (choose
+                               [ wrap (Ivar.read closed) (fun () -> false)
+                               ; wrap (Sem.acquire s) (fun () -> true) ] )
+                        with
+                        | true ->
+                            Sem.release s
+                        | false ->
+                            () ) ;
+                    Fiber.fork sc (fun () -> Ivar.fill closed ()) ;
+                    Fiber.yield () ;
+                    Sem.release s )
+              done ;
+              all_free s 1 ) )
+    ; test "no permit is lost or doubled with choose, cancel and many fibers"
+        (fun () ->
+          w.run (fun () ->
+              let n = 2 in
+              let s = Sem.create n in
+              let body, over = holders n in
+              Fiber.scope (fun sc ->
+                  for i = 1 to 12 do
+                    Fiber.fork sc (fun () ->
+                        for j = 1 to 10 do
+                          match (i + j) mod 3 with
+                          | 0 ->
+                              Sem.use s body
+                          | 1 ->
+                              if
+                                sync
+                                  (choose
+                                     [ wrap (Sem.acquire s) (fun () -> true)
+                                     ; wrap
+                                         (Time.after Mono (Span.us 50))
+                                         (fun () -> false) ] )
+                              then
+                                Fun.protect
+                                  ~finally:(fun () -> Sem.release s)
+                                  body
+                          | _ -> (
+                            try
+                              Fiber.with_timeout Mono (Span.us 100) (fun () ->
+                                  Sem.use s body )
+                            with Fiber.Timeout -> () )
+                        done )
+                  done ) ;
+              equal bool false (over ()) ;
+              all_free s n ) )
+    ; test "release above the initial count raises Invalid_argument" (fun () ->
+          w.run (fun () ->
+              let s = Sem.create 2 in
+              let above =
+                Invalid_argument
+                  "Fiber.Semaphore.release: the count is at its initial value"
+              in
+              raises above (fun () -> Sem.release s) ;
+              sync (Sem.acquire s) ;
+              Sem.release s ;
+              raises above (fun () -> Sem.release s) ;
+              all_free s 2 ;
+              raises
+                (Invalid_argument
+                   "Fiber.Semaphore.create: the count is negative" ) (fun () ->
+                  Sem.create (-1) ) ) )
+    ; test "acquire is a cancellation point when a permit is free" (fun () ->
+          w.run (fun () ->
+              let s = Sem.create 1 in
+              Fiber.scope (fun sc ->
+                  Fiber.cancel sc (Boom "stop") ;
+                  raises (Fiber.Cancelled (Boom "stop")) (fun () ->
+                      Sem.use s ignore ) ) ;
+              all_free s 1 ) ) ]
+
 (* Files and directories (milestone M2). *)
 
 (* [File.Error] is [Net.Error]. *)
@@ -1673,6 +1876,7 @@ let tests w =
         ; udp w
         ; overflow_runs w
         ; layers w
+        ; semaphores w
         ; files w
         ; pipes w ]
       @ many w ) ]

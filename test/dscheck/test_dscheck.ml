@@ -662,6 +662,146 @@ let signal_delivery () =
         Atomic.get continued + queued t s = 1
         && if got then !cell = 1 && count = 0 else count = 1 )
 
+(* The semaphore (design section 2.5, Locks for fiber code, and
+   spec/tla/Semaphore.tla). [sem free] has an initial count of 2 and [free] free
+   permits: the other permits are with holders. *)
+module Sem = Locks.Semaphore
+
+let sem free =
+  let t = Sem.create 2 in
+  Atomic.set t.Sem.free free ; t
+
+let base_leaf ev =
+  match ev with Event.Base mk -> (mk ()).Event.leaf | _ -> assert false
+
+(* 1 if the sync committed to branch [i] (it got the permit). *)
+let got s i = if C.state s.S.word = C.Done i then 1 else 0
+
+(* The scan of a sync with one acquire branch on [dom], and its end. *)
+let acquire_scan dom t s continued () =
+  if not (S.is_done s) then base_leaf (Sem.acquire t) dom s 0 ;
+  match C.park s.S.word with `Done _ -> Atomic.incr continued | `Parked -> ()
+
+let release dom t () = List.iter (S.resume dom) (Sem.give t)
+
+(* An acquire with no free permit while a holder releases on another domain. The
+   waiter gets the permit: the release finds its offer, or the scan finds the
+   free permit (no lost wakeup). *)
+let sem_acquire_release () =
+  trace (fun () ->
+      let t = S.create ~domains:2 () in
+      let w = world () in
+      let p = sem 0 and x = new_sync (scope_node ()) in
+      let continued = Atomic.make 0 in
+      spawn_in w (acquire_scan t.S.doms.(0) p x continued) ;
+      spawn_in w (release t.S.doms.(1) p) ;
+      fun () ->
+        got x 0 = 1
+        && Atomic.get p.Sem.free = 0
+        && Atomic.get continued + queued t x = 1 )
+
+(* An acquire with a free permit while a cancel ends its sync. The sync takes
+   the permit only if it commits to the acquire. *)
+let sem_acquire_cancel () =
+  trace (fun () ->
+      let t = S.create ~domains:2 () in
+      let w = world () in
+      let p = sem 1 and x = new_sync (scope_node ()) in
+      let continued = Atomic.make 0 in
+      spawn_in w (acquire_scan t.S.doms.(0) p x continued) ;
+      spawn_in w (fun () ->
+          match C.notify x.S.word (-1) with
+          | C.Resume ->
+              S.resume t.S.doms.(1) x
+          | C.In_scan | C.Lost _ ->
+              () ) ;
+      fun () ->
+        got x 0 + Atomic.get p.Sem.free = 1
+        && Atomic.get continued + queued t x = 1 )
+
+(* Two parked waiters, a release, and a cancel of the first waiter at the same
+   time. The permit goes to the first waiter, or to the second one if the cancel
+   came first (FIFO). No permit is lost or doubled. *)
+let sem_release_cancel () =
+  trace (fun () ->
+      let t = S.create ~domains:2 () in
+      let w = world () in
+      let d0 = t.S.doms.(0) and d1 = t.S.doms.(1) in
+      let p = sem 0 in
+      let x = new_sync ~id:0 (scope_node ())
+      and y = new_sync ~id:1 (scope_node ()) in
+      List.iter
+        (fun s ->
+          base_leaf (Sem.acquire p) d0 s 0 ;
+          ignore (C.park s.S.word) )
+        [x; y] ;
+      spawn_in w (release d0 p) ;
+      spawn_in w (fun () ->
+          match C.notify x.S.word (-1) with
+          | C.Resume ->
+              S.resume d1 x
+          | C.In_scan | C.Lost _ ->
+              () ) ;
+      fun () ->
+        got x 0 + got y 0 + Atomic.get p.Sem.free = 1
+        && (got y 0 = 0 || C.state x.S.word = C.Done (-1))
+        && queued t x = 1
+        && queued t y = got y 0 )
+
+(* A parked sync with two branches: an acquire (branch 0) and a recv on a
+   channel (branch 1). A send on domain 1 and a release on domain 0 come at the
+   same time. The sync commits to one branch, and the permit stays free if the
+   recv won. The release can meet the word as Claimed. *)
+let sem_lost_choose () =
+  trace (fun () ->
+      let t = S.create ~domains:2 () in
+      let w = world () in
+      let d0 = t.S.doms.(0) and d1 = t.S.doms.(1) in
+      let p = sem 0 and c = Chan.create () in
+      let x = new_sync ~id:0 (scope_node ())
+      and y = new_sync ~id:1 (scope_node ()) in
+      base_leaf (Sem.acquire p) d0 x 0 ;
+      base_leaf (Chan.recv c) d0 x 1 ;
+      ignore (C.park x.S.word) ;
+      let continued = Atomic.make 0 in
+      spawn_in w (release d0 p) ;
+      spawn_in w (fun () ->
+          base_leaf (Chan.send c 7) d1 y 0 ;
+          match C.park y.S.word with
+          | `Done _ ->
+              Atomic.incr continued
+          | `Parked ->
+              () ) ;
+      fun () ->
+        (* A partner of a channel resumes [x] in its next slot. *)
+        let in_next =
+          Array.fold_left
+            (fun n d ->
+              match Atomic.get d.S.next with
+              | Some r when r.S.rfiber == x.S.owner ->
+                  n + 1
+              | _ ->
+                  n )
+            0 t.S.doms
+        in
+        got x 0 + Atomic.get p.Sem.free = 1
+        && got x 0 + got y 0 = 1
+        && queued t x + in_next = 1 )
+
+(* Two releases on two domains and one parked waiter. The waiter gets one
+   permit, and the other one is free. *)
+let sem_two_releases () =
+  trace (fun () ->
+      let t = S.create ~domains:2 () in
+      let w = world () in
+      let d0 = t.S.doms.(0) and d1 = t.S.doms.(1) in
+      let p = sem 0 and x = new_sync (scope_node ()) in
+      base_leaf (Sem.acquire p) d0 x 0 ;
+      ignore (C.park x.S.word) ;
+      spawn_in w (release d0 p) ;
+      spawn_in w (release d1 p) ;
+      fun () -> got x 0 = 1 && Atomic.get p.Sem.free = 1 && queued t x = 1 )
+
 let () =
   print_endline "dscheck" ;
   case "commit: a commit during the scan" commit_during_scan ;
@@ -690,6 +830,15 @@ let () =
   case "fd: a Register and a close at the same time" register_and_close ;
   case "jobs: a completion and a cancel of its waiter" job_completion ;
   case "signals: a delivery and a cancel of the waiter" signal_delivery ;
+  case "semaphore: an acquire and a release at the same time"
+    sem_acquire_release ;
+  case "semaphore: an acquire with a free permit and a cancel"
+    sem_acquire_cancel ;
+  case "semaphore: a release and a cancel of the first waiter"
+    sem_release_cancel ;
+  case "semaphore: a release while a send commits the other branch"
+    sem_lost_choose ;
+  case "semaphore: two releases and one waiter" sem_two_releases ;
   case "commit: two fibers that sync on each other, liveness" (fun () ->
       live cross_setup ) ;
   if !failures > 0 then exit 1
