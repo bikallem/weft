@@ -8,6 +8,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <sched.h>
 #include <signal.h>
 #include <stdatomic.h>
 #include <stdint.h>
@@ -74,18 +75,35 @@ value weft_kq_del(value kq, value fd) {
 /* Signals (design section 2.7, Signals). A watched signal has the handler
    [on_signal]: it adds 1 to the count of the signal, then it writes the wake
    pipe of domain 0. Domain 0 reads the pipe, then takes the counts, so it
-   sees each count before its write. The handler runs on any thread that does
-   not block the signal, also during a wait of a domain: kevent then gives
-   EINTR. SA_RESTART restarts the other calls. The counts and the pipe are
-   for the process, so one world at a time can watch signals. */
+   sees each count before its write.
+
+   The handler runs on any thread that does not block the signal, also during
+   a wait of a domain: kevent then gives EINTR. SA_RESTART restarts most other
+   calls, for example read, write and waitid. A call such as select or
+   nanosleep in fiber code on a domain can give EINTR.
+
+   The handler must run on the signal stack of the thread (SA_ONSTACK). OCaml
+   code runs on small stacks of fibers, and a signal frame on such a stack
+   corrupts the stack and the heap. OCaml gives a signal stack to each thread
+   that it makes: the main thread, the thread of each domain and each
+   systhread. The pools and the watchdog block all signals.
+
+   The counts and the pipe are for the process, so one world at a time can
+   watch signals: a world claims [sig_wake] with a CAS from -1. [sig_running]
+   counts the handlers that run, so that the release waits until no handler
+   can write the pipe. */
 
 #define MAX_SIG 129
 
 static atomic_int sig_counts[MAX_SIG];
 static atomic_int sig_wake = -1;
+static atomic_int sig_running;
 
 static void on_signal(int s) {
   int e = errno;
+  /* Before the load of [sig_wake]: a release that sees 0 comes before the
+     load, which then gives -1. */
+  atomic_fetch_add(&sig_running, 1);
   if (s > 0 && s < MAX_SIG) atomic_fetch_add(&sig_counts[s], 1);
   int fd = atomic_load(&sig_wake);
   if (fd >= 0) {
@@ -93,12 +111,23 @@ static void on_signal(int s) {
     ssize_t r = write(fd, &one, 1);
     (void)r;
   }
+  atomic_fetch_sub(&sig_running, 1);
   errno = e;
 }
 
-/* The wake pipe of domain 0 for the handler, or -1. */
-value weft_kq_sig_wake(value fd) {
-  atomic_store(&sig_wake, Int_val(fd));
+/* Claim the handler for the wake pipe [fd] of domain 0. [false] if another
+   world holds it. */
+value weft_kq_sig_claim(value fd) {
+  int none = -1;
+  return Val_bool(atomic_compare_exchange_strong(&sig_wake, &none, Int_val(fd)));
+}
+
+/* Release the handler. After the return, no handler writes the pipe, so the
+   world can close it. A handler is short and never blocks, so the wait is
+   short. */
+value weft_kq_sig_release(value unit) {
+  atomic_store(&sig_wake, -1);
+  while (atomic_load(&sig_running) > 0) sched_yield();
   return Val_unit;
 }
 
@@ -113,7 +142,7 @@ value weft_kq_sig_catch(value signo) {
   memset(&sa, 0, sizeof sa);
   sa.sa_handler = on_signal;
   sigfillset(&sa.sa_mask);
-  sa.sa_flags = SA_RESTART;
+  sa.sa_flags = SA_RESTART | SA_ONSTACK;
   atomic_store(&sig_counts[s], 0);
   if (sigaction(s, &sa, &prev) < 0) caml_failwith("sigaction");
   memcpy(Bytes_val(old), &prev, sizeof prev);

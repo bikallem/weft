@@ -21,6 +21,10 @@
 (*     the permit becomes free.                                            *)
 (*   - A timer and a cancel: one-word partners of a sync.                 *)
 (*                                                                         *)
+(* Each sync has at most one acquire branch. A second acquire branch of   *)
+(* the same sync on the same semaphore is only one more stale offer for   *)
+(* a release. A dscheck test examines it (test/dscheck).                   *)
+(*                                                                         *)
 (* A fiber that gets the permit holds it, then releases it. A parked      *)
 (* fiber waits for its resume, so a lost wakeup is a deadlock of TLC.     *)
 (*                                                                         *)
@@ -449,12 +453,11 @@ HeldAcquired == \A f \in held : res[f] = "acq"
 \* Each continuation has at most one resume.
 AtMostOneResume == \A f \in Fibers : resumes[f] <= 1
 
-\* A permit is free only if no offer in the queue can take it: a release
-\* gives a permit to a waiter before it makes the permit free. Thus a new
-\* acquire never takes a permit before an older waiter (FIFO), and a
-\* parked waiter never waits while a permit is free.
-NoIdlePermit ==
-  free > 0 => \A j \in 1..Len(queue) : word[queue[j]] = "D"
+\* A permit is free only if the queue is empty: a release removes each
+\* stale offer and gives a permit to a waiter before it makes the permit
+\* free. Thus a new acquire never takes a permit before an older waiter
+\* (FIFO), and a parked waiter never waits while a permit is free.
+NoIdlePermit == free > 0 => queue = <<>>
 
 \* A release gives the permit to the oldest live offer (FIFO).
 Fifo == ~unfair

@@ -112,6 +112,24 @@ static int make_addr(int kind, value host, int port, struct sockaddr_storage *sa
   return -EINVAL;
 }
 
+/* The text of the host and the port of an IPv4 or IPv6 address. [buf] has
+   INET6_ADDRSTRLEN bytes. It gives 0, or -1 for another family. */
+static int inet_text(const struct sockaddr_storage *sa, char *buf, int *port) {
+  if (sa->ss_family == AF_INET) {
+    const struct sockaddr_in *in4 = (const struct sockaddr_in *)sa;
+    inet_ntop(AF_INET, &in4->sin_addr, buf, INET6_ADDRSTRLEN);
+    *port = ntohs(in4->sin_port);
+    return 0;
+  }
+  if (sa->ss_family == AF_INET6) {
+    const struct sockaddr_in6 *in6 = (const struct sockaddr_in6 *)sa;
+    inet_ntop(AF_INET6, &in6->sin6_addr, buf, INET6_ADDRSTRLEN);
+    *port = ntohs(in6->sin6_port);
+    return 0;
+  }
+  return -1;
+}
+
 static int new_socket(int family, int type) {
 #ifdef SOCK_NONBLOCK
   int fd = socket(family, type | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
@@ -154,13 +172,7 @@ value weft_local_addr(value fd) {
   int r = 0, port = 0;
   if (getsockname(Int_val(fd), (struct sockaddr *)&sa, &len) < 0) {
     r = ERR;
-  } else if (sa.ss_family == AF_INET) {
-    inet_ntop(AF_INET, &((struct sockaddr_in *)&sa)->sin_addr, buf, sizeof buf);
-    port = ntohs(((struct sockaddr_in *)&sa)->sin_port);
-    n = strlen(buf);
-  } else if (sa.ss_family == AF_INET6) {
-    inet_ntop(AF_INET6, &((struct sockaddr_in6 *)&sa)->sin6_addr, buf, sizeof buf);
-    port = ntohs(((struct sockaddr_in6 *)&sa)->sin6_port);
+  } else if (inet_text(&sa, buf, &port) == 0) {
     n = strlen(buf);
   } else if (sa.ss_family == AF_UNIX) {
     /* The path can have no NUL byte at the end. A length more than the
@@ -234,13 +246,7 @@ value weft_accept(value lfd) {
     fd = ERR;
   } else {
     sock_flags(fd);
-    if (sa.ss_family == AF_INET) {
-      inet_ntop(AF_INET, &((struct sockaddr_in *)&sa)->sin_addr, buf, sizeof buf);
-      port = ntohs(((struct sockaddr_in *)&sa)->sin_port);
-    } else if (sa.ss_family == AF_INET6) {
-      inet_ntop(AF_INET6, &((struct sockaddr_in6 *)&sa)->sin6_addr, buf, sizeof buf);
-      port = ntohs(((struct sockaddr_in6 *)&sa)->sin6_port);
-    }
+    inet_text(&sa, buf, &port);
   }
   host = caml_copy_string(buf);
   result = caml_alloc_tuple(4);
@@ -296,12 +302,8 @@ value weft_recvfrom(value fd, value buf, value off, value len) {
                        MSG_DONTWAIT, (struct sockaddr *)&sa, &alen);
   if (n < 0) {
     n = ERR;
-  } else if (sa.ss_family == AF_INET) {
-    inet_ntop(AF_INET, &((struct sockaddr_in *)&sa)->sin_addr, text, sizeof text);
-    port = ntohs(((struct sockaddr_in *)&sa)->sin_port);
-  } else if (sa.ss_family == AF_INET6) {
-    inet_ntop(AF_INET6, &((struct sockaddr_in6 *)&sa)->sin6_addr, text, sizeof text);
-    port = ntohs(((struct sockaddr_in6 *)&sa)->sin6_port);
+  } else {
+    inet_text(&sa, text, &port);
   }
   host = caml_copy_string(text);
   result = caml_alloc_tuple(3);
