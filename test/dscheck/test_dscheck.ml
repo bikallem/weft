@@ -802,6 +802,119 @@ let sem_two_releases () =
       spawn_in w (release d1 p) ;
       fun () -> got x 0 = 1 && Atomic.get p.Sem.free = 1 && queued t x = 1 )
 
+(* The variable (design section 2.4, A variable). [var_sync dom t seen x got] is
+   the sync of [x] on [changed t seen] on [dom]: the guard, the leaf and the end
+   of the scan. [got] gets the result of the event. *)
+let var_sync dom t seen x got continued () =
+  let leaves, results, _ = Event.flatten (Var.changed t seen) in
+  got := Some results.(0) ;
+  leaves.(0) dom x 0 ;
+  match C.park x.S.word with `Done _ -> Atomic.incr continued | `Parked -> ()
+
+let var_set dom t v () = List.iter (S.resume dom) (Var.change t v)
+
+(* The value of the event, if the sync committed. *)
+let var_result x got =
+  match (C.state x.S.word, !got) with
+  | C.Done 0, Some r ->
+      Some (r ())
+  | _ ->
+      None
+
+(* A sync on [changed t 0] while a set of 1 runs on another domain. The fiber
+   gets 1: the guard reads the new state, or the set fills the Ivar of the old
+   state (no lost wake). *)
+let var_set_changed () =
+  trace (fun () ->
+      let t = S.create ~domains:2 () in
+      let w = world () in
+      let v = Var.create 0 and x = new_sync (scope_node ()) in
+      let got = ref None and continued = Atomic.make 0 in
+      spawn_in w (var_sync t.S.doms.(0) v 0 x got continued) ;
+      spawn_in w (var_set t.S.doms.(1) v 1) ;
+      fun () ->
+        var_result x got = Some 1
+        && Var.get v = 1
+        && Atomic.get continued + queued t x = 1 )
+
+(* Two sets on two domains, and a sync on [changed t 1] on a third domain. The
+   fiber waits only while the value is 1, and the event never gives 1. Thus each
+   state that a fiber waits on has a set that fills its Ivar. *)
+let var_two_sets () =
+  trace (fun () ->
+      let t = S.create ~domains:3 () in
+      let w = world () in
+      let v = Var.create 0 and x = new_sync (scope_node ()) in
+      let got = ref None and continued = Atomic.make 0 in
+      spawn_in w (var_sync t.S.doms.(0) v 1 x got continued) ;
+      spawn_in w (var_set t.S.doms.(1) v 1) ;
+      spawn_in w (var_set t.S.doms.(2) v 2) ;
+      fun () ->
+        List.mem (Var.get v) [1; 2]
+        &&
+        match var_result x got with
+        | Some r ->
+            r <> 1 && Atomic.get continued + queued t x = 1
+        | None ->
+            C.state x.S.word = C.Parked && Var.get v = 1 && queued t x = 0 )
+
+(* A set of 1 and a set of 0 again on one domain, while a fiber syncs on
+   [changed t 0] on another domain. If the fiber reads the last state, it waits:
+   the value is 0 again. Else it gets 1, never 0. *)
+let var_set_back () =
+  trace (fun () ->
+      let t = S.create ~domains:2 () in
+      let w = world () in
+      let v = Var.create 0 and x = new_sync (scope_node ()) in
+      let got = ref None and continued = Atomic.make 0 in
+      spawn_in w (var_sync t.S.doms.(0) v 0 x got continued) ;
+      spawn_in w (fun () ->
+          var_set t.S.doms.(1) v 1 () ;
+          var_set t.S.doms.(1) v 0 () ) ;
+      fun () ->
+        Var.get v = 0
+        &&
+        match var_result x got with
+        | Some r ->
+            r = 1 && Atomic.get continued + queued t x = 1
+        | None ->
+            C.state x.S.word = C.Parked && queued t x = 0 )
+
+(* A set of the value of [t] is not a change: the fiber that syncs on [changed t
+   0] stays parked. *)
+let var_same_value () =
+  trace (fun () ->
+      let t = S.create ~domains:2 () in
+      let w = world () in
+      let v = Var.create 0 and x = new_sync (scope_node ()) in
+      let got = ref None and continued = Atomic.make 0 in
+      spawn_in w (var_sync t.S.doms.(0) v 0 x got continued) ;
+      spawn_in w (var_set t.S.doms.(1) v 0) ;
+      fun () ->
+        C.state x.S.word = C.Parked && Atomic.get continued + queued t x = 0 )
+
+(* A set while a cancel ends the sync of the waiter. One of them wins, and the
+   fiber continues one time. *)
+let var_set_cancel () =
+  trace (fun () ->
+      let t = S.create ~domains:2 () in
+      let w = world () in
+      let d0 = t.S.doms.(0) and d1 = t.S.doms.(1) in
+      let v = Var.create 0 and x = new_sync (scope_node ()) in
+      let got = ref None and continued = Atomic.make 0 in
+      var_sync d0 v 0 x got continued () ;
+      spawn_in w (var_set d0 v 1) ;
+      spawn_in w (fun () ->
+          match C.notify x.S.word (-1) with
+          | C.Resume ->
+              S.resume d1 x
+          | C.In_scan | C.Lost _ ->
+              () ) ;
+      fun () ->
+        Var.get v = 1
+        && (var_result x got = Some 1 || C.state x.S.word = C.Done (-1))
+        && queued t x = 1 )
+
 let () =
   print_endline "dscheck" ;
   case "commit: a commit during the scan" commit_during_scan ;
@@ -839,6 +952,11 @@ let () =
   case "semaphore: a release while a send commits the other branch"
     sem_lost_choose ;
   case "semaphore: two releases and one waiter" sem_two_releases ;
+  case "variable: a set and a sync on changed at the same time" var_set_changed ;
+  case "variable: two sets and a waiter on the first value" var_two_sets ;
+  case "variable: a set and a set back during a sync" var_set_back ;
+  case "variable: a set of the same value does not wake" var_same_value ;
+  case "variable: a set and a cancel of the waiter" var_set_cancel ;
   case "commit: two fibers that sync on each other, liveness" (fun () ->
       live cross_setup ) ;
   if !failures > 0 then exit 1
