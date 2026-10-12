@@ -440,14 +440,22 @@ let no_threads () =
 
 let read_pipe = Portable.drain Pipe.read
 
+(* A shell starts a background job with SIGINT ignored, and a child inherits
+   this action. Thus the test gives SIGINT its default action for the time of
+   the spawn. *)
+let with_default_sigint f =
+  let old = Sys.signal Sys.sigint Sys.Signal_default in
+  Fun.protect ~finally:(fun () -> Sys.set_signal Sys.sigint old) f
+
 (* The child gets no blocked signals, also when run blocks SIGINT. *)
 let child_sigint () =
   let before = open_fds () in
-  Weft_linux.run ~domains:1 ~signals:[SIGINT] (fun () ->
-      let p = Process.spawn "sleep" ["10"] in
-      Time.sleep Mono (Span.ms 20) ;
-      Process.kill p SIGINT ;
-      is_true (Process.wait p = Process.Signaled SIGINT) ) ;
+  with_default_sigint (fun () ->
+      Weft_linux.run ~domains:1 ~signals:[SIGINT] (fun () ->
+          let p = Process.spawn "sleep" ["10"] in
+          Time.sleep Mono (Span.ms 20) ;
+          Process.kill p SIGINT ;
+          is_true (Process.wait p = Process.Signaled SIGINT) ) ) ;
   equal int before (open_fds ())
 
 let child_output () =
