@@ -2,7 +2,9 @@
    the Linux world. An echo server runs on 1, 2, 4 and 8 domains, and
    [Runtime_events] records the GC phases of each domain. Each run must fit in
    the ring of each domain, thus: OCAMLRUNPARAM=e=20 dune exec bench/q6.exe.
-   With e=22, the reader of OCaml 5.5 gave "corrupt stream". *)
+   OCaml 5.5 keeps the size of the file of all rings in an int, and the file has
+   rings for 128 domains by default. Thus e=21 and more do not work
+   (ocaml/ocaml#14999, fixed for OCaml 5.6). *)
 
 open Weft
 module R = Runtime_events
