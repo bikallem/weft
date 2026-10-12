@@ -19,6 +19,13 @@
  (modules few_fds)
  (libraries weft weft.linux))
 
+(executable
+ (name unwatch)
+ (enabled_if
+  (= %{system} linux))
+ (modules unwatch)
+ (libraries weft weft.linux unix))
+
 ; An executable and a rule, not a test stanza: on another system, dune
 ; builds the executable of a test stanza also if its enabled_if is false.
 
@@ -33,7 +40,7 @@
  (alias runtest)
  (enabled_if
   (= %{system} linux))
- (deps echo_client.exe no_threads.exe few_fds.exe)
+ (deps echo_client.exe no_threads.exe few_fds.exe unwatch.exe)
  (action
   (setenv
    WEFT_ECHO_CLIENT
@@ -44,6 +51,9 @@
     (setenv
      WEFT_FEW_FDS
      %{dep:few_fds.exe}
-     (progn
-      (run %{exe:test_linux.exe} --corrected)
-      (diff? test_linux.ml test_linux.ml.corrected)))))))
+     (setenv
+      WEFT_UNWATCH
+      %{dep:unwatch.exe}
+      (progn
+       (run %{exe:test_linux.exe} --corrected)
+       (diff? test_linux.ml test_linux.ml.corrected))))))))
