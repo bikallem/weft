@@ -32,6 +32,15 @@ val run :
     loop that yields until a time comes never ends in the simulator, because the
     time moves only at a quiescence.
 
+    The fork rule: [run] starts no OS domain and no OS thread, for each value of
+    [~domains]. The virtual domains, the jobs of [File], [Dir] and [Dns], the
+    fake processes of [Process.spawn], the timers and the faults all run on the
+    thread that calls [run]. Thus a process can call [Unix.fork] before, between
+    and after runs, for example a tool that forks one process for each mutant.
+    OCaml 5 refuses [Unix.fork] after a [Domain.spawn], also after its
+    [Domain.join], so other code of the process must not start a domain, for
+    example [Weft_linux.run] with more than one domain.
+
     @raise Livelock
       with the fibers that are not parked. A long stream of data is progress, so
       it is not a livelock.

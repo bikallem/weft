@@ -1091,6 +1091,14 @@ Fiber code must obey the same rules (section 2.5, Locks for fiber code).
 
 The simulator finds errors in the order of events between domains, at the level of world effects and fiber switches. It does not try the other orders of the atomic operations between two switch points, because a virtual domain does not stop between them. For the lock-free parts, a model checker such as `dscheck` is necessary (section 2.14, milestone M1).
 
+### The fork rule (issue 8)
+
+`Sim.run` starts no OS domain and no OS thread, for each value of `~domains`. The virtual domains run on the thread that calls `run` (section Virtual domains, above). A `Blocking` job of `File`, `Dir` or `Dns` runs in the agenda of the simulator, not in a pool of threads (section The wait steps, below). A fake process of `Process.spawn` is a record, not a child of the OS. The timers and the faults are also events of the agenda.
+
+Thus a process can call `Unix.fork` before, between and after runs. A tool for mutation tests needs this rule, because it forks one process for each mutant. OCaml 5 refuses `Unix.fork` after a `Domain.spawn`, also after its `Domain.join`. A test on OCaml 5.5.0 verified this. Thus other code of the process must not start a domain, for example `Weft_linux.run` with more than one domain.
+
+The test `test/sim_fork` makes sure of the rule. It does a run with each part of the simulator on 1, 2, 4, 8 and 16 domains, and it forks after each run. On Linux, it also counts the threads of the process in `/proc/self/task`. Its control spawns a domain at the end, and then the fork must fail. The build of the test refuses the `threads` library (`forbidden_libraries`), so `weft` and `weft.sim` cannot start a thread. The only `Domain.spawn` of the library is in `run_world` of the core, and only the production worlds call it.
+
 ### The model of the fds
 
 The simulator copies the edge-triggered behavior of Linux strictly. If it gave more edges than Linux, it would hide code that does not read until `EAGAIN`. The rules:
@@ -1166,7 +1174,7 @@ For a manual check point, `Sim.settle sim` waits until the program is quiescent.
 
 ## 2.9 What makes the simulator deterministic
 
-- **One OS thread.** The virtual domains run on one thread, and the seed sets their order.
+- **One OS thread.** The virtual domains run on one thread, and the seed sets their order. A run starts no OS domain and no OS thread (section 2.8, The fork rule).
 - **Every input of the library comes from the world.** Time, I/O, random numbers, the `choose` order and the domain order go through world effects. The I/O modules cover the full Unix I/O API, so fiber code has no reason to call `Unix`.
 - **Other inputs that the simulator does not control.** A direct call to `Unix`, the stdlib I/O (section 2.3), `Random.self_init`, a `Hashtbl` with a random seed, `Sys.time` and environment variables. A test must not use them, or must give them a fixed value.
 - **The GC.** A fill from a finaliser (milestone M3) depends on the time of the GC. Such a test gives the same result only in the same binary with the same history (section 2.5).
