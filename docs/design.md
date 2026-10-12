@@ -1626,3 +1626,10 @@ Three subagents reviewed the limit of detached jobs and UDP with the socket opti
 | K | The `counted` field, the positional initializers of the pools, the docs of `udp` and `get_option`, and a claim of this document that a Linux test examined each fact of UDP | Each one is simpler or correct |
 
 The CI found two more problems. On macOS, dune built the executable of a `test` stanza with a false `enabled_if`, so the Linux suites are now an executable and a `runtest` rule. The CI kernel kept 2 datagrams with the smallest receive buffer, and Linux 7.1 keeps 1: the cost of a datagram depends on the kernel, so the portable test examines only a loss.
+
+The kqueue suite crashed or hung on macOS and FreeBSD only sometimes. A manual workflow (`stress.yml`) runs the suite many times, and it found two more bugs:
+
+- **A race in the OCaml 5.5 runtime.** The fiber of a promise can fail on another domain than the domain that made the promise. `Gc.finalise_last` on the promise then put a young value of another domain in the table of the failing domain. A minor GC reads these values after its end barrier, so the other domain can already free its minor heap or allocate over the value. The result was a segmentation fault, also on Linux. A program of 20 lines with no weft code shows the race. The finaliser now goes on a new cell of the failing domain (section 2.5, Errors). A portable test crashed in 17 of 20 runs before the fix, and in 0 of 200 runs after the fix.
+- **A race in the result of a connect.** If the RST came after the first read of `SO_ERROR`, `getpeername` failed, and on macOS it gave `EINVAL`. A second read of `SO_ERROR` now gives the error of the connect.
+
+After the two fixes, 60 of 60 runs of the suite on macOS passed. Before the fixes, one run also hung, and I do not know if the race of the runtime caused the hang.
