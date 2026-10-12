@@ -175,6 +175,10 @@ module Fiber : sig
 
     val equal : t -> t -> bool
 
+    val compare : t -> t -> int
+    (** In one run, the order is the order of the forks. Thus [Map.Make] and
+        [Set.Make] take [Id]. *)
+
     val hash : t -> int
 
     val to_int : t -> int

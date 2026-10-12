@@ -2213,6 +2213,7 @@ let pipes w =
 
 (* The ids of fibers (design section 2.5, The id of a fiber). *)
 module Ids = Hashtbl.Make (Fiber.Id)
+module Id_set = Set.Make (Fiber.Id)
 
 let same a b = Fiber.Id.equal a b
 
@@ -2246,7 +2247,19 @@ let fiber_ids w =
                     (fun iv -> Ids.replace ids (sync (Ivar.read iv)) ())
                     [pinned; daemon] ) ;
               (* main, 10 promises, the pinned fiber and the daemon *)
-              equal int 13 (Ids.length ids) ) )
+              equal int 13 (Ids.length ids) ;
+              (* A set of the ids has the same 13 ids, and main is the smallest:
+                 it is the first fiber of the run. *)
+              let set =
+                Ids.fold (fun id () acc -> Id_set.add id acc) ids Id_set.empty
+              in
+              equal int 13 (Id_set.cardinal set) ;
+              is_true (same main (Id_set.min_elt set)) ;
+              equal int 0 (Fiber.Id.compare main main) ;
+              is_true
+                (Id_set.for_all
+                   (fun id -> same id main || Fiber.Id.compare main id < 0)
+                   set ) ) )
     ; test "a fiber keeps its id when it moves to another domain" (fun () ->
           (* A move is not sure on a machine with few CPUs, so the test of the
              simulator makes sure of it. *)

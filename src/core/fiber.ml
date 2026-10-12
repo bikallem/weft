@@ -44,6 +44,8 @@ module Id = struct
 
   let equal = Int.equal
 
+  let compare = Int.compare
+
   let hash = Hashtbl.hash
 
   let to_int t = t
