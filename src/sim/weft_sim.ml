@@ -883,25 +883,28 @@ let spawn t (sp : Op.spawn) =
         ; from_stdout= fd from_stdout
         ; from_stderr= fd from_stderr }
 
-(* A signal to the program itself (design section 2.8, Signals). Domain 0 gets a
-   watched signal at its next [Wait]. Each other signal gets the default action,
-   and the world ignores SIGPIPE. Only these signals do not end the process: the
-   simulator has no stop of a process. *)
+(* The signals with a default action that does not end the process: a stop, a
+   continue or an ignore. 21, 22 and 23 are SIGTTIN, SIGTTOU and SIGURG on
+   Linux. The simulator has no stop of a process. The signal 0 only tells that
+   the process exists. *)
+let no_end = function
+  | Op.SIGSTOP
+  | SIGTSTP
+  | SIGCONT
+  | SIGCHLD
+  | SIGWINCH
+  | Other_signal (0 | 21 | 22 | 23) ->
+      true
+  | _ ->
+      false
+
+(* A signal to the program itself (design section 2.7, The end of a watch).
+   Domain 0 gets a watched signal at its next [Wait]. Each other signal gets the
+   default action, and the world ignores SIGPIPE. *)
 let send_self t sg =
   if List.mem sg t.watched then
     t.net.edges <- (0, World.Ready.Signal (sg, 1)) :: t.net.edges
-  else
-    match sg with
-    | Op.SIGPIPE
-    | SIGCHLD
-    | SIGWINCH
-    | SIGCONT
-    | SIGSTOP
-    | SIGTSTP
-    | Other_signal 0 ->
-        ()
-    | _ ->
-        t.killed <- Some sg
+  else if not (sg = Op.SIGPIPE || no_end sg) then t.killed <- Some sg
 
 let submit : type a. t -> a Op.t -> (a, Op.error) result =
  fun t op ->
@@ -1133,11 +1136,7 @@ let submit : type a. t -> a Op.t -> (a, Op.error) result =
         ( match (p.status, sg) with
         | Some _, _ ->
             ()
-        | None, (Op.SIGSTOP | SIGTSTP | SIGCONT | SIGCHLD | SIGWINCH) ->
-            (* The default action of these signals does not end the process, and
-               signal 0 only tells that the process exists. *)
-            ()
-        | None, Op.Other_signal 0 ->
+        | None, _ when no_end sg ->
             ()
         | None, _ when sg <> Op.SIGKILL && List.mem sg p.prog.ignores ->
             ()
