@@ -437,13 +437,17 @@ let net w =
 
 (* [read_now], [write_now] and [reset]. *)
 
-(* Read with [readable] and [read_now] until the end of the stream. *)
+(* Read with [readable] and [read_now] until the end of the stream. The limit of
+   the stale events stops a loop that spins: in the simulator, the time does not
+   move while a fiber spins. *)
 let read_now_all c =
-  let b = Buffer.create 64 and buf = Bytes.create 4096 in
+  let b = Buffer.create 64 and buf = Bytes.create 4096 and stale = ref 0 in
   let rec loop () =
     sync (Net.readable c) ;
     match Net.read_now c buf 0 4096 with
     | None ->
+        incr stale ;
+        if !stale > 1000 then failwith "the loop spins" ;
         loop ()
     | Some 0 ->
         Buffer.contents b
@@ -511,7 +515,10 @@ let now_and_reset w =
                   Net.close c )
                 (fun c ->
                   (* The read of another fiber takes the data with no EAGAIN, so
-                     the read flag of its domain stays set. *)
+                     the read flag of its domain stays set. The worlds with one
+                     domain find a loop that spins. On more domains, the other
+                     fiber can run on another domain, and the test then proves
+                     less. *)
                   Fiber.scope (fun s ->
                       let b = Fiber.fork_promise s (fun () -> read_n c 1) in
                       Fiber.yield () ;
@@ -639,6 +646,19 @@ let reset_details w =
                   sync (Ivar.read reset) ;
                   pause () ;
                   equal string "EPIPE" (error_of (fun () -> Net.write c "x")) ) ) )
+    ; test "a close with unread data sends a reset" (fun () ->
+          w.run (fun () ->
+              let sent = Ivar.create () in
+              with_conn w
+                (fun c ->
+                  sync (Ivar.read sent) ;
+                  pause () ;
+                  Net.close c )
+                (fun c ->
+                  Net.write c "unread" ;
+                  Ivar.fill sent () ;
+                  equal string "ECONNRESET" (read_error c) ;
+                  equal string "" (read_all c) ) ) )
     ; test "a reset of a Unix socket gives the end of the stream" (fun () ->
           w.run (fun () ->
               let a = Net.Unix (Filename.concat (w.tmp ()) "s") in

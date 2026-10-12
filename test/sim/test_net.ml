@@ -724,6 +724,40 @@ let reset_latency () =
       Net.close l ;
       equal int 0 (Sim.open_fds sim) )
 
+(* With [resets], a reset at the write of one fiber wakes a reader fiber on the
+   same socket. *)
+let reset_wakes_reader () =
+  for seed = 1 to 20 do
+    Sim.run ~seed (fun sim ->
+        Sim.net_faults sim {Sim.no_faults with resets= true} ;
+        let a = Net.Tcp ("resets", 2) in
+        let l = Net.listen a in
+        Fiber.scope (fun s ->
+            (* The server reads all and writes nothing. *)
+            Fiber.fork s (fun () ->
+                let c, _ = Net.accept l in
+                ( try ignore (read_all c)
+                  with Net.Error ((Reset | Broken_pipe), _) -> () ) ;
+                Net.close c ) ;
+            let c = Net.connect a in
+            let reader =
+              Fiber.fork_promise s (fun () ->
+                  try read_all c with Net.Error (Reset, _) -> "reset" )
+            in
+            (* The reader waits before the first write. *)
+            Fiber.yield () ;
+            ( try
+                while true do
+                  Net.write c "x"
+                done
+              with Net.Error (Reset, _) -> () ) ;
+            (* The writer took the reset, so the reader gets the end of the
+               stream. *)
+            equal string "" (Promise.await reader) ;
+            Net.close c ) ;
+        Net.close l )
+  done
+
 (* With [resets], some connections end with ECONNRESET, and the others echo all
    of their data. *)
 let random_resets () =
@@ -804,6 +838,8 @@ let tests =
       ; test "a reset comes to the peer after the latency" reset_latency
       ; test "the fault resets ends some connections with ECONNRESET"
           random_resets
+      ; test "a reset of the fault wakes a reader on the same socket"
+          reset_wakes_reader
       ; slow "10,000 connections use the fd slots again" many_connections ]
   ; group "udp"
       [ test "udp_loss loses about one datagram in 8" udp_loss

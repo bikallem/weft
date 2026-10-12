@@ -161,9 +161,9 @@ let write_now fd buf off len =
 let shutdown fd =
   ok "Net.shutdown" (attempt fd "Net.shutdown" (fun os -> Op.Shutdown os))
 
-(* The mark of the reset is a use of the fd, as a read: it holds a user. Then
+(* The option of the reset is a use of the fd, as a read: it holds a user. Then
    [close] does the close protocol, and the close(2) of the last user sends the
-   reset. If the record is already closing, or if the OS refuses the mark, the
+   reset. If the record is already closing, or if the OS refuses the option, the
    close is a normal close. I think that macOS refuses an option on a connection
    that ended in the two directions. *)
 let reset fd =

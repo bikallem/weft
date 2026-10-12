@@ -600,6 +600,8 @@ let write_conn t c buf off len =
     | Some _ when c.tcp && n.resets && Prng.int t.prng 64 = 0 ->
         reset_conn t c ;
         c.eof <- true ;
+        (* A fiber that waits on this side reads the end of the stream. *)
+        edge n c.cfd ~read:true ~write:true ;
         Error Op.Reset
     | Some p ->
         let space = capacity - avail p - p.inflight in
@@ -1093,7 +1095,10 @@ let submit : type a. t -> a Op.t -> (a, Op.error) result =
           Hashtbl.remove n.opts fd ;
           ( match sfd with
           | Conn c ->
-              if c.abort then reset_conn t c else close_conn t c
+              (* Linux also sends a reset at the close of a TCP socket with
+                 unread data. *)
+              if c.abort || (c.tcp && avail c > 0) then reset_conn t c
+              else close_conn t c
           | Dgm g ->
               Hashtbl.remove n.udp_names g.dkey
           | Lsn l ->
