@@ -340,7 +340,13 @@ let fresh_port n used =
   let rec go tries =
     let p = n.next_port in
     n.next_port <- (if p >= 65535 then 40000 else p + 1) ;
-    if used p && tries > 0 then go (tries - 1) else p
+    if
+      used p
+      && ( tries > 0 )
+         [@mutate
+           off "the count of tries matters only when all ports are in use"]
+    then go ((tries - 1) [@mutate off "the same reason"])
+    else p
   in
   (go (65535 - 40000)
    [@mutate off "the count of tries matters only when all ports are in use"] )
