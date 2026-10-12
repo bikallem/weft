@@ -786,6 +786,24 @@ let layers w =
                   raises Promise.Cancelled (fun () -> Promise.await p)
               | None ->
                   failwith "no promise" ) )
+      (* A fiber on another domain makes the promise, and its fiber fails on
+         domain 0. Then the run ends, and the other domains terminate. The
+         finaliser of the failure must not hold a value of their minor heaps. *)
+    ; test "a promise that fails on another domain than its fork" (fun () ->
+          for _ = 1 to 200 do
+            w.run (fun () ->
+                Fiber.scope (fun s ->
+                    for _ = 1 to 8 do
+                      Fiber.fork s (fun () ->
+                          Fiber.yield () ;
+                          if (Domain.self () :> int) <> 0 then
+                            let p =
+                              Fiber.fork_promise ~pinned:true s (fun () ->
+                                  raise (Boom "p") )
+                            in
+                            raises (Boom "p") (fun () -> Promise.await p) )
+                    done ) )
+          done )
     ; test "two fibers that wake each other do not starve the queue" (fun () ->
           w.run (fun () ->
               let a = Chan.create () and b = Chan.create () in

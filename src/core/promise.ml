@@ -18,7 +18,10 @@ type 'a t =
             hold the promise. *)
   ; mutable unawaited: int Atomic.t option
         (** After a failure: the count of the run (design section 2.5, Errors).
-        *) }
+        *)
+  ; mutable cell: unit ref option
+        (** After a failure: the value of the finaliser. Only the promise holds
+            it. *) }
 
 (* The report of a promise that failed and that no fiber awaited (design section
    2.5, Errors). It gets the id of the run of the promise. The simulator puts
@@ -47,13 +50,17 @@ let rec start p inner =
   | Running _ ->
       assert false (* Only the fiber of the promise starts it. *)
 
-(* Only a promise that failed gets a finaliser. *)
+(* Only a promise that failed gets a finaliser. The finaliser goes on a new
+   cell, not on the promise: another domain can hold the promise in its minor
+   heap. In OCaml 5.5, [Gc.finalise_last] on a young value of another domain
+   lets the minor GC read freed memory. *)
 let fork ?name ?pinned scope f =
   let p =
     { result= Ivar.create ()
     ; state= Atomic.make Not_started
     ; awaited= Atomic.make false
-    ; unawaited= None }
+    ; unawaited= None
+    ; cell= None }
   in
   Fiber.fork ?name ?pinned scope (fun () ->
       let r =
@@ -67,11 +74,13 @@ let fork ?name ?pinned scope f =
             let run = Atomic.get Sched.outside in
             p.unawaited <- Option.map (fun (t, _) -> t.Sched.unawaited) run ;
             Option.iter Atomic.incr p.unawaited ;
+            let cell = ref () in
+            p.cell <- Some cell ;
             Gc.finalise_last
               (finaliser
                  (Option.map (fun (t, _) -> t.Sched.run_id) run)
                  e p.awaited )
-              p ;
+              cell ;
             Error (e, bt)
       in
       Ivar.fill p.result r ) ;
