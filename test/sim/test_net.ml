@@ -642,7 +642,22 @@ let option_sizes () =
         (Portable.error_of (fun () -> Net.set_option u No_delay true)) ;
       let l = Net.listen (Net.Unix "/s") in
       equal string "EOPNOTSUPP"
-        (Portable.error_of (fun () -> Net.set_option l No_delay true)) )
+        (Portable.error_of (fun () -> Net.set_option l No_delay true)) ;
+      (* The defaults of a TCP socket. *)
+      let t = Net.listen (Net.Tcp ("h", 1)) in
+      equal int 131072 (Net.get_option t Recv_buffer) ;
+      equal int 16384 (Net.get_option t Send_buffer) )
+
+let udp_port_range () =
+  Sim.run (fun _ ->
+      let einval = Some (Net.Other "EINVAL") in
+      let error f =
+        match f () with _ -> None | exception Net.Error (e, _) -> Some e
+      in
+      is_true (error (fun () -> Net.udp ("h", -1)) = einval) ;
+      is_true (error (fun () -> Net.udp ("h", 65536)) = einval) ;
+      Net.close (Net.udp ("h", 65535)) ;
+      Net.close (Net.udp ("h", 1)) )
 
 let tests =
   [ group "net"
@@ -680,7 +695,8 @@ let tests =
       ; test "a datagram of more than 65507 bytes gives EMSGSIZE" udp_size
       ; test "the latency delays a datagram" udp_latency
       ; test "the port 0 gives a free port" udp_free_ports
-      ; test "the sizes of the buffers follow Linux" option_sizes ]
+      ; test "the sizes of the buffers follow Linux" option_sizes
+      ; test "a UDP port out of range gives EINVAL" udp_port_range ]
   ; group "sim"
       [ test "settle waits until the others are quiescent" settle_runs_others
       ; test "manual mode: advance_until moves the time" manual_mode
