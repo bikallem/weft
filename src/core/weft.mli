@@ -6,7 +6,9 @@ val version : string
 module Span = Span
 module Clock = Clock
 
-(** {1 Events} (design section 2.4) *)
+(** {1 Events}
+
+    Design section 2.4. *)
 
 (** An event: a value that a fiber can wait for. *)
 type 'a event
@@ -36,7 +38,9 @@ val always : 'a -> 'a event
 val never : 'a event
 (** [never] is never ready. *)
 
-(** {1 Time} (design section 2.6) *)
+(** {1 Time}
+
+    Design section 2.6. *)
 
 module Time : sig
   val now : 'time Clock.line -> 'time
@@ -62,7 +66,9 @@ module Time : sig
   val posix_to_unix_s : Clock.posix -> float
 end
 
-(** {1 Fibers} (design section 2.5) *)
+(** {1 Fibers}
+
+    Design section 2.5. *)
 
 module Promise : sig
   type 'a t
@@ -221,16 +227,18 @@ module Ivar : sig
       (design section 2.5, Fiber code with no handler). If the Ivar is full at
       that time, the fill does nothing. It gives [false] if no [run] is active.
       One [run] at a time takes these fills. An Ivar belongs to the [run] that
-      created it or that last added a waiter to it: a fill of an Ivar of a
-      [run] that ended does nothing and gives [false]. The simulator accepts
-      fills only with [Sim.run ~outside_fills:true]. *)
+      created it or that last added a waiter to it: a fill of an Ivar of a [run]
+      that ended does nothing and gives [false]. The simulator accepts fills
+      only with [Sim.run ~outside_fills:true]. *)
 
   val read : 'a t -> 'a event
 
   val peek : 'a t -> 'a option
 end
 
-(** {1 Worlds} (design section 2.3) *)
+(** {1 Worlds}
+
+    Design section 2.3. *)
 
 module type WORLD = World.WORLD
 
@@ -302,7 +310,9 @@ module Chan : sig
   val recv : 'a t -> 'a event
 end
 
-(** {1 Sockets} (design sections 2.3 and 2.7) *)
+(** {1 Sockets}
+
+    Design sections 2.3 and 2.7. *)
 
 module Net : sig
   type addr = Private.Net.addr =
@@ -403,12 +413,14 @@ module Net : sig
   val get_option : t -> 'a sockopt -> 'a
 end
 
-(** {1 Files and directories} (design section 2.3, The I/O modules)
+(** {1 Files and directories}
 
-    Each operation runs on the thread pool in production, and the simulator
-    has an in-memory file system. Each operation is a cancellation point: on a
-    cancel, the fiber does not wait for the operation, and the pool completes
-    it alone (design section 2.5, Blocking operations). *)
+    Design section 2.3, The I/O modules.
+
+    Each operation runs on the thread pool in production, and the simulator has
+    an in-memory file system. Each operation is a cancellation point: on a
+    cancel, the fiber does not wait for the operation, and the pool completes it
+    alone (design section 2.5, Blocking operations). *)
 
 module File : sig
   (** An open file. *)
@@ -514,7 +526,9 @@ module Pipe : sig
   (** As [Net.close]. *)
 end
 
-(** {1 Signals and processes} (design section 2.7, Signals) *)
+(** {1 Signals and processes}
+
+    Design section 2.7, Signals. *)
 
 module Signal : sig
   type t = Private.Op.signal =

@@ -12,6 +12,9 @@ bug-reports: "https://github.com/bikallem/weft/issues"
 depends: [
   "dune" {>= "3.17"}
   "ocaml" {>= "5.3"}
+  "windtrap" {with-test & >= "0.2.0"}
+  "ppx_windtrap" {with-test & >= "0.2.0"}
+  "dscheck" {with-test & >= "0.6.0"}
   "odoc" {with-doc}
 ]
 build: [

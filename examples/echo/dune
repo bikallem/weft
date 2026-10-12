@@ -1,0 +1,19 @@
+; An echo server. The same code runs on Linux (echo_server.exe) and in the
+; simulator (test_echo.ml).
+
+(library
+ (name echo)
+ (modules echo)
+ (libraries weft))
+
+(executable
+ (name echo_server)
+ (modules echo_server)
+ (enabled_if
+  (= %{system} linux))
+ (libraries echo weft weft.linux))
+
+(test
+ (name test_echo)
+ (modules test_echo)
+ (libraries echo weft weft.sim))
