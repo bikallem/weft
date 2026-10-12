@@ -606,8 +606,9 @@ let unwatch_busy () =
           Pipe.close out ;
           is_true (st = Process.Signaled SIGINT) ) )
 
-(* Run [f] in a fiber on domain 1. Domain 0 computes, so domain 1 takes the new
-   fiber. *)
+(* Run [f] in a fiber on domain 1. If the caller runs on domain 0, it computes,
+   so domain 1 takes the new fiber. The caller can also run on domain 1, for
+   example after a sleep. *)
 let on_domain_1 f =
   let dom () = Private.Sched.prog "test" Private.Sched.Dom_index in
   let rec go tries =
@@ -624,7 +625,7 @@ let on_domain_1 f =
         done ) ;
     if Atomic.get ran <> Some 1 then go (tries - 1)
   in
-  go 20
+  if dom () = 1 then f () else go 20
 
 (* In the process of the test: the waiter raises, a later received and a second
    unwatch raise, and SIGTERM stays an event. The thread of the unwatch and the
