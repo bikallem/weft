@@ -30,10 +30,6 @@ external epoll_wait : int -> bool -> (int * bool * bool) array
 
 (* Child processes and signals (weft_proc.c). *)
 
-external spawn :
-     string * string array * string array * bool * string * int array
-  -> int * int * int * int * int = "weft_spawn"
-
 external wait_child : int -> int * int = "weft_wait_child"
 
 external pidfd_kill : int -> int -> int = "weft_pidfd_kill"
@@ -178,7 +174,9 @@ module World = struct
     match op with
     | Op.Spawn sp ->
         if spawn_has_nul sp then nul_error
-        else spawned_of (spawn (spawn_args sp))
+        else
+          (* The world ignores only SIGPIPE: it blocks the watched signals. *)
+          spawned_of (spawn_child (spawn_args sp) [|number_of Op.SIGPIPE|])
     | Op.Wait_child fd ->
         status_of (wait_child fd)
     | Op.Kill (fd, s) ->

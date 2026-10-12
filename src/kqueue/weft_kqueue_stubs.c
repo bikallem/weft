@@ -2,13 +2,13 @@
    Each domain has one kqueue. An fd has a read filter and a write filter with
    EV_CLEAR, so its events are edges, as with EPOLLET. The alarm is the timeout
    of kevent. Signals come through EVFILT_SIGNAL, and the exit of a child
-   through EVFILT_PROC. The stubs never block, except a wait with a timeout,
-   which releases the runtime lock. A stub gives a value >= 0, or -errno. */
+   through EVFILT_PROC. The stubs never block, except a wait with a timeout
+   and the wait for a zombie, which release the runtime lock. A stub gives a
+   value >= 0, or -errno. */
 
 #include <errno.h>
 #include <fcntl.h>
 #include <signal.h>
-#include <spawn.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -25,8 +25,6 @@
 #include <caml/signals.h>
 
 #define ERR (-errno)
-
-extern char **environ;
 
 value weft_kq_create(value unit) {
   int kq = kqueue();
@@ -128,95 +126,38 @@ value weft_kq_wait(value kq, value ns) {
   CAMLreturn(result);
 }
 
+/* Read all bytes of a non-blocking fd, a wake pipe. */
+value weft_drain_all(value fd) {
+  char buf[256];
+  while (read(Int_val(fd), buf, sizeof buf) > 0) {
+  }
+  return Val_unit;
+}
+
+/* Write one byte to a wake pipe or to the exit pipe of a child. A full pipe already wakes its reader. */
+value weft_poke(value fd) {
+  char one = 1;
+  ssize_t r = write(Int_val(fd), &one, 1);
+  (void)r;
+  return Val_unit;
+}
+
 /* Child processes */
 
-/* A NULL-terminated copy of an array of strings. The strings stay in the OCaml
-   heap: the call does not allocate in it, so the GC cannot move them. */
-static char **c_strings(value a) {
-  mlsize_t n = Wosize_val(a);
-  char **c = malloc((n + 1) * sizeof *c);
-  if (c == NULL) return NULL;
-  for (mlsize_t i = 0; i < n; i++) c[i] = (char *)String_val(Field(a, i));
-  c[n] = NULL;
-  return c;
-}
-
-/* A pipe with FD_CLOEXEC on the two ends. */
-static int cloexec_pipe(int p[2]) {
-  if (pipe(p) < 0) return -1;
-  fcntl(p[0], F_SETFD, FD_CLOEXEC);
-  fcntl(p[1], F_SETFD, FD_CLOEXEC);
-  return 0;
-}
-
-/* [args] is (prog, argv, env, has_env, cwd, stdio), as on Linux. The result is
-   (pid, -1, stdin, stdout, stderr): the parent ends of the pipes, or -1. pid is
-   -errno on an error. The world makes the fd of the exit. */
-value weft_kq_spawn(value args) {
-  CAMLparam1(args);
-  CAMLlocal1(r);
-  value prog = Field(args, 0), stdio = Field(args, 5);
-  int ends[3] = {-1, -1, -1}, child[3] = {-1, -1, -1};
-  pid_t pid = 0;
-  int e = 0;
-  posix_spawn_file_actions_t fa;
-  posix_spawnattr_t at;
-  sigset_t none, def;
-  char **argv = c_strings(Field(args, 1));
-  char **envp = Bool_val(Field(args, 3)) ? c_strings(Field(args, 2)) : environ;
-  if (argv == NULL || envp == NULL) {
-    free(argv);
-    if (envp != environ) free(envp);
-    caml_raise_out_of_memory();
-  }
-  posix_spawn_file_actions_init(&fa);
-  posix_spawnattr_init(&at);
-  for (int i = 0; i < 3 && e == 0; i++) {
-    int kind = Int_val(Field(stdio, i));
-    if (kind == 1) {
-      e = posix_spawn_file_actions_addopen(&fa, i, "/dev/null", O_RDWR, 0);
-    } else if (kind == 2) {
-      int p[2];
-      if (cloexec_pipe(p) < 0) {
-        e = errno;
-        break;
-      }
-      ends[i] = i == 0 ? p[1] : p[0];
-      child[i] = i == 0 ? p[0] : p[1];
-      fcntl(ends[i], F_SETFL, O_NONBLOCK);
-      e = posix_spawn_file_actions_adddup2(&fa, child[i], i);
-    }
-  }
-  if (e == 0 && caml_string_length(Field(args, 4)) > 0)
-    e = posix_spawn_file_actions_addchdir_np(&fa, String_val(Field(args, 4)));
-  if (e == 0) {
-    /* The child gets no blocked signals, and the default action for the
-       signals that the world ignores. */
-    sigemptyset(&none);
-    sigfillset(&def);
-    sigdelset(&def, SIGKILL);
-    sigdelset(&def, SIGSTOP);
-    posix_spawnattr_setsigmask(&at, &none);
-    posix_spawnattr_setsigdefault(&at, &def);
-    posix_spawnattr_setflags(&at, POSIX_SPAWN_SETSIGMASK | POSIX_SPAWN_SETSIGDEF);
-    e = posix_spawnp(&pid, String_val(prog), &fa, &at, argv, envp);
-  }
-  posix_spawn_file_actions_destroy(&fa);
-  posix_spawnattr_destroy(&at);
-  free(argv);
-  if (envp != environ) free(envp);
-  for (int i = 0; i < 3; i++) {
-    if (child[i] >= 0) close(child[i]);
-    if (e != 0 && ends[i] >= 0) {
-      close(ends[i]);
-      ends[i] = -1;
-    }
-  }
-  r = caml_alloc_tuple(5);
-  Store_field(r, 0, Val_int(e != 0 ? -e : pid));
-  Store_field(r, 1, Val_int(-1));
-  for (int i = 0; i < 3; i++) Store_field(r, 2 + i, Val_int(ends[i]));
-  CAMLreturn(r);
+/* Wait until the child is a zombie, with no reap. The world calls it only
+   after the kernel told of the exit, so the wait is short. EVFILT_PROC can
+   report the exit before the child is a zombie, and then a reap with WNOHANG
+   finds nothing. An error (ECHILD) ends the wait: the reap then gives it. */
+value weft_kq_zombie(value pid) {
+  siginfo_t info;
+  int p = Int_val(pid), r;
+  caml_enter_blocking_section();
+  do {
+    memset(&info, 0, sizeof info);
+    r = waitid(P_PID, p, &info, WEXITED | WNOWAIT);
+  } while (r < 0 && errno == EINTR);
+  caml_leave_blocking_section();
+  return Val_unit;
 }
 
 /* (kind, code): kind 0 runs, 1 exited with the code, 2 ended by the signal

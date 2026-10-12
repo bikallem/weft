@@ -1,8 +1,9 @@
-/* The thread pools of the Linux world (design section 2.3). The threads of a
+/* The thread pools of the POSIX worlds (design section 2.3). The threads of a
    pool never run OCaml code, and they block all signals. A job never uses the
    memory of the user: a read fills a buffer of the job, and a write copies the
    data at the start. A completed job goes to the mailbox of the domain that
-   started it, and a write to the eventfd of that domain wakes it.
+   started it, and a write to the wake fd of that domain wakes it: an eventfd
+   on Linux, or the write end of a pipe on kqueue.
 
    There are two pools: one for the names (getaddrinfo, getnameinfo), and one
    for the files and the directories. Thus a DNS server that does not answer
@@ -76,7 +77,7 @@ struct box {
   int64_t *ids;
   int n, cap;
   int evfd;
-  int closed; /* The world closed: the eventfd can be closed. */
+  int closed; /* The world closed: the wake fds can be closed. */
 };
 
 /* The mailboxes of one world. Each job that can post holds a reference. */
@@ -256,13 +257,13 @@ static void reverse(struct job *j) {
   if (inet_pton(AF_INET, j->s1, &v4->sin_addr) == 1) {
     v4->sin_family = AF_INET;
     sl = sizeof *v4;
-#if defined(__APPLE__) || defined(__FreeBSD__)
+#ifdef HAVE_SA_LEN
     v4->sin_len = sl;
 #endif
   } else if (inet_pton(AF_INET6, j->s1, &v6->sin6_addr) == 1) {
     v6->sin6_family = AF_INET6;
     sl = sizeof *v6;
-#if defined(__APPLE__) || defined(__FreeBSD__)
+#ifdef HAVE_SA_LEN
     v6->sin6_len = sl;
 #endif
   } else {
@@ -609,7 +610,7 @@ value weft_mbx_create(value evfds) {
   return caml_copy_nativeint((intnat)w);
 }
 
-/* After this call, no worker writes an eventfd of the world. */
+/* After this call, no worker writes a wake fd of the world. */
 value weft_mbx_close(value mbx) {
   struct mbx *w = Mbx_val(mbx);
   for (int i = 0; i < w->ndoms; i++) {

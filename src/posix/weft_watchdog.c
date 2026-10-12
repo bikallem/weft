@@ -1,4 +1,4 @@
-/* The watchdog of the Linux world (design section 2.5, The limit of a busy
+/* The watchdog of the POSIX worlds (design section 2.5, The limit of a busy
    domain). A C thread reads the beat of each domain: the scheduler adds one at
    the start of a fiber and one at its end, so an odd beat tells that a fiber
    runs. If the beat of a domain is odd and does not change for the limit, the

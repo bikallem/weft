@@ -1,13 +1,13 @@
 /* Child processes and signals of the Linux world (design section 2.7,
-   Signals). A child comes from pidfd_spawnp, so its pidfd exists before any
-   code can reap it. The pidfd is readable when the child exits, and
-   waitid (P_PIDFD) ends the zombie. Signals come through a signalfd. */
+   Signals). A child comes from pidfd_spawnp (weft_spawn.c of weft.posix), so
+   its pidfd exists before any code can reap it. The pidfd is readable when
+   the child exits, and waitid (P_PIDFD) ends the zombie. Signals come through
+   a signalfd. */
 
 #define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
 #include <signal.h>
-#include <spawn.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/pidfd.h>
@@ -22,97 +22,9 @@
 
 #define ERR (-errno)
 
-extern char **environ;
-
 static void set_of(value sigs, sigset_t *set) {
   sigemptyset(set);
   for (mlsize_t i = 0; i < Wosize_val(sigs); i++) sigaddset(set, Int_val(Field(sigs, i)));
-}
-
-/* A NULL-terminated copy of an array of strings. The strings stay in the OCaml
-   heap: the call does not allocate in it, so the GC cannot move them. */
-static char **c_strings(value a) {
-  mlsize_t n = Wosize_val(a);
-  char **c = malloc((n + 1) * sizeof *c);
-  if (c == NULL) return NULL;
-  for (mlsize_t i = 0; i < n; i++) c[i] = (char *)String_val(Field(a, i));
-  c[n] = NULL;
-  return c;
-}
-
-/* [args] is (prog, argv, env, has_env, cwd, stdio): stdio has a kind for the
-   fds 0, 1 and 2 (0 inherit, 1 /dev/null, 2 a pipe). The result is (pid, pidfd,
-   stdin, stdout, stderr): the parent ends of the pipes, or -1. pid is -errno
-   on an error. */
-value weft_spawn(value args) {
-  CAMLparam1(args);
-  CAMLlocal1(r);
-  value prog = Field(args, 0), stdio = Field(args, 5);
-  int ends[3] = {-1, -1, -1}, child[3] = {-1, -1, -1};
-  int pid = 0, pidfd = -1, e = 0;
-  posix_spawn_file_actions_t fa;
-  posix_spawnattr_t at;
-  sigset_t none, def;
-  char **argv = c_strings(Field(args, 1));
-  char **envp = Bool_val(Field(args, 3)) ? c_strings(Field(args, 2)) : environ;
-  if (argv == NULL || envp == NULL) {
-    free(argv);
-    if (envp != environ) free(envp);
-    caml_raise_out_of_memory();
-  }
-  posix_spawn_file_actions_init(&fa);
-  posix_spawnattr_init(&at);
-  for (int i = 0; i < 3 && e == 0; i++) {
-    int kind = Int_val(Field(stdio, i));
-    if (kind == 1) {
-      e = posix_spawn_file_actions_addopen(&fa, i, "/dev/null", O_RDWR, 0);
-    } else if (kind == 2) {
-      int p[2];
-      if (pipe2(p, O_CLOEXEC) < 0) {
-        e = errno;
-        break;
-      }
-      /* The child gets fd 0 as the read end, and the fds 1 and 2 as write
-         ends. Only the end of the parent is non-blocking. */
-      ends[i] = i == 0 ? p[1] : p[0];
-      child[i] = i == 0 ? p[0] : p[1];
-      fcntl(ends[i], F_SETFL, O_NONBLOCK);
-      e = posix_spawn_file_actions_adddup2(&fa, child[i], i);
-    }
-  }
-  if (e == 0 && caml_string_length(Field(args, 4)) > 0)
-    e = posix_spawn_file_actions_addchdir_np(&fa, String_val(Field(args, 4)));
-  if (e == 0) {
-    /* The child gets no blocked signals, and the default action for SIGPIPE,
-       which the world ignores. */
-    sigemptyset(&none);
-    sigemptyset(&def);
-    sigaddset(&def, SIGPIPE);
-    posix_spawnattr_setsigmask(&at, &none);
-    posix_spawnattr_setsigdefault(&at, &def);
-    posix_spawnattr_setflags(&at, POSIX_SPAWN_SETSIGMASK | POSIX_SPAWN_SETSIGDEF);
-    e = pidfd_spawnp(&pidfd, String_val(prog), &fa, &at, argv, envp);
-  }
-  if (e == 0) {
-    pid = pidfd_getpid(pidfd);
-    if (pid < 0) pid = 0;
-  }
-  posix_spawn_file_actions_destroy(&fa);
-  posix_spawnattr_destroy(&at);
-  free(argv);
-  if (envp != environ) free(envp);
-  for (int i = 0; i < 3; i++) {
-    if (child[i] >= 0) close(child[i]);
-    if (e != 0 && ends[i] >= 0) {
-      close(ends[i]);
-      ends[i] = -1;
-    }
-  }
-  r = caml_alloc_tuple(5);
-  Store_field(r, 0, Val_int(e != 0 ? -e : pid));
-  Store_field(r, 1, Val_int(pidfd));
-  for (int i = 0; i < 3; i++) Store_field(r, 2 + i, Val_int(ends[i]));
-  CAMLreturn(r);
 }
 
 /* (kind, code): kind 0 runs, 1 exited with the code, 2 ended by the signal

@@ -15,7 +15,7 @@
   (flags
    (:standard -O2 -Wall -Wextra -Wno-unused-parameter))
   (extra_deps weft_posix.h)
-  (names weft_posix_stubs weft_pool weft_watchdog))
+  (names weft_posix_stubs weft_pool weft_watchdog weft_spawn))
  (c_library_flags -lpthread)
  (instrumentation
   (backend ppx_windtrap.coverage))

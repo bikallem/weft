@@ -9,6 +9,12 @@
 
 #define ERR (-errno)
 
+/* The BSD systems have a length field in each address, and FreeBSD refuses a
+   bind without it. */
+#if defined(__APPLE__) || defined(__FreeBSD__)
+#define HAVE_SA_LEN 1
+#endif
+
 static inline int64_t weft_now_ns(void) {
   struct timespec ts;
   clock_gettime(CLOCK_MONOTONIC, &ts);

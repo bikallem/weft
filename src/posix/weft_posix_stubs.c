@@ -28,12 +28,6 @@
 
 #include "weft_posix.h"
 
-/* The BSD systems have a length field in each address, and FreeBSD refuses a
-   bind without it. */
-#if defined(__APPLE__) || defined(__FreeBSD__)
-#define HAVE_SA_LEN 1
-#endif
-
 /* Linux has no SO_NOSIGPIPE, and macOS has no MSG_NOSIGNAL. The world also
    ignores SIGPIPE. */
 #ifndef MSG_NOSIGNAL
@@ -170,26 +164,21 @@ value weft_connect(value kind, value host, value port) {
   return Val_int(fd);
 }
 
-static int socket_error(int fd) {
-  int e = 0;
-  socklen_t l = sizeof e;
-  if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &e, &l) < 0) return ERR;
-  return -e;
-}
-
-/* The result of a connect. SO_ERROR is 0 also while the connect continues,
-   so a connected socket is one with a peer. The error of the connect can
-   come after the first read of SO_ERROR: then getpeername fails (EINVAL on
-   macOS), and a second read of SO_ERROR gives the error. */
+/* The result of a connect: a connected socket is one with a peer. If there
+   is no peer, SO_ERROR gives the error of the connect, or 0 while the
+   connect continues. The kernel sets SO_ERROR before it removes the peer, so
+   a failure that comes during the call is never lost. A connected socket
+   keeps its SO_ERROR for the next read or write. With no peer, getpeername
+   gives ENOTCONN, or EINVAL on macOS after a reset. */
 value weft_connect_result(value fd) {
-  int e = socket_error(Int_val(fd));
-  if (e != 0) return Val_int(e);
   struct sockaddr_storage sa;
   socklen_t len = sizeof sa;
   if (getpeername(Int_val(fd), (struct sockaddr *)&sa, &len) == 0) return Val_int(0);
   int pe = errno;
-  e = socket_error(Int_val(fd));
-  if (e != 0) return Val_int(e);
+  int e = 0;
+  socklen_t l = sizeof e;
+  if (getsockopt(Int_val(fd), SOL_SOCKET, SO_ERROR, &e, &l) < 0) return Val_int(ERR);
+  if (e != 0) return Val_int(-e);
   return Val_int(pe == ENOTCONN ? -EAGAIN : -pe);
 }
 
@@ -374,22 +363,6 @@ value weft_write(value fd, value buf, value off, value len) {
 }
 
 value weft_close(value fd) { return Val_int(close(Int_val(fd)) < 0 ? ERR : 0); }
-
-/* Read all bytes of a non-blocking fd, for example a wake pipe. */
-value weft_drain_all(value fd) {
-  char buf[256];
-  while (read(Int_val(fd), buf, sizeof buf) > 0) {
-  }
-  return Val_unit;
-}
-
-/* Write one byte to a wake pipe. A full pipe already wakes its reader. */
-value weft_poke(value fd) {
-  char one = 1;
-  ssize_t r = write(Int_val(fd), &one, 1);
-  (void)r;
-  return Val_unit;
-}
 
 value weft_getrandom(value buf) {
   size_t len = caml_string_length(buf);

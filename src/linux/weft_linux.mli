@@ -1,5 +1,6 @@
 (** The Linux world (design section 2.7): one epoll set for each domain,
-    edge-triggered, with a [timerfd] alarm on [CLOCK_MONOTONIC] and an [eventfd]
+    edge-triggered, with a [timerfd] alarm on [CLOCK_MONOTONIC], a second
+    [timerfd] on [CLOCK_REALTIME] for the [Posix] deadlines, and an [eventfd]
     for [wake]. *)
 
 (** The state of the world: the poller of each domain. *)
@@ -18,7 +19,8 @@ val create : ?domains:int -> ?signals:Weft.Signal.t list -> unit -> t
     mask. SIGPIPE is ignored, so a write with no reader gives EPIPE. *)
 
 val close : t -> unit
-(** [close t] closes the fds of the pollers. *)
+(** [close t] stops the thread pools, closes the fds of the world and restores
+    the signal mask of [create]. *)
 
 val run :
      ?slack:Weft.Span.t
@@ -37,7 +39,7 @@ val run :
     stops the watchdog. *)
 
 val local_port : Weft.Net.t -> int
-(** The port of a TCP socket, for example after a listen on port 0. *)
+(** The port of a TCP or UDP socket, for example after a listen on port 0. *)
 
 (**/**)
 

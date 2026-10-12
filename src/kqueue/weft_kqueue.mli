@@ -19,7 +19,8 @@ val create : ?domains:int -> ?signals:Weft.Signal.t list -> unit -> t
     world examines the clock again at least each second. *)
 
 val close : t -> unit
-(** [close t] closes the fds of the pollers. *)
+(** [close t] stops the thread pools, closes the fds of the world, also the exit
+    pipes of the children, and restores the signal actions of [create]. *)
 
 val run :
      ?slack:Weft.Span.t

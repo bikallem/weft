@@ -45,10 +45,6 @@ external fd_write : int -> bytes -> int -> int -> int = "weft_write"
 
 external close_fd : int -> int = "weft_close"
 
-external drain_all : int -> unit = "weft_drain_all"
-
-external poke : int -> unit = "weft_poke"
-
 external getrandom : bytes -> int = "weft_getrandom"
 
 external errno_codes : unit -> int array = "weft_errno_codes"
@@ -421,8 +417,15 @@ let host_port = function
   | Op.Unix path ->
       (1, path, 0)
 
-(* The arguments of a spawn for the stubs of a world: (prog, argv, env, has_env,
-   cwd, stdio), with a kind for the fds 0, 1 and 2. *)
+(* [spawn_child args defaults] (weft_spawn.c). [defaults] are the signals that
+   get the default action in the child. *)
+external spawn_child :
+     string * string array * string array * bool * string * int array
+  -> int array
+  -> int * int * int * int * int = "weft_spawn"
+
+(* The arguments of [spawn_child]: (prog, argv, env, has_env, cwd, stdio), with
+   a kind for the fds 0, 1 and 2. *)
 let spawn_args (sp : Op.spawn) =
   let kind = function Op.Inherit -> 0 | Op.Null -> 1 | Op.Piped -> 2 in
   ( sp.prog
@@ -438,8 +441,8 @@ let spawn_has_nul (sp : Op.spawn) =
     @ Option.value ~default:[] sp.env
     @ Option.to_list sp.cwd )
 
-(* The result of a spawn stub: (pid or -errno, the fd of the exit, stdin,
-   stdout, stderr), with -1 for no pipe. *)
+(* The result of [spawn_child]: (pid or -errno, the pidfd, stdin, stdout,
+   stderr), with -1 for no pipe. *)
 let spawned_of (pid, pidfd, i, o, e) =
   let fd x =
     if (x < 0) [@mutate off "fd 0 is the stdin of the process"] then None
