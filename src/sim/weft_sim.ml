@@ -76,8 +76,8 @@ type conn =
   ; mutable eof: bool  (** The peer ended its send side. *)
   ; mutable shut: bool  (** This side ended its send side. *)
   ; mutable reset: bool
-        (** A reset came: the next read with no data, or the next write, gives
-            [Reset]. *)
+        (** A reset came: the next read with no data, or on TCP the next write,
+            gives [Reset]. *)
   ; mutable abort: bool  (** [Reset_on_close]: the close sends a reset. *)
   ; mutable established: bool
   ; mutable refused: bool
@@ -573,14 +573,17 @@ let close_conn t c =
   | None ->
       ()
 
-(* A reset (RST) from [c] to its peer, as on Linux. The peer reads the data that
-   came before the reset. Then its next read with no data, or its next write,
-   gives ECONNRESET, and later reads give the end of the stream. A Unix socket
-   has no reset. After a [Shutdown] of [c], Linux gives the peer the end of the
-   stream and EPIPE. These two cases are a normal close. *)
+(* A reset from [c] to its peer, as on Linux. The peer reads the data that came
+   before the reset. Then its next read with no data gives ECONNRESET, and later
+   reads give the end of the stream. On TCP (an RST), the next write also gives
+   ECONNRESET, and clears it. After a [Shutdown] of [c], a TCP peer gets the end
+   of the stream and EPIPE. A Unix stream socket gives a reset only if [c] has
+   unread data, also after a [Shutdown], and a write of the peer gives EPIPE.
+   The other cases are a normal close. *)
 let reset_conn t c =
+  let reset = if c.tcp then not c.shut else c.role = Sock && avail c > 0 in
   match c.peer with
-  | Some p when c.tcp && not c.shut ->
+  | Some p when reset ->
       c.peer <- None ;
       deliver t c p (fun () ->
           p.reset <- true ;
@@ -597,7 +600,7 @@ let reset_conn t c =
    the peer gets the reset after the delay. *)
 let write_conn t c buf off len =
   let n = t.net in
-  if c.reset then (
+  if c.reset && c.tcp then (
     c.reset <- false ;
     Error Op.Reset )
   else if c.shut then Error Op.Broken_pipe
@@ -1135,9 +1138,9 @@ let submit : type a. t -> a Op.t -> (a, Op.error) result =
           Hashtbl.remove n.opts fd ;
           ( match sfd with
           | Conn c ->
-              (* Linux also sends a reset at the close of a TCP socket with
-                 unread data. *)
-              if c.abort || (c.tcp && avail c > 0) then reset_conn t c
+              (* Linux also sends a reset at the close of a TCP or Unix stream
+                 socket with unread data. *)
+              if c.abort || (c.role = Sock && avail c > 0) then reset_conn t c
               else close_conn t c
           | Dgm g ->
               Hashtbl.remove n.udp_names g.dkey
@@ -1147,7 +1150,10 @@ let submit : type a. t -> a Op.t -> (a, Op.error) result =
                 (fun s ->
                   match s.peer with
                   | Some c ->
-                      c.refused <- true ;
+                      (* The connection is established: it gets a reset, as from
+                         [reset_conn]. *)
+                      c.reset <- true ;
+                      c.eof <- true ;
                       c.peer <- None ;
                       edge n c.cfd ~read:true ~write:true
                   | None ->
