@@ -1463,10 +1463,20 @@ let run ?(seed = 0) ?(domains = 1) ?(auto = true) ?(signals = [])
             (try Printexc.to_string e with _ -> "an exception")
       | _ ->
           old_report run e ) ;
-  (* Also when the run raises: the next runs must not get these hooks. *)
+  (* Also when the run raises: the next runs must not get these hooks. A run can
+     end with fibers that wait (Deadlock, Livelock or an exception). Their syncs
+     become [Done], so a fill or a send of a later run finds them stale and
+     never resumes a fiber of this run. *)
   let restore () =
     ignore (Atomic.compare_and_set Sched.outside slot None) ;
-    Atomic.set Weft.Private.promise_report old_report
+    Atomic.set Weft.Private.promise_report old_report ;
+    Sched.Spin.with_lock s.fibers_lock (fun () ->
+        Hashtbl.iter
+          (fun _ (f : Sched.fiber) ->
+            Option.iter
+              (fun (y : Sched.sync) -> ignore (Sched.C.notify y.word (-1)))
+              (Atomic.get f.current) )
+          s.fibers )
   in
   let result = Sched.start s (fun () -> main t) in
   let st = Array.map (fun d -> Start d) s.doms in

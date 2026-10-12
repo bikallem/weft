@@ -102,6 +102,37 @@ let dead_waiter () =
       is_false (Ivar.fill_from_outside !iv 1) ;
       Fiber.yield () )
 
+(* A run ends in Deadlock with a fiber that waits on [iv]. In a later run, a
+   fiber fills [iv], with no waiter (dead_fill) or after a register of its own
+   waiter (dead_and_live). The dead waiter never runs again. *)
+let dead_run iv resumed =
+  raises_match
+    (function Sim.Deadlock _ -> true | _ -> false)
+    (fun () ->
+      Sim.run (fun _ ->
+          iv := Ivar.create () ;
+          ignore (sync (Ivar.read !iv) : int) ;
+          resumed := true ) )
+
+let dead_fill () =
+  let iv = ref (Ivar.create ()) and resumed = ref false in
+  dead_run iv resumed ;
+  Sim.run (fun _ -> Ivar.fill !iv 7 ; Fiber.yield () ; Fiber.yield ()) ;
+  is_false !resumed
+
+let dead_and_live () =
+  let iv = ref (Ivar.create ()) and resumed = ref false in
+  dead_run iv resumed ;
+  Sim.run (fun _ ->
+      Fiber.scope (fun s ->
+          let p = Fiber.fork_promise s (fun () -> sync (Ivar.read !iv)) in
+          Fiber.yield () ;
+          Ivar.fill !iv 7 ;
+          equal int 7 (Promise.await p) ;
+          Fiber.yield () ;
+          Fiber.yield () ) ) ;
+  is_false !resumed
+
 (* An Ivar belongs to the run of its last waiter: a fiber of a later run waits
    for it, and a fill from outside reaches that fiber. *)
 let later_waiter () =
@@ -346,5 +377,9 @@ let tests =
       ; test "a later run does not resume a waiter of a run that ended"
           dead_waiter
       ; test "a fill reaches a waiter of a later run" later_waiter
+      ; test "a fill of a fiber does not resume a waiter of a run that ended"
+          dead_fill
+      ; test "a register of a later run drops the waiters of a run that ended"
+          dead_and_live
       ; test "no run: fill_from_outside gives false" (fun () ->
             is_false (Ivar.fill_from_outside (Ivar.create ()) ()) ) ] ]
