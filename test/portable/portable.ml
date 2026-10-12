@@ -476,17 +476,23 @@ let first_write_error c =
 
 (* A connection, and a server fiber that runs [f] on the accepted socket. The
    server starts only after [connect] gave the socket: if the reset came during
-   the connect, [connect] would raise ECONNRESET. *)
+   the connect, [connect] would raise ECONNRESET. The client starts only after
+   [accept] gave the socket: on FreeBSD, an accept of a connection that the
+   client reset in the backlog gives ECONNABORTED. *)
 let with_conn w f client =
   let l, a = w.listen () in
-  let connected = Ivar.create () in
+  let connected = Ivar.create () and accepted = Ivar.create () in
   Fiber.scope (fun s ->
       Fiber.fork s (fun () ->
           let c, _ = Net.accept l in
+          Ivar.fill accepted () ;
           sync (Ivar.read connected) ;
           f c ) ;
       let c = Net.connect a in
-      Ivar.fill connected () ; client c ; Net.close c ) ;
+      Ivar.fill connected () ;
+      sync (Ivar.read accepted) ;
+      client c ;
+      Net.close c ) ;
   Net.close l
 
 let now_and_reset w =
