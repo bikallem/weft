@@ -155,7 +155,7 @@ val run :
     then runs [main] as the first fiber. [~domains] is in milestone M1. *)
 ```
 
-The signals are an argument of the world, for example `Weft_linux.run ~signals` (M2). The world must block them before it starts a thread, and only the world starts the threads.
+The signals are an argument of the world, for example `Weft_linux.run ~signals` (M2). The world must block them before it starts a thread, and only the world starts the threads. `Signal.unwatch` stops the watch of one signal while the world runs, and the signal gets its action again (section 2.7, The end of a watch).
 
 The effect constructors (`Now`, `Submit`, `Wait`, `Wake`, `Random`, `Switch`) are private. The `.mli` does not export them. Thus only `run` and `Sim.run` can handle them, and fiber code cannot catch them by accident. Fiber code calls functions such as `Time.now Mono` or `Net.read fd buf`.
 
@@ -196,7 +196,7 @@ Each operation is a constructor of the GADT `'a Op.t`, for example `Read : fd * 
 | `File` | `open`, `read`, `write`, `pread`, `pwrite`, `fsync`, `stat`, `truncate` | `Blocking` operations on the thread pool | An in-memory file system |
 | `Dir` | `mkdir`, `readdir`, `rename`, `unlink`, `rmdir` | `Blocking` operations on the thread pool | The in-memory file system |
 | `Process` | `spawn`, `wait`, `kill`, the exit event | `pidfd_spawn` and a `pidfd` on Linux, `EVFILT_PROC` on kqueue | A table of fake processes that the test scripts |
-| `Signal` | The signal event | `signalfd`, `EVFILT_SIGNAL` | The test sends the signal |
+| `Signal` | The signal event, `unwatch` | `signalfd` on Linux, a handler of the world on kqueue | The test sends the signal |
 | `Dns` | `getaddrinfo`, `getnameinfo` | `Blocking` operations on the thread pool | A name table that the test gives |
 
 "The full Unix I/O API" does not include these calls:
@@ -929,7 +929,7 @@ Then `Net.read` blocks, and it ignores the deadline and the stop. After `EAGAIN`
 - One kqueue for each domain (`src/kqueue`, after M3). `EV_CLEAR` gives the edge-triggered behavior. Each filter of an fd goes in its own `kevent` call, because an end of a pipe can refuse one of them.
 - The alarm is the timeout of `kevent`, a relative span from `Now Mono`, and not an `EVFILT_TIMER` entry. Thus the open points about absolute timers (`NOTE_ABSTIME`, `NOTE_ABSOLUTE`) do not apply. A step of the wall clock does not end a wait, so a wait for a `Posix` deadline ends after 1 s at most.
 - `wake` writes a pipe of the domain, and not `EVFILT_USER`: a worker of a thread pool must write an fd after it posts a completion, and the pipe serves the two.
-- Signals use `EVFILT_SIGNAL` on domain 0, with the action `SIG_IGN` (but not for `SIGCHLD`). A test of macOS and FreeBSD in CI verifies that a `SIGTERM` to the process comes as an event.
+- Signals use a handler of the world, which counts each signal and writes the wake pipe of domain 0 (section Signals, below). Before issue 6, they used `EVFILT_SIGNAL` on domain 0, with the action `SIG_IGN`. A test of macOS and FreeBSD in CI verifies that a `SIGTERM` to the process comes as an event.
 - A child has no pidfd. Its fd is a pipe, and domain 0 watches the child with `EVFILT_PROC` (`NOTE_EXIT`). At the exit, the world writes one byte to the pipe, so the fiber that waits gets a normal read edge. If `EVFILT_PROC` refuses the child because it already exited, the world writes the pipe at once. The kernel can tell of the exit before the child is a zombie. Then a reap with `WNOHANG` finds nothing, and no second edge comes. Thus after the exit, the reap first waits for the zombie with `waitid (WNOWAIT)`, in a blocking section. The reap and a `kill` are under one lock, so a `kill` never goes to a pid that the system gave again. A test spawns 50 children that exit at once, on 2 domains. It does not show which of the two ways occurs.
 - The parts that the two POSIX worlds share are in `src/posix` (`weft.posix`): the sockets, pipes, thread pools, errors and the watchdog, with portable C. On macOS, a timed wait uses `pthread_cond_timedwait_relative_np`, because macOS has no `pthread_condattr_setclock`.
 - **Not verified:** a system sleep on macOS, the combination of near timeouts by macOS, and OpenBSD and NetBSD.
@@ -941,7 +941,8 @@ Then `Net.read` blocks, and it ignores the deadline and the stop. After `EAGAIN`
 **How the worlds wait on a signal:**
 
 - **Linux:** a `signalfd` is in the epoll set. It is readable when one of its signals is pending. A `read` gives one 128-byte `signalfd_siginfo` record for each pending signal, and the read consumes the signal. The world reads until `EAGAIN`, as for any other fd.
-- **BSD and macOS:** `EVFILT_SIGNAL` in the kqueue. It does not replace the normal delivery. It records each delivery, also for a signal set to `SIG_IGN`. Thus the world sets each signal to `SIG_IGN` and then watches it. The `data` field gives the number of deliveries since the last `kevent` call. I took this from my knowledge of the FreeBSD `kqueue(2)` man page, and I did not verify it on macOS.
+- **BSD and macOS (issue 6):** a C handler of the world (`weft_kqueue_stubs.c`). The handler adds 1 to an atomic count of the signal, then it writes one byte to the wake pipe of domain 0. Domain 0 reads the pipe, then it takes the counts with an exchange. A handler adds before it writes, so domain 0 sees each count before its byte. The counts and the fd of the pipe are static, because a handler gets no other argument. Thus one world at a time can watch signals. The handler has `SA_RESTART`, and it blocks all signals while it runs.
+- **BSD and macOS, before issue 6:** `EVFILT_SIGNAL` in the kqueue. It does not replace the normal delivery. It records each delivery, also for a signal set to `SIG_IGN`. Thus the world set each signal to `SIG_IGN` and then watched it. The end of a watch showed a problem of this method (The end of a watch, below), and the handler replaced it.
 
 **The rules for `signalfd` (from the Linux man page):**
 
@@ -956,18 +957,46 @@ Then `Net.read` blocks, and it ignores the deadline and the stop. After `EAGAIN`
 - **`run ~signals:[...]`** blocks the selected signals in the main thread, before it starts a domain or a thread, including the thread pool. All of the threads thus copy the mask. The default set is empty. A program names each signal that it wants as an event, for example `~signals:[SIGINT; SIGTERM]`. With a default set, a program that does not wait on `SIGINT` does not stop at Ctrl-C.
 - **Domain 0 holds the signal source.** The poller of domain 0 reads it. The event goes to the waiting fiber through the ready queues, and any domain can run that fiber. If domain 0 is busy, a signal waits until its next poll.
 - **`SIGPIPE` is set to `SIG_IGN`.** A write to a closed socket then gives `EPIPE` and does not stop the process.
-- **`Process.spawn` restores the mask in the child.** A child inherits the blocked mask, and without a change it never sees `SIGINT` or `SIGTERM`. `posix_spawn` with `POSIX_SPAWN_SETSIGMASK` prevents this. Also, a child inherits `SIG_IGN` across `exec`. Thus `POSIX_SPAWN_SETSIGDEF` resets `SIGPIPE` to `SIG_DFL`. On BSD, it also resets each watched signal, because the world sets these signals to `SIG_IGN`.
+- **`Process.spawn` restores the mask in the child.** A child inherits the blocked mask, and without a change it never sees `SIGINT` or `SIGTERM`. `posix_spawn` with `POSIX_SPAWN_SETSIGMASK` prevents this. Also, a child inherits `SIG_IGN` across `exec`. Thus `POSIX_SPAWN_SETSIGDEF` resets `SIGPIPE` to `SIG_DFL`. On BSD, the `exec` gives the default action to each watched signal, because each one has a handler. After `Signal.unwatch s`, the child inherits the action of `s` in the parent, the action from before `run`, on each world.
 - **No `SIGCHLD`.** Child processes use `pidfd` (Linux) and `EVFILT_PROC` (kqueue). These give one event for each child, so rule 3 has no effect on them.
 - **`pidfd_spawn`.** On Linux, `Process.spawn` uses `pidfd_spawn` (glibc 2.39 and later). Thus the `pidfd` exists before any code can reap the child. The library has no form for an older glibc. A form with `posix_spawn` and then `pidfd_open` is safe only if `SIGCHLD` is not `SIG_IGN`, `SA_NOCLDWAIT` is not set, and no other code reaps the child (pidfd_open(2)).
 - **The pool threads block all signals** (section 2.3).
 - **Signals from a CPU fault are not events.** `SIGSEGV`, `SIGBUS` and `SIGFPE` go to the thread that caused them, at that instruction. They cannot wait in a queue.
 - **The event:** `Signal.received s : int event` gives the number of times that `s` occurred since the last commit of a `received s` event. On Linux this number can be 1 for many normal signals (rule 3), so code must not depend on the exact count.
 - **One fiber gets each signal.** The world keeps one count for each watched signal. A commit of `received s` takes the count and sets it to 0. If two fibers wait on `s`, only one of them gets it. A signal that comes when no fiber waits stays in the count until the next commit. For a broadcast, one fiber waits on the signal and fills an `Ivar` that many fibers read.
-- **The simulator:** a test calls `Sim.signal sim SIGTERM`, and the simulator makes the event ready at the next switch point. A test can thus check a graceful shutdown with an exact result.
+- **The simulator:** a test calls `Sim.signal sim SIGTERM`, and the simulator makes the event ready at the next switch point. A test can thus check a graceful shutdown with an exact result. A signal that the program does not watch gets its default action. If the action ends the process, the run ends at once with `Sim.Killed s` (issue 6).
+
+**The end of a watch (issue 6).** `Signal.unwatch s` stops the watch of `s` for the remaining time of the run. caravan needs it: the first `SIGINT` stops a server gracefully, the second aborts it, and the third must end the process, also if a handler of the server does not stop. The rules:
+
+- The signal gets the action that it had before `run`. For most signals, this is the default action. The Linux world never changes this action, and the kqueue world restores it.
+- No signal is lost. A signal that came before the unwatch goes to a fiber, or it gets its action: the pending signals of the world, the signals in the count of the scheduler, and the signals that domain 0 read but did not deliver yet.
+- A fiber that waits on `received s` at the unwatch raises `Invalid_argument` at its `sync`. A later `received s` and a second `unwatch s` also raise it. A watch does not start again.
+- The unwatch does not block. A busy domain does not delay the action: the kernel gives it.
+
+The order of the steps:
+
+1. The world stops the watch (`Op.Unwatch`). After this step, the kernel gives each new signal its action.
+2. The scheduler marks the signal under the lock of the signals (`Unwatch_signal`). The waiters commit with -1 in their cell, and they raise. The count goes to the fiber of the unwatch.
+3. If the count is not 0, the fiber sends the signal to the process again (`Op.Resend`, `kill (getpid ())`). A `deliver` after the mark also sends its signals again.
+
+The world goes first. If the scheduler marked first, a resend before step 1 would come back to the source of the world, and domain 0 would send it again in a loop until step 1. `Signal.tla` (section 2.16) examines the steps with domain 0, a waiter and a sender, on the two worlds.
+
+**Linux.** The world changes the mask of the signalfd: `signalfd (fd, mask)` with an fd changes the mask of that fd. Then the calling thread unblocks `s` with `pthread_sigmask`. A signal of the process goes to a thread that does not block it. The other threads of the world block `s`: the domains copied the mask, and the pools, the watchdog and the tick and backup threads of OCaml block all signals. Thus each new `s` goes to the thread of the unwatch, with its action. A signal that is pending at the unblock also goes to this thread at once. I think that, for a fatal action, the kernel ends the whole process at the send (`complete_signal` in `kernel/signal.c`), but I did not verify it. The thread of the unwatch is the thread of a domain, so it lives until the end of `run`. `close` restores the mask of the thread of `run`. A test verified that a process ends by `SIGINT` in each case: after a fiber took a `SIGINT`, with a `SIGINT` in the count, with a `SIGINT` just before the unwatch, and with a domain that computes with no switch.
+
+The other methods for Linux:
+
+- **Unblock `s` in each thread.** A thread cannot change the mask of another thread. The world must send a message to each domain and each pool thread, and it cannot reach the threads of other code. One thread is sufficient.
+- **Domain 0 gives the action.** The world keeps the watch, and domain 0 sets `SIG_DFL`, unblocks `s` and raises it at the next `s`. A busy domain 0 then delays the action, and step 3 of caravan is for a program that does not stop.
+
+**kqueue.** The world restores the old action with `sigaction`. Then it takes the count of the handler and sends the count again, so these signals get their action. Each signal goes to the handler or to the action, because `sigaction` is one atomic change. A handler that started before the restore can still add to the count. Domain 0 takes the counts of all signals of `create`, also of a signal that the world does not watch any more, so the scheduler gets these signals and sends them again.
+
+With `EVFILT_SIGNAL`, the kernel records a signal also after the restore. Thus a record does not tell if the signal came before the restore (the signal was ignored, and it needs a resend) or after it (the action occurred). A resend then gives a second action, and for an action that does not end the process, the record of the resend gives a loop of resends. `EV_DELETE` stops the records, but it also drops the records that domain 0 did not take, so a signal is lost. Thus the handler replaced `EVFILT_SIGNAL`. The handler can interrupt a call of a domain: `kevent` gives `EINTR`, and the loop polls again. `SA_RESTART` restarts the other calls. I did not verify the kqueue world on this Linux host. Its tests are the same as on Linux, and the CI of macOS and FreeBSD runs them.
+
+**The simulator.** `Op.Unwatch` removes the signal from the watched list. `Op.Resend` and `Sim.signal` of a signal that the program does not watch give the default action. If the action ends the process, the step of the world effect raises `Sim.Killed s`, and no domain continues. `SIGCHLD`, `SIGWINCH`, `SIGCONT`, `SIGSTOP`, `SIGTSTP` and the signal 0 do nothing, as for a fake process, and `SIGPIPE` does nothing, because the world ignores it. `Sim.signal` performs a world effect only for such a signal, so the runs of the earlier tests do not change. Before issue 6, `Sim.signal` of such a signal was a `Model_error`.
 
 **Why not the other methods:**
 
-- **The self-pipe method.** A signal handler writes one byte to a pipe in the poller. It works on all systems, and affect uses a similar "signal bypass fd". But in OCaml, the handler runs only at a safe point in OCaml code. I think that a domain asleep in `epoll_wait` gets `EINTR` only if the kernel delivers the signal to that thread. I did not verify this. The Poll world uses this method, because it has no other one.
+- **The self-pipe method.** A signal handler writes one byte to a pipe in the poller. It works on all systems, and affect uses a similar "signal bypass fd". But in OCaml, a handler of `Sys.signal` runs only at a safe point in OCaml code. I think that a domain asleep in `epoll_wait` gets `EINTR` only if the kernel delivers the signal to that thread. I did not verify this. The Poll world uses this method, because it has no other one. Since issue 6, the kqueue world uses this method with a C handler, which runs at once and writes the wake pipe of domain 0. The Linux world keeps the `signalfd`: it needs no handler, so no call of a domain gets `EINTR`.
 - **`epoll_pwait` with a signal mask.** It changes the mask only during the wait. The signal then ends the wait with `EINTR`. This gives an interrupt, not an event.
 
 **Not sure:**
@@ -1026,6 +1055,7 @@ module Sim : sig
   exception Lost_wakeup of string list
   exception Livelock of string list           (* milestone M3 *)
   exception Model_error of string
+  exception Killed of Signal.t                 (* issue 6 *)
   (** The program broke the order of the OS, for example a close(2)
       before a Deregister. *)
 end
@@ -1176,7 +1206,7 @@ The cost of an effect is a perform and a handler call for each world operation. 
 
 ## 2.12 Decisions
 
-Decisions 1 to 6 were made on 2026-10-09, decisions 7 to 9 on 2026-10-10, decisions 10 and 11 on 2026-10-12 (issue 1), decision 12 on 2026-10-12 (issue 2), decisions 13 and 14 on 2026-10-12 (issue 3), decisions 15 to 17 on 2026-10-12 (issue 4), and decisions 18 to 20 on 2026-10-12 (issue 5).
+Decisions 1 to 6 were made on 2026-10-09, decisions 7 to 9 on 2026-10-10, decisions 10 and 11 on 2026-10-12 (issue 1), decision 12 on 2026-10-12 (issue 2), decisions 13 and 14 on 2026-10-12 (issue 3), decisions 15 to 17 on 2026-10-12 (issue 4), decisions 18 to 20 on 2026-10-12 (issue 5), and decisions 21 to 25 on 2026-10-13 (issue 6).
 
 | No. | Question | Decision |
 |---|---|---|
@@ -1200,6 +1230,11 @@ Decisions 1 to 6 were made on 2026-10-09, decisions 7 to 9 on 2026-10-10, decisi
 | 18 | The event of a variable | `Var.changed t seen`, which is ready when the value is not `seen` (section 2.4, A variable). An event for the next set loses a set between the `get` and the sync, and the fiber then waits with an old value. A version type also has no race, but it adds a type and changes `get`. |
 | 19 | The equality of a variable | Physical equality (`==`). A set of the same value is not a change, so the event never gives `seen`. A function `equal` of the user can raise, and it runs in the CAS loop of `set`. |
 | 20 | The place and the code of a variable | A top-level `Var`, next to `Ivar`, because no stdlib module has this name. The code is a composition of an `Atomic`, `guard`, `always` and `Ivar.read`, with no new protocol, so it has no TLA+ model. `dscheck` examines its CAS. |
+| 21 | The API of the end of a watch | `Signal.unwatch s` (section 2.7, The end of a watch). An option of `run`, for example `~default_after:n`, gives the action after `n` signals. But the OS does not queue signals, so many `SIGINT` can give a count of 1, and `n` is not exact. The program knows when it stops, and `unwatch` lets it use other rules, for example a time limit. |
+| 22 | The end of a watch on Linux | The signalfd stops to take the signal, then the thread of the unwatch unblocks it. One thread that does not block a signal gets each signal of the process. An unblock in each thread needs a message to each thread, and a resend from domain 0 waits for a busy domain 0. |
+| 23 | The signals on kqueue | A handler of the world counts each signal and wakes domain 0, in place of `SIG_IGN` and `EVFILT_SIGNAL`. A record of `EVFILT_SIGNAL` does not tell if its signal came before or after the restore of the action, so the end of a watch can lose a signal or give its action two times. |
+| 24 | A waiter at the end of a watch | Its `sync` raises `Invalid_argument`, as a later `received` does. A waiter that waits forever hides the error, and the close of an fd also ends its waiters with an error. |
+| 25 | The action of a signal in the simulator | The run ends with `Sim.Killed s` at an action that ends the process, so a test can examine it. `Sim.signal` of a signal that the program does not watch gives the default action, as on Linux, and not a `Model_error`. |
 
 Also on 2026-10-10, the user accepted the milestone plan of section 2.14. Decisions 4, 7 and 8 stay, and they come in milestone M1. Milestone M0 has one domain.
 
@@ -1345,7 +1380,7 @@ The sections of this document mark each part that does not come in M0 with its m
 - **The end of `run`.** A job that a fiber detached can still hold the user of an fd when `main` returns. The domain that started the job waits for its completion before its loop ends, so the fd closes. A job with no fd, for example `Dns.resolve`, does not hold the end of `run`.
 - **The threads of a pool.** A new job starts a thread when the idle threads are fewer than the queued jobs, up to the maximum. Thus a job that blocks does not stop the next job. If a pool has no thread and cannot start one, its queued jobs complete with `EAGAIN`.
 - **The limit of detached jobs** of each pool and the warning after 1 s (section 2.3) came after M3. A pool has 16 threads for the files and 8 for the names, and a limit of 8 and 4 more threads for the detached jobs that run. A thread over the limit ends when it has no job. A detach of a job in the queue removes the job, and the pool posts its completion at once, so the domain releases the fd of the job.
-- **The signals are an argument of the world** (section 2.3): `Weft_linux.run ~signals` and `Sim.run ~signals`. The guard of `Signal.received` asks the world if it watches the signal (`Op.Watch`). If not, it raises `Invalid_argument`. The world also gives the form of the signal that it delivers, so `Other_signal 10` and `SIGUSR1` are one event on Linux. `Sim.signal` of a signal that the program does not watch is a `Model_error`, because the OS does the default action.
+- **The signals are an argument of the world** (section 2.3): `Weft_linux.run ~signals` and `Sim.run ~signals`. The guard of `Signal.received` asks the world if it watches the signal (`Op.Watch`). If not, it raises `Invalid_argument`. The world also gives the form of the signal that it delivers, so `Other_signal 10` and `SIGUSR1` are one event on Linux. `Sim.signal` of a signal that the program does not watch is a `Model_error`, because the OS does the default action. Issue 6 changed this: the simulator gives the default action (section 2.7, The end of a watch).
 - **The count of a signal.** A commit takes the count. A delivery puts the count in the cell of the waiter before the commit, because the owner can read the cell at once on another domain.
 - **A child process.** `Process.spawn` uses `pidfd_spawnp` (glibc 2.39). The pidfd is a normal fd record in the poller. One fiber reaps the child with `waitid`, fills an Ivar with the status, and then closes the pidfd. The other fibers read the Ivar.
 - **The faults of the network** (`Sim.net_faults`): a jitter, short reads and writes, and an edge with no change one time in 8. A write of at most 4096 bytes (`PIPE_BUF`) to a pipe is atomic, as on Linux. A TCP stream loses no data and keeps its order, so the loss and the reordering of packets show only as delays. The partitions need the host of each side of a connection, and the simulator does not record it. Thus the partitions are not done. With the faults, the tests found that the echo server of the tests dropped the rest of a short write.
@@ -1413,7 +1448,7 @@ It has three problems:
 
 The protocols that run on many domains at the same time have models in PlusCal, in `spec/tla`. The TLC model checker examines each order of their steps. Each model has the protocol of this design, and a set of planted bugs. Each planted bug must give a failure. Thus the model can find the errors that matter, and it is not only a model that always passes. Some models also have simplifications (constants with the prefix `Simp`). A simplification must pass, and section 2.5 uses the ones that passed.
 
-Run all of the models with `nix develop -c spec/tla/check.sh`. `MODELS="Ivar Fd"` selects some of them. The script runs `JOBS` cases at the same time (default 4), each one with `-lncheck final`, so that TLC checks the liveness property one time at the end. The 51 cases take about 17 minutes on a machine with 16 CPUs. The slowest case, `Wake.tla` with no bug and 15.3 million states, takes about 11 minutes, and it is the lower limit of the run time. The flake of the repository gives the TLA+ tools.
+Run all of the models with `nix develop -c spec/tla/check.sh`. `MODELS="Ivar Fd"` selects some of them. The script runs `JOBS` cases at the same time (default 4), each one with `-lncheck final`, so that TLC checks the liveness property one time at the end. The 59 cases take about 17 minutes on a machine with 16 CPUs. The slowest case, `Wake.tla` with no bug and 15.3 million states, takes about 11 minutes, and it is the lower limit of the run time. The flake of the repository gives the TLA+ tools.
 
 | Model | Protocol (section) | Properties | Planted bugs that fail |
 |---|---|---|---|
@@ -1423,6 +1458,7 @@ Run all of the models with `nix develop -c spec/tla/check.sh`. `MODELS="Ivar Fd"
 | `Wake.tla` | The loop of a domain: idle and wake, steal, next slot, pinned queue, injection queue (2.5) | Each item runs, a pinned item runs only on domain 0, no lost wakeup | The decrease of `searching` after the second check, no second check, a pinned push that wakes any domain. Simplifications that pass: no steal of a next slot, no search limit, no last wake, no `searching` count. |
 | `Fd.tla` | The fd record: `Rcfd`, the registrations, the close notices, the removal (2.7) | One `close(2)`, no `close(2)` of another file, no use after `close(2)`, no `EPOLL_CTL_DEL` of a new file, `EPOLL_CTL_DEL` before `close(2)`, termination | A count and a closed bit, a Register that reads the state first, a registration with no user. A simplification that passes: no CAS on the domain bit. |
 | `Semaphore.tla` | `Fiber.Semaphore`: the acquire in a `choose`, the release, a timer and a cancel (2.5, issue 4). Three scenarios: a `choose` with a timer, a cancel of the first waiter, and two permits with two holders. | No permit is lost or doubled, a holder got its permit from its acquire, at most one resume, no free permit while a live offer waits, FIFO, a correct end state, termination | An acquire with no lock, a take of the permit before the commit, a release that gives the permit to the head with no commit (the composition with no nack), a release to any offer |
+| `Signal.tla` | `Signal.unwatch`: a sender, domain 0, a waiter with two syncs and the unwatch (2.7, issue 6). Two scenarios: Linux, and kqueue with a handler that adds to the count after the restore. | No signal is lost or doubled, no action before the unwatch, each signal goes to the waiter or gets its action, termination | A deliver after the mark that drops the signals, a mark that leaves the count, a mark that does not commit the waiter, a sync after the mark that waits, a kqueue domain 0 that takes only the watched signals |
 
 **What the models showed about the design:**
 
@@ -1435,7 +1471,7 @@ Run all of the models with `nix develop -c spec/tla/check.sh`. `MODELS="Ivar Fd"
 
 **A correction from the review of M0.** In `Scope.tla`, the fork of K checked only the flag of S. The design and the code read the flags of the whole chain of S, because the nested scopes have no flags of their own. The fork step now reads `FirstFlag("S")`, and the 16 cases of `Scope.tla` give the expected results.
 
-**The limits.** The models are small: two or three fibers or domains in each scenario, a few work items, and one fd. Each model takes some details as one atomic step, and another model examines them, for example the commit in `Scope.tla` and `Ivar.tla`. The models do not cover the simulator, the OS facts, the handoff of `Fiber.Mutex`, promises or signals. `Var` has no model, because it is a composition of `Ivar.read` and one CAS (section 2.4, A variable). `dscheck` still examines the OCaml code, because the OCaml code can differ from the model. In M2, two `dscheck` tests examine the completion of a job and the delivery of a signal, each with a cancel from another domain (section 3.8).
+**The limits.** The models are small: two or three fibers or domains in each scenario, a few work items, and one fd. Each model takes some details as one atomic step, and another model examines them, for example the commit in `Scope.tla` and `Ivar.tla`. The models do not cover the simulator, the OS facts, the handoff of `Fiber.Mutex`, promises, or signals other than the end of a watch. `Signal.tla` takes each kernel step as one atomic step, and it does not model the count of a signal that the OS does not queue. `Var` has no model, because it is a composition of `Ivar.read` and one CAS (section 2.4, A variable). `dscheck` still examines the OCaml code, because the OCaml code can differ from the model. In M2, two `dscheck` tests examine the completion of a job and the delivery of a signal, each with a cancel from another domain (section 3.8). Issue 6 adds a `dscheck` test of a delivery, a waiter and the mark of an unwatch on three domains.
 
 ## 2.17 Tests with windtrap
 
