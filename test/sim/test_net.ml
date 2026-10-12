@@ -648,6 +648,13 @@ let option_sizes () =
       equal int 131072 (Net.get_option t Recv_buffer) ;
       equal int 16384 (Net.get_option t Send_buffer) )
 
+(* The port 0 goes around after 65535, from 40000 again. *)
+let udp_ports_go_around () =
+  Sim.run (fun _ ->
+      for _ = 40000 to 65535 + 1 do
+        Net.close (Net.udp ("h", 0))
+      done )
+
 let udp_port_range () =
   Sim.run (fun _ ->
       let einval = Some (Net.Other "EINVAL") in
@@ -696,7 +703,8 @@ let tests =
       ; test "the latency delays a datagram" udp_latency
       ; test "the port 0 gives a free port" udp_free_ports
       ; test "the sizes of the buffers follow Linux" option_sizes
-      ; test "a UDP port out of range gives EINVAL" udp_port_range ]
+      ; test "a UDP port out of range gives EINVAL" udp_port_range
+      ; test "the port 0 goes around after 65535" udp_ports_go_around ]
   ; group "sim"
       [ test "settle waits until the others are quiescent" settle_runs_others
       ; test "manual mode: advance_until moves the time" manual_mode

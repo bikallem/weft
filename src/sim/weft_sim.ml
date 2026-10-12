@@ -335,7 +335,8 @@ let fresh_port n used =
     n.next_port <- (if p >= 65535 then 40000 else p + 1) ;
     if used p && tries > 0 then go (tries - 1) else p
   in
-  go (65535 - 40000)
+  (go (65535 - 40000)
+   [@mutate off "the count of tries matters only when all ports are in use"] )
 
 let new_fd n =
   let fd = n.next_fd in
@@ -916,7 +917,10 @@ let submit : type a. t -> a Op.t -> (a, Op.error) result =
         else port
       in
       let k = key port in
-      if port < 0 || port > 65535 then Error (Op.Other "EINVAL")
+      if
+        (port < 0) [@mutate off "the port 0 got a free port before this check"]
+        || port > 65535
+      then Error (Op.Other "EINVAL")
       else if Hashtbl.mem n.udp_names k then Error Op.In_use
       else
         let fd = new_fd n in

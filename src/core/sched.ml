@@ -416,8 +416,11 @@ end
    queue. *)
 let outside : (t * ((dom -> unit) -> unit)) option Atomic.t = Atomic.make None
 
+(* The tag of an Ivar that no run made. *)
+let no_run = -1
+
 let active_run () =
-  match Atomic.get outside with Some (t, _) -> t.run_id | None -> -1
+  match Atomic.get outside with Some (t, _) -> t.run_id | None -> no_run
 
 (* The atomic register of an Ivar (design section 2.4, spec/tla/Ivar.tla). *)
 module Iv = struct
@@ -1859,7 +1862,7 @@ let fill_from_outside iv v =
   | Some (t, _)
     when match Atomic.get iv with
          | Empty (run, _) ->
-             run >= 0 && run <> t.run_id
+             run <> no_run && run <> t.run_id
          | Full _ ->
              false ->
       false
