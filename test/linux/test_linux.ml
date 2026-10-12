@@ -21,11 +21,11 @@ let world =
   ; listen=
       (fun () ->
         let l = Net.listen (Net.Tcp ("127.0.0.1", 0)) in
-        (l, Net.Tcp ("127.0.0.1", Weft_linux.local_port l)) )
+        (l, Net.local_addr l) )
   ; udp=
       (fun () ->
         let s = Net.udp ("127.0.0.1", 0) in
-        (s, ("127.0.0.1", Weft_linux.local_port s)) )
+        (s, Portable.host_port s) )
   ; tmp }
 
 let elapsed_ns f =
@@ -68,7 +68,7 @@ let other_process () =
   let pid =
     Weft_linux.run ~domains:1 (fun () ->
         let l = Net.listen (Net.Tcp ("127.0.0.1", 0)) in
-        let port = Weft_linux.local_port l in
+        let _, port = Portable.host_port l in
         let pid =
           Unix.create_process client
             [|client; string_of_int port|]
@@ -171,8 +171,7 @@ let unix_peer_addr () =
           let c = Net.connect (Net.Unix path) in
           let s, peer = Net.accept l in
           is_true (peer = Net.Unix "") ;
-          (* A Unix socket has no port. *)
-          equal int 0 (Weft_linux.local_port l) ;
+          is_true (Net.local_addr l = Net.Unix path) ;
           Net.close s ;
           Net.close c ;
           Net.close l ) )
@@ -383,19 +382,42 @@ let full_warning () =
 let udp_ipv6 () =
   Weft_linux.run ~domains:1 (fun () ->
       let a = Net.udp ("::1", 0) and b = Net.udp ("::1", 0) in
-      let a_addr = ("::1", Weft_linux.local_port a) in
+      let a_addr = Portable.host_port a in
       Net.sendto b (Bytes.of_string "hi") 0 2 a_addr ;
       let buf = Bytes.create 8 in
       let k, from = Net.recvfrom a buf 0 8 in
       equal string "hi" (Bytes.sub_string buf 0 k) ;
-      is_true (from = ("::1", Weft_linux.local_port b)) ;
+      is_true (from = Portable.host_port b) ;
       Net.close a ;
       Net.close b )
+
+(* The local address on Linux: the text of an IPv6 address, and the address of
+   "localhost". *)
+let local_addr_text () =
+  Weft_linux.run ~domains:1 (fun () ->
+      let l6 = Net.listen (Net.Tcp ("::1", 0)) in
+      let a6 = Net.local_addr l6 in
+      let c = Net.connect a6 in
+      let s, peer = Net.accept l6 in
+      ( match (a6, Net.local_addr c) with
+      | Net.Tcp ("::1", p), Net.Tcp ("::1", q) ->
+          is_true (p > 0 && q > 0)
+      | _ ->
+          fail "not ::1" ) ;
+      is_true (Net.local_addr c = peer) ;
+      is_true (Net.local_addr s = a6) ;
+      let l4 = Net.listen (Net.Tcp ("localhost", 0)) in
+      ( match Net.local_addr l4 with
+      | Net.Tcp ("127.0.0.1", p) ->
+          is_true (p > 0)
+      | _ ->
+          fail "not 127.0.0.1" ) ;
+      List.iter Net.close [s; c; l6; l4] )
 
 let udp_size_limit () =
   Weft_linux.run ~domains:1 (fun () ->
       let a = Net.udp ("127.0.0.1", 0) in
-      let a_addr = ("127.0.0.1", Weft_linux.local_port a) in
+      let a_addr = Portable.host_port a in
       Net.set_option a Recv_buffer 100_000 ;
       Net.sendto a (Bytes.make 65507 'x') 0 65507 a_addr ;
       let buf = Bytes.create 70_000 in
@@ -671,6 +693,8 @@ let linux =
     ; test "C4: a job that blocks does not stop the next job" blocked_job
     ; test "a detach after the completion of a pool with no thread" no_threads
     ; test "UDP on IPv6" udp_ipv6
+    ; test "local_addr gives IPv6 text, and 127.0.0.1 for localhost"
+        local_addr_text
     ; test "a datagram of 65507 bytes goes through" udp_size_limit
     ; test "the sizes of the buffers, as in the simulator" option_sizes
     ; test "a detach of a job in the queue removes it" detach_queued

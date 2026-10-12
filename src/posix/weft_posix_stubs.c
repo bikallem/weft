@@ -11,6 +11,7 @@
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <signal.h>
+#include <stddef.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
@@ -138,15 +139,46 @@ value weft_listen(value kind, value host, value port, value backlog) {
   return Val_int(fd);
 }
 
-/* The port of a TCP or UDP socket, for a socket on port 0. */
-value weft_local_port(value fd) {
+/* [weft_local_addr fd] gives (0 or -errno, host, port, unix), as
+   [weft_accept]. For a Unix socket, the host is the path, or "" if the socket
+   has no path. */
+value weft_local_addr(value fd) {
+  CAMLparam1(fd);
+  CAMLlocal2(result, host);
   struct sockaddr_storage sa;
+  memset(&sa, 0, sizeof sa);
   socklen_t len = sizeof sa;
-  if (getsockname(Int_val(fd), (struct sockaddr *)&sa, &len) < 0) return Val_int(ERR);
-  if (sa.ss_family == AF_INET) return Val_int(ntohs(((struct sockaddr_in *)&sa)->sin_port));
-  if (sa.ss_family == AF_INET6)
-    return Val_int(ntohs(((struct sockaddr_in6 *)&sa)->sin6_port));
-  return Val_int(0);
+  char buf[INET6_ADDRSTRLEN] = "";
+  const char *text = buf;
+  size_t n = 0;
+  int r = 0, port = 0;
+  if (getsockname(Int_val(fd), (struct sockaddr *)&sa, &len) < 0) {
+    r = ERR;
+  } else if (sa.ss_family == AF_INET) {
+    inet_ntop(AF_INET, &((struct sockaddr_in *)&sa)->sin_addr, buf, sizeof buf);
+    port = ntohs(((struct sockaddr_in *)&sa)->sin_port);
+    n = strlen(buf);
+  } else if (sa.ss_family == AF_INET6) {
+    inet_ntop(AF_INET6, &((struct sockaddr_in6 *)&sa)->sin6_addr, buf, sizeof buf);
+    port = ntohs(((struct sockaddr_in6 *)&sa)->sin6_port);
+    n = strlen(buf);
+  } else if (sa.ss_family == AF_UNIX) {
+    /* The path can have no NUL byte at the end. A length more than the
+       buffer tells that the OS truncated the address. */
+    size_t off = offsetof(struct sockaddr_un, sun_path);
+    if (len > sizeof sa) len = sizeof sa;
+    text = ((struct sockaddr_un *)&sa)->sun_path;
+    n = len > off ? strnlen(text, len - off) : 0;
+  } else {
+    r = -EAFNOSUPPORT;
+  }
+  host = caml_alloc_initialized_string(n, text);
+  result = caml_alloc_tuple(4);
+  Store_field(result, 0, Val_int(r));
+  Store_field(result, 1, host);
+  Store_field(result, 2, Val_int(port));
+  Store_field(result, 3, Val_bool(r == 0 && sa.ss_family == AF_UNIX));
+  CAMLreturn(result);
 }
 
 value weft_connect(value kind, value host, value port) {

@@ -22,11 +22,11 @@ let world domains =
   ; listen=
       (fun () ->
         let l = Net.listen (Net.Tcp ("127.0.0.1", 0)) in
-        (l, Net.Tcp ("127.0.0.1", Weft_kqueue.local_port l)) )
+        (l, Net.local_addr l) )
   ; udp=
       (fun () ->
         let s = Net.udp ("127.0.0.1", 0) in
-        (s, ("127.0.0.1", Weft_kqueue.local_port s)) )
+        (s, Portable.host_port s) )
   ; tmp }
 
 let elapsed_ns f =

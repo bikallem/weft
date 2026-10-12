@@ -312,5 +312,3 @@ let run ?slack ?domains ?signals ?(watchdog = Some (Weft.Span.ms 10)) main =
     (module World)
     (create ~domains ?signals ())
     ~close ?slack ~domains ~watchdog main
-
-let local_port fd = local_port ~name:"Weft_kqueue.local_port" fd

@@ -406,6 +406,41 @@ let client_ports_differ () =
       let _, p2 = Net.accept l in
       is_true (p1 <> p2) )
 
+(* The ports of a listen on port 0, of a client and of a UDP socket on port 0
+   come from one counter. Thus each run gives the same ports. *)
+let local_ports () =
+  let ports () =
+    Sim.run (fun _ ->
+        let l = Net.listen (Net.Tcp ("server", 0)) in
+        let a = Net.local_addr l in
+        let c = Net.connect a in
+        let s, peer = Net.accept l in
+        let u = Net.udp ("server", 0) in
+        [a; Net.local_addr c; peer; Net.local_addr s; Net.local_addr u] )
+  in
+  let r = ports () in
+  is_true
+    ( r
+    = Net.
+        [ Tcp ("server", 40000)
+        ; Tcp ("client", 40001)
+        ; Tcp ("client", 40001)
+        ; Tcp ("server", 40000)
+        ; Tcp ("server", 40002) ] ) ;
+  is_true (ports () = r)
+
+(* A listen on port 0 skips a port that a listener uses, and no listener has the
+   port 0. *)
+let listen_port_0 () =
+  Sim.run (fun _ ->
+      let l1 = Net.listen (Net.Tcp ("server", 40000)) in
+      let l2 = Net.listen (Net.Tcp ("server", 0)) in
+      is_true (Net.local_addr l1 = Net.Tcp ("server", 40000)) ;
+      is_true (Net.local_addr l2 = Net.Tcp ("server", 40001)) ;
+      raises_match
+        (function Net.Error (Refused, _) -> true | _ -> false)
+        (fun () -> ignore (Net.connect (Net.Tcp ("server", 0)))) )
+
 (* The bytes that the latency holds count against the buffer of the peer. *)
 let inflight_backpressure () =
   Sim.run (fun sim ->
@@ -826,6 +861,8 @@ let tests =
       ; test "a partial read keeps the rest" partial_read
       ; test "a full backlog gives ECONNREFUSED" backlog_limit
       ; test "two clients get different ports" client_ports_differ
+      ; test "the simulator selects the same ports in each run" local_ports
+      ; test "a listen on port 0 skips the ports in use" listen_port_0
       ; test "the bytes in flight count against the buffer"
           inflight_backpressure
       ; test "a Register of a ready fd gives an edge at once" register_ready_fd

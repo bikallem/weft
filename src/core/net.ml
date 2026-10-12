@@ -97,6 +97,9 @@ let connect addr =
       close fd ;
       Printexc.raise_with_backtrace e bt
 
+let local_addr fd =
+  ok "Net.local_addr" (attempt fd "Net.local_addr" (fun os -> Op.Local_addr os))
+
 (* The range of a read or a write. A read needs at least one byte: a read of 0
    bytes would give 0, the same result as the end of the stream. *)
 let check_range ~read name buf off len =

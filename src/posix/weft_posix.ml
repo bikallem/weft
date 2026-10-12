@@ -11,7 +11,7 @@ external posix_ns : unit -> int64 = "weft_posix_ns"
 
 external listen : int -> string -> int -> int -> int = "weft_listen"
 
-external local_port_of : int -> int = "weft_local_port"
+external local_addr : int -> int * string * int * bool = "weft_local_addr"
 
 external connect : int -> string -> int -> int = "weft_connect"
 
@@ -491,6 +491,12 @@ let submit : type a. pool -> a Op.t -> (a, Op.error) result option =
       else Some (result r)
   | Op.Connect_result fd ->
       Some (unit (connect_result fd))
+  | Op.Local_addr fd ->
+      let r, host, port, unix = local_addr fd in
+      Some
+        (Result.map
+           (fun () -> if unix then Op.Unix host else Op.Tcp (host, port))
+           (unit r) )
   | Op.Read (fd, buf, off, len) ->
       Some (result (recv fd buf off len))
   | Op.Write (fd, buf, off, len) ->
@@ -594,10 +600,3 @@ let run (type w) ~name (module W : Weft.WORLD with type t = w) (w : w) ~close
       close w )
     (fun () ->
       Weft.Private.run_world ?slack ~domains ~on_create:start (module W) w main )
-
-let local_port ~name (fd : Weft.Net.t) =
-  Net.acquire fd name ;
-  let p = local_port_of fd.Sched.os in
-  Net.release fd ;
-  if p < 0 then raise (Net.Error (error_of (-p), name)) ;
-  p

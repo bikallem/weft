@@ -81,7 +81,7 @@ let echo ~domains ~clients ~rounds =
   let (secs, _), stats =
     run_with_stats ~domains (fun () ->
         let l = Net.listen (Net.Tcp ("127.0.0.1", 0)) in
-        let a = Net.Tcp ("127.0.0.1", Weft_linux.local_port l) in
+        let a = Net.local_addr l in
         let t0 = now_s () in
         Fiber.scope (fun s ->
             Fiber.fork_daemon s (fun () ->

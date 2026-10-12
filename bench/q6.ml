@@ -61,7 +61,7 @@ let echo ~domains ~alloc ~clients ~rounds =
   let lat = Array.make_matrix clients rounds 0L in
   Weft_linux.run ~domains (fun () ->
       let l = Net.listen (Net.Tcp ("127.0.0.1", 0)) in
-      let a = Net.Tcp ("127.0.0.1", Weft_linux.local_port l) in
+      let a = Net.local_addr l in
       let t0 = Unix.gettimeofday () in
       let w0 = R.Timestamp.(to_int64 (get_current ())) in
       Fiber.scope (fun s ->

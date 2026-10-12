@@ -38,9 +38,6 @@ val run :
     thread writes a warning to [stderr] with the index of the domain. [None]
     stops the watchdog. *)
 
-val local_port : Weft.Net.t -> int
-(** The port of a TCP or UDP socket, for example after a listen on port 0. *)
-
 (**/**)
 
 val alarm_sets : unit -> int

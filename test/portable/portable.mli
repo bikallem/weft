@@ -34,3 +34,6 @@ val drain : ('a -> bytes -> int -> int -> int) -> 'a -> string
 
 val error_of : (unit -> 'a) -> string
 (** The text of the error that [f] raises, or ["no error"]. *)
+
+val host_port : Weft.Net.t -> string * int
+(** The local host and port of a TCP or UDP socket. *)

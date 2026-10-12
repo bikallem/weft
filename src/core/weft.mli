@@ -348,6 +348,20 @@ module Net : sig
 
   val connect : addr -> t
 
+  val local_addr : t -> addr
+  (** The local address of a socket, for example the port that the OS selected
+      for a listen on port 0. A connected socket has a port that the OS
+      selected. An accepted socket has the address that its client connected to.
+      A Unix socket with no path, for example a client, gives [Unix ""]. A UDP
+      socket gives [Tcp (host, port)]. In the production worlds, the host is an
+      IP address, for example ["127.0.0.1"] after a listen on ["localhost"]. In
+      the simulator, the host is the name of the listener or of the UDP socket.
+      A client has the host ["client"]. The simulator selects the port of a
+      client, and a port for [listen] and [udp] on port 0, from a counter that
+      starts at 40000.
+
+      @raise Error with [Bad_fd] if the socket is closed. *)
+
   val read : t -> bytes -> int -> int -> int
   (** [read t buf off len] reads at least one byte, or gives 0 at the end of the
       stream.

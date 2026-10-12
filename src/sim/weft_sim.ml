@@ -83,6 +83,7 @@ type conn =
   ; mutable refused: bool
   ; mutable cfd: int  (** [-1] until the server side is accepted. *)
   ; remote: Op.addr
+  ; local: Op.addr  (** [Local_addr]. *)
   ; tcp: bool  (** A TCP socket, not a Unix socket or a pipe. *) }
 
 (* [pending] counts the connections that the latency still holds, so that they
@@ -94,7 +95,8 @@ type listener =
   ; backlog: conn Queue.t
   ; limit: int
   ; mutable pending: int
-  ; ltcp: bool }
+  ; ltcp: bool
+  ; laddr: Op.addr  (** The address, with the port of a listen on port 0. *) }
 
 (* A UDP socket: its address, and the datagrams that came, with their senders.
    [bytes] counts the cost of the queue, against the receive buffer. A datagram
@@ -778,6 +780,7 @@ let new_pipe n =
     ; refused= false
     ; cfd= new_fd n
     ; remote= Op.Unix ""
+    ; local= Op.Unix ""
     ; tcp= false }
   in
   let r = mk Rd_end and w = mk Wr_end in
@@ -856,6 +859,15 @@ let submit : type a. t -> a Op.t -> (a, Op.error) result =
   in
   match op with
   | Op.Listen (addr, backlog) ->
+      (* A listen on port 0 gets a free port, as on Linux. *)
+      let addr =
+        match addr with
+        | Op.Tcp (h, 0) ->
+            let used p = Hashtbl.mem n.names (key (Op.Tcp (h, p))) in
+            Op.Tcp (h, fresh_port n used)
+        | a ->
+            a
+      in
       let k = key addr in
       if Hashtbl.mem n.names k then Error Op.In_use
       else
@@ -863,8 +875,12 @@ let submit : type a. t -> a Op.t -> (a, Op.error) result =
         let ltcp = match addr with Op.Tcp _ -> true | Op.Unix _ -> false in
         Hashtbl.replace n.fds fd
           (Lsn
-             {key= k; backlog= Queue.create (); limit= backlog; pending= 0; ltcp}
-          ) ;
+             { key= k
+             ; backlog= Queue.create ()
+             ; limit= backlog
+             ; pending= 0
+             ; ltcp
+             ; laddr= addr } ) ;
         Hashtbl.replace n.names k fd ;
         Ok fd
   | Op.Connect addr -> (
@@ -876,8 +892,13 @@ let submit : type a. t -> a Op.t -> (a, Op.error) result =
         match Hashtbl.find_opt n.fds lfd with
         | Some (Lsn l) when Queue.length l.backlog + l.pending < l.limit ->
             l.pending <- l.pending + 1 ;
-            let port = fresh_port n (fun _ -> false) in
-            let mk remote =
+            (* The client has the host "client" and a port from the counter. A
+               Unix client has no path. *)
+            let client =
+              if l.ltcp then Op.Tcp ("client", fresh_port n (fun _ -> false))
+              else Op.Unix ""
+            in
+            let mk ~local remote =
               { role= Sock
               ; inbox= Buffer.create 64
               ; rpos= 0
@@ -892,9 +913,10 @@ let submit : type a. t -> a Op.t -> (a, Op.error) result =
               ; refused= false
               ; cfd= -1
               ; remote
+              ; local
               ; tcp= l.ltcp }
             in
-            let c = mk addr and s = mk (Op.Tcp ("client", port)) in
+            let c = mk ~local:client addr and s = mk ~local:l.laddr client in
             c.peer <- Some s ;
             s.peer <- Some c ;
             s.established <- true ;
@@ -920,6 +942,18 @@ let submit : type a. t -> a Op.t -> (a, Op.error) result =
           if c.refused then Error Op.Refused
           else if c.established then Ok ()
           else Error Op.Would_block )
+  | Op.Local_addr fd -> (
+    match Hashtbl.find_opt n.fds fd with
+    | Some (Lsn l) ->
+        Ok l.laddr
+    | Some (Conn {role= Sock; local; _}) ->
+        Ok local
+    | Some (Dgm g) ->
+        Ok (Op.Tcp (g.host, g.port))
+    | Some (Conn _ | Fil _ | Pfd _) ->
+        Error (Op.Other "ENOTSOCK")
+    | None ->
+        Error Op.Bad_fd )
   | Op.Accept lfd -> (
     match Hashtbl.find_opt n.fds lfd with
     | Some (Lsn l) -> (

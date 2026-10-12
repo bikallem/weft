@@ -78,6 +78,13 @@ let error_of f =
   | exception Net.Error (e, _) ->
       Format.asprintf "%a" Private.Op.pp_error e
 
+let host_port s =
+  match Net.local_addr s with
+  | Net.Tcp (host, port) ->
+      (host, port)
+  | Net.Unix _ ->
+      invalid_arg "host_port"
+
 let events w =
   group "events"
     [ test "always, never, wrap and guard" (fun () ->
@@ -693,6 +700,88 @@ let until_answer s dst msg f =
         go (n - 1)
   in
   go 100
+
+(* The host of the addresses of the world. *)
+let host_of w =
+  let l, a = w.listen () in
+  Net.close l ;
+  match a with Net.Tcp (h, _) -> h | Net.Unix _ -> invalid_arg "host_of"
+
+let local_addr w =
+  group "local_addr"
+    [ test "a listen on port 0 gets a port, and a client connects to it"
+        (fun () ->
+          w.run (fun () ->
+              let host = host_of w in
+              let l = Net.listen (Net.Tcp (host, 0)) in
+              let a = Net.local_addr l in
+              ( match a with
+              | Net.Tcp (h, p) ->
+                  equal string host h ;
+                  is_true (p > 0)
+              | Net.Unix _ ->
+                  fail "a Unix address" ) ;
+              Fiber.scope (fun s ->
+                  Fiber.fork_daemon s (fun () -> echo_server l) ;
+                  let c = Net.connect a in
+                  Net.write c "hello" ;
+                  equal string "hello" (read_n c 5) ;
+                  Net.close c ) ;
+              Net.close l ) )
+    ; test "an accepted socket and its client agree on the two addresses"
+        (fun () ->
+          w.run (fun () ->
+              let l = Net.listen (Net.Tcp (host_of w, 0)) in
+              let a = Net.local_addr l in
+              let c = Net.connect a in
+              let s, peer = Net.accept l in
+              is_true (Net.local_addr s = a) ;
+              is_true (Net.local_addr c = peer) ;
+              ( match peer with
+              | Net.Tcp (_, p) ->
+                  is_true (p > 0)
+              | Net.Unix _ ->
+                  fail "a Unix address" ) ;
+              (* The client keeps its port after the close of the peer. *)
+              Net.close s ;
+              is_true (Net.local_addr c = peer) ;
+              Net.close c ;
+              Net.close l ) )
+    ; test "a Unix listener has its path, and a Unix client has no path"
+        (fun () ->
+          w.run (fun () ->
+              let a = Net.Unix (Filename.concat (w.tmp ()) "s") in
+              let l = Net.listen a in
+              let c = Net.connect a in
+              let s, peer = Net.accept l in
+              is_true (Net.local_addr l = a) ;
+              is_true (Net.local_addr s = a) ;
+              is_true (Net.local_addr c = Net.Unix "") ;
+              is_true (peer = Net.Unix "") ;
+              Net.close s ;
+              Net.close c ;
+              Net.close l ) )
+    ; test "a UDP socket on port 0 gets a port" (fun () ->
+          w.run (fun () ->
+              let u, u_addr = w.udp () in
+              equal (pair string int) u_addr (host_port u) ;
+              let host = fst u_addr in
+              let a = Net.udp (host, 0) and b = Net.udp (host, 0) in
+              let ha, pa = host_port a and hb, pb = host_port b in
+              equal string host ha ;
+              equal string host hb ;
+              is_true (pa > 0 && pb > 0 && pa <> pb) ;
+              Net.close a ;
+              Net.close b ;
+              Net.close u ) )
+    ; test "a closed socket gives EBADF" (fun () ->
+          w.run (fun () ->
+              let l, _ = w.listen () and u, _ = w.udp () in
+              Net.close l ;
+              Net.close u ;
+              equal string "EBADF" (error_of (fun () -> Net.local_addr l)) ;
+              equal string "EBADF" (error_of (fun () -> Net.local_addr u)) ) )
+    ]
 
 let udp w =
   group "udp"
@@ -1465,6 +1554,7 @@ let tests w =
         ; scopes w
         ; net w
         ; now_and_reset w
+        ; local_addr w
         ; udp w
         ; overflow_runs w
         ; layers w

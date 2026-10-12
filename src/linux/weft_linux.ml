@@ -263,6 +263,4 @@ let run ?slack ?domains ?signals ?(watchdog = Some (Weft.Span.ms 10)) main =
     (create ~domains ?signals ())
     ~close ?slack ~domains ~watchdog main
 
-let local_port fd = local_port ~name:"Weft_linux.local_port" fd
-
 let alarm_sets () = Atomic.get alarm_sets
