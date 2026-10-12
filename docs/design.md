@@ -764,7 +764,7 @@ The native form is the only form in which the commit and the transfer of the per
 - One sync with two acquire branches of one semaphore, and two releases
 - An acquire with a free permit while a `Chan` partner holds the word as `Claimed`.
 
-The tests of the public API run in the simulator, also with 200 seeds on 4 virtual domains, and in the Linux world. A test waits until each waiter is parked (`Commit.state` of its sync), so that the FIFO order does not depend on a sleep. At the end of each test, `try_acquire` makes sure that each permit is free and that no other permit exists. Thus a lost permit gives a failure, not a hang.
+The tests of the public API run in the simulator, also with 200 seeds on 4 virtual domains, and in the Linux world. A test waits until each waiter is parked (`Commit.state` of its sync), so that the FIFO order does not depend on a sleep. After the last release of a semaphore, each test makes sure with `try_acquire` that each permit is free and that no other permit exists. The tests take a free permit with `try_acquire`, not with a blocking acquire. Thus a lost permit gives a failure, not a hang.
 
 ### Fiber code with no handler
 

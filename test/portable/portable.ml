@@ -1549,14 +1549,14 @@ let semaphores w =
     ; test "an acquire that loses a choose does not take the permit" (fun () ->
           w.run (fun () ->
               let s = Sem.create 1 in
-              sync (Sem.acquire s) ;
+              is_true (Sem.try_acquire s) ;
               equal bool false (acquire_in_1ms s) ;
               Sem.release s ;
               all_free s 1 ) )
     ; test "the waiters get the permits in FIFO order" (fun () ->
           w.run (fun () ->
               let s = Sem.create 1 and log = Log.create () in
-              sync (Sem.acquire s) ;
+              is_true (Sem.try_acquire s) ;
               Fiber.scope (fun sc ->
                   let ps =
                     List.init 5 (fun i ->
@@ -1569,7 +1569,7 @@ let semaphores w =
     ; test "a cancel of a waiter gives the permit to the next waiter" (fun () ->
           w.run (fun () ->
               let s = Sem.create 1 and log = Log.create () in
-              sync (Sem.acquire s) ;
+              is_true (Sem.try_acquire s) ;
               Fiber.scope (fun sc ->
                   let wait i =
                     fork_parked sc (fun () ->
@@ -1596,7 +1596,7 @@ let semaphores w =
               in
               (* The end comes first: the lock stays with its holder. *)
               let s = Sem.create 1 and closed = Ivar.create () in
-              sync (Sem.acquire s) ;
+              is_true (Sem.try_acquire s) ;
               Fiber.scope (fun sc ->
                   let p = Fiber.fork_promise sc (fun () -> close s closed) in
                   Time.sleep Mono (Span.ms 1) ;
@@ -1606,7 +1606,7 @@ let semaphores w =
               all_free s 1 ;
               (* The lock comes first. *)
               let s = Sem.create 1 and closed = Ivar.create () in
-              sync (Sem.acquire s) ;
+              is_true (Sem.try_acquire s) ;
               Fiber.scope (fun sc ->
                   let p =
                     Fiber.fork_promise sc (fun () ->
@@ -1624,7 +1624,7 @@ let semaphores w =
               let s = Sem.create 1 in
               for _ = 1 to 20 do
                 let closed = Ivar.create () in
-                sync (Sem.acquire s) ;
+                is_true (Sem.try_acquire s) ;
                 Fiber.scope (fun sc ->
                     Fiber.fork sc (fun () ->
                         match
@@ -1676,7 +1676,7 @@ let semaphores w =
                   done ) ;
               equal bool false (over ()) ;
               all_free s n ) )
-    ; test "release above the initial count raises Invalid_argument" (fun () ->
+    ; test "release above the maximum raises Invalid_argument" (fun () ->
           w.run (fun () ->
               let s = Sem.create 2 in
               let above =
@@ -1684,7 +1684,7 @@ let semaphores w =
                   "Fiber.Semaphore.release: the free permits are at the maximum"
               in
               raises above (fun () -> Sem.release s) ;
-              sync (Sem.acquire s) ;
+              is_true (Sem.try_acquire s) ;
               Sem.release s ;
               raises above (fun () -> Sem.release s) ;
               all_free s 2 ;
@@ -1731,6 +1731,10 @@ let semaphores w =
                   is_true (Sem.try_release s) ;
                   equal bool false (Sem.try_acquire s) ;
                   Promise.await p ) ;
+              (* The test and the waiter each hold one permit. *)
+              Sem.release s ;
+              Sem.release s ;
+              all_free s 2 ;
               (* A count with no limit. *)
               let u = Sem.create ~max:max_int 0 in
               for _ = 1 to 1000 do
@@ -1752,7 +1756,7 @@ let semaphores w =
         (fun () ->
           w.run (fun () ->
               let s = Sem.create 1 in
-              sync (Sem.acquire s) ;
+              is_true (Sem.try_acquire s) ;
               Fiber.scope (fun sc ->
                   let p = fork_parked sc (fun () -> sync (Sem.acquire s)) in
                   Sem.release s ;
