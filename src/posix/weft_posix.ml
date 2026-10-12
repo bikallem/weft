@@ -171,8 +171,11 @@ let error_of e =
   else if e = enotdir then Op.Not_dir
   else if e = eisdir then Op.Is_dir
   else if e = enotempty then Op.Not_empty
-  else if e = emfile || e = enfile || e = enobufs || e = enomem then
-    Op.No_resources (errname e)
+  else if
+    e = emfile
+    || ( e = enfile || e = enobufs || e = enomem )
+       [@mutate off "a test can give only EMFILE"]
+  then Op.No_resources (errname e)
   else Op.Other (errname e)
 
 (* [EAGAIN] of an operation that makes a process or a thread: the OS has no
@@ -493,7 +496,12 @@ let submit : type a. pool -> a Op.t -> (a, Op.error) result option =
          removes one connection from the backlog, so the loop ends. *)
       let rec take () =
         let ((r, _, _, _) as a) = accept fd in
-        if r = -econnaborted then take () else a
+        if
+          ( r = -econnaborted )
+          [@mutate
+            off "Linux gives no ECONNABORTED; the CI of FreeBSD tests it"]
+        then take ()
+        else a
       in
       let r, host, port, unix = take () in
       Some

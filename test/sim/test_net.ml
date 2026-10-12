@@ -875,6 +875,9 @@ let fd_limit_each_op () =
       Sim.set_fd_limit sim (Some (Sim.open_fds sim + 1)) ;
       emfile Pipe.create ;
       emfile (fun () -> Process.spawn ~stdout:Piped "p" []) ;
+      Sim.set_fd_limit sim (Some (Sim.open_fds sim + 2)) ;
+      emfile (fun () -> Process.spawn ~stdout:Piped "p" []) ;
+      Sim.set_fd_limit sim (Some (Sim.open_fds sim + 1)) ;
       is_true (Process.wait (Process.spawn "p" []) = Process.Exited 0) ;
       let u = Net.udp ("a", 1) in
       emfile (fun () -> Net.udp ("a", 2)) ;
@@ -882,7 +885,13 @@ let fd_limit_each_op () =
       Net.close (Net.udp ("a", 2)) ;
       Sim.set_fd_limit sim None ;
       let r, w = Pipe.create () in
-      Pipe.close r ; Pipe.close w )
+      Pipe.close r ;
+      Pipe.close w ;
+      Sim.set_fd_limit sim (Some 0) ;
+      emfile Pipe.create ;
+      raises_match
+        (function Invalid_argument _ -> true | _ -> false)
+        (fun () -> Sim.set_fd_limit sim (Some (-1))) )
 
 (* The accept loop of caravan: on EMFILE, it pauses for 100 ms, then tries
    again. A fiber that waits in accept gets EMFILE when a connection comes. A
