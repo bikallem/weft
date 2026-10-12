@@ -28,7 +28,9 @@ jobs:
       - uses: cachix/install-nix-action@v31
       - name: Build
         run: nix develop -c dune build
+      # The result does not depend on the system.
       - name: Format
+        if: runner.os == 'Linux'
         run: nix develop -c dune build @fmt
       - name: Test
         run: nix develop -c dune runtest --force
@@ -54,11 +56,5 @@ jobs:
             eval "$(opam env)"
             opam install dune windtrap ppx_windtrap dscheck
             dune build
-            # One line for each test, and a limit for each test: a run that
-            # stops shows its last test. One run of the kqueue suite stopped
-            # with no message, so it runs 5 times.
             export WINDTRAP_VERBOSE=1 WINDTRAP_TIMEOUT=120
-            for i in 1 2 3 4 5; do
-              ./_build/default/test/kqueue/test_kqueue.exe > kq.log 2>&1 || { echo "test_kqueue: exit $? in run $i"; tail -40 kq.log; exit 1; }
-            done
             dune runtest --force

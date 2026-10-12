@@ -40,7 +40,7 @@ jobs:
             if kill -0 $pid 2>/dev/null; then
               echo "run $i hangs"
               tail -30 kq.log
-              sudo lldb -p $pid --batch -o "thread backtrace all" | head -400
+              sudo lldb -p $pid --batch -o "thread backtrace all" | head -400 || true
               kill -9 $pid
               exit 1
             fi
@@ -55,7 +55,7 @@ jobs:
               for c in /cores/core.*; do
                 [ -e "$c" ] || continue
                 echo "core $c"
-                lldb -c "$c" "$exe" --batch -o "thread backtrace all" | head -300
+                lldb -c "$c" "$exe" --batch -o "thread backtrace all" | head -300 || true
               done
               exit 1
             fi
