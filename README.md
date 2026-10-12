@@ -97,8 +97,30 @@ nix develop -c dune runtest
 nix develop -c spec/tla/check.sh     # the TLA+ models of the design
 ```
 
-The packages are `weft` (the core), `weft.sim` (the simulator) and
-`weft.linux` (the Linux world).
+The libraries are `weft` (the core), `weft.sim` (the simulator),
+`weft.linux` (the Linux world), `weft.kqueue` (the world for macOS and
+FreeBSD) and `weft.posix` (the parts that the two worlds share).
+
+## Use weft from another flake
+
+The flake gives weft as a package. To build it with the OCaml of your own
+scope:
+
+```nix
+inputs.weft = {
+  url = "github:bikallem/weft";
+  inputs.nixpkgs.follows = "nixpkgs";
+};
+
+ocamlPackages = pkgs.ocaml-ng.ocamlPackages_5_5.overrideScope (final: prev: {
+  weft = final.callPackage weft.lib.package { };
+});
+```
+
+Then add `ocamlPackages.weft` to your packages. Inside
+`with ocamlPackages; [ ... ]`, the name `weft` is the flake input, not the
+package. The flake also has `overlays.default`, which adds weft to
+`ocaml-ng.ocamlPackages_5_5`, and `packages.<system>.weft`.
 
 ## Design
 
