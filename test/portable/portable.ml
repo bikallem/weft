@@ -1497,10 +1497,11 @@ let holders n =
   (body, fun () -> Atomic.get over)
 
 (* Take [n] permits, then make sure that no other permit is free. Thus no permit
-   was lost or doubled. A lost permit makes the acquire wait forever. *)
+   was lost or doubled. The tries do not wait, so a lost permit gives a failure
+   and not a hang. *)
 let all_free s n =
   for _ = 1 to n do
-    sync (Sem.acquire s)
+    is_true (Sem.try_acquire s)
   done ;
   equal bool false (Sem.try_acquire s)
 
@@ -1710,8 +1711,32 @@ let semaphores w =
           w.run (fun () ->
               let s = Sem.create 1 in
               raises Exit (fun () -> Sem.use s (fun () -> raise Exit)) ;
+              all_free s 1 ;
+              Sem.release s ;
               equal int 3 (Sem.use s (fun () -> 3)) ;
               all_free s 1 ) )
+    ; test
+        "try_release gives false at the maximum, and a waiter gets its permit"
+        (fun () ->
+          w.run (fun () ->
+              (* A rate limit: the refill of a full bucket does nothing. *)
+              let s = Sem.create ~max:2 0 in
+              is_true (Sem.try_release s) ;
+              is_true (Sem.try_release s) ;
+              equal bool false (Sem.try_release s) ;
+              all_free s 2 ;
+              (* A parked waiter gets the permit of try_release. *)
+              Fiber.scope (fun sc ->
+                  let p = fork_parked sc (fun () -> sync (Sem.acquire s)) in
+                  is_true (Sem.try_release s) ;
+                  equal bool false (Sem.try_acquire s) ;
+                  Promise.await p ) ;
+              (* A count with no limit. *)
+              let u = Sem.create ~max:max_int 0 in
+              for _ = 1 to 1000 do
+                Sem.release u
+              done ;
+              all_free u 1000 ) )
     ; test "try_acquire takes only a free permit" (fun () ->
           w.run (fun () ->
               let s = Sem.create 2 in

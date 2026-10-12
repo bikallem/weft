@@ -682,7 +682,8 @@ let acquire_scan dom t s continued () =
   if not (S.is_done s) then base_leaf (Sem.acquire t) dom s 0 ;
   match C.park s.S.word with `Done _ -> Atomic.incr continued | `Parked -> ()
 
-let release dom t () = List.iter (S.resume dom) (Sem.give t)
+let release dom t () =
+  List.iter (S.resume dom) (Option.value ~default:[] (Sem.give t))
 
 (* The resumes of a sync in a next slot: a partner of a channel resumes it
    there. *)

@@ -244,8 +244,8 @@ module Semaphore = struct
 
   let acquire t = Event.Base (fun () -> {Event.leaf= leaf t; result= ignore})
 
-  (* A free permit is never one that a waiter can take, because the queue is
-     empty when [free] is more than 0. Thus the try keeps the FIFO order. *)
+  (* When a permit is free, no waiter is in the queue. Thus the try keeps the
+     FIFO order. *)
   let try_acquire t =
     Spin.with_lock t.slock (fun () ->
         let n = Atomic.get t.free in
@@ -255,7 +255,8 @@ module Semaphore = struct
           true ) )
 
   (* Give the permit to the oldest waiter that did not leave, or make it free.
-     The result is the syncs to resume. *)
+     The result is the syncs to resume, or [None] if the free permits are at the
+     maximum. *)
   let give t =
     Spin.with_lock t.slock (fun () ->
         let rec first = function
@@ -273,22 +274,25 @@ module Semaphore = struct
         match first (Chan.offers t.waiters) with
         | Some (rest, resumed) ->
             Atomic.set t.waiters.front rest ;
-            resumed
+            Some resumed
         | None ->
             (* Each offer was stale. *)
             Atomic.set t.waiters.front [] ;
             let n = Atomic.get t.free in
-            if n >= t.max then
-              invalid_arg
-                "Fiber.Semaphore.release: the free permits are at the maximum" ;
-            Atomic.set t.free (n + 1) ;
-            [] )
+            if n >= t.max then None
+            else (
+              Atomic.set t.free (n + 1) ;
+              Some [] ) )
 
   (* [Self] first: outside a fiber, the release raises [Not_in_fiber] before it
      gives the permit to a waiter that nobody would then resume. *)
-  let release t =
+  let try_release t =
     ignore (self ()) ;
-    enqueue (give t)
+    match give t with Some resumed -> enqueue resumed ; true | None -> false
+
+  let release t =
+    if not (try_release t) then
+      invalid_arg "Fiber.Semaphore.release: the free permits are at the maximum"
 
   let use t f =
     Event.sync (acquire t) ;

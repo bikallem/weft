@@ -217,9 +217,9 @@ module Fiber : sig
 
     val create : ?max:int -> int -> t
     (** [create ?max n] is a semaphore with [n] free permits. A release never
-        makes more than [max] permits free. The default [max] is [n]. Use
-        [create ~max:m 0] for a count that starts at 0, for example the tokens
-        of a rate limit.
+        makes more than [max] permits free. The default [max] is [n]. A count
+        with no limit, as [Semaphore.Counting.make 0] of the stdlib, is
+        [create ~max:max_int 0].
 
         @raise Invalid_argument if [n < 0] or [max < n]. *)
 
@@ -241,6 +241,12 @@ module Fiber : sig
 
         @raise Invalid_argument
           if the free permits are already at the [max] of [create]. *)
+
+    val try_release : t -> bool
+    (** As [release], but it gives [false] and changes nothing if the free
+        permits are already at the [max] of [create]. For example, the refill of
+        a rate limit with [create ~max:m 0] uses it, because a refill of a full
+        bucket is normal. *)
 
     val use : t -> (unit -> 'a) -> 'a
     (** [use t f] acquires a permit, runs [f] and releases the permit, also if
