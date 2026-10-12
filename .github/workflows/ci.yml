@@ -47,7 +47,10 @@ jobs:
             opam install dune windtrap ppx_windtrap dscheck
             dune build
             # One line for each test, and a limit for each test: a run that
-            # stops shows its last test.
-            export WINDTRAP_VERBOSE=1 WINDTRAP_STREAM=1 WINDTRAP_TIMEOUT=120
-            ./_build/default/test/kqueue/test_kqueue.exe || echo "test_kqueue: exit $?"
+            # stops shows its last test. One run of the kqueue suite stopped
+            # with no message, so it runs 5 times.
+            export WINDTRAP_VERBOSE=1 WINDTRAP_TIMEOUT=120
+            for i in 1 2 3 4 5; do
+              ./_build/default/test/kqueue/test_kqueue.exe > kq.log 2>&1 || { echo "test_kqueue: exit $? in run $i"; tail -40 kq.log; exit 1; }
+            done
             dune runtest --force
