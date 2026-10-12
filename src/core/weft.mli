@@ -383,7 +383,9 @@ module Net : sig
   val close : t -> unit
   (** Closes the socket. A fiber that waits on it, and each later operation,
       gets [Error (Bad_fd, _)]. A second [close] does nothing. [close] never
-      blocks, so a cancelled fiber can call it. *)
+      blocks, so a cancelled fiber can call it. On Linux, the close of a TCP or
+      Unix stream socket with unread data sends a reset: the next read of the
+      peer gets [Error (Reset, _)]. *)
 
   val reset : t -> unit
   (** Closes a TCP socket with a reset (RST, [SO_LINGER] with a time of 0). The
@@ -396,7 +398,8 @@ module Net : sig
       A reset after [shutdown] gives the peer the end of the stream and
       [Error (Broken_pipe, _)], as on Linux. If the peer already closed, or if
       [t] is closed, a listener, a Unix socket or a UDP socket, [reset] is the
-      same as [close]. *)
+      same as [close]. Thus a Unix socket with unread data also gives a reset.
+  *)
 
   val readable : t -> unit event
   (** Ready when the socket can be read. It is also ready after a [close]: the

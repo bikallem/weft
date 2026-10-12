@@ -614,6 +614,27 @@ let now_and_reset w =
               Net.reset l ;
               equal string "EBADF" (error_of (fun () -> Net.accept l)) ) ) ]
 
+(* A Unix connection. The client writes data that the server does not read, then
+   the server runs [close] on its socket. Then the client runs [client]. *)
+let unix_unread w close client =
+  let a = Net.Unix (Filename.concat (w.tmp ()) "u") in
+  let l = Net.listen a in
+  let sent = Ivar.create () and closed = Ivar.create () in
+  Fiber.scope (fun s ->
+      Fiber.fork s (fun () ->
+          let c, _ = Net.accept l in
+          sync (Ivar.read sent) ;
+          close c ;
+          Ivar.fill closed () ) ;
+      let c = Net.connect a in
+      Net.write c "unread" ;
+      Ivar.fill sent () ;
+      sync (Ivar.read closed) ;
+      Time.sleep Mono (Span.ms 10) ;
+      client c ;
+      Net.close c ) ;
+  Net.close l
+
 (* The details of a reset that follow Linux. The simulator and the Linux world
    run them. *)
 let reset_details w =
@@ -670,7 +691,26 @@ let reset_details w =
                   let c = Net.connect a in
                   equal string "" (read_all c) ;
                   Net.close c ) ;
-              Net.close l ) ) ]
+              Net.close l ) )
+    ; test "a Unix socket with unread data: a close resets the reads only"
+        (fun () ->
+          w.run (fun () ->
+              unix_unread w
+                (fun c -> Net.close c)
+                (fun c ->
+                  (* A write gives EPIPE and leaves the error for the read. *)
+                  let write () = error_of (fun () -> Net.write c "x") in
+                  equal string "EPIPE" (write ()) ;
+                  equal string "EPIPE" (write ()) ;
+                  equal string "ECONNRESET" (read_error c) ;
+                  equal string "" (read_all c) ) ) )
+    ; test "a Unix socket with unread data: a reset after shutdown" (fun () ->
+          w.run (fun () ->
+              unix_unread w
+                (fun c -> Net.shutdown c ; Net.reset c)
+                (fun c ->
+                  equal string "ECONNRESET" (read_error c) ;
+                  equal string "" (read_all c) ) ) ) ]
 
 (* UDP and the socket options. A world can lose datagrams (the faults world), so
    a test sends again after a timeout. *)
