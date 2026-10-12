@@ -218,20 +218,6 @@ let open_fds t = Hashtbl.length t.net.fds
 
 let key addr = Format.asprintf "%a" Op.pp_addr addr
 
-(* The checks of an address in the POSIX worlds ([with_addr]): a NUL byte in a
-   host or a path, or a port out of range, gives EINVAL. *)
-let addr_error h p =
-  if String.contains h '\000' then
-    Some (Op.Other "EINVAL: a NUL byte in a string")
-  else if p < 0 || p > 65535 then Some (Op.Other "EINVAL")
-  else None
-
-let addr_error_of = function
-  | Op.Tcp (h, p) ->
-      addr_error h p
-  | Op.Unix path ->
-      addr_error path 0
-
 let avail c = Buffer.length c.inbox - c.rpos
 
 let readable n fd =
@@ -866,7 +852,7 @@ let spawn t (sp : Op.spawn) =
         ; from_stdout= fd from_stdout
         ; from_stderr= fd from_stderr }
 
-let submit_op : type a. t -> a Op.t -> (a, Op.error) result =
+let submit : type a. t -> a Op.t -> (a, Op.error) result =
  fun t op ->
   let n = t.net in
   let conn fd k =
@@ -1235,23 +1221,6 @@ let submit_op : type a. t -> a Op.t -> (a, Op.error) result =
     | _ ->
         model_error
           "Deregister of fd %d on domain %d, which has no registration" fd d )
-
-let submit : type a. t -> a Op.t -> (a, Op.error) result =
- fun t op ->
-  let checked =
-    match op with
-    | Op.Listen (addr, _) ->
-        addr_error_of addr
-    | Op.Connect addr ->
-        addr_error_of addr
-    | Op.Udp (h, p) ->
-        addr_error h p
-    | Op.Sendto (_, _, _, _, h, p) ->
-        addr_error h p
-    | _ ->
-        None
-  in
-  match checked with Some e -> Error e | None -> submit_op t op
 
 (* The edges of domain [d], the oldest first. *)
 let take_edges t d =

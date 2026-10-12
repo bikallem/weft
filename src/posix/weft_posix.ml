@@ -298,11 +298,6 @@ let args_of : type a. int -> int -> a Op.blocking -> job_args =
   | Op.Resolve host | Op.Reverse host ->
       {base with s1= host}
 
-(* The C side reads each string up to its first NUL byte. *)
-let has_nul = List.exists (fun s -> String.contains s '\000')
-
-let nul_error = Error (Op.Other "EINVAL: a NUL byte in a string")
-
 let kind_of_int = function
   | 0 ->
       Op.Regular
@@ -419,15 +414,6 @@ let host_port = function
   | Op.Unix path ->
       (1, path, 0)
 
-(* The checks of an address before the C side, as in the simulator. The C side
-   reads a string up to its first NUL byte, and [Int_val] to an [int] of C cuts
-   a large port. Thus without these checks, the socket can use a different
-   address. *)
-let with_addr h port k =
-  if String.contains h '\000' then nul_error
-  else if port < 0 || port > 65535 then Error (Op.Other "EINVAL")
-  else k ()
-
 (* [spawn_child args defaults] (weft_spawn.c). [defaults] are the signals that
    get the default action in the child. *)
 external spawn_child :
@@ -445,12 +431,6 @@ let spawn_args (sp : Op.spawn) =
   , Option.is_some sp.env
   , Option.value ~default:"" sp.cwd
   , [|kind sp.stdin; kind sp.stdout; kind sp.stderr|] )
-
-let spawn_has_nul (sp : Op.spawn) =
-  has_nul
-    ( (sp.prog :: sp.argv)
-    @ Option.value ~default:[] sp.env
-    @ Option.to_list sp.cwd )
 
 (* The result of [spawn_child]: (pid or -errno, the pidfd, stdin, stdout,
    stderr), with -1 for no pipe. *)
@@ -484,7 +464,7 @@ let submit : type a. pool -> a Op.t -> (a, Op.error) result option =
   match op with
   | Op.Listen (addr, backlog) ->
       let kind, h, port = host_port addr in
-      Some (with_addr h port (fun () -> result (listen kind h port backlog)))
+      Some (result (listen kind h port backlog))
   | Op.Accept fd ->
       let r, host, port, unix = accept fd in
       Some
@@ -493,13 +473,11 @@ let submit : type a. pool -> a Op.t -> (a, Op.error) result option =
            (result r) )
   | Op.Connect addr ->
       let kind, h, port = host_port addr in
-      Some
-        (with_addr h port (fun () ->
-             let r = connect kind h port in
-             (* A Unix socket gives EAGAIN when the backlog of the listener is
-                full. This is not a connect that continues. *)
-             if r = -eagain then Error (Op.Other "EAGAIN: the backlog is full")
-             else result r ) )
+      let r = connect kind h port in
+      (* A Unix socket gives EAGAIN when the backlog of the listener is full.
+         This is not a connect that continues. *)
+      if r = -eagain then Some (Error (Op.Other "EAGAIN: the backlog is full"))
+      else Some (result r)
   | Op.Connect_result fd ->
       Some (unit (connect_result fd))
   | Op.Local_addr fd ->
@@ -517,11 +495,9 @@ let submit : type a. pool -> a Op.t -> (a, Op.error) result option =
   | Op.Reset_on_close fd ->
       Some (unit (reset_on_close fd))
   | Op.Udp (host, port) ->
-      Some (with_addr host port (fun () -> result (udp host port)))
+      Some (result (udp host port))
   | Op.Sendto (fd, buf, off, len, host, port) ->
-      Some
-        (with_addr host port (fun () ->
-             result (sendto fd buf off len (host, port)) ) )
+      Some (result (sendto fd buf off len (host, port)))
   | Op.Recvfrom (fd, buf, off, len) ->
       let n, host, port = recvfrom fd buf off len in
       Some (Result.map (fun n -> (n, host, port)) (result n))
@@ -549,14 +525,12 @@ let submit : type a. pool -> a Op.t -> (a, Op.error) result option =
   | Op.Start (dom, op) ->
       let id = Atomic.fetch_and_add p.next_job 1 in
       let args = args_of id dom op in
-      if has_nul [args.s1; args.s2] then Some nul_error
-      else
-        (* The lock covers the start, so the job is in the table before its
-           completion can come. *)
-        Some
-          (Mutex.protect p.lock (fun () ->
-               Hashtbl.replace p.jobs id (job_start p.mbx args) ;
-               Ok id ) )
+      (* The lock covers the start, so the job is in the table before its
+         completion can come. *)
+      Some
+        (Mutex.protect p.lock (fun () ->
+             Hashtbl.replace p.jobs id (job_start p.mbx args) ;
+             Ok id ) )
   | Op.Finish (id, op) -> (
     match take_job p id with
     | Some j ->

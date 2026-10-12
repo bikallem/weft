@@ -318,7 +318,8 @@ end
 module Net : sig
   (** A port out of the range 0 to 65535 gives [Error (Other "EINVAL", _)]. A
       NUL byte in a host or a path gives
-      [Error (Other "EINVAL: a NUL byte in a string", _)], as in [File]. *)
+      [Error (Other "EINVAL: a NUL byte in a string", _)], as for each path,
+      name and argument of [File], [Dir], [Dns] and [Process.spawn]. *)
   type addr = Private.Net.addr =
     | Tcp of string * int
         (** A host and a port. [local_addr] also gives the address of a UDP

@@ -75,9 +75,6 @@ static int sock_flags(int fd) {
 static int make_addr(int kind, value host, int port, struct sockaddr_storage *sa,
                      socklen_t *len) {
   memset(sa, 0, sizeof *sa);
-  /* A guard: the OCaml side refuses a NUL byte. The C side stops at a NUL
-     byte. Thus the address can be a different address. */
-  if (!caml_string_is_c_safe(host)) return -EINVAL;
   const char *h = String_val(host);
   if (kind == 1) {
     struct sockaddr_un *un = (struct sockaddr_un *)sa;
