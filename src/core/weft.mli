@@ -215,10 +215,13 @@ module Fiber : sig
   module Semaphore : sig
     type t
 
-    val create : int -> t
-    (** [create n] is a semaphore with [n] free permits.
+    val create : ?max:int -> int -> t
+    (** [create ?max n] is a semaphore with [n] free permits. A release never
+        makes more than [max] permits free. The default [max] is [n]. Use
+        [create ~max:m 0] for a count that starts at 0, for example the tokens
+        of a rate limit.
 
-        @raise Invalid_argument if [n < 0]. *)
+        @raise Invalid_argument if [n < 0] or [max < n]. *)
 
     val acquire : t -> unit event
     (** An event that takes one permit. The sync gets the permit only if it
@@ -226,11 +229,18 @@ module Fiber : sig
         cancel ends the sync, the permit goes to the next waiter. The waiters
         get the permits in the order in which they started to wait (FIFO). *)
 
+    val try_acquire : t -> bool
+    (** Takes a free permit and gives [true], or gives [false] if no permit is
+        free. It does not wait, and it is not a cancellation point. A [choose]
+        of [acquire] and [always] is not a try: if a permit is free, the
+        [choose] selects one of the two ready branches at random. *)
+
     val release : t -> unit
-    (** Gives one permit back: to the oldest waiter, or to the free permits.
+    (** Returns one permit to the semaphore: to the oldest waiter, or to the
+        free permits.
 
         @raise Invalid_argument
-          if the free permits are already the [n] of [create n]. *)
+          if the free permits are already at the [max] of [create]. *)
 
     val use : t -> (unit -> 'a) -> 'a
     (** [use t f] acquires a permit, runs [f] and releases the permit, also if
