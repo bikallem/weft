@@ -1225,7 +1225,7 @@ The sections of this document mark each part that does not come in M0 with its m
   - `sendto` and `recvfrom` need a UDP socket: on Linux, a `sendto` on a TCP socket ignores the address and can send a part. `Net.read` on a UDP socket takes one datagram, and `Net.write` gives `EDESTADDRREQ`.
   - A datagram of more than 65507 bytes gives `EMSGSIZE`.
   - The jitter can reorder datagrams, and `udp_loss` of `Sim.net_faults` loses one datagram in 8. The tests of the faults world send again after a timeout.
-  - A size option keeps two times the value, from 2304 bytes up to the default limit of Linux (425984). `No_delay` gives `EOPNOTSUPP` on a Unix socket and `ENOPROTOOPT` on a UDP socket. An accepted socket gets the options of its listener.
+  - A size option keeps two times the value, from 2304 bytes (4608 for `Send_buffer`) up to the default limit of Linux (425984). The limit depends on the configuration of the kernel, so only the simulator examines it. `No_delay` gives `EOPNOTSUPP` on a Unix socket and `ENOPROTOOPT` on a UDP socket. An accepted socket gets the options of its listener.
 
 ### M3: the tuning
 

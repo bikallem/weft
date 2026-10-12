@@ -636,6 +636,8 @@ let option_sizes () =
       equal int 200_000 (Net.get_option u Recv_buffer) ;
       Net.set_option u Send_buffer 1_000_000 ;
       equal int 425984 (Net.get_option u Send_buffer) ;
+      Net.set_option u Send_buffer 1 ;
+      equal int 4608 (Net.get_option u Send_buffer) ;
       equal string "ENOPROTOOPT"
         (Portable.error_of (fun () -> Net.set_option u No_delay true)) ;
       let l = Net.listen (Net.Unix "/s") in

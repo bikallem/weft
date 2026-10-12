@@ -655,7 +655,9 @@ let copy_opts o =
   ; rcvbuf= o.rcvbuf
   ; sndbuf= o.sndbuf }
 
-let size v = Int.max 2304 (Int.min (2 * v) 425984)
+(* The smallest size: 2304 bytes for a receive buffer, 4608 for a send buffer,
+   as on Linux. *)
+let size ~least v = Int.max least (Int.min (2 * v) 425984)
 
 let set_opt : type a. opts -> a Op.sockopt -> a -> unit =
  fun o opt v ->
@@ -667,9 +669,9 @@ let set_opt : type a. opts -> a Op.sockopt -> a -> unit =
   | Op.Broadcast ->
       o.broadcast <- v
   | Op.Recv_buffer ->
-      o.rcvbuf <- size v
+      o.rcvbuf <- size ~least:2304 v
   | Op.Send_buffer ->
-      o.sndbuf <- size v
+      o.sndbuf <- size ~least:4608 v
 
 let get_opt : type a. opts -> a Op.sockopt -> a =
  fun o opt ->

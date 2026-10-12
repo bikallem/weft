@@ -162,7 +162,10 @@ let recvfrom fd buf off len =
     retry ~write:false fd "Net.recvfrom" (fun os ->
         Op.Recvfrom (os, buf, off, len) )
   in
-  (after_read fd n, (host, port))
+  (* An empty datagram counts as one byte: a reader of empty datagrams also
+     yields. *)
+  ignore (after_read fd (Int.max n 1)) ;
+  (n, (host, port))
 
 (* Socket options. *)
 type 'a sockopt = 'a Op.sockopt =

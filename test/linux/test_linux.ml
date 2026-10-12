@@ -405,6 +405,8 @@ let option_sizes () =
       equal int 2304 (Net.get_option u Recv_buffer) ;
       Net.set_option u Recv_buffer 100_000 ;
       equal int 200_000 (Net.get_option u Recv_buffer) ;
+      Net.set_option u Send_buffer 1 ;
+      equal int 4608 (Net.get_option u Send_buffer) ;
       Net.close u )
 
 (* A pool that cannot start a thread completes its jobs with EAGAIN. A detach
