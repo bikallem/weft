@@ -35,11 +35,13 @@ let elapsed_ns f =
       Int64.to_int (Span.to_ns (Time.diff Mono (Time.now Mono) t0)) )
 
 (* Without load, a sleep ends between the deadline and the deadline plus 2 ms
-   (the slack of 100 us included). A CI machine is shared, so there the upper
-   limit is 50 ms. A sleep never ends before its deadline. *)
+   (the slack of 100 us included). A CI runner is shared, and the load can stop
+   the process: on macOS, a sleep took 89.6 ms. Thus on CI the upper limit is
+   500 ms, as in the kqueue world. It finds a timer that does not fire, not a
+   small delay. A sleep never ends before its deadline. *)
 let sleep_10ms () =
   let limit =
-    if Sys.getenv_opt "CI" = Some "true" then 50_000_000 else 12_000_000
+    if Sys.getenv_opt "CI" = Some "true" then 500_000_000 else 12_000_000
   in
   for _ = 1 to 20 do
     let ns = elapsed_ns (fun () -> Time.sleep Mono (Span.ms 10)) in
