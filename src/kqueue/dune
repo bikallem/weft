@@ -1,0 +1,17 @@
+; The kqueue world: macOS and FreeBSD (design section 2.7). Its own stubs and
+; those of weft.posix do each OS call, so it does not link unix.
+
+(library
+ (name weft_kqueue)
+ (public_name weft.kqueue)
+ (enabled_if
+  (or
+   (= %{system} macosx)
+   (= %{system} freebsd)))
+ (libraries weft weft.posix)
+ (foreign_stubs
+  (language c)
+  (flags
+   (:standard -O2 -Wall -Wextra -Wno-unused-parameter))
+  (names weft_kqueue_stubs))
+ (c_library_flags -lpthread))

@@ -1,0 +1,19 @@
+; The tests of the kqueue world, on macOS and FreeBSD. An executable and a
+; rule, as in test/linux.
+
+(executable
+ (name test_kqueue)
+ (enabled_if
+  (or
+   (= %{system} macosx)
+   (= %{system} freebsd)))
+ (libraries weft weft.kqueue windtrap portable unix))
+
+(rule
+ (alias runtest)
+ (enabled_if
+  (or
+   (= %{system} macosx)
+   (= %{system} freebsd)))
+ (action
+  (run %{exe:test_kqueue.exe})))
