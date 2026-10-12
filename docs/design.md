@@ -421,6 +421,16 @@ module Fiber : sig
   val cancel : scope -> exn -> unit
   val yield : unit -> unit
 
+  module Id : sig                        (* issue 9 *)
+    type t
+    val equal : t -> t -> bool
+    val hash : t -> int
+    val to_int : t -> int
+  end
+  val self : unit -> Id.t
+  (** The id of the fiber that calls it. Section "The id of a fiber"
+      that follows gives the details. *)
+
   val shield : (unit -> 'a) -> 'a
   (** In [f], a [sync] does not see the cancel of the outer scopes. *)
 
@@ -564,6 +574,41 @@ All three scenarios pass. Five planted bugs each give a failure: a join that a c
 
 **In the simulator.** The scope cancels its members in the fork order, so the seed sets the full result. After a scope ends, the simulator examines its state. It must find no fibers of that scope, and no live offers or heap entries. An offer or an entry is live if its sync word is not `Done`. Stale entries can stay until their owner drops them.
 
+### The id of a fiber (issue 9)
+
+Each fiber has an id. `Fiber.self ()` gives the id of the fiber that calls it, and `Fiber.Id.equal` compares two ids. weft has no fiber-local storage. The text that follows gives the reasons.
+
+**Why caravan needs an id.** In the caravan client, the producer of a request body runs in a writer fiber. Suppose that the producer uses its own response. Then the release of the connection waits for the end of the writer, and this wait never ends. With affect, caravan finds this case with `Fun.Async.Call.current` and `Fun.Async.Call.equal`, and it raises `Invalid_argument`. With weft, the writer keeps `Fiber.self ()` in its job. The release compares this id with `Fiber.self ()` of its caller.
+
+**The scheduler cannot find this case.** The simulator finds it only when all fibers block, as `Deadlock`. On Linux, the other connections continue, so nothing finds it. The release waits for a value that the writer gives at its end, for example an `Ivar`. Any fiber can fill an `Ivar`, so the scheduler does not know which fiber a wait depends on. A check for all events needs a graph of the waits, with a cost at each `sync`. The scheduler can find one case: a fiber that awaits a promise and is in the scope of that promise. But a daemon of that scope does not wait forever, because the scope cancels it when the other members end. Also, the wait of caravan is not on a promise. Thus weft does not add this check.
+
+**The designs in caravan with no new API.** We examined two designs:
+
+- A flag in the job that tells that the producer runs. This is not sufficient. Another fiber can call the release while the producer runs, and the wait of that fiber is correct.
+- A handler of the scope (section "Effect handlers of a scope" that follows). caravan runs the body in `Fiber.scope ~handler`, and the handler answers an effect of caravan with the job of the writer. This finds also a fiber of a nested scope of the producer, which waits forever too, because the scope of the producer waits for it. But each effect of the producer then goes through one more handler, at 3 to 5 ns each. A call from a fiber that is not the writer gets `Effect.Unhandled`, an exception. The code is also not clear.
+
+Thus weft adds the id. It is small, and it has the semantics of affect.
+
+**What a fiber is.** Each fiber that the scheduler runs has one id: `main`, and each fiber of `fork`, `fork_daemon`, `fork_isolated` and `fork_promise`, also a pinned fiber. The body of `Fiber.scope`, `shield` and `with_timeout` runs in the fiber of the caller, so it has the id of the caller. The handler of a scope also runs in the fiber. A job of the pool, a finaliser and a signal handler are not fibers, so `self` raises `Not_in_fiber` there.
+
+**The id is the number of the fiber record.** The record holds the id, and the record goes with the fiber at each steal. Thus the id never changes when the fiber moves to a different domain. All nodes of one run share one atomic counter, and each new fiber takes the next value with `fetch_and_add`. `main` has 0. In the simulator, the seed sets the order of the forks, so a seed gives the same ids, also after other runs in the same process. Before issue 9, one global counter gave the numbers, and they depended on the tests that ran before. Thus:
+
+- The ids of two runs can be equal.
+- `Id.t` is an `int`, not the fiber record. A kept id thus does not keep the scopes and the continuation of the fiber alive.
+- `Id.to_int` is for logs. The simulator names a fiber with no name `fiber-n`, with the same number, so a log and a `Deadlock` report agree.
+- `Id` has `equal` and `hash`, so `Hashtbl.Make (Fiber.Id)` gives a table of fibers.
+- `self` costs one effect. A fork costs the same `fetch_and_add` as before.
+
+**Fiber-local storage, not at this time.** Other libraries have these forms:
+
+- OCaml's `Domain.DLS` has one value for each domain. A fiber moves between domains, and in the simulator all virtual domains share one DLS (section "How a fiber finds its domain" that follows). Thus DLS cannot hold a value of a fiber.
+- Eio has `Fiber.create_key`, `Fiber.get` and `Fiber.with_binding`. The context of a fiber holds an `Hmap`, and a fork copies the map of the parent, so the child fibers inherit the bindings (`lib_eio/core/fiber.ml`).
+- Lwt has `Lwt.new_key`, `Lwt.get` and `Lwt.with_value`. The value goes with the callbacks that the code registers in `with_value`.
+
+caravan needs only the id. The other use is a request id in logs and traces. In weft, the code gives it as an argument, or it uses a handler of the scope with an effect of the user. Each fiber of the scope and of its nested scopes runs in that handler, so this is the inheritance of Eio for the fibers of a scope. A fiber that the code forks into an outer scope does not get it. A `Fiber.Local` adds decisions that no user needs at this time: if a fork copies the values, the cost of this copy at each fork, and the restore of `with_value` when the function raises. The id does not block a later `Fiber.Local`. Its values can be a field of the fiber record, next to the id, and `fork` can copy them from the fiber of the caller.
+
+**The tests.** The portable tests (simulator with 200 seeds on 4 virtual domains, Linux on 1 and 4 domains, kqueue) examine the ids of each type of fiber, a body that has the id of its caller, the check of caravan, and `Not_in_fiber`. In the simulator, a seed gives the same ids in two runs on 4 domains, and the order of the ids changes with the seed. A fiber keeps its id when a different domain runs it. A planted global counter gives failures in these tests.
+
 ### Exceptions
 
 **The backtrace.** An exception goes from a child fiber to the fiber that called `Fiber.scope`, which has a different stack. Thus:
@@ -624,6 +669,7 @@ A user can have their own effects, for example a counter or a logger. A handler 
 | Stealing | Full. A fiber that ran can move to another domain. | The same (decision 7) |
 | User effect handlers | `Call_handler`, composed for descendants | `Fiber.scope ~handler`, composed for nested scopes |
 | Priorities | Hints. `Fun.Async.main` ignores them at this time. | None in the first version |
+| The identity of a call | `Fun.Async.Call.current` and `Fun.Async.Call.equal` | `Fiber.self` and `Fiber.Id.equal` (issue 9) |
 
 ### The state of each domain
 
@@ -1246,7 +1292,7 @@ The cost of an effect is a perform and a handler call for each world operation. 
 
 ## 2.12 Decisions
 
-Decisions 1 to 6 were made on 2026-10-09, decisions 7 to 9 on 2026-10-10, decisions 10 and 11 on 2026-10-12 (issue 1), decision 12 on 2026-10-12 (issue 2), decisions 13 and 14 on 2026-10-12 (issue 3), decisions 15 to 17 on 2026-10-12 (issue 4), decisions 18 to 20 on 2026-10-12 (issue 5), decisions 21 to 25 on 2026-10-13 (issue 6), decision 26 on 2026-10-13 (issue 7), and decisions 27 to 29 on 2026-10-13 (issue 8).
+Decisions 1 to 6 were made on 2026-10-09, decisions 7 to 9 on 2026-10-10, decisions 10 and 11 on 2026-10-12 (issue 1), decision 12 on 2026-10-12 (issue 2), decisions 13 and 14 on 2026-10-12 (issue 3), decisions 15 to 17 on 2026-10-12 (issue 4), decisions 18 to 20 on 2026-10-12 (issue 5), decisions 21 to 25 on 2026-10-13 (issue 6), decision 26 on 2026-10-13 (issue 7), decisions 27 to 29 on 2026-10-13 (issue 8), and decisions 30 to 32 on 2026-10-13 (issue 9).
 
 | No. | Question | Decision |
 |---|---|---|
@@ -1279,6 +1325,9 @@ Decisions 1 to 6 were made on 2026-10-09, decisions 7 to 9 on 2026-10-10, decisi
 | 27 | Threads in the simulator | None. `Sim.run` starts no OS domain and no OS thread (section 2.8, The fork rule). A tool for mutation tests forks after a run, and OCaml 5 refuses a fork after a `Domain.spawn`. A pool of threads for the jobs also gives completions in an order that the seed does not control. `test/sim_fork` makes sure of the rule. |
 | 28 | The place of a socket pair | `Sim.socket_pair`, only in the simulator (section 2.8, A socket pair). `socketpair(2)` gives Unix sockets. Thus a core function gives TCP in the simulator and Unix in production, or Unix sockets in the two, with no TCP behavior for the tests. A TCP pair on loopback needs a listener, and another process can connect to it first. Portable code can make it with `listen`, `connect` and `accept`. |
 | 29 | A fault of one connection | `Sim.fault s e` breaks the connection (section 2.8, A fault of one connection). The next read or write gets `e` one time, then `s` has the end of the stream. A `Reset` also goes to the peer. An error that comes one time and keeps the connection open gives states that the OS never gives, for example a write that succeeds after `EPIPE`. A fault for one direction only adds a parameter, but the error of a socket on Linux goes to the first read or write. An error until the close is also not the behavior of Linux. |
+| 30 | A check for a fiber that waits for itself | `Fiber.self` and `Fiber.Id`, with `equal`, `hash` and `to_int` (section 2.5, The id of a fiber). The scheduler cannot find the wait of caravan: it waits for an `Ivar`, and any fiber can fill an `Ivar`. A handler of the scope with an effect of caravan needs no new API. But each effect of the producer then goes through that handler, and a call from another fiber gets an exception. |
+| 31 | The numbers of the ids | One counter for each run, which all nodes of the run share. Thus a seed gives the same ids in the simulator, also after other runs. The id is an `int`, not the fiber record, so a kept id does not keep the scopes of the fiber alive. The ids of two runs can be equal. |
+| 32 | Fiber-local storage | Not at this time. caravan needs only the id. A request id for logs can go in an argument or in a handler of the scope. A fork that copies the values costs time at each fork, and no user needs it at this time. A later `Fiber.Local` can be a field of the fiber record, next to the id, so the id does not block it. |
 
 Also on 2026-10-10, the user accepted the milestone plan of section 2.14. Decisions 4, 7 and 8 stay, and they come in milestone M1. Milestone M0 has one domain.
 

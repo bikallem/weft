@@ -335,7 +335,7 @@ let pinned_wake seed =
 (* The check of the queues at quiescence sees a fiber in a next slot. *)
 let lost_next () =
   let t = S.create ~domains:1 () in
-  let f = S.new_fiber [] in
+  let f = S.new_fiber [S.new_node (S.Scope_node (S.new_scope_state ()))] in
   S.push_next t.S.doms.(0) f (fun () -> S.Finished) ;
   is_true
     (List.mem "the queue of domain 0 is not empty"

@@ -2023,6 +2023,78 @@ let pipes w =
               Pipe.close r ;
               Pipe.close wr ) ) ]
 
+(* The ids of fibers (design section 2.5, The id of a fiber). *)
+module Ids = Hashtbl.Make (Fiber.Id)
+
+let same a b = Fiber.Id.equal a b
+
+let fiber_ids w =
+  group "fiber ids"
+    [ test "each fork gives a new id, and a body has the id of its caller"
+        (fun () ->
+          w.run (fun () ->
+              let main = Fiber.self () in
+              equal int 0 (Fiber.Id.to_int main) ;
+              is_true (same main (Fiber.scope (fun _ -> Fiber.self ()))) ;
+              is_true (same main (Fiber.shield Fiber.self)) ;
+              is_true
+                (same main (Fiber.with_timeout Mono (Span.s 10) Fiber.self)) ;
+              let ids = Ids.create 16 in
+              Ids.replace ids main () ;
+              Fiber.scope (fun s ->
+                  let ps =
+                    List.init 10 (fun _ ->
+                        Fiber.fork_promise s (fun () -> Fiber.self ()) )
+                  in
+                  List.iter (fun p -> Ids.replace ids (Promise.await p) ()) ps ;
+                  let pinned = Atomic.make None and daemon = Atomic.make None in
+                  Fiber.fork ~pinned:true s (fun () ->
+                      Atomic.set pinned (Some (Fiber.self ())) ) ;
+                  Fiber.fork_daemon s (fun () ->
+                      Atomic.set daemon (Some (Fiber.self ())) ) ;
+                  Time.sleep Mono (Span.ms 1) ;
+                  List.iter
+                    (fun a -> Ids.replace ids (Option.get (Atomic.get a)) ())
+                    [pinned; daemon] ) ;
+              (* main, 10 promises, the pinned fiber and the daemon *)
+              equal int 13 (Ids.length ids) ) )
+    ; test "a fiber keeps its id when it moves to another domain" (fun () ->
+          (* A move is not sure on a machine with few CPUs, so the test of the
+             simulator makes sure of it. *)
+          for _ = 1 to 10 do
+            w.run (fun () ->
+                Fiber.scope (fun s ->
+                    for _ = 1 to 20 do
+                      Fiber.fork s (fun () ->
+                          let id = Fiber.self () in
+                          for _ = 1 to 30 do
+                            Fiber.yield () ;
+                            is_true (same id (Fiber.self ()))
+                          done )
+                    done ) )
+          done )
+    ; test "a writer refuses a wait for its own end" (fun () ->
+          (* The check of caravan: the producer of a request body runs in the
+             writer fiber, and the release waits for the end of the writer. *)
+          w.run (fun () ->
+              let writer = Atomic.make None and ended = Ivar.create () in
+              let release () =
+                match Atomic.get writer with
+                | Some id when same id (Fiber.self ()) ->
+                    invalid_arg "own end"
+                | _ ->
+                    sync (Ivar.read ended)
+              in
+              Fiber.scope (fun s ->
+                  Fiber.fork s (fun () ->
+                      Atomic.set writer (Some (Fiber.self ())) ;
+                      raises (Invalid_argument "own end") release ;
+                      Ivar.fill ended () ) ;
+                  release () ) ) )
+    ; test "self outside a fiber raises Not_in_fiber" (fun () ->
+          raises (Fiber.Not_in_fiber "Fiber.self") (fun () ->
+              ignore (Fiber.self ()) ) ) ]
+
 let tests w =
   [ group w.name
       ( [ events w
@@ -2036,6 +2108,7 @@ let tests w =
         ; layers w
         ; semaphores w
         ; vars w
+        ; fiber_ids w
         ; files w
         ; pipes w ]
       @ many w ) ]

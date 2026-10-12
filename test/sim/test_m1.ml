@@ -111,6 +111,59 @@ let replay () =
   is_true (first = again) ;
   greater int ~than:1 (List.length (List.sort_uniq compare first))
 
+(* The ids of the fibers of a run. Each of 6 fibers forks 3 fibers on the domain
+   that runs it, so the order of these forks comes from the seed. *)
+let id_trace seed =
+  let log = ref [] in
+  Sim.run ~seed ~domains:4 (fun _ ->
+      Fiber.scope (fun s ->
+          for i = 1 to 6 do
+            Fiber.fork s (fun () ->
+                let parent = Fiber.Id.to_int (Fiber.self ()) in
+                Fiber.yield () ;
+                Fiber.scope (fun s ->
+                    for j = 1 to 3 do
+                      Fiber.fork s (fun () ->
+                          let id = Fiber.Id.to_int (Fiber.self ()) in
+                          log := (i, j, parent, id, dom ()) :: !log )
+                    done ) )
+          done ) ) ;
+  !log
+
+(* A fiber keeps its id on each domain that runs it. It gives [true] if a fiber
+   moved. *)
+let id_moves seed =
+  let moved = ref false in
+  Sim.run ~seed ~domains:4 (fun _ ->
+      Fiber.scope (fun s ->
+          for _ = 1 to 20 do
+            Fiber.fork s (fun () ->
+                let id = Fiber.self () and d = dom () in
+                for _ = 1 to 20 do
+                  Fiber.yield () ;
+                  is_true (Fiber.Id.equal id (Fiber.self ())) ;
+                  if dom () <> d then moved := true
+                done )
+          done ) ) ;
+  !moved
+
+(* A seed gives the same ids when it runs again, also after other runs. The ids
+   of a run are 0 (main) to 24, and the seed sets their order. *)
+let id_replay () =
+  let first = List.init 20 (fun s -> id_trace (s + 1)) in
+  let again = List.init 20 (fun s -> id_trace (s + 1)) in
+  is_true (first = again) ;
+  List.iter
+    (fun log ->
+      let ids = List.sort compare (List.map (fun (_, _, _, id, _) -> id) log) in
+      equal (list int) (List.init 18 (fun k -> k + 7)) ids ;
+      is_true (List.for_all (fun (i, _, parent, _, _) -> parent = i) log) )
+    first ;
+  greater int ~than:1
+    (List.length
+       (List.sort_uniq compare
+          (List.map (List.map (fun (i, j, _, id, _) -> (i, j, id))) first) ) )
+
 (* The protocol of with_nack (design section 2.4): a client sends a request with
    its nack, and it waits for the reply or a timeout. The server waits to send
    the reply or for the nack. Each request that timed out gives the server its
@@ -203,6 +256,10 @@ let tests =
   [ group "many domains"
       [ test "a stolen fiber uses the state of the thief" thief_uses_its_state
       ; test "a seed gives the same order of events" replay
+      ; test "a seed gives the same fiber ids on 4 domains" id_replay
+      ; test "a fiber keeps its id on each domain, with 50 seeds" (fun () ->
+            let moves = List.init 50 (fun s -> id_moves (s + 1)) in
+            is_true (List.mem true moves) )
       ; test "the counters of the measurements count" counters
       ; test "the server gets the nack of each client that left" (fun () ->
             seeds 200 nack_server )

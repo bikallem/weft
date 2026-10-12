@@ -22,6 +22,9 @@ val semaphores : world -> Windtrap.test
 val vars : world -> Windtrap.test
 (** The tests of [Var] (issue 5), also in [tests]. *)
 
+val fiber_ids : world -> Windtrap.test
+(** The tests of [Fiber.self] and [Fiber.Id] (issue 9), also in [tests]. *)
+
 val files : world -> Windtrap.test
 (** The tests of [File] and [Dir] (milestone M2), also in [tests]. *)
 

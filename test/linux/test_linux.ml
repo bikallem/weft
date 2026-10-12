@@ -862,4 +862,12 @@ let linux =
 let () =
   exit
     (Windtrap.run "linux"
-       (Portable.tests world @ [Portable.reset_details world; linux]) )
+       ( Portable.tests world
+       @ [ Portable.reset_details world
+         ; group "linux on 4 domains"
+             [ Portable.fiber_ids
+                 { world with
+                   name= "linux on 4 domains"
+                 ; domains= 4
+                 ; run= (fun f -> Weft_linux.run ~domains:4 f) } ]
+         ; linux ] ) )
