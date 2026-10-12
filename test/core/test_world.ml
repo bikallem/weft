@@ -340,7 +340,7 @@ let utc_known () =
   check_utc 1_791_828_000 (2026, 10, 12, 18, 0, 0, 1) ;
   check_utc 1_000_000_000 (2001, 9, 9, 1, 46, 40, 0) ;
   check_utc (-86400) (1969, 12, 31, 0, 0, 0, 3) ;
-  (* The two ends of [Clock.posix]. *)
+  (* The first and the last whole second of [Clock.posix]. *)
   check_utc 9_223_372_036 (2262, 4, 11, 23, 47, 16, 5) ;
   check_utc (-9_223_372_036) (1677, 9, 21, 0, 12, 44, 2)
 
@@ -350,7 +350,13 @@ let utc_fraction () =
   equal int 0 (at 999_999_999L).second ;
   equal int 59 (at (-1L)).second ;
   equal int 1969 (at (-1L)).year ;
-  equal int 58 (at (-1_000_000_001L)).second
+  equal int 58 (at (-1_000_000_001L)).second ;
+  (* The smallest [Clock.posix] is in the second 00:12:43, which [of_utc]
+     rejects. *)
+  let lo = at Int64.min_int in
+  is_true (lo = utc (1677, 9, 21, 0, 12, 43, 2)) ;
+  is_true (Time.of_utc lo = None) ;
+  is_true (at Int64.max_int = utc (2262, 4, 11, 23, 47, 16, 5))
 
 (* The first day of each month, in a leap year and in a common year. *)
 let utc_months () =

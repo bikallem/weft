@@ -152,6 +152,8 @@ type net =
   ; mutable next_fd: int
   ; names: (string, int) Hashtbl.t  (** The listeners, by address. *)
   ; udp_names: (string, int) Hashtbl.t  (** The UDP sockets, by address. *)
+  ; client_ports: (int, int) Hashtbl.t
+        (** The ports of the TCP clients that are not closed, with their fds. *)
   ; opts: (int, opts) Hashtbl.t
         (** The options of each socket, after its first [Set_option] or
             [Get_option]. *)
@@ -444,7 +446,10 @@ let perform : type a. t -> a Op.blocking -> (raw, Op.error) result option =
   | Op.Mkdir (path, perm) ->
       unit (Sim_fs.mkdir fs path perm ~now)
   | Op.Readdir path ->
-      Some (Result.map (fun l -> R_names l) (Sim_fs.readdir fs path))
+      (* opendir uses an fd. *)
+      Some
+        (let* () = room n 1 in
+         Result.map (fun l -> R_names l) (Sim_fs.readdir fs path) )
   | Op.Rename (src, dst) ->
       unit (Sim_fs.rename fs src dst)
   | Op.Unlink path ->
@@ -929,25 +934,28 @@ let spawn t (sp : Op.spawn) =
         ; from_stdout= fd from_stdout
         ; from_stderr= fd from_stderr }
 
-(* A signal to the program itself (design section 2.8, Signals). Domain 0 gets a
-   watched signal at its next [Wait]. Each other signal gets the default action,
-   and the world ignores SIGPIPE. Only these signals do not end the process: the
-   simulator has no stop of a process. *)
+(* The signals with a default action that does not end the process: a stop, a
+   continue or an ignore. 21, 22 and 23 are SIGTTIN, SIGTTOU and SIGURG on
+   Linux. The simulator has no stop of a process. The signal 0 only tells that
+   the process exists. *)
+let no_end = function
+  | Op.SIGSTOP
+  | SIGTSTP
+  | SIGCONT
+  | SIGCHLD
+  | SIGWINCH
+  | Other_signal (0 | 21 | 22 | 23) ->
+      true
+  | _ ->
+      false
+
+(* A signal to the program itself (design section 2.7, The end of a watch).
+   Domain 0 gets a watched signal at its next [Wait]. Each other signal gets the
+   default action, and the world ignores SIGPIPE. *)
 let send_self t sg =
   if List.mem sg t.watched then
     t.net.edges <- (0, World.Ready.Signal (sg, 1)) :: t.net.edges
-  else
-    match sg with
-    | Op.SIGPIPE
-    | SIGCHLD
-    | SIGWINCH
-    | SIGCONT
-    | SIGSTOP
-    | SIGTSTP
-    | Other_signal 0 ->
-        ()
-    | _ ->
-        t.killed <- Some sg
+  else if not (sg = Op.SIGPIPE || no_end sg) then t.killed <- Some sg
 
 let submit : type a. t -> a Op.t -> (a, Op.error) result =
  fun t op ->
@@ -1001,12 +1009,18 @@ let submit : type a. t -> a Op.t -> (a, Op.error) result =
           refused ()
       | Some lfd -> (
         match Hashtbl.find_opt n.fds lfd with
+        | Some (Lsn {ltcp= true; _})
+          when Hashtbl.length n.client_ports > 65535 - 40000 ->
+            (* Each port of the counter has an open client, as Linux gives
+               EADDRNOTAVAIL when it has no free port. *)
+            Error (Op.Other "EADDRNOTAVAIL")
         | Some (Lsn l) when Queue.length l.backlog + l.pending < l.limit ->
             l.pending <- l.pending + 1 ;
-            (* The client has the host "client" and a port from the counter. A
-               Unix client has no path. *)
+            (* The client has the host "client" and a port from the counter that
+               no open client has. A Unix client has no path. *)
             let client =
-              if l.ltcp then Op.Tcp ("client", fresh_port n (fun _ -> false))
+              if l.ltcp then
+                Op.Tcp ("client", fresh_port n (Hashtbl.mem n.client_ports))
               else Op.Unix ""
             in
             let c = new_sock ~tcp:l.ltcp ~local:client addr
@@ -1016,6 +1030,11 @@ let submit : type a. t -> a Op.t -> (a, Op.error) result =
             s.established <- true ;
             c.cfd <- new_fd n ;
             Hashtbl.replace n.fds c.cfd (Conn c) ;
+            ( match client with
+            | Op.Tcp (_, p) ->
+                Hashtbl.replace n.client_ports p c.cfd
+            | Op.Unix _ ->
+                () ) ;
             later t (fun () ->
                 l.pending <- l.pending - 1 ;
                 match Hashtbl.find_opt n.fds lfd with
@@ -1091,11 +1110,7 @@ let submit : type a. t -> a Op.t -> (a, Op.error) result =
         else port
       in
       let k = key port in
-      if
-        (port < 0) [@mutate off "the port 0 got a free port before this check"]
-        || port > 65535
-      then Error (Op.Other "EINVAL")
-      else if Hashtbl.mem n.udp_names k then Error Op.In_use
+      if Hashtbl.mem n.udp_names k then Error Op.In_use
       else
         let fd = new_fd n in
         Hashtbl.replace n.fds fd
@@ -1155,11 +1170,7 @@ let submit : type a. t -> a Op.t -> (a, Op.error) result =
         ( match (p.status, sg) with
         | Some _, _ ->
             ()
-        | None, (Op.SIGSTOP | SIGTSTP | SIGCONT | SIGCHLD | SIGWINCH) ->
-            (* The default action of these signals does not end the process, and
-               signal 0 only tells that the process exists. *)
-            ()
-        | None, Op.Other_signal 0 ->
+        | None, _ when no_end sg ->
             ()
         | None, _ when sg <> Op.SIGKILL && List.mem sg p.prog.ignores ->
             ()
@@ -1235,6 +1246,12 @@ let submit : type a. t -> a Op.t -> (a, Op.error) result =
           Hashtbl.remove n.opts fd ;
           ( match sfd with
           | Conn c ->
+              ( match c.local with
+              | Op.Tcp (_, p) when Hashtbl.find_opt n.client_ports p = Some fd
+                ->
+                  Hashtbl.remove n.client_ports p
+              | Op.Tcp _ | Op.Unix _ ->
+                  () ) ;
               (* Linux also sends a reset at the close of a TCP or Unix stream
                  socket with unread data. *)
               if c.abort || (c.role = Sock && avail c > 0) then reset_conn t c
@@ -1620,6 +1637,7 @@ let run ?(seed = 0) ?(domains = 1) ?(auto = true) ?(signals = [])
         ; next_fd= 3
         ; names= Hashtbl.create ~random:false 8
         ; udp_names= Hashtbl.create ~random:false 8
+        ; client_ports= Hashtbl.create ~random:false 8
         ; opts= Hashtbl.create ~random:false 8
         ; regs= Hashtbl.create ~random:false 16
         ; edges= []

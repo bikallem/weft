@@ -18,11 +18,14 @@
 (*   - The waiter does Syncs syncs of received. Under the lock, it takes  *)
 (*     the count, or it waits. After the mark, its sync raises.           *)
 (*   - The unwatch. The world stops the watch first. Linux: the signalfd  *)
-(*     stops to take the signal, then the thread unblocks it, and the     *)
-(*     kernel gives the pending signals their action. kqueue: the old     *)
-(*     action comes back, then the world takes the count and sends it     *)
+(*     does not take the signal any more, then the thread unblocks it,    *)
+(*     and the kernel gives the pending signals their action. kqueue: the *)
+(*     old action comes back, then the world takes the count and sends it *)
 (*     again. Then the scheduler marks the signal under the lock, takes   *)
 (*     the count, and the waiter raises. The count goes to Op.Resend.     *)
+(*   - Linux: the thread of the unwatch can end before domain 0. Then no  *)
+(*     thread unblocks the signal, until domain 0 unblocks it in its own  *)
+(*     thread at its next wait.                                            *)
 (*                                                                         *)
 (* The property: each signal goes to a fiber or gets its action, exactly  *)
 (* one time, and no signal gets its action before the unwatch starts.     *)
@@ -37,7 +40,8 @@ CONSTANTS
   BugNoCountTake,    \* the mark leaves the count of the scheduler
   BugWaiterStays,    \* the mark does not commit the waiter
   BugLeafNoCheck,    \* a sync after the mark waits, as before the unwatch
-  BugTakeWatched     \* kqueue: domain 0 takes only the watched signals
+  BugTakeWatched,    \* kqueue: domain 0 takes only the watched signals
+  BugNoMainUnblock   \* Linux: domain 0 does not unblock the signal
 
 Sends == 2
 Syncs == 2
@@ -46,6 +50,7 @@ Snd == 1
 Dom == 2
 Wtr == 3
 Unw == 4
+Thr == 5
 
 (* --algorithm Signal {
 variables
@@ -60,7 +65,9 @@ variables
   lock = 0,           \* the lock of the signals of the scheduler
   waiting = FALSE,    \* the waiter is in the list of the waiters
   wres = "none",      \* what the sync of the waiter got
-  started = FALSE;    \* the unwatch started
+  started = FALSE,    \* the unwatch started
+  mainReq = FALSE,    \* Linux: domain 0 must unblock the signal
+  mainUnblocked = FALSE; \* Linux: the thread of domain 0 unblocked it
 
 \* Op.Resend: a signal to the process itself.
 macro resend(n) {
@@ -98,6 +105,15 @@ r1:
     await ~(BugTakeWatched /\ Scenario = "kqueue" /\ unblocked);
     k := pending;
     pending := 0;
+  } or {
+    \* Linux: at its wait, domain 0 unblocks the signal in its thread.
+    await Scenario = "linux" /\ mainReq /\ ~mainUnblocked;
+    await ~BugNoMainUnblock;
+    mainUnblocked := TRUE;
+    unblocked := TRUE;
+    acted := acted + pending;
+    pending := 0;
+    goto r1;
   } or {
     await pc[Snd] = "Done" /\ pc[Unw] = "Done" /\ pending = 0;
     goto Done;
@@ -161,6 +177,7 @@ u2:
   unblocked := TRUE;
   acted := acted + pending;
   pending := 0;
+  if (Scenario = "linux") { mainReq := TRUE; };
 u3:
   await lock = 0;
   lock := Unw;
@@ -179,16 +196,25 @@ u5:
   resend(c);
   c := 0;
 }
+
+\* Linux: the thread of the unwatch ends, for example with its domain.
+fair process (thr = Thr)
+{
+t1:
+  await pc[Unw] \notin {"u1", "u2"};
+  if (Scenario = "linux" /\ ~mainUnblocked) { unblocked := FALSE; };
+}
 } *)
 
 \* BEGIN TRANSLATION
 VARIABLES sent, acted, taken, pending, fdwatch, unblocked, marked, count, 
-          lock, waiting, wres, started, pc, k, n, c
+          lock, waiting, wres, started, mainReq, mainUnblocked, pc, k, n, c
 
 vars == << sent, acted, taken, pending, fdwatch, unblocked, marked, count, 
-           lock, waiting, wres, started, pc, k, n, c >>
+           lock, waiting, wres, started, mainReq, mainUnblocked, pc, k, n, c
+        >>
 
-ProcSet == {Snd} \cup {Dom} \cup {Wtr} \cup {Unw}
+ProcSet == {Snd} \cup {Dom} \cup {Wtr} \cup {Unw} \cup {Thr}
 
 Init == (* Global variables *)
         /\ sent = 0
@@ -203,6 +229,8 @@ Init == (* Global variables *)
         /\ waiting = FALSE
         /\ wres = "none"
         /\ started = FALSE
+        /\ mainReq = FALSE
+        /\ mainUnblocked = FALSE
         (* Process dom *)
         /\ k = 0
         (* Process wtr *)
@@ -212,7 +240,8 @@ Init == (* Global variables *)
         /\ pc = [self \in ProcSet |-> CASE self = Snd -> "s1"
                                         [] self = Dom -> "r1"
                                         [] self = Wtr -> "w1"
-                                        [] self = Unw -> "u1"]
+                                        [] self = Unw -> "u1"
+                                        [] self = Thr -> "t1"]
 
 s1 == /\ pc[Snd] = "s1"
       /\ IF sent < Sends
@@ -230,13 +259,14 @@ s1 == /\ pc[Snd] = "s1"
             ELSE /\ pc' = [pc EXCEPT ![Snd] = "Done"]
                  /\ UNCHANGED << sent, acted, pending >>
       /\ UNCHANGED << taken, fdwatch, unblocked, marked, count, lock, waiting, 
-                      wres, started, k, n, c >>
+                      wres, started, mainReq, mainUnblocked, k, n, c >>
 
 s2 == /\ pc[Snd] = "s2"
       /\ pending' = pending + 1
       /\ pc' = [pc EXCEPT ![Snd] = "s1"]
       /\ UNCHANGED << sent, acted, taken, fdwatch, unblocked, marked, count, 
-                      lock, waiting, wres, started, k, n, c >>
+                      lock, waiting, wres, started, mainReq, mainUnblocked, k, 
+                      n, c >>
 
 snd == s1 \/ s2
 
@@ -247,18 +277,28 @@ r1 == /\ pc[Dom] = "r1"
             /\ k' = pending
             /\ pending' = 0
             /\ pc' = [pc EXCEPT ![Dom] = "r2"]
+            /\ UNCHANGED <<acted, unblocked, mainUnblocked>>
+         \/ /\ Scenario = "linux" /\ mainReq /\ ~mainUnblocked
+            /\ ~BugNoMainUnblock
+            /\ mainUnblocked' = TRUE
+            /\ unblocked' = TRUE
+            /\ acted' = acted + pending
+            /\ pending' = 0
+            /\ pc' = [pc EXCEPT ![Dom] = "r1"]
+            /\ k' = k
          \/ /\ pc[Snd] = "Done" /\ pc[Unw] = "Done" /\ pending = 0
             /\ pc' = [pc EXCEPT ![Dom] = "Done"]
-            /\ UNCHANGED <<pending, k>>
-      /\ UNCHANGED << sent, acted, taken, fdwatch, unblocked, marked, count, 
-                      lock, waiting, wres, started, n, c >>
+            /\ UNCHANGED <<acted, pending, unblocked, mainUnblocked, k>>
+      /\ UNCHANGED << sent, taken, fdwatch, marked, count, lock, waiting, wres, 
+                      started, mainReq, n, c >>
 
 r2 == /\ pc[Dom] = "r2"
       /\ lock = 0
       /\ lock' = Dom
       /\ pc' = [pc EXCEPT ![Dom] = "r3"]
       /\ UNCHANGED << sent, acted, taken, pending, fdwatch, unblocked, marked, 
-                      count, waiting, wres, started, k, n, c >>
+                      count, waiting, wres, started, mainReq, mainUnblocked, k, 
+                      n, c >>
 
 r3 == /\ pc[Dom] = "r3"
       /\ IF marked
@@ -282,7 +322,8 @@ r3 == /\ pc[Dom] = "r3"
       /\ k' = 0
       /\ lock' = 0
       /\ pc' = [pc EXCEPT ![Dom] = "r1"]
-      /\ UNCHANGED << sent, fdwatch, unblocked, marked, started, n, c >>
+      /\ UNCHANGED << sent, fdwatch, unblocked, marked, started, mainReq, 
+                      mainUnblocked, n, c >>
 
 dom == r1 \/ r2 \/ r3
 
@@ -294,14 +335,16 @@ w1 == /\ pc[Wtr] = "w1"
             ELSE /\ pc' = [pc EXCEPT ![Wtr] = "Done"]
                  /\ UNCHANGED << wres, n >>
       /\ UNCHANGED << sent, acted, taken, pending, fdwatch, unblocked, marked, 
-                      count, lock, waiting, started, k, c >>
+                      count, lock, waiting, started, mainReq, mainUnblocked, k, 
+                      c >>
 
 w2 == /\ pc[Wtr] = "w2"
       /\ lock = 0
       /\ lock' = Wtr
       /\ pc' = [pc EXCEPT ![Wtr] = "w3"]
       /\ UNCHANGED << sent, acted, taken, pending, fdwatch, unblocked, marked, 
-                      count, waiting, wres, started, k, n, c >>
+                      count, waiting, wres, started, mainReq, mainUnblocked, k, 
+                      n, c >>
 
 w3 == /\ pc[Wtr] = "w3"
       /\ IF marked /\ ~BugLeafNoCheck
@@ -317,13 +360,14 @@ w3 == /\ pc[Wtr] = "w3"
       /\ lock' = 0
       /\ pc' = [pc EXCEPT ![Wtr] = "w4"]
       /\ UNCHANGED << sent, acted, pending, fdwatch, unblocked, marked, 
-                      started, k, n, c >>
+                      started, mainReq, mainUnblocked, k, n, c >>
 
 w4 == /\ pc[Wtr] = "w4"
       /\ wres # "none"
       /\ pc' = [pc EXCEPT ![Wtr] = "w1"]
       /\ UNCHANGED << sent, acted, taken, pending, fdwatch, unblocked, marked, 
-                      count, lock, waiting, wres, started, k, n, c >>
+                      count, lock, waiting, wres, started, mainReq, 
+                      mainUnblocked, k, n, c >>
 
 wtr == w1 \/ w2 \/ w3 \/ w4
 
@@ -336,22 +380,27 @@ u1 == /\ pc[Unw] = "u1"
                  /\ UNCHANGED fdwatch
       /\ pc' = [pc EXCEPT ![Unw] = "u2"]
       /\ UNCHANGED << sent, acted, taken, pending, marked, count, lock, 
-                      waiting, wres, k, n, c >>
+                      waiting, wres, mainReq, mainUnblocked, k, n, c >>
 
 u2 == /\ pc[Unw] = "u2"
       /\ unblocked' = TRUE
       /\ acted' = acted + pending
       /\ pending' = 0
+      /\ IF Scenario = "linux"
+            THEN /\ mainReq' = TRUE
+            ELSE /\ TRUE
+                 /\ UNCHANGED mainReq
       /\ pc' = [pc EXCEPT ![Unw] = "u3"]
       /\ UNCHANGED << sent, taken, fdwatch, marked, count, lock, waiting, wres, 
-                      started, k, n, c >>
+                      started, mainUnblocked, k, n, c >>
 
 u3 == /\ pc[Unw] = "u3"
       /\ lock = 0
       /\ lock' = Unw
       /\ pc' = [pc EXCEPT ![Unw] = "u4"]
       /\ UNCHANGED << sent, acted, taken, pending, fdwatch, unblocked, marked, 
-                      count, waiting, wres, started, k, n, c >>
+                      count, waiting, wres, started, mainReq, mainUnblocked, k, 
+                      n, c >>
 
 u4 == /\ pc[Unw] = "u4"
       /\ marked' = TRUE
@@ -368,7 +417,7 @@ u4 == /\ pc[Unw] = "u4"
       /\ lock' = 0
       /\ pc' = [pc EXCEPT ![Unw] = "u5"]
       /\ UNCHANGED << sent, acted, taken, pending, fdwatch, unblocked, started, 
-                      k, n >>
+                      mainReq, mainUnblocked, k, n >>
 
 u5 == /\ pc[Unw] = "u5"
       /\ IF unblocked
@@ -379,15 +428,28 @@ u5 == /\ pc[Unw] = "u5"
       /\ c' = 0
       /\ pc' = [pc EXCEPT ![Unw] = "Done"]
       /\ UNCHANGED << sent, taken, fdwatch, unblocked, marked, count, lock, 
-                      waiting, wres, started, k, n >>
+                      waiting, wres, started, mainReq, mainUnblocked, k, n >>
 
 unw == u1 \/ u2 \/ u3 \/ u4 \/ u5
+
+t1 == /\ pc[Thr] = "t1"
+      /\ pc[Unw] \notin {"u1", "u2"}
+      /\ IF Scenario = "linux" /\ ~mainUnblocked
+            THEN /\ unblocked' = FALSE
+            ELSE /\ TRUE
+                 /\ UNCHANGED unblocked
+      /\ pc' = [pc EXCEPT ![Thr] = "Done"]
+      /\ UNCHANGED << sent, acted, taken, pending, fdwatch, marked, count, 
+                      lock, waiting, wres, started, mainReq, mainUnblocked, k, 
+                      n, c >>
+
+thr == t1
 
 (* Allow infinite stuttering to prevent deadlock on termination. *)
 Terminating == /\ \A self \in ProcSet: pc[self] = "Done"
                /\ UNCHANGED vars
 
-Next == snd \/ dom \/ wtr \/ unw
+Next == snd \/ dom \/ wtr \/ unw \/ thr
            \/ Terminating
 
 Spec == /\ Init /\ [][Next]_vars
@@ -395,6 +457,7 @@ Spec == /\ Init /\ [][Next]_vars
         /\ WF_vars(dom)
         /\ WF_vars(wtr)
         /\ WF_vars(unw)
+        /\ WF_vars(thr)
 
 Termination == <>(\A self \in ProcSet: pc[self] = "Done")
 

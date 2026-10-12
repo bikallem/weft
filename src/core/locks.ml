@@ -202,27 +202,31 @@ end
    short lock of the semaphore makes "take a free permit, else register an
    offer" one atomic step. A release commits the word of the oldest waiter with
    a one-word commit, under the same lock. That commit gives the permit: the
-   waiter gets it if the commit wins, and a waiter that lost its choose or got a
-   cancel has a word that is already [Done], so the permit goes to the next
+   waiter gets it only if the commit wins. A waiter that lost its choose or got
+   a cancel has a word that is already [Done]. Then the permit goes to the next
    waiter. Thus no step leaves a permit with a fiber that does not use it. *)
 module Semaphore = struct
   type t =
     { slock: Spin.t
-    ; initial: int
+    ; max: int  (** The maximum of the free permits. *)
     ; free: int Atomic.t
           (** The free permits. Only a holder of [slock] changes it. It is an
               atomic location only so that dscheck sees each access. *)
     ; waiters: unit Chan.side
           (** The offers of the acquires, the oldest first. When [free] is more
-              than 0, each offer is stale: a release gives a permit to a waiter
-              before it makes the permit free. *) }
+              than 0, the queue is empty: a release gives a permit to a waiter
+              before it makes the permit free, and an acquire adds an offer only
+              when no permit is free. *) }
 
   (* The offers hold no value. *)
   let no_cell : unit option ref = ref None
 
-  let create n =
+  let create ?max n =
+    let max = Option.value max ~default:n in
     if n < 0 then invalid_arg "Fiber.Semaphore.create: the count is negative" ;
-    {slock= Spin.make (); initial= n; free= Atomic.make n; waiters= Chan.side ()}
+    if max < n then
+      invalid_arg "Fiber.Semaphore.create: the maximum is less than the count" ;
+    {slock= Spin.make (); max; free= Atomic.make n; waiters= Chan.side ()}
 
   (* The leaf of [acquire]. A free permit goes to the sync only if the sync
      commits to this branch. *)
@@ -240,36 +244,55 @@ module Semaphore = struct
 
   let acquire t = Event.Base (fun () -> {Event.leaf= leaf t; result= ignore})
 
+  (* When a permit is free, no waiter is in the queue. Thus the try keeps the
+     FIFO order. *)
+  let try_acquire t =
+    Spin.with_lock t.slock (fun () ->
+        let n = Atomic.get t.free in
+        n > 0
+        &&
+        ( Atomic.set t.free (n - 1) ;
+          true ) )
+
   (* Give the permit to the oldest waiter that did not leave, or make it free.
-     The result is the syncs to resume. *)
+     The result is the syncs to resume, or [None] if the free permits are at the
+     maximum. *)
   let give t =
     Spin.with_lock t.slock (fun () ->
         let rec first = function
           | [] ->
-              let n = Atomic.get t.free in
-              if n >= t.initial then
-                invalid_arg
-                  "Fiber.Semaphore.release: the count is at its initial value" ;
-              Atomic.set t.free (n + 1) ;
-              ([], [])
+              None
           | (o : unit Chan.offer) :: rest -> (
             match C.notify o.osync.word o.obranch with
             | C.Resume ->
-                (rest, [o.osync])
+                Some (rest, [o.osync])
             | C.In_scan ->
-                (rest, [])
+                Some (rest, [])
             | C.Lost _ ->
                 first rest )
         in
-        let rest, resumed = first (Chan.offers t.waiters) in
-        Atomic.set t.waiters.front rest ;
-        resumed )
+        match first (Chan.offers t.waiters) with
+        | Some (rest, resumed) ->
+            Atomic.set t.waiters.front rest ;
+            Some resumed
+        | None ->
+            (* Each offer was stale. *)
+            Atomic.set t.waiters.front [] ;
+            let n = Atomic.get t.free in
+            if n >= t.max then None
+            else (
+              Atomic.set t.free (n + 1) ;
+              Some [] ) )
 
   (* [Self] first: outside a fiber, the release raises [Not_in_fiber] before it
      gives the permit to a waiter that nobody would then resume. *)
-  let release t =
+  let try_release t =
     ignore (self ()) ;
-    enqueue (give t)
+    match give t with Some resumed -> enqueue resumed ; true | None -> false
+
+  let release t =
+    if not (try_release t) then
+      invalid_arg "Fiber.Semaphore.release: the free permits are at the maximum"
 
   let use t f =
     Event.sync (acquire t) ;

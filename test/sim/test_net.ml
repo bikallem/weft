@@ -441,6 +441,48 @@ let listen_port_0 () =
         (function Net.Error (Refused, _) -> true | _ -> false)
         (fun () -> ignore (Net.connect (Net.Tcp ("server", 0)))) )
 
+(* After the counter goes around, a client does not get the port of an open
+   client. UDP sockets on port 0 move the counter. The close of a client frees
+   its port. *)
+let client_port_wraps () =
+  Sim.run (fun _ ->
+      let a = Net.Tcp ("server", 65535) in
+      let _l = Net.listen a in
+      let rec around () =
+        let u = Net.udp ("u", 0) in
+        let p = Net.local_addr u in
+        Net.close u ;
+        if p <> Net.Tcp ("u", 65535) then around ()
+      in
+      let c1 = Net.connect a in
+      is_true (Net.local_addr c1 = Net.Tcp ("client", 40000)) ;
+      around () ;
+      let c2 = Net.connect a in
+      is_true (Net.local_addr c2 = Net.Tcp ("client", 40001)) ;
+      Net.close c1 ;
+      around () ;
+      let c3 = Net.connect a in
+      is_true (Net.local_addr c3 = Net.Tcp ("client", 40000)) )
+
+(* When each port of the counter has an open client, a connect gives
+   EADDRNOTAVAIL. The close of a client frees its port again. *)
+let no_free_port () =
+  Sim.run (fun _ ->
+      let a = Net.Tcp ("server", 1) in
+      let _l = Net.listen ~backlog:30_000 a in
+      let clients = List.init (65536 - 40000) (fun _ -> Net.connect a) in
+      raises_match
+        (function
+          | Net.Error (Other "EADDRNOTAVAIL", "Net.connect") ->
+              true
+          | _ ->
+              false )
+        (fun () -> Net.connect a) ;
+      let c = List.nth clients 7 in
+      let p = Net.local_addr c in
+      Net.close c ;
+      is_true (Net.local_addr (Net.connect a) = p) )
+
 (* The bytes that the latency holds count against the buffer of the peer. *)
 let inflight_backpressure () =
   Sim.run (fun sim ->
@@ -870,6 +912,7 @@ let fd_limit_each_op () =
       emfile (fun () -> Net.udp ("a", 1)) ;
       emfile Pipe.create ;
       emfile (fun () -> File.openfile [Read] "/missing") ;
+      emfile (fun () -> Dir.readdir "/") ;
       emfile (fun () -> Process.spawn "missing" []) ;
       (* With one free fd, a pipe and a spawn with a pipe fail. *)
       Sim.set_fd_limit sim (Some (Sim.open_fds sim + 1)) ;
@@ -1297,6 +1340,8 @@ let tests =
       ; test "two clients get different ports" client_ports_differ
       ; test "the simulator selects the same ports in each run" local_ports
       ; test "a listen on port 0 skips the ports in use" listen_port_0
+      ; test "a client skips the port of an open client" client_port_wraps
+      ; test "a connect with no free port gives EADDRNOTAVAIL" no_free_port
       ; test "the bytes in flight count against the buffer"
           inflight_backpressure
       ; test "a Register of a ready fd gives an edge at once" register_ready_fd
