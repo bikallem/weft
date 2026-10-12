@@ -486,3 +486,9 @@ value weft_signal_numbers(value unit) {
   for (int i = 0; i < n; i++) Store_field(r, i, Val_int(numbers[i]));
   CAMLreturn(r);
 }
+
+/* Send a signal to the process itself, not to the calling thread: a thread
+   that does not block it gets it (design section 2.7, The end of a watch). */
+value weft_resend(value sig) {
+  return Val_int(kill(getpid(), Int_val(sig)) < 0 ? ERR : 0);
+}

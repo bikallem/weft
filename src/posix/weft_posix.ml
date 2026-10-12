@@ -57,6 +57,8 @@ external errname : int -> string = "weft_errname"
 
 external signal_numbers : unit -> int array = "weft_signal_numbers"
 
+external resend : int -> int = "weft_resend"
+
 (* The thread pools (weft_pool.c). *)
 
 (* The fields of a job, in the order of [weft_job_start]. Only the C side reads
@@ -484,7 +486,8 @@ let status_of (kind, code) =
       Error (error_of (-e))
 
 (* The operations that do not depend on the poller. [None] for the others:
-   [Register], [Deregister], [Spawn], [Wait_child], [Kill] and [Watch]. *)
+   [Register], [Deregister], [Spawn], [Wait_child], [Kill], [Watch] and
+   [Unwatch]. *)
 let submit : type a. pool -> a Op.t -> (a, Op.error) result option =
  fun p op ->
   match op with
@@ -595,8 +598,11 @@ let submit : type a. pool -> a Op.t -> (a, Op.error) result option =
   | Op.Spawn _
   | Op.Wait_child _
   | Op.Kill _
-  | Op.Watch _ ->
+  | Op.Watch _
+  | Op.Unwatch _ ->
       None
+  | Op.Resend s ->
+      Some (unit (resend (number_of s)))
 
 let now (type time) (line : time Weft.Clock.line) : time =
   Weft.Clock.of_ns line

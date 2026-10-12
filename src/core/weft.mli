@@ -706,9 +706,23 @@ module Signal : sig
       for example with [Weft_linux.run ~signals].
 
       @raise Invalid_argument
-        at [sync], if the world does not watch [s], or if [s] cannot be an
-        event: [SIGILL], [SIGFPE], [SIGSEGV], [SIGBUS], [SIGKILL] and [SIGSTOP].
-  *)
+        at [sync], if the world does not watch [s] (also after [unwatch s]), or
+        if [s] cannot be an event: [SIGILL], [SIGFPE], [SIGSEGV], [SIGBUS],
+        [SIGKILL] and [SIGSTOP]. *)
+
+  val unwatch : t -> unit
+  (** [unwatch s] stops the watch of [s] for the remaining time of the run. The
+      signal then gets the action that it had before [run], usually the default
+      action: for [SIGINT], the end of the process. A signal that came before
+      the unwatch and that no fiber took also gets the action, so the process
+      can end in [unwatch]. A fiber that waits on [received s] at the unwatch
+      raises [Invalid_argument] at its [sync], as a later [received s] does.
+      [unwatch] does not block. A server that stops gracefully at the first
+      [SIGINT] can call it, so that the next [SIGINT] ends the process.
+
+      @raise Invalid_argument
+        if the world does not watch [s], also after an earlier [unwatch s], or
+        if [s] cannot be an event. *)
 end
 
 module Process : sig

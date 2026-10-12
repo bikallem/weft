@@ -24,22 +24,45 @@ type t = Op.signal =
 
 (* A signal from a CPU fault goes to the thread that caused it, and SIGKILL and
    SIGSTOP cannot be caught: they are not events. *)
+let check name s =
+  match s with
+  | SIGILL | SIGFPE | SIGSEGV | SIGBUS | SIGKILL | SIGSTOP ->
+      invalid_arg (name ^ ": this signal cannot be an event")
+  | _ ->
+      ()
+
+let not_watched = "Signal.received: the world does not watch this signal"
+
 let received s =
   Event.guard (fun () ->
-      ( match s with
-      | SIGILL | SIGFPE | SIGSEGV | SIGBUS | SIGKILL | SIGSTOP ->
-          invalid_arg "Signal.received: this signal cannot be an event"
-      | _ ->
-          () ) ;
+      check "Signal.received" s ;
       (* The world gives the form of [s] that it delivers. *)
       let s =
         match Net.submit "Signal.received" (Op.Watch s) with
         | Ok s ->
             s
         | Error _ ->
-            invalid_arg "Signal.received: the world does not watch this signal"
+            invalid_arg not_watched
       in
       Event.Base
         (fun () ->
           let cell = ref 0 in
-          {Event.leaf= Sched.signal_leaf s cell; result= (fun () -> !cell)} ) )
+          { Event.leaf= Sched.signal_leaf s cell
+          ; result=
+              (fun () ->
+                (* -1: an unwatch ended the watch while the fiber waited. *)
+                if !cell < 0 then invalid_arg not_watched else !cell ) } ) )
+
+(* The world stops the watch first, so a signal that it reads later is not lost:
+   [deliver] sends it again (design section 2.7, The end of a watch). *)
+let unwatch s =
+  check "Signal.unwatch" s ;
+  let s =
+    match Net.submit "Signal.unwatch" (Op.Unwatch s) with
+    | Ok s ->
+        s
+    | Error _ ->
+        invalid_arg "Signal.unwatch: the world does not watch this signal"
+  in
+  let n = Sched.prog "Signal.unwatch" (Sched.Unwatch_signal s) in
+  if n > 0 then ignore (Net.submit "Signal.unwatch" (Op.Resend s))

@@ -121,6 +121,8 @@ type _ t =
   | Wait_child : fd -> status option t
   | Kill : fd * signal -> unit t
   | Watch : signal -> signal t
+  | Unwatch : signal -> signal t
+  | Resend : signal -> unit t
   | Detach : int -> unit t
 
 let pp_addr ppf = function

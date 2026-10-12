@@ -185,6 +185,14 @@ type _ t =
       (** [Ok s] if the world gives this signal as [Ready.Signal s]: [s] is the
           form of the signal in [Ready.Signal], for example [SIGUSR1] for
           [Other_signal 10] on Linux. *)
+  | Unwatch : signal -> signal t
+      (** Stops the watch of a signal: the signal gets its action again, the
+          action that it had before [run]. A signal that came and that the world
+          did not give yet also gets the action. [Ok s] gives the form of the
+          signal, as [Watch]. *)
+  | Resend : signal -> unit t
+      (** Sends the signal to the process itself, after an [Unwatch]: the signal
+          gets its action. *)
   | Detach : int -> unit t
       (** The fiber does not wait for the job any more. The world drops its
           result, and closes the fd that it opened. The completion still comes.

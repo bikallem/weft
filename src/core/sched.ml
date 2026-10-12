@@ -160,6 +160,9 @@ and _ req =
           function runs at its completion. *)
   | Detach_job : int -> unit req
       (** The fiber does not wait for the job any more. *)
+  | Unwatch_signal : Op.signal -> int req
+      (** The world stopped the watch of the signal. Each waiter raises, and the
+          count that no fiber took goes to the fiber. *)
   | Cancel_at : int64 * ctx -> C.t req
       (** The deadline of [with_timeout]: an entry in the heap of the domain
           that cancels the node. The word is the state of the entry. *)
@@ -253,10 +256,12 @@ and t =
   ; signals_lock: Spin.t }
 
 (* A signal (design section 2.7, Signals). A commit of a waiter takes the count,
-   and it puts the count in the cell of the waiter before the commit. *)
+   and it puts the count in the cell of the waiter before the commit. After an
+   unwatch, the cell gets -1, and the waiter raises. *)
 and sigstate =
   { mutable count: int
-  ; mutable swait: (sync * int * int ref) list  (** The newest first. *) }
+  ; mutable swait: (sync * int * int ref) list  (** The newest first. *)
+  ; mutable unwatched: bool  (** After [Signal.unwatch]. *) }
 
 (* A completion that the world gives with [Ready.External]: the end of a job of
    the pool, or of [Sim.settle]. *)
@@ -877,18 +882,22 @@ let sigstate t sg =
   | Some st ->
       st
   | None ->
-      let st = {count= 0; swait= []} in
+      let st = {count= 0; swait= []; unwatched= false} in
       Hashtbl.replace t.signals sg st ;
       st
 
 (* A waiter of [received sg]: it takes the count if the count is not 0. If not,
-   it waits, and the waiters with a [Done] sync go. *)
+   it waits, and the waiters with a [Done] sync go. After an unwatch, it commits
+   with -1 in the cell. *)
 let signal_leaf sg cell : leaf =
  fun dom s i ->
   let t = dom.sched in
   Spin.with_lock t.signals_lock (fun () ->
       let st = sigstate t sg in
-      if st.count > 0 then (
+      if st.unwatched then (
+        cell := -1 ;
+        ignore (C.self_commit s.word i) )
+      else if st.count > 0 then (
         cell := st.count ;
         match C.self_commit s.word i with
         | Ok () ->
@@ -900,35 +909,68 @@ let signal_leaf sg cell : leaf =
           (s, i, cell)
           :: List.filter (fun (s, _, _) -> not (is_done s)) st.swait )
 
-(* [n] more of [sg]: the oldest waiter that can commit takes the count. *)
+(* [n] more of [sg]: the oldest waiter that can commit takes the count. After an
+   unwatch, the world sends the signal again, and it gets its action (design
+   section 2.7, The end of a watch). *)
 let deliver dom sg n =
   let t = dom.sched in
-  let resumed =
+  let unwatched, resumed =
     Spin.with_lock t.signals_lock (fun () ->
         let st = sigstate t sg in
-        st.count <- st.count + n ;
-        let rec give resumed = function
-          | [] ->
-              (resumed, [])
-          | ws when st.count = 0 ->
-              (resumed, ws)
-          | (s, i, cell) :: rest -> (
-              cell := st.count ;
+        if st.unwatched then (true, [])
+        else (
+          st.count <- st.count + n ;
+          let rec give resumed = function
+            | [] ->
+                (resumed, [])
+            | ws when st.count = 0 ->
+                (resumed, ws)
+            | (s, i, cell) :: rest -> (
+                cell := st.count ;
+                match C.notify s.word i with
+                | C.Resume ->
+                    st.count <- 0 ;
+                    (s :: resumed, rest)
+                | C.In_scan ->
+                    st.count <- 0 ;
+                    (resumed, rest)
+                | C.Lost _ ->
+                    give resumed rest )
+          in
+          let resumed, rest = give [] (List.rev st.swait) in
+          st.swait <- List.rev rest ;
+          (false, resumed) ) )
+  in
+  if unwatched then ignore (World.perform "sched" (World.Submit (Op.Resend sg)))
+  else List.iter (resume dom) resumed
+
+(* The end of the watch of [sg], after the world stopped it. Each waiter commits
+   with -1, and the count that no fiber took goes to the caller. A later
+   [deliver] sends the signal again. *)
+let unwatch_signal dom sg =
+  let t = dom.sched in
+  let n, resumed =
+    Spin.with_lock t.signals_lock (fun () ->
+        let st = sigstate t sg in
+        let n = st.count in
+        st.unwatched <- true ;
+        st.count <- 0 ;
+        let resumed =
+          List.filter_map
+            (fun (s, i, cell) ->
+              cell := -1 ;
               match C.notify s.word i with
               | C.Resume ->
-                  st.count <- 0 ;
-                  (s :: resumed, rest)
-              | C.In_scan ->
-                  st.count <- 0 ;
-                  (resumed, rest)
-              | C.Lost _ ->
-                  give resumed rest )
+                  Some s
+              | C.In_scan | C.Lost _ ->
+                  None )
+            st.swait
         in
-        let resumed, rest = give [] (List.rev st.swait) in
-        st.swait <- List.rev rest ;
-        resumed )
+        st.swait <- [] ;
+        (n, resumed) )
   in
-  List.iter (resume dom) resumed
+  List.iter (resume dom) resumed ;
+  n
 
 let on_ready dom = function
   | World.Ready.Signal (sg, n) ->
@@ -1149,6 +1191,10 @@ let rec run_fiber : dom -> fiber -> step -> unit =
       in
       Heap.push dom.heap ~cancels:node ~deadline s 0 ;
       run_fiber dom fiber (Effect.Deep.continue k s.word)
+  | Suspended (Unwatch_signal sg, k) ->
+      let n = unwatch_signal dom sg in
+      flush_wake dom ;
+      run_fiber dom fiber (Effect.Deep.continue k n)
   | Suspended (Detach_job id, k) ->
       drop_external dom.sched id ;
       ignore (World.perform "job" (World.Submit (Op.Detach id))) ;

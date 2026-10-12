@@ -43,7 +43,10 @@ val run :
       scheduler did not run.
     @raise Model_error
       if the program breaks the order of the OS, for example a close(2) before a
-      Deregister. *)
+      Deregister.
+    @raise Killed
+      if the program gets a signal with an action that ends the process (see
+      {!signal}). *)
 
 val settle : t -> unit
 (** [settle t] waits until the program is quiescent. *)
@@ -149,10 +152,12 @@ val add_program : t -> string -> (string list -> program) -> unit
     that is not in the table gives [No_entry]. *)
 
 val signal : t -> Weft.Signal.t -> unit
-(** [signal t s] sends [s] to the program. Domain 0 gets it at its next switch
-    point.
-
-    @raise Model_error if [run ~signals] does not hold [s]. *)
+(** [signal t s] sends [s] to the program. If the program watches [s], domain 0
+    gets it at its next switch point. If not, for example after
+    [Signal.unwatch s], [s] gets its default action at once. The action ends the
+    run with [Killed s], except for [SIGCHLD], [SIGWINCH], [SIGCONT], [SIGSTOP],
+    [SIGTSTP] and [Other_signal 0], which do nothing. The world ignores
+    [SIGPIPE], so it also does nothing. *)
 
 (** The fibers that wait. *)
 exception Deadlock of string list
@@ -168,6 +173,11 @@ exception Livelock of string list
 (** The exceptions of the promises of the run that failed and that no fiber
     awaited. [run] raises it at its end, after a full GC. *)
 exception Unawaited of string list
+
+(** The program got a signal with an action that ends the process, for example
+    [SIGINT] after [Signal.unwatch SIGINT]. [run] raises it at once, as the OS
+    ends the process. *)
+exception Killed of Weft.Signal.t
 
 (**/**)
 

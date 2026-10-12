@@ -36,9 +36,13 @@ external pidfd_kill : int -> int -> int = "weft_pidfd_kill"
 
 external sigmask_block : int array -> bytes = "weft_sigmask_block"
 
+external sigmask_unblock : int array -> unit = "weft_sigmask_unblock"
+
 external sigmask_restore : bytes -> unit = "weft_sigmask_restore"
 
-external signalfd : int array -> int = "weft_signalfd"
+external signalfd : int -> int array -> int = "weft_signalfd"
+(* [signalfd (-1) sigs] makes a signalfd. [signalfd fd sigs] changes the signals
+   of [fd]. *)
 
 external signalfd_read : int -> int array = "weft_signalfd_read"
 
@@ -64,7 +68,9 @@ type t =
   { doms: dom array
   ; rng: int Atomic.t
   ; pool: pool
-  ; watched: Op.signal list  (** The signals of [run ~signals]. *)
+  ; watched: Op.signal list Atomic.t
+        (** The signals of [run ~signals], with no signal of an unwatch. *)
+  ; unwatch_lock: Mutex.t  (** For the change of [watched] and of [sigfd]. *)
   ; sigfd: int  (** The signalfd in the poller of domain 0, or [-1]. *)
   ; old_mask: bytes option  (** The signal mask before [create]. *) }
 
@@ -125,7 +131,7 @@ let create ?(domains = 1) ?(signals = []) () =
     if signals = [] then (None, -1)
     else
       let old = sigmask_block nums in
-      let fd = signalfd nums in
+      let fd = signalfd (-1) nums in
       if (fd < 0) [@mutate off "fd 0 is the stdin of the process"] then (
         sigmask_restore old ;
         failwith ("signalfd: " ^ strerror (-fd)) ) ;
@@ -145,7 +151,8 @@ let create ?(domains = 1) ?(signals = []) () =
   { doms
   ; rng= new_rng ()
   ; pool= create_pool (Array.map (fun d -> d.evfd) doms)
-  ; watched= List.map (fun s -> signal_of (number_of s)) signals
+  ; watched= Atomic.make (List.map (fun s -> signal_of (number_of s)) signals)
+  ; unwatch_lock= Mutex.create ()
   ; sigfd
   ; old_mask }
 
@@ -160,6 +167,27 @@ let close t =
       ignore (close_fd d.evfd) ;
       ignore (close_fd d.epfd) )
     t.doms
+
+(* The end of a watch (design section 2.7). The signalfd stops to take [s]
+   first. Then the calling thread unblocks [s], and each later signal goes to
+   this thread with its action. A signal that is pending at this time also goes
+   to this thread, so no signal is lost. The thread is a thread of a domain, and
+   it lives until the end of the world. Each other thread of the world blocks
+   [s], or all signals for the pools and the watchdog. *)
+let unwatch t s =
+  let s = signal_of (number_of s) in
+  Mutex.protect t.unwatch_lock (fun () ->
+      let watched = Atomic.get t.watched in
+      if not (List.mem s watched) then
+        Error (Op.Other "the world does not watch this signal")
+      else
+        let rest = List.filter (fun x -> x <> s) watched in
+        let r = signalfd t.sigfd (Array.of_list (List.map number_of rest)) in
+        if r < 0 then Error (error_of (-r))
+        else (
+          Atomic.set t.watched rest ;
+          sigmask_unblock [|number_of s|] ;
+          Ok s ) )
 
 (* The calls of timerfd_settime, for the measurements. *)
 let alarm_sets = Atomic.make 0
@@ -183,8 +211,10 @@ module World = struct
         unit (pidfd_kill fd (number_of s))
     | Op.Watch s ->
         let s = signal_of (number_of s) in
-        if List.mem s t.watched then Ok s
+        if List.mem s (Atomic.get t.watched) then Ok s
         else Error (Op.Other "the world does not watch this signal")
+    | Op.Unwatch s ->
+        unwatch t s
     | Op.Register (d, fd, token) ->
         unit (epoll_add t.doms.(d).epfd fd token)
     | Op.Deregister (d, fd) ->

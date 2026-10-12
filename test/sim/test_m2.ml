@@ -344,15 +344,16 @@ let processes =
               equal int 2 (Atomic.get got) ) )
     ; test "C8: the simulator watches only the signals of run ~signals"
         (fun () ->
-          Sim.run (fun sim ->
-              raises
-                (Invalid_argument
-                   "Signal.received: the world does not watch this signal" )
-                (fun () -> sync (Signal.received SIGTERM) ) ;
-              raises
-                (Sim.Model_error
-                   "Sim.signal: the program does not watch this signal" )
-                (fun () -> Sim.signal sim SIGTERM ) ) )
+          (* A signal that the program does not watch gets its default action:
+             SIGWINCH does nothing, and SIGTERM ends the run. *)
+          raises (Sim.Killed SIGTERM) (fun () ->
+              Sim.run (fun sim ->
+                  raises
+                    (Invalid_argument
+                       "Signal.received: the world does not watch this signal"
+                    ) (fun () -> sync (Signal.received SIGTERM) ) ;
+                  Sim.signal sim SIGWINCH ;
+                  Sim.signal sim SIGTERM ) ) )
     ; test "C9: SIGTSTP and signal 0 do not end a fake program" (fun () ->
           Sim.run (fun sim ->
               Sim.add_program sim "p" (fun _ -> Sim.program ()) ;
@@ -458,6 +459,112 @@ let faults_world =
          let d = Printf.sprintf "/tmp%d" !n in
          Dir.mkdir d ; d ) }
 
+(* The end of a watch (issue 6). *)
+
+let not_watched = "Signal.received: the world does not watch this signal"
+
+(* [f] must end the run with [Killed sg]. *)
+let killed sg f =
+  match f () with
+  | () ->
+      failwith "the run did not end"
+  | exception Sim.Killed s ->
+      is_true (s = sg)
+
+(* caravan: the first SIGINT stops the server gracefully, and the second aborts
+   it. The third gets the default action, and the process ends. *)
+let three_sigints seed =
+  let at = ref 0L in
+  killed SIGINT (fun () ->
+      Sim.run ~seed ~domains:4 ~signals:[SIGINT] (fun sim ->
+          Fiber.scope (fun s ->
+              Fiber.fork s (fun () ->
+                  equal int 1 (sync (Signal.received SIGINT)) ;
+                  equal int 1 (sync (Signal.received SIGINT)) ;
+                  Signal.unwatch SIGINT ) ;
+              for _ = 1 to 3 do
+                Time.sleep Mono (Span.ms 1) ;
+                at := Clock.to_ns Mono (Time.now Mono) ;
+                Sim.signal sim SIGINT
+              done ;
+              Time.sleep Mono (Span.ms 1) ) ) ) ;
+  equal int64 3_000_000L !at
+
+let unwatch =
+  group "unwatch"
+    [ test "the third SIGINT ends the process, with 100 seeds" (fun () ->
+          for seed = 1 to 100 do
+            three_sigints seed
+          done )
+    ; test "a signal in the count gets its action at the unwatch" (fun () ->
+          killed SIGINT (fun () ->
+              Sim.run ~signals:[SIGINT] (fun sim ->
+                  Sim.signal sim SIGINT ;
+                  Time.sleep Mono (Span.ms 1) ;
+                  Signal.unwatch SIGINT ) ) )
+    ; test "a signal that domain 0 did not take gets its action" (fun () ->
+          killed SIGINT (fun () ->
+              Sim.run ~signals:[SIGINT] (fun sim ->
+                  Sim.signal sim SIGINT ;
+                  Signal.unwatch SIGINT ;
+                  Time.sleep Mono (Span.ms 1) ) ) ;
+          for seed = 1 to 50 do
+            killed SIGTERM (fun () ->
+                Sim.run ~seed ~domains:4 ~signals:[SIGTERM] (fun sim ->
+                    Sim.signal sim SIGTERM ;
+                    Signal.unwatch SIGTERM ;
+                    Time.sleep Mono (Span.ms 1) ) )
+          done )
+    ; test "a waiter at the unwatch raises, with 50 seeds" (fun () ->
+          for seed = 1 to 50 do
+            Sim.run ~seed ~domains:4 ~signals:[SIGINT; SIGTERM] (fun sim ->
+                Fiber.scope (fun s ->
+                    let p =
+                      Fiber.fork_promise s (fun () ->
+                          match
+                            sync
+                              (choose
+                                 [ Signal.received SIGINT
+                                 ; Signal.received SIGTERM ] )
+                          with
+                          | _ ->
+                              "no error"
+                          | exception Invalid_argument m ->
+                              m )
+                    in
+                    Time.sleep Mono (Span.ms 1) ;
+                    Signal.unwatch SIGINT ;
+                    equal string not_watched (Promise.await p) ) ;
+                raises (Invalid_argument not_watched) (fun () ->
+                    sync (Signal.received SIGINT) ) ;
+                raises
+                  (Invalid_argument
+                     "Signal.unwatch: the world does not watch this signal" )
+                  (fun () -> Signal.unwatch SIGINT ) ;
+                (* SIGTERM stays an event. *)
+                Sim.signal sim SIGTERM ;
+                equal int 1 (sync (Signal.received SIGTERM)) )
+          done )
+    ; test "SIGWINCH and SIGPIPE do nothing after the unwatch" (fun () ->
+          Sim.run ~signals:[SIGWINCH; SIGPIPE] (fun sim ->
+              Sim.signal sim SIGWINCH ;
+              Time.sleep Mono (Span.ms 1) ;
+              Signal.unwatch SIGWINCH ;
+              Signal.unwatch SIGPIPE ;
+              Sim.signal sim SIGWINCH ;
+              Sim.signal sim SIGPIPE ;
+              Time.sleep Mono (Span.ms 1) ) )
+    ; test "an unwatch of a signal that is not watched raises" (fun () ->
+          Sim.run (fun _ ->
+              raises
+                (Invalid_argument
+                   "Signal.unwatch: the world does not watch this signal" )
+                (fun () -> Signal.unwatch SIGINT ) ;
+              raises
+                (Invalid_argument
+                   "Signal.unwatch: this signal cannot be an event" ) (fun () ->
+                  Signal.unwatch SIGKILL ) ) ) ]
+
 let tests =
   [ Windtrap.group "200 seeds"
       [ Portable.layers seeds_200
@@ -468,4 +575,5 @@ let tests =
   ; processes
   ; group "with faults" (Portable.tests faults_world)
   ; group "signals"
-      [test "SIGTERM gives a graceful shutdown with 100 seeds" shutdown_test] ]
+      [ test "SIGTERM gives a graceful shutdown with 100 seeds" shutdown_test
+      ; unwatch ] ]
