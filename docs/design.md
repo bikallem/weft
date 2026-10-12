@@ -722,8 +722,9 @@ For the same reason as the stdlib `Mutex`, fiber code must not use a spin loop t
 ```ocaml
 module Semaphore : sig
   type t
-  val create : int -> t               (* the free permits at the start *)
+  val create : ?max:int -> int -> t   (* the free permits at the start *)
   val acquire : t -> unit event
+  val try_acquire : t -> bool
   val release : t -> unit
   val use : t -> (unit -> 'a) -> 'a
 end
@@ -731,26 +732,38 @@ end
 
 A lock is `create 1`. The acquire is an event, so a `choose` can wait for a permit and for other events. For example, the close of a WebSocket in caravan waits for the reader lock or for the end of the connection, the first of the two. `use t f` acquires a permit, runs `f` and releases the permit, also if `f` raises. A semaphore protects a count, not data, so an exception does not poison it. The acquire is a cancellation point, also when a permit is free.
 
+`try_acquire` takes a free permit under the lock, or it gives `false`. It does not wait. A `choose` of `acquire` and `always` is not a try: if a permit is free, the two branches are ready, and the `choose` selects one of them at random. On Linux, such a `choose` took a free permit only 57 and 49 times in 100. A free permit never belongs to a waiter, because the queue is empty when a permit is free (below). Thus `try_acquire` keeps the FIFO order.
+
 **The acquire is a base event.** It uses the protocol of a `Chan` (section 2.4, The atomic register):
 
 1. The leaf of `acquire` holds the short lock of the semaphore. If a permit is free, the sync commits itself to the branch with a CAS on its word (the self-commit). The leaf takes the permit only if this CAS succeeds. If no permit is free, the leaf adds an offer (the sync and the branch) at the tail of the queue.
-2. `release` holds the same lock. It takes the offer at the head of the queue and commits the word of its sync with a one-word commit. If the commit succeeds, the permit goes to that sync, and the release resumes the fiber if it is parked. If the word is `Done`, the sync lost its `choose`, or a cancel ended it. Then the release removes the offer and takes the next one. If no offer stays, the permit becomes free.
+2. `release` holds the same lock. It takes the offer at the head of the queue and commits the word of its sync with a one-word commit. If the commit succeeds, the permit goes to that sync, and the release resumes the fiber if it is parked. If the word is `Done`, the sync lost its `choose`, a cancel ended it, or an earlier release committed another acquire branch of the same sync. Then the release removes the offer and takes the next one. If no offer stays, the permit becomes free.
 
-Thus one CAS on the sync word commits the sync and gives the permit. A sync that commits to another branch never has the permit, so no fiber must give it back. A permit is free only when the queue has no live offer. Thus a new acquire never takes a permit before an older waiter, and the order is FIFO, as for `Fiber.Mutex`. The offers of the syncs that lost stay in the queue until a release meets them or the queue drops its stale offers, as a side of a `Chan` does.
+Thus one CAS on the sync word commits the sync and gives the permit. A sync that commits to another branch never has the permit, so no fiber must return the permit to the semaphore. A permit is free only when the queue is empty: a release removes each stale offer before it makes the permit free, and an acquire adds an offer only when no permit is free. Thus a new acquire never takes a permit before an older waiter, and the order is FIFO, as for `Fiber.Mutex`. The offers of the syncs that lost stay in the queue until a release meets them or the queue drops its stale offers, as a side of a `Chan` does.
 
-**Why not a guard and a nack.** caravan proposed a composition: a `guard` adds a waiter `Ivar` to a queue, a release fills the first waiter, and a `with_nack` removes a waiter that lost. If a release filled that waiter before the `choose` ended, the nack must give the permit to the next waiter. We did not select this form, for three reasons:
+**Why not a guard and a nack.** caravan recommended a composition: a `guard` adds a waiter `Ivar` to a queue, a release fills the first waiter, and a `with_nack` removes a waiter that lost. If a release filled that waiter before the `choose` ended, the nack must give the permit to the next waiter. We did not select this form, for three reasons:
 
-- The nack is an event. Only a fiber that syncs on it can give the permit back. Thus each acquire needs a fiber, or the semaphore needs a server fiber. That fiber is in a scope, and a cancel of the scope loses the permit.
+- The nack is an event. Only a fiber that syncs on it can return the permit to the semaphore. Thus each acquire needs a fiber, or the semaphore needs a server fiber. That fiber is in a scope, and a cancel of the scope loses the permit.
 - Between the fill and the nack, the permit is in the `Ivar` of a fiber that does not use it. The next waiter waits until the fiber that lost runs again.
 - The native form needs no `Ivar`, no nack and no fiber.
 
 The native form is the only form in which the commit and the transfer of the permit are one atomic step. `Semaphore.tla` (section 2.16) has the planted bug of the composition without its nack: a release that gives the permit to the head of the queue with no commit. TLC finds the lost permit.
 
-**A release above the start count.** `release` raises `Invalid_argument` if the free permits are already the count of `create`. A second release of one permit is a bug of the program, and a free increase hides it: a lock then lets two fibers in. The check does not find each such bug: while other fibers hold permits, a second release looks correct. A program that needs a count that starts at 0 creates the semaphore with the maximum count, and it acquires the permits at the start.
+**A release above the maximum.** `create ?max n` starts with `n` free permits, and `max` is `n` by default. `release` raises `Invalid_argument` if the free permits are already `max`. A second release of one permit is a bug of the program, and a free increase hides it: a lock then lets two fibers hold it. The check does not find each such bug: while other fibers hold permits, a second release looks correct. A count that starts at 0 and grows, for example the tokens of a rate limit, uses `create ~max:m 0`. Thus a port of `Semaphore.Counting.make 0` does not deadlock, and a refill does not catch `Invalid_argument`. With no `max`, `create 0` gives a semaphore that never has a permit. `create` raises `Invalid_argument` if `n < 0` or `max < n`.
 
 **The place and the code.** The module is `Fiber.Semaphore`, next to `Fiber.Mutex`, not a top-level `Semaphore`. With `open Weft`, a top-level module hides `Stdlib.Semaphore`, and a program that uses the stdlib semaphore between domains then gets the fiber semaphore. `Fiber.Mutex` keeps its own code. A mutex has a poison state, a shield node for `Condition.wait` and a `lock` that is not an event. A mutex on top of the semaphore needs all of these parts, so it is not simpler.
 
-**The tests.** The simulator never runs a release between the leaf and its self-commit, so it cannot reach the case where a cancel or a partner commits the sync in this time. Five `dscheck` tests examine the races between domains: an acquire and a release, an acquire with a free permit and a cancel, a release and a cancel of the first waiter, a release while a `Chan` partner commits the other branch, and two releases with one waiter. The tests of the public API run in the simulator, also with 200 seeds on 4 virtual domains, and in the Linux world.
+**The tests.** The simulator never runs a release between the leaf and its self-commit. Thus it cannot reach the case where a cancel or a partner commits the sync in this time. Seven `dscheck` tests examine the races between domains:
+
+- An acquire and a release
+- An acquire with a free permit, and a cancel
+- A release, and a cancel of the first waiter
+- A release while a `Chan` partner commits the other branch
+- Two releases and one waiter
+- One sync with two acquire branches of one semaphore, and two releases
+- An acquire with a free permit while a `Chan` partner holds the word as `Claimed`.
+
+The tests of the public API run in the simulator, also with 200 seeds on 4 virtual domains, and in the Linux world. A test waits until each waiter is parked (`Commit.state` of its sync), so that the FIFO order does not depend on a sleep.
 
 ### Fiber code with no handler
 
@@ -1148,7 +1161,7 @@ Decisions 1 to 6 were made on 2026-10-09, decisions 7 to 9 on 2026-10-10, decisi
 | 14 | `ECONNABORTED` of `accept` | The POSIX worlds take the next connection, as Go and libuv do (section 2.7). A typed error makes each accept loop catch an error that Linux and the simulator never give, and the loop can do nothing with the connection. |
 | 15 | The acquire of a semaphore in a `choose` | `Fiber.Semaphore.acquire` is a base event with the commit protocol, as `Chan.recv` is (section 2.5, Locks for fiber code). A release commits the word of the oldest waiter, so the commit and the transfer of the permit are one atomic step. A composition of `guard` and `with_nack` needs a fiber that waits for the nack, and a cancel of that fiber loses the permit. |
 | 16 | The place of the semaphore | `Fiber.Semaphore`, next to `Fiber.Mutex`. A top-level `Semaphore` hides `Stdlib.Semaphore` after `open Weft`. `Fiber.Mutex` keeps its own code, because a semaphore has no poison state and no shield node for `Condition.wait`. |
-| 17 | A release above the start count | `Invalid_argument`, as for `Fiber.Mutex.unlock` of a mutex that is not locked. A free increase hides a second release, and a lock then lets two fibers in. |
+| 17 | A release above the maximum | `create ?max n`, with `max` = `n` by default. A release above `max` raises `Invalid_argument`, as `Fiber.Mutex.unlock` does for a mutex that is not locked. A free increase hides a second release, and a lock then lets two fibers hold it. A count that starts at 0 uses `create ~max:m 0`. With no `max` and an error, `create 0` never gives a permit, and a refill must catch the error. |
 
 Also on 2026-10-10, the user accepted the milestone plan of section 2.14. Decisions 4, 7 and 8 stay, and they come in milestone M1. Milestone M0 has one domain.
 
@@ -1371,7 +1384,7 @@ Run all of the models with `nix develop -c spec/tla/check.sh`. `MODELS="Ivar Fd"
 | `Ivar.tla` | The atomic register of an `Ivar`, and `Ivar.fill_from_outside` (2.4, 2.5) | At most one resume, one fill, no waiters after the fill, a correct end state, termination | A finaliser that commits the waiters itself, a register that is not atomic |
 | `Wake.tla` | The loop of a domain: idle and wake, steal, next slot, pinned queue, injection queue (2.5) | Each item runs, a pinned item runs only on domain 0, no lost wakeup | The decrease of `searching` after the second check, no second check, a pinned push that wakes any domain. Simplifications that pass: no steal of a next slot, no search limit, no last wake, no `searching` count. |
 | `Fd.tla` | The fd record: `Rcfd`, the registrations, the close notices, the removal (2.7) | One `close(2)`, no `close(2)` of another file, no use after `close(2)`, no `EPOLL_CTL_DEL` of a new file, `EPOLL_CTL_DEL` before `close(2)`, termination | A count and a closed bit, a Register that reads the state first, a registration with no user. A simplification that passes: no CAS on the domain bit. |
-| `Semaphore.tla` | `Fiber.Semaphore`: the acquire in a `choose`, the release, a timer and a cancel (2.5, issue 4). Three scenarios: a `choose` with a timer, a cancel of the first waiter, and two permits with two holders. | No permit is lost or doubled, a holder got its permit from its acquire, at most one resume, no free permit while a live offer waits, FIFO, a correct end state, termination | An acquire with no lock, a take of the permit before the commit, a release that gives the permit to the head with no commit (the composition with no nack), a release to any offer |
+| `Semaphore.tla` | `Fiber.Semaphore`: the acquire in a `choose`, the release, a timer and a cancel (2.5, issue 4). Three scenarios: a `choose` with a timer, a cancel of the first waiter, and two permits with two holders. | No permit is lost or doubled, a holder got its permit from its acquire, at most one resume, no free permit while the queue has an offer, FIFO, a correct end state, termination | An acquire with no lock, a take of the permit before the commit, a release that gives the permit to the head with no commit (the composition with no nack), a release to any offer |
 
 **What the models showed about the design:**
 
