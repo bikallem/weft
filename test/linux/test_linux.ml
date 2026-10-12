@@ -35,12 +35,16 @@ let elapsed_ns f =
       Int64.to_int (Span.to_ns (Time.diff Mono (Time.now Mono) t0)) )
 
 (* Without load, a sleep ends between the deadline and the deadline plus 2 ms
-   (the slack of 100 us included). *)
+   (the slack of 100 us included). A CI machine is shared, so there the upper
+   limit is 50 ms. A sleep never ends before its deadline. *)
 let sleep_10ms () =
+  let limit =
+    if Sys.getenv_opt "CI" = Some "true" then 50_000_000 else 12_000_000
+  in
   for _ = 1 to 20 do
     let ns = elapsed_ns (fun () -> Time.sleep Mono (Span.ms 10)) in
     at_least int ~than:10_000_000 ns ;
-    less int ~than:12_000_000 ns
+    less int ~than:limit ns
   done
 
 let sleep_10s () =
