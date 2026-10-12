@@ -129,10 +129,10 @@ let never_early (slack_us, sleep_us) =
   at_least int64 ~than:(us sleep_us) woke ;
   less int64 ~than:(Int64.add (us sleep_us) (Int64.add (us slack_us) 1L)) woke
 
-let default_slack_is_1ms () =
+let default_slack_is_100us () =
   let w = Manual.make () in
-  ignore (run w (fun () -> Time.sleep Mono (Span.us 1500))) ;
-  equal (list int64) [ms 2] w.alarms
+  ignore (run w (fun () -> Time.sleep Mono (Span.us 1550))) ;
+  equal (list int64) [us 1600] w.alarms
 
 (* A busy domain polls each 61 switches, so a due timer runs before a long loop
    of yields ends (design section 2.5, A busy domain also polls). *)
@@ -196,7 +196,7 @@ let world =
            (fun ppf (a, b) -> Format.fprintf ppf "(slack %dus, sleep %dus)" a b)
            no_early_fire )
         never_early
-    ; test "the default slack is 1 ms" default_slack_is_1ms
+    ; test "the default slack is 100 us" default_slack_is_100us
     ; test "a busy domain polls its timers" busy_domain_polls
     ; test "an idle poll that makes a timer ready does not sleep"
         idle_poll_finds_timer

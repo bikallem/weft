@@ -29,7 +29,7 @@ val run :
   -> 'a
 (** [run main] runs [main] with a new Linux world, and closes the world at the
     end. [~domains] is [min 4 (Domain.recommended_domain_count ())] by default
-    (open question 6).
+    (open question 6). [~slack] is 100 us by default (open question 7).
 
     [~watchdog] is the limit of the watchdog, 10 ms by default (open question
     7): if a fiber runs on a domain for more than the limit with no switch, a C

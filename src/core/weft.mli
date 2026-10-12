@@ -245,6 +245,10 @@ val run :
     the calling thread, and each other domain on an OCaml domain of its own. The
     world must have a poller for each domain.
 
+    [~slack] (100 us by default) rounds the alarm of a domain up to a multiple
+    of the slack. Thus near deadlines share one alarm. A timer never fires
+    before its deadline (open question 7).
+
     @raise Invalid_argument if [domains] is not in the range 1 to 62. *)
 
 (** The parts inside the library. They are for the tests and for the worlds of

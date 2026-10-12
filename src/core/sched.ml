@@ -1734,7 +1734,7 @@ let reason () =
 let next_run = Atomic.make 0
 
 (* The scheduler of [domains] domains. *)
-let create ?(slack = Span.ms 1) ?(simulated = false) ~domains () =
+let create ?(slack = Span.us 100) ?(simulated = false) ~domains () =
   if domains < 1 || domains > 62 then
     invalid_arg "run: the number of domains is not in the range 1 to 62" ;
   let t =

@@ -31,7 +31,7 @@ let elapsed_ns f =
       Int64.to_int (Span.to_ns (Time.diff Mono (Time.now Mono) t0)) )
 
 (* Without load, a sleep ends between the deadline and the deadline plus 2 ms
-   (the slack of 1 ms included). *)
+   (the slack of 100 us included). *)
 let sleep_10ms () =
   for _ = 1 to 20 do
     let ns = elapsed_ns (fun () -> Time.sleep Mono (Span.ms 10)) in
