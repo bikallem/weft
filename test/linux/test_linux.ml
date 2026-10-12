@@ -771,6 +771,43 @@ let unwatched () =
            "Signal.received: the world does not watch this signal" ) (fun () ->
           sync (Signal.received SIGUSR1) ) )
 
+(* [Time.to_utc] and [Time.of_utc] agree with [Unix.gmtime] for random times in
+   the full range of [Clock.posix], and for the days near the ends of the months
+   and the years. *)
+let utc_against_gmtime () =
+  let st = Random.State.make [|7|] in
+  let limit = 9_223_372_036 in
+  let check secs =
+    let t = Clock.of_ns Posix (Int64.mul (Int64.of_int secs) 1_000_000_000L) in
+    let u = Time.to_utc t and g = Unix.gmtime (float_of_int secs) in
+    if
+      not
+        ( u.year = g.tm_year + 1900
+        && u.month = g.tm_mon + 1
+        && u.day = g.tm_mday && u.hour = g.tm_hour && u.minute = g.tm_min
+        && u.second = g.tm_sec && u.weekday = g.tm_wday )
+    then fail (Printf.sprintf "to_utc differs from gmtime at %d s" secs) ;
+    match Time.of_utc u with
+    | Some t' when t' = t ->
+        ()
+    | _ ->
+        fail (Printf.sprintf "of_utc is not the inverse of to_utc at %d s" secs)
+  in
+  for _ = 1 to 200_000 do
+    check
+      (Int64.to_int (Random.State.int64 st (Int64.of_int (2 * limit))) - limit)
+  done ;
+  (* Narrow ranges: near 1970, and near 2000 to 2100. *)
+  for _ = 1 to 100_000 do
+    check (Random.State.int st 400_000_000 - 200_000_000) ;
+    check (946_684_800 + Random.State.int st 1_000_000_000)
+  done ;
+  (* Every day boundary from 1900 to 2100, and one second before it. *)
+  for d = -25_567 to 47_482 do
+    check (d * 86400) ;
+    check ((d * 86400) - 1)
+  done
+
 let linux =
   group "linux"
     [ test "a Unix domain socket echoes" unix_socket
@@ -819,7 +856,8 @@ let linux =
         pinned_sleeps
     ; test ~timeout:30. "B: a pinned fiber that yields does not starve"
         pinned_yield
-    ; test "a signal that run does not watch is not an event" unwatched ]
+    ; test "a signal that run does not watch is not an event" unwatched
+    ; test "Time.to_utc agrees with Unix.gmtime" utc_against_gmtime ]
 
 let () =
   exit
