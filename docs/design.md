@@ -896,6 +896,9 @@ module Time : sig
   val sleep : Clock.mono Clock.line -> Span.t -> unit
   val posix_of_unix_s : float -> Clock.posix
   val posix_to_unix_s : Clock.posix -> float
+  type utc = { year : int; month : int; day : int; hour : int; minute : int; second : int; weekday : int }
+  val to_utc : Clock.posix -> utc
+  val of_utc : utc -> Clock.posix option
 end
 ```
 
@@ -906,6 +909,15 @@ end
 - **Timers use only `Mono` until milestone M3.** `at`, `after` and `sleep` take only the `Mono` line. A `Posix` timer that the library converts to a `Mono` deadline at the arm does not follow a clock step, so the choice of the line would have no effect, or it would mislead. Thus there is one heap and one alarm for each domain. The calls keep the line argument, so milestone M3 can change the type to `'time Clock.line` and add a real `Posix` alarm with `TFD_TIMER_CANCEL_ON_SET`. Code that uses `Mono` does not change.
 - With an int64 count of nanoseconds, a `posix` time can go up to the year 2262. `add` gives `None` on overflow. This prevents the defect from the session, where a wait of 2^63 ns or more ended at once.
 - If `add` gives `None`, `Time.after` gives `never`, and `Time.sleep` sleeps until a cancel. A negative span gives an event that is ready at once.
+- **The UTC date of a time (issue 7).** `Time.to_utc` gives the year, month (1 to 12), day (1 to 31), hour, minute, second and weekday (0 is Sunday) of a `Clock.posix`. `Time.of_utc` is the inverse. The two functions are pure integer code in the core, which does not link `unix`, so they are the same in all worlds, also in the simulator, where `Sim.set_posix` sets the date. A caravan `Date` header, a cookie, a log line and a certificate date use them.
+  - The conversion from a day number to a calendar date is `civil_from_days` of Howard Hinnant (`days_from_civil` for the inverse). Its source is in the comment of `src/core/time.ml`. It is exact for the proleptic Gregorian calendar. The tests compare it with `Unix.gmtime` for more than 500,000 times in the Linux tests, which link `unix`.
+  - A time before 1970 gives a date before 1970. The code takes the floor of the seconds, so the time 1 ns before 1970 is 1969-12-31 23:59:59. A division that rounds to zero gives 1970-01-01 00:00:00.
+  - The range is the range of `Clock.posix`: 1677-09-21 00:12:43 to 2262-04-11 23:47:16. The smallest `Clock.posix` is 0.85 s before 00:12:44, so `to_utc` gives 00:12:43 for it, but `of_utc` gives `None` for 00:12:43. The first whole second that `of_utc` accepts is 00:12:44. All results fit in an `int`, so there is no overflow in `to_utc`. `of_utc` gives `None` outside this range. A date such as 9999-12-31 is not a `Clock.posix`.
+  - POSIX time has no leap second: each day has 86400 seconds, and the OS clock does not show a leap second as a separate second (Linux repeats the second 23:59:59, or an NTP daemon slews the clock across the leap second). Thus `second` is never 60, and `of_utc` gives `None` for a second of 60.
+  - `of_utc` gives `None` also for a field that is out of range, for example 31 April or 29 February of a common year. It ignores `weekday`, because a caller that parses a date can have a weekday that is not correct, and the check of it is the task of the caller.
+  - The record has no fraction of a second. `to_utc` cuts the fraction. A `Date` header, a cookie and a certificate have whole seconds, and a caller that wants the fraction takes it from `Time.diff` or from the `Span`. This keeps `utc` the same as the type in the issue and a simple value to compare.
+  - The functions are in `Time`, next to `posix_to_unix_s`, and not in `Clock`: `Clock` has only the types of the lines, and `Time` has the operations. `to_utc` takes only `Clock.posix`, so a `mono` time cannot give a date.
+  - Not added: a formatter of the RFC 9110 IMF-fixdate (`Sun, 12 Oct 2026 18:00:00 GMT`). It is HTTP text, and weft has no HTTP code. With `utc` it is a few lines in caravan, and a name table of months and days would be in the API of the core.
 - Each domain keeps one deadline heap. A timer is a heap entry. The alarm is one event source in the poller of the domain.
 
 ## 2.7 The production worlds
@@ -1260,7 +1272,7 @@ The cost of an effect is a perform and a handler call for each world operation. 
 
 ## 2.12 Decisions
 
-Decisions 1 to 6 were made on 2026-10-09, decisions 7 to 9 on 2026-10-10, decisions 10 and 11 on 2026-10-12 (issue 1), decision 12 on 2026-10-12 (issue 2), decisions 13 and 14 on 2026-10-12 (issue 3), decisions 15 to 17 on 2026-10-12 (issue 4), decisions 18 to 20 on 2026-10-12 (issue 5), and decisions 21 to 25 on 2026-10-13 (issue 6).
+Decisions 1 to 6 were made on 2026-10-09, decisions 7 to 9 on 2026-10-10, decisions 10 and 11 on 2026-10-12 (issue 1), decision 12 on 2026-10-12 (issue 2), decisions 13 and 14 on 2026-10-12 (issue 3), decisions 15 to 17 on 2026-10-12 (issue 4), decisions 18 to 20 on 2026-10-12 (issue 5), decisions 21 to 25 on 2026-10-13 (issue 6), and decision 26 on 2026-10-13 (issue 7).
 
 | No. | Question | Decision |
 |---|---|---|
@@ -1289,6 +1301,7 @@ Decisions 1 to 6 were made on 2026-10-09, decisions 7 to 9 on 2026-10-10, decisi
 | 23 | The signals on kqueue | A handler of the world counts each signal and wakes domain 0, in place of `SIG_IGN` and `EVFILT_SIGNAL`. It runs on the signal stack (`SA_ONSTACK`), and one world at a time holds it. A record of `EVFILT_SIGNAL` does not tell if its signal came before or after the restore of the action, so the end of a watch can lose a signal or give its action two times. |
 | 24 | A waiter at the end of a watch | Its `sync` raises `Invalid_argument`, as a later `received` does. A waiter that waits forever hides the error, and the close of an fd also ends its waiters with an error. |
 | 25 | The action of a signal in the simulator | The run ends with `Sim.Killed s` at an action that ends the process, so a test can examine it. `Sim.signal` of a signal that the program does not watch gives the default action, as on Linux, and not a `Model_error`. |
+| 26 | The UTC date of a `Clock.posix` | `Time.to_utc` and `Time.of_utc` in the core, with a record with no fraction of a second, as the issue proposes (section 2.6). A date of the full range of `Clock.posix` fits in an `int`. The code is the algorithm of Hinnant, not a table or a loop on years, and the Linux tests compare it with `Unix.gmtime`. |
 
 Also on 2026-10-10, the user accepted the milestone plan of section 2.14. Decisions 4, 7 and 8 stay, and they come in milestone M1. Milestone M0 has one domain.
 

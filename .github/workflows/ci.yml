@@ -56,6 +56,5 @@ jobs:
             eval "$(opam env)"
             opam install dune windtrap ppx_windtrap dscheck
             dune build
-            # The VM gets only the variables in envs, so CI is not set.
-            export CI=true WINDTRAP_VERBOSE=1 WINDTRAP_TIMEOUT=120
+            export WINDTRAP_VERBOSE=1 WINDTRAP_TIMEOUT=120
             dune runtest --force

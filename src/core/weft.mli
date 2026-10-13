@@ -64,6 +64,31 @@ module Time : sig
   val posix_of_unix_s : float -> Clock.posix
 
   val posix_to_unix_s : Clock.posix -> float
+
+  (** A date and a time of day in UTC (design section 2.6). *)
+  type utc =
+    { year: int
+    ; month: int  (** 1 to 12. *)
+    ; day: int  (** 1 to 31. *)
+    ; hour: int  (** 0 to 23. *)
+    ; minute: int  (** 0 to 59. *)
+    ; second: int  (** 0 to 59. *)
+    ; weekday: int  (** 0 is Sunday, 6 is Saturday. *) }
+
+  val to_utc : Clock.posix -> utc
+  (** The date of a time in the proleptic Gregorian calendar. A time before 1970
+      gives a date before 1970. [to_utc] removes the fraction of a second: the
+      result is the second at or before the time. POSIX time has no leap second,
+      so [second] is never 60, and a day always has 86400 seconds. The result
+      covers the full range of [Clock.posix], the years 1677 to 2262. The
+      smallest [Clock.posix] is 1677-09-21 00:12:43.145224192, so for the first
+      0.85 s of the range [to_utc] gives 00:12:43. *)
+
+  val of_utc : utc -> Clock.posix option
+  (** The inverse of [to_utc]. It ignores [weekday]. It gives [None] if a field
+      is out of range (for example, a second of 60), or if the time is outside
+      the range of [Clock.posix]. The first whole second of the range is
+      00:12:44, so [of_utc] gives [None] for 1677-09-21 00:12:43. *)
 end
 
 (** {1 Fibers}

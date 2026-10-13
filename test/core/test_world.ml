@@ -318,6 +318,114 @@ let posix_round_trip () =
   equal (float 1e-3) 1_700_000_000.25
     (Time.posix_to_unix_s (Time.posix_of_unix_s 1_700_000_000.25))
 
+(* [posix s] is the time [s] seconds after 1970-01-01 00:00:00 UTC. *)
+let posix s = Clock.of_ns Posix (Int64.mul (Int64.of_int s) 1_000_000_000L)
+
+let utc (year, month, day, hour, minute, second, weekday) =
+  {Time.year; month; day; hour; minute; second; weekday}
+
+let check_utc secs fields =
+  let u = utc fields in
+  is_true (Time.to_utc (posix secs) = u) ;
+  match Time.of_utc u with
+  | None ->
+      fail "of_utc gave None"
+  | Some t ->
+      equal int64 (Clock.to_ns Posix (posix secs)) (Clock.to_ns Posix t)
+
+let utc_known () =
+  check_utc 0 (1970, 1, 1, 0, 0, 0, 4) ;
+  check_utc (-1) (1969, 12, 31, 23, 59, 59, 3) ;
+  check_utc 951_782_400 (2000, 2, 29, 0, 0, 0, 2) ;
+  check_utc 1_791_828_000 (2026, 10, 12, 18, 0, 0, 1) ;
+  check_utc 1_000_000_000 (2001, 9, 9, 1, 46, 40, 0) ;
+  check_utc (-86400) (1969, 12, 31, 0, 0, 0, 3) ;
+  (* The first and the last whole second of [Clock.posix]. *)
+  check_utc 9_223_372_036 (2262, 4, 11, 23, 47, 16, 5) ;
+  check_utc (-9_223_372_036) (1677, 9, 21, 0, 12, 44, 2)
+
+let utc_fraction () =
+  (* A fraction cuts to the second at or before the time. *)
+  let at ns = Time.to_utc (Clock.of_ns Posix ns) in
+  equal int 0 (at 999_999_999L).second ;
+  equal int 59 (at (-1L)).second ;
+  equal int 1969 (at (-1L)).year ;
+  equal int 58 (at (-1_000_000_001L)).second ;
+  (* The smallest [Clock.posix] is in the second 00:12:43, which [of_utc]
+     rejects. *)
+  let lo = at Int64.min_int in
+  is_true (lo = utc (1677, 9, 21, 0, 12, 43, 2)) ;
+  is_true (Time.of_utc lo = None) ;
+  is_true (at Int64.max_int = utc (2262, 4, 11, 23, 47, 16, 5))
+
+(* The first day of each month, in a leap year and in a common year. *)
+let utc_months () =
+  let first_days y =
+    List.init 12 (fun i ->
+        let m = i + 1 in
+        match Time.of_utc (utc (y, m, 1, 0, 0, 0, 0)) with
+        | None ->
+            fail "of_utc gave None"
+        | Some t ->
+            let u = Time.to_utc t in
+            (u.year, u.month, u.day, u.weekday) )
+  in
+  (* 2024 is a leap year. *)
+  is_true
+    ( first_days 2024
+    = [ (2024, 1, 1, 1)
+      ; (2024, 2, 1, 4)
+      ; (2024, 3, 1, 5)
+      ; (2024, 4, 1, 1)
+      ; (2024, 5, 1, 3)
+      ; (2024, 6, 1, 6)
+      ; (2024, 7, 1, 1)
+      ; (2024, 8, 1, 4)
+      ; (2024, 9, 1, 0)
+      ; (2024, 10, 1, 2)
+      ; (2024, 11, 1, 5)
+      ; (2024, 12, 1, 0) ] ) ;
+  (* 2023 is a common year. *)
+  is_true
+    ( first_days 2023
+    = [ (2023, 1, 1, 0)
+      ; (2023, 2, 1, 3)
+      ; (2023, 3, 1, 3)
+      ; (2023, 4, 1, 6)
+      ; (2023, 5, 1, 1)
+      ; (2023, 6, 1, 4)
+      ; (2023, 7, 1, 6)
+      ; (2023, 8, 1, 2)
+      ; (2023, 9, 1, 5)
+      ; (2023, 10, 1, 0)
+      ; (2023, 11, 1, 3)
+      ; (2023, 12, 1, 5) ] ) ;
+  (* The last day of February, and the century rules. *)
+  let ok f = Time.of_utc (utc f) <> None in
+  is_true (ok (2024, 2, 29, 0, 0, 0, 0)) ;
+  is_false (ok (2023, 2, 29, 0, 0, 0, 0)) ;
+  is_false (ok (1900, 2, 29, 0, 0, 0, 0)) ;
+  is_true (ok (2000, 2, 29, 0, 0, 0, 0))
+
+let utc_invalid () =
+  let none f = Time.of_utc (utc f) = None in
+  is_true (none (2026, 0, 1, 0, 0, 0, 0)) ;
+  is_true (none (2026, 13, 1, 0, 0, 0, 0)) ;
+  is_true (none (2026, 4, 31, 0, 0, 0, 0)) ;
+  is_true (none (2026, 4, 0, 0, 0, 0, 0)) ;
+  is_true (none (2026, 4, 1, 24, 0, 0, 0)) ;
+  is_true (none (2026, 4, 1, 0, 60, 0, 0)) ;
+  (* No leap second in POSIX time. *)
+  is_true (none (2016, 12, 31, 23, 59, 60, 0)) ;
+  is_true (none (2026, 4, 1, 0, 0, -1, 0)) ;
+  (* Outside the range of [Clock.posix]. *)
+  is_true (none (2262, 4, 12, 0, 0, 0, 0)) ;
+  is_true (none (1677, 9, 20, 0, 0, 0, 0)) ;
+  is_true (none (1677, 9, 21, 0, 12, 43, 0)) ;
+  is_true (none (9999, 12, 31, 23, 59, 59, 0)) ;
+  is_true (none (max_int, 1, 1, 0, 0, 0, 0)) ;
+  is_true (none (min_int, 1, 1, 0, 0, 0, 0))
+
 let time_outside_fiber () =
   raises_match
     (function Fiber.Not_in_fiber "Time.now" -> true | _ -> false)
@@ -330,6 +438,10 @@ let time =
         add_overflows_exactly
     ; test "diff saturates" diff_saturates
     ; test "posix and unix seconds" posix_round_trip
+    ; test "to_utc and of_utc: known dates" utc_known
+    ; test "to_utc cuts the fraction of a second" utc_fraction
+    ; test "to_utc: the months of a leap year and a common year" utc_months
+    ; test "of_utc: a date out of range gives None" utc_invalid
     ; test "Time.now outside run raises Not_in_fiber" time_outside_fiber ]
 
 let tests = [world; span; time]
