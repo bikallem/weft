@@ -70,7 +70,10 @@ and ctx =
         (** The nested nodes that are not shields, by node id, under [lock]. *)
   ; chain: handler
         (** The handlers of the user on the chain of scopes, the outermost
-            first. Each fiber of the node runs inside it. *) }
+            first. Each fiber of the node runs inside it. *)
+  ; fids: int Atomic.t
+        (** The next fiber id. All nodes of one run share it (design section
+            2.5, The id of a fiber). *) }
 
 (* A handler of the user (design section 2.5, Effect handlers of a scope). *)
 and handler = {handle: 'a. (unit -> 'a) -> 'a}
@@ -572,11 +575,11 @@ end
 
 (* The fibers. *)
 
-let next_fid = Atomic.make 0
-
-(* A fiber with no name has the name "": [Sched_debug] names it. *)
+(* A fiber gets the next id of the nodes of its run. Thus the ids of a run start
+   at 0, and in the simulator a seed gives the same ids. A fiber with no name
+   has the name "": [Sched_debug] names it. *)
 let new_fiber ?(name = "") ?(pinned = false) ctxs =
-  let fid = Atomic.fetch_and_add next_fid 1 in
+  let fid = Atomic.fetch_and_add (List.hd ctxs).fids 1 in
   {fid; name; ctxs; current= Atomic.make None; queued= false; pinned}
 
 (* The table of live fibers exists only in the simulator. *)
@@ -1066,7 +1069,8 @@ let new_node ?parent ?handler kind =
   ; lock= Spin.make ()
   ; members= Hashtbl.create ~random:false 4
   ; children= Hashtbl.create ~random:false 4
-  ; chain }
+  ; chain
+  ; fids= (match parent with Some p -> p.fids | None -> Atomic.make 0) }
 
 let add_member_to n f =
   Spin.with_lock n.lock (fun () -> Hashtbl.replace n.members f.fid f)

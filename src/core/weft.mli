@@ -167,6 +167,36 @@ module Fiber : sig
   val yield : unit -> unit
   (** Puts the fiber at the tail of the queue. It is a cancellation point. *)
 
+  (** The id of a fiber (design section 2.5, The id of a fiber). Two fibers of
+      one run have different ids. A fiber keeps its id when it moves to a
+      different domain. *)
+  module Id : sig
+    type t
+
+    val equal : t -> t -> bool
+
+    val compare : t -> t -> int
+    (** In one run, the order is the order of the forks. Thus [Map.Make] and
+        [Set.Make] take [Id]. *)
+
+    val hash : t -> int
+
+    val to_int : t -> int
+    (** The number of the fiber in its run: [main] has 0, and each new fiber
+        gets the next number. The reports of the simulator name a fiber with no
+        name ["fiber-n"], with the same number. In the simulator, a seed gives
+        the same numbers. The ids of two runs can be equal. *)
+  end
+
+  val self : unit -> Id.t
+  (** The id of the fiber that calls it. The body of [scope], [shield] and
+      [with_timeout] runs in the fiber of the caller, so it has the id of the
+      caller. Each [fork] makes a new fiber with a new id, also [fork_promise].
+      For example, a writer fiber can keep its id, and a function can then
+      refuse a call from that fiber that waits for the end of the writer.
+
+      @raise Not_in_fiber outside a fiber. *)
+
   val shield : (unit -> 'a) -> 'a
   (** In [f], a [sync] does not see the cancels of the outer scopes. *)
 

@@ -37,6 +37,22 @@ let fork_daemon ?name scope f = Sched.fork_daemon ?name scope f
 
 let cancel = Sched.cancel
 
+(* The id of a fiber is the id of its record (design section 2.5, The id of a
+   fiber). The record goes with the fiber to each domain. *)
+module Id = struct
+  type t = int
+
+  let equal = Int.equal
+
+  let compare = Int.compare
+
+  let hash = Hashtbl.hash
+
+  let to_int t = t
+end
+
+let self () = (Sched.self ()).fid
+
 let shield = Sched.shield
 
 let yield = Event.yield
