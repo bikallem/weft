@@ -195,8 +195,9 @@ let unwatch_waiter () =
 (* A storm of signals while fibers run on small stacks (issue 6). The handler of
    the world must run on the signal stack (SA_ONSTACK): on a stack of a fiber,
    it corrupts the stack and the heap. A child shell sends SIGUSR1 in a loop for
-   2 s, and 8 fibers on 2 domains run effect handlers. A copy of this test on
-   Linux, with the handler with no SA_ONSTACK, crashed in each run. *)
+   2 s, and 8 fibers on 2 domains run effect handlers. Then the test counts the
+   signals of the storm. A copy of this test on Linux, with the handler with no
+   SA_ONSTACK, crashed in each run. *)
 type _ Effect.t += Step : int -> int Effect.t
 
 let rec items n acc = if n = 0 then acc else items (n - 1) (n :: acc)
@@ -258,7 +259,24 @@ let signal_storm () =
             done ) ;
         Process.kill sender SIGKILL ;
         ignore (Process.wait sender) ;
-        Atomic.get got )
+        (* Domain 0 takes the counts only when it polls, and a busy domain polls
+           each 61 switches. On a slow runner, domain 0 can make fewer switches
+           in the 2 s, and the fiber then gets no signal. Thus take the counts
+           of the storm that remain, until no signal comes in 100 ms. *)
+        let rec rest () =
+          match
+            sync
+              (choose
+                 [ Signal.received SIGUSR1
+                 ; wrap (Time.after Mono (Span.ms 100)) (fun () -> 0) ] )
+          with
+          | 0 ->
+              ()
+          | n ->
+              ignore (Atomic.fetch_and_add got n) ;
+              rest ()
+        in
+        rest () ; Atomic.get got )
   in
   at_least int ~than:100 got
 
