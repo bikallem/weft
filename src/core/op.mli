@@ -132,6 +132,9 @@ type _ t =
       (** Starts a connect. The fd is writable when the connect ends. *)
   | Connect_result : fd -> unit t
       (** The result of a connect: [Would_block] while it continues. *)
+  | Local_addr : fd -> addr t
+      (** [getsockname]: the local address of a socket. A Unix socket with no
+          path gives [Unix ""]. *)
   | Read : fd * bytes * int * int -> int t  (** 0 at the end of the stream. *)
   | Write : fd * bytes * int * int -> int t
   | Shutdown : fd -> unit t  (** Ends the send side. *)

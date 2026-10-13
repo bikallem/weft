@@ -11,7 +11,7 @@ external posix_ns : unit -> int64 = "weft_posix_ns"
 
 external listen : int -> string -> int -> int -> int = "weft_listen"
 
-external local_port_of : int -> int = "weft_local_port"
+external local_addr : int -> int * string * int * bool = "weft_local_addr"
 
 external connect : int -> string -> int -> int = "weft_connect"
 
@@ -298,11 +298,6 @@ let args_of : type a. int -> int -> a Op.blocking -> job_args =
   | Op.Resolve host | Op.Reverse host ->
       {base with s1= host}
 
-(* The C side reads each string up to its first NUL byte. *)
-let has_nul = List.exists (fun s -> String.contains s '\000')
-
-let nul_error = Error (Op.Other "EINVAL: a NUL byte in a string")
-
 let kind_of_int = function
   | 0 ->
       Op.Regular
@@ -437,12 +432,6 @@ let spawn_args (sp : Op.spawn) =
   , Option.value ~default:"" sp.cwd
   , [|kind sp.stdin; kind sp.stdout; kind sp.stderr|] )
 
-let spawn_has_nul (sp : Op.spawn) =
-  has_nul
-    ( (sp.prog :: sp.argv)
-    @ Option.value ~default:[] sp.env
-    @ Option.to_list sp.cwd )
-
 (* The result of [spawn_child]: (pid or -errno, the pidfd, stdin, stdout,
    stderr), with -1 for no pipe. *)
 let spawned_of (pid, pidfd, i, o, e) =
@@ -491,6 +480,12 @@ let submit : type a. pool -> a Op.t -> (a, Op.error) result option =
       else Some (result r)
   | Op.Connect_result fd ->
       Some (unit (connect_result fd))
+  | Op.Local_addr fd ->
+      let r, host, port, unix = local_addr fd in
+      Some
+        (Result.map
+           (fun () -> if unix then Op.Unix host else Op.Tcp (host, port))
+           (unit r) )
   | Op.Read (fd, buf, off, len) ->
       Some (result (recv fd buf off len))
   | Op.Write (fd, buf, off, len) ->
@@ -530,14 +525,12 @@ let submit : type a. pool -> a Op.t -> (a, Op.error) result option =
   | Op.Start (dom, op) ->
       let id = Atomic.fetch_and_add p.next_job 1 in
       let args = args_of id dom op in
-      if has_nul [args.s1; args.s2] then Some nul_error
-      else
-        (* The lock covers the start, so the job is in the table before its
-           completion can come. *)
-        Some
-          (Mutex.protect p.lock (fun () ->
-               Hashtbl.replace p.jobs id (job_start p.mbx args) ;
-               Ok id ) )
+      (* The lock covers the start, so the job is in the table before its
+         completion can come. *)
+      Some
+        (Mutex.protect p.lock (fun () ->
+             Hashtbl.replace p.jobs id (job_start p.mbx args) ;
+             Ok id ) )
   | Op.Finish (id, op) -> (
     match take_job p id with
     | Some j ->
@@ -594,10 +587,3 @@ let run (type w) ~name (module W : Weft.WORLD with type t = w) (w : w) ~close
       close w )
     (fun () ->
       Weft.Private.run_world ?slack ~domains ~on_create:start (module W) w main )
-
-let local_port ~name (fd : Weft.Net.t) =
-  Net.acquire fd name ;
-  let p = local_port_of fd.Sched.os in
-  Net.release fd ;
-  if p < 0 then raise (Net.Error (error_of (-p), name)) ;
-  p

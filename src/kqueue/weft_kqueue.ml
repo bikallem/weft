@@ -222,7 +222,7 @@ module World = struct
    fun t op ->
     match op with
     | Op.Spawn sp ->
-        if spawn_has_nul sp then nul_error else spawn t sp
+        spawn t sp
     | Op.Wait_child fd -> (
       match proc t fd with Some p -> wait_child t p | None -> Error Op.Bad_fd )
     | Op.Kill (fd, s) -> (
@@ -312,5 +312,3 @@ let run ?slack ?domains ?signals ?(watchdog = Some (Weft.Span.ms 10)) main =
     (module World)
     (create ~domains ?signals ())
     ~close ?slack ~domains ~watchdog main
-
-let local_port fd = local_port ~name:"Weft_kqueue.local_port" fd

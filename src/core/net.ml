@@ -69,6 +69,24 @@ let writable fd = fd_event ~write:true ~clear:false fd
 
 let ok name = function Ok v -> v | Error e -> raise (Error (e, name))
 
+(* The checks of the strings and the ports that go to the OS, one time for all
+   worlds (design section 2.3). The C side reads a string up to its first NUL
+   byte, and [Int_val] to an [int] of C cuts a large port. Thus without these
+   checks, the OS can use a different path or address. *)
+let check_string name s =
+  if String.contains s '\000' then
+    raise (Error (Op.Other "EINVAL: a NUL byte in a string", name))
+
+let check_host_port name (host, port) =
+  check_string name host ;
+  if port < 0 || port > 65535 then raise (Error (Op.Other "EINVAL", name))
+
+let check_addr name = function
+  | Tcp (host, port) ->
+      check_host_port name (host, port)
+  | Unix path ->
+      check_string name path
+
 (* [close] never blocks. If users remain, each domain with a registration gets a
    close notice, and the last user calls close(2) (design section 2.7,
    spec/tla/Fd.tla). A second close does nothing. [Self] first: outside a fiber,
@@ -78,6 +96,7 @@ let close fd =
   if Rc.close fd then prog "Net.close" (Close_notices fd)
 
 let listen ?(backlog = 128) addr =
+  check_addr "Net.listen" addr ;
   Fdtab.alloc
     (ok "Net.listen" (submit "Net.listen" (Op.Listen (addr, backlog))))
 
@@ -86,6 +105,7 @@ let accept l =
   (Fdtab.alloc os, peer)
 
 let connect addr =
+  check_addr "Net.connect" addr ;
   let fd =
     Fdtab.alloc (ok "Net.connect" (submit "Net.connect" (Op.Connect addr)))
   in
@@ -96,6 +116,9 @@ let connect addr =
       let bt = Printexc.get_raw_backtrace () in
       close fd ;
       Printexc.raise_with_backtrace e bt
+
+let local_addr fd =
+  ok "Net.local_addr" (attempt fd "Net.local_addr" (fun os -> Op.Local_addr os))
 
 (* The range of a read or a write. A read needs at least one byte: a read of 0
    bytes would give 0, the same result as the end of the stream. *)
@@ -178,6 +201,7 @@ let reset fd =
 (* UDP (design section 2.3, The I/O modules). A datagram moves in one operation,
    or not at all. *)
 let udp (host, port) =
+  check_host_port "Net.udp" (host, port) ;
   Fdtab.alloc ~kind:Udp (ok "Net.udp" (submit "Net.udp" (Op.Udp (host, port))))
 
 (* On Linux, a sendto on a TCP socket ignores the address, and it can send a
@@ -188,6 +212,8 @@ let check_udp name fd =
 let sendto fd buf off len (host, port) =
   check_range ~read:false "Net.sendto" buf off len ;
   check_udp "Net.sendto" fd ;
+  (* Before the submit: a closed socket also gives this error. *)
+  check_host_port "Net.sendto" (host, port) ;
   ignore
     (retry ~write:true fd "Net.sendto" (fun os ->
          Op.Sendto (os, buf, off, len, host, port) ) )

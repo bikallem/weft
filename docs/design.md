@@ -191,7 +191,7 @@ Each operation is a constructor of the GADT `'a Op.t`, for example `Read : fd * 
 
 | Module | Operations | Production | Simulator |
 |---|---|---|---|
-| `Net` | Sockets: TCP, UDP, Unix domain. `listen`, `accept`, `connect`, `read`, `write`, `read_now`, `write_now`, `sendto`, `recvfrom`, `shutdown`, `reset`, socket options | Non-blocking fds in the poller | The in-memory network |
+| `Net` | Sockets: TCP, UDP, Unix domain. `listen`, `accept`, `connect`, `local_addr`, `read`, `write`, `read_now`, `write_now`, `sendto`, `recvfrom`, `shutdown`, `reset`, socket options | Non-blocking fds in the poller | The in-memory network |
 | `Pipe` | `pipe`, `read`, `write` | Non-blocking fds in the poller | In-memory buffers |
 | `File` | `open`, `read`, `write`, `pread`, `pwrite`, `fsync`, `stat`, `truncate` | `Blocking` operations on the thread pool | An in-memory file system |
 | `Dir` | `mkdir`, `readdir`, `rename`, `unlink`, `rmdir` | `Blocking` operations on the thread pool | The in-memory file system |
@@ -203,6 +203,8 @@ Each operation is a constructor of the GADT `'a Op.t`, for example `Read : fd * 
 
 - `fork`. In OCaml 5, `Unix.fork` raises `Failure` if the program ever spawned a domain. `Process.spawn` takes its place.
 - The calls that only block, for example `Unix.sleep` and `Unix.select`. `Time.sleep` and `choose` take their place.
+
+**The checks of the strings and the ports (issue 2).** The C side reads a string only up to its first NUL byte, and `Int_val` cuts a large port to an `int` of C. Thus without a check, the OS can use a different path or address. The core does the checks one time, before the submit, and each world gives the same errors. A NUL byte in a path, a host, a name of `Dns` or an argument of `Process.spawn` gives `EINVAL: a NUL byte in a string`. A port out of the range 0 to 65535 gives `EINVAL`. The check comes before the use of the fd. Thus a `sendto` on a closed socket with a bad address gives `EINVAL`, not `EBADF`.
 
 **Direct calls to `Unix`.** A wrapper does not stop a library that calls `Unix` directly. This call goes past the world with no warning, as in caravan. Thus:
 
@@ -798,6 +800,8 @@ Each domain has its own poller (section 2.5). A fiber registers an fd in the pol
 
 Then `Net.read` blocks, and it ignores the deadline and the stop. After `EAGAIN`, `read_now` clears the flag of the domain with a request to the scheduler (`Clear_ready`), as the wait of `read` does. Thus the next `readable` waits for a new edge, and a loop of `readable` and `read_now` does not spin. The domain takes its edges only between fibers, so no edge can come between the attempt and the clear. An edge from before the attempt can come after the clear, and a fiber that moves to another domain can find a stale flag there. In these cases, the loop does one more attempt, and that attempt clears the flag again.
 
+**The local address (issue 2).** `Net.local_addr` calls `getsockname` with a user of the fd, as a read. It gives the host as text from `inet_ntop`, the same text as `accept` and `recvfrom`. Thus a listen on `localhost` gives `127.0.0.1`, and an IPv6 address has its short form, for example `::1`. A UDP socket gives `Tcp (host, port)`, because `addr` has only `Tcp` and `Unix` (decision 12). A Unix socket gives its path, up to the length that `getsockname` gives, because the path can have no NUL byte at the end. A Unix socket with no path, for example a client, gives `Unix ""`. An accepted Unix socket gives the path of its listener. A test on Linux 7.1 and the portable tests in the CI of FreeBSD and macOS (run 38308971000) verified this. The core refuses an address with a NUL byte or a port out of range before the submit (section 2.3, The checks of the strings and the ports).
+
 **An fd in many pollers (M1).** A fiber can block on X on domain A, move, and block on X on domain B later. Then X is in the two epoll sets, and A gets edges that nobody waits for. Linux gives a new edge for each arrival of data, also when the only fiber of the fd is busy and not blocked. Thus an edge with no live waiter is normal, also with one domain. A removes X from its set when an edge of X comes on A with no live waiter on A, and another domain also has a registration of X: then the fiber of X moved. The removal is an `EPOLL_CTL_DEL`, a change of the domain bit and the release of the user of the registration (see `close`, below). A close notice does the same steps. The two run on the thread of A, so they never interleave. If a fiber blocks on X on A again, A adds X again. Open question 4 has the measurements.
 
 **The waiters.** A commit on another branch leaves a stale waiter in a registration. The owner drops the waiters with a `Done` sync word when it adds a waiter and when an event comes. Thus a registration holds its live waiters and at most the stale waiters since the last add. Without this rule, a loop such as `choose [Net.readable fd; Time.after Mono 1s]` on a quiet connection adds one stale waiter each second.
@@ -958,6 +962,7 @@ The simulator copies the edge-triggered behavior of Linux strictly. If it gave m
 - The end of a stream and `EPOLLRDHUP` give edges.
 - **A reset (issue 1).** The simulator copies the results of Linux in section 2.7, What a reset gives on Linux. The close of a socket with `Reset_on_close` sends a reset to the peer, after the latency and after the data. The reset sets a flag of the peer: its next read with no data gives `ECONNRESET` and clears the flag. On TCP, the next write does the same. The peer has the end of the stream and no peer, so a later read gives 0 and a write gives `EPIPE`. A TCP socket after `Shutdown`, and a Unix socket with no unread data, get a normal close.
 - The close of a TCP or Unix stream socket with unread data also sends a reset, as on Linux (section 2.7). The close of a listener gives a reset to each connection in its backlog, also as on Linux. A connect in flight gets `ECONNREFUSED`. Data that arrives after the close or the reset of the receiver is lost.
+- **The addresses (issue 2).** A listen on port 0 gets the next free port of a counter that starts at 40000, as Linux gives a free port. A UDP socket on port 0 and each TCP client also get the next port of this counter, and a client has the host `client`. After the counter goes around, a client skips the ports of the clients that are not closed. Thus a seed gives the same ports in each run. The core refuses a bad port or a NUL byte before the submit, so the simulator does not check them (section 2.3). If each port of the counter has an open client, a connect gives `EADDRNOTAVAIL`, as on Linux. An accepted socket has the address of its listener, and its peer is the address of the client. A Unix client has no path: its address and the peer of its accepted socket are `Unix ""`, as on Linux.
 - **The fault `resets` of `Sim.net_faults`.** One write of a TCP socket in 64 resets the connection, as a middlebox can. The write gives `ECONNRESET` at once, and the peer gets the reset after the delay. A test of a client or a server can thus reach its `Reset` paths. The faults world of the portable tests does not enable it, because a reset ends the exchange of a test.
 - The simulator checks the order of production: a `close(2)` must come after the Deregister of each domain in the set, and a Deregister or an event must never name a closed or reused pair of slot and generation.
 
@@ -1073,7 +1078,7 @@ The cost of an effect is a perform and a handler call for each world operation. 
 
 ## 2.12 Decisions
 
-Decisions 1 to 6 were made on 2026-10-09, decisions 7 to 9 on 2026-10-10, and decisions 10 and 11 on 2026-10-12 (issue 1).
+Decisions 1 to 6 were made on 2026-10-09, decisions 7 to 9 on 2026-10-10, decisions 10 and 11 on 2026-10-12 (issue 1), and decision 12 on 2026-10-12 (issue 2).
 
 | No. | Question | Decision |
 |---|---|---|
@@ -1088,6 +1093,7 @@ Decisions 1 to 6 were made on 2026-10-09, decisions 7 to 9 on 2026-10-10, and de
 | 9 | Tests | windtrap 0.2.0: property, stateful and expect tests, coverage and mutation testing (section 2.17) |
 | 10 | A read with no wait | `Net.read_now` and `Net.write_now`, which clear the flag of the domain after `EAGAIN` (section 2.7). A fiber for each read costs a fiber and a scope for each wait. A cancel for the stop cannot stop only the idle connections. |
 | 11 | A close with a reset | `Net.reset`, not a `Linger` socket option. A linger time of more than 0 makes `close(2)` block, and the simulator models one reset more easily than all linger times. The simulator gives the reset to the peer, and the fault `resets` of `Sim.net_faults` resets a connection at random (section 2.8). |
+| 12 | The local address | `Net.local_addr` in the core, not a function of each world, so that code for all worlds and the simulator can use it (sections 2.7 and 2.8). We removed `Weft_linux.local_port` and `Weft_kqueue.local_port`, because `local_addr` gives the same port. A UDP socket gives `Tcp (host, port)`. A `Udp` constructor in `addr` adds a case that `listen` and `connect` must refuse, and a separate function for UDP adds a second API for one task. |
 
 Also on 2026-10-10, the user accepted the milestone plan of section 2.14. Decisions 4, 7 and 8 stay, and they come in milestone M1. Milestone M0 has one domain.
 

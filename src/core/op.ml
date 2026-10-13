@@ -98,6 +98,7 @@ type _ t =
   | Accept : fd -> (fd * addr) t
   | Connect : addr -> fd t
   | Connect_result : fd -> unit t
+  | Local_addr : fd -> addr t
   | Read : fd * bytes * int * int -> int t
   | Write : fd * bytes * int * int -> int t
   | Shutdown : fd -> unit t

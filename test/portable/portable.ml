@@ -78,6 +78,13 @@ let error_of f =
   | exception Net.Error (e, _) ->
       Format.asprintf "%a" Private.Op.pp_error e
 
+let host_port s =
+  match Net.local_addr s with
+  | Net.Tcp (host, port) ->
+      (host, port)
+  | Net.Unix _ ->
+      invalid_arg "host_port"
+
 let events w =
   group "events"
     [ test "always, never, wrap and guard" (fun () ->
@@ -778,6 +785,126 @@ let until_answer s dst msg f =
   in
   go 100
 
+(* The host of the addresses of the world. *)
+let host_of w =
+  let l, a = w.listen () in
+  Net.close l ;
+  match a with Net.Tcp (h, _) -> h | Net.Unix _ -> invalid_arg "host_of"
+
+let local_addr w =
+  group "local_addr"
+    [ test "a listen on port 0 gets a port, and a client connects to it"
+        (fun () ->
+          w.run (fun () ->
+              let host = host_of w in
+              let l = Net.listen (Net.Tcp (host, 0)) in
+              let a = Net.local_addr l in
+              ( match a with
+              | Net.Tcp (h, p) ->
+                  equal string host h ;
+                  is_true (p > 0)
+              | Net.Unix _ ->
+                  fail "a Unix address" ) ;
+              Fiber.scope (fun s ->
+                  Fiber.fork_daemon s (fun () -> echo_server l) ;
+                  let c = Net.connect a in
+                  Net.write c "hello" ;
+                  equal string "hello" (read_n c 5) ;
+                  Net.close c ) ;
+              Net.close l ) )
+    ; test "an accepted socket and its client agree on the two addresses"
+        (fun () ->
+          w.run (fun () ->
+              let l = Net.listen (Net.Tcp (host_of w, 0)) in
+              let a = Net.local_addr l in
+              let c = Net.connect a in
+              let s, peer = Net.accept l in
+              is_true (Net.local_addr s = a) ;
+              is_true (Net.local_addr c = peer) ;
+              ( match peer with
+              | Net.Tcp (_, p) ->
+                  is_true (p > 0)
+              | Net.Unix _ ->
+                  fail "a Unix address" ) ;
+              (* The client keeps its port after the close of the peer. *)
+              Net.close s ;
+              is_true (Net.local_addr c = peer) ;
+              Net.close c ;
+              Net.close l ) )
+    ; test "a Unix listener has its path, and a Unix client has no path"
+        (fun () ->
+          w.run (fun () ->
+              let a = Net.Unix (Filename.concat (w.tmp ()) "s") in
+              let l = Net.listen a in
+              let c = Net.connect a in
+              let s, peer = Net.accept l in
+              is_true (Net.local_addr l = a) ;
+              is_true (Net.local_addr s = a) ;
+              is_true (Net.local_addr c = Net.Unix "") ;
+              is_true (peer = Net.Unix "") ;
+              Net.close s ;
+              Net.close c ;
+              Net.close l ) )
+    ; test "a UDP socket on port 0 gets a port" (fun () ->
+          w.run (fun () ->
+              let u, u_addr = w.udp () in
+              equal (pair string int) u_addr (host_port u) ;
+              let host = fst u_addr in
+              let a = Net.udp (host, 0) and b = Net.udp (host, 0) in
+              let ha, pa = host_port a and hb, pb = host_port b in
+              equal string host ha ;
+              equal string host hb ;
+              is_true (pa > 0 && pb > 0 && pa <> pb) ;
+              Net.close a ;
+              Net.close b ;
+              Net.close u ) )
+    ; test "a port out of range or a NUL byte gives EINVAL" (fun () ->
+          w.run (fun () ->
+              let host = host_of w in
+              let einval f = equal string "EINVAL" (error_of f) in
+              let nul f =
+                equal string "EINVAL: a NUL byte in a string" (error_of f)
+              in
+              (* A port of more than 32 bits is not cut to its low bits. *)
+              let big = 1 lsl 32 in
+              let l = Net.listen (Net.Tcp (host, 0)) in
+              let p =
+                match Net.local_addr l with Net.Tcp (_, p) -> p | _ -> 0
+              in
+              List.iter
+                (fun port ->
+                  einval (fun () -> Net.listen (Net.Tcp (host, port))) ;
+                  einval (fun () -> Net.connect (Net.Tcp (host, port))) ;
+                  einval (fun () -> Net.udp (host, port)) )
+                [65536; -1; big] ;
+              einval (fun () -> Net.connect (Net.Tcp (host, big + p))) ;
+              nul (fun () -> Net.listen (Net.Tcp (host ^ "\000x", 0))) ;
+              nul (fun () -> Net.connect (Net.Tcp (host ^ "\000x", p))) ;
+              let path = Filename.concat (w.tmp ()) "s" in
+              nul (fun () -> Net.listen (Net.Unix (path ^ "\000x"))) ;
+              nul (fun () -> Net.connect (Net.Unix (path ^ "\000x"))) ;
+              nul (fun () -> Net.udp (host ^ "\000x", 0)) ;
+              let u, (_, up) = w.udp () and b = Bytes.of_string "x" in
+              einval (fun () -> Net.sendto u b 0 1 (host, 65536)) ;
+              einval (fun () -> Net.sendto u b 0 1 (host, big + up)) ;
+              nul (fun () -> Net.sendto u b 0 1 (host ^ "\000x", up)) ;
+              (* The core checks the address before it uses the socket. Thus a
+                 closed socket with a bad address gives EINVAL, not EBADF. *)
+              Net.close u ;
+              einval (fun () -> Net.sendto u b 0 1 (host, 65536)) ;
+              nul (fun () -> Net.sendto u b 0 1 (host ^ "\000x", up)) ;
+              equal string "EBADF"
+                (error_of (fun () -> Net.sendto u b 0 1 (host, up))) ;
+              Net.close l ) )
+    ; test "a closed socket gives EBADF" (fun () ->
+          w.run (fun () ->
+              let l, _ = w.listen () and u, _ = w.udp () in
+              Net.close l ;
+              Net.close u ;
+              equal string "EBADF" (error_of (fun () -> Net.local_addr l)) ;
+              equal string "EBADF" (error_of (fun () -> Net.local_addr u)) ) )
+    ]
+
 let udp w =
   group "udp"
     [ test "a datagram gets its answer, with the addresses of the two sides"
@@ -1474,6 +1601,30 @@ let files w =
               Dir.rename (p "dir/sub") (p "empty") ;
               equal (list string) [] (Dir.readdir (p "dir")) ;
               is_true ((File.stat (p "empty")).kind = File.Directory) ) )
+    ; test "a NUL byte in a path, a name or an argument gives EINVAL" (fun () ->
+          w.run (fun () ->
+              let p = Filename.concat (w.tmp ()) in
+              let bad = p "a\000b" in
+              Dir.mkdir (p "a") ;
+              let nul f =
+                equal string "EINVAL: a NUL byte in a string" (fs_error f)
+              in
+              nul (fun () -> File.openfile [Write; Create] bad) ;
+              nul (fun () -> File.stat bad) ;
+              nul (fun () -> Dir.mkdir bad) ;
+              nul (fun () -> Dir.readdir bad) ;
+              nul (fun () -> Dir.rename (p "a") bad) ;
+              nul (fun () -> Dir.rename bad (p "c")) ;
+              nul (fun () -> Dir.unlink bad) ;
+              nul (fun () -> Dir.rmdir bad) ;
+              nul (fun () -> Dns.resolve "localhost\000x") ;
+              nul (fun () -> Dns.reverse "127.0.0.1\000x") ;
+              nul (fun () -> Process.spawn "sh\000x" []) ;
+              nul (fun () -> Process.spawn "sh" ["-c\000x"]) ;
+              nul (fun () -> Process.spawn ~env:["A=\000"] "sh" []) ;
+              nul (fun () -> Process.spawn ~cwd:bad "sh" []) ;
+              (* Nothing changed. *)
+              equal (list string) [] (Dir.readdir (p "a")) ) )
     ; test "pread and pwrite at offset 0 do not move the offset" (fun () ->
           w.run (fun () ->
               let path = Filename.concat (w.tmp ()) "o" in
@@ -1549,6 +1700,7 @@ let tests w =
         ; scopes w
         ; net w
         ; now_and_reset w
+        ; local_addr w
         ; udp w
         ; overflow_runs w
         ; layers w

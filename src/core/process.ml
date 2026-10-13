@@ -20,6 +20,9 @@ type t =
 let spawn ?env ?cwd ?(stdin = Inherit) ?(stdout = Inherit) ?(stderr = Inherit)
     prog args =
   let sp = {Op.prog; argv= prog :: args; env; cwd; stdin; stdout; stderr} in
+  List.iter
+    (Net.check_string "Process.spawn")
+    ((prog :: args) @ Option.value ~default:[] env @ Option.to_list cwd) ;
   let r = Net.ok "Process.spawn" (Net.submit "Process.spawn" (Op.Spawn sp)) in
   let alloc kind = Option.map (Sched.Fdtab.alloc ~kind) in
   { pid= r.pid

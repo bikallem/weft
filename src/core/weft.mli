@@ -316,11 +316,16 @@ end
     Design sections 2.3 and 2.7. *)
 
 module Net : sig
+  (** A port out of the range 0 to 65535 gives [Error (Other "EINVAL", _)]. A
+      NUL byte in a host or a path gives
+      [Error (Other "EINVAL: a NUL byte in a string", _)], as for each path,
+      name and argument of [File], [Dir], [Dns] and [Process.spawn]. *)
   type addr = Private.Net.addr =
     | Tcp of string * int
-    | Unix of string
-        (** In the simulator, the host of [Tcp] is a name, for example
+        (** A host and a port. [local_addr] also gives the address of a UDP
+            socket as [Tcp]. In the simulator, the host is a name, for example
             ["server"]. *)
+    | Unix of string  (** The path of a Unix domain socket. *)
 
   (** A socket. *)
   type t = Private.Net.t
@@ -347,6 +352,20 @@ module Net : sig
   val accept : t -> t * addr
 
   val connect : addr -> t
+
+  val local_addr : t -> addr
+  (** The local address of a socket, for example the port that the OS selected
+      for a listen on port 0. A connected socket has a port that the OS
+      selected. An accepted socket has the address that its client connected to.
+      A Unix socket with no path, for example a client, gives [Unix ""]. A UDP
+      socket gives [Tcp (host, port)]. In the production worlds, the host is an
+      IP address, for example ["127.0.0.1"] after a listen on ["localhost"]. In
+      the simulator, the host is the name of the listener or of the UDP socket.
+      A client has the host ["client"]. The simulator selects the port of a
+      client, and a port for [listen] and [udp] on port 0, from a counter that
+      starts at 40000.
+
+      @raise Error with [Bad_fd] if the socket is closed. *)
 
   val read : t -> bytes -> int -> int -> int
   (** [read t buf off len] reads at least one byte, or gives 0 at the end of the
@@ -414,10 +433,11 @@ module Net : sig
 
   val udp : string * int -> t
   (** [udp (host, port)] gives a UDP socket, bound to the host and the port. The
-      port 0 gives a free port. In the simulator, the host is a name, for
-      example ["client"]. [close] closes the socket. [read] takes one datagram
-      with no address, and 0 is then an empty datagram, not the end of a stream.
-      [write] raises [Error (Other "EDESTADDRREQ", _)]. *)
+      port 0 gives a free port, and [local_addr] gives it as [Tcp (host, port)].
+      In the simulator, the host is a name, for example ["client"]. [close]
+      closes the socket. [read] takes one datagram with no address, and 0 is
+      then an empty datagram, not the end of a stream. [write] raises
+      [Error (Other "EDESTADDRREQ", _)]. *)
 
   val sendto : t -> bytes -> int -> int -> string * int -> unit
   (** [sendto t buf off len (host, port)] sends one datagram with the bytes of

@@ -83,6 +83,7 @@ type conn =
   ; mutable refused: bool
   ; mutable cfd: int  (** [-1] until the server side is accepted. *)
   ; remote: Op.addr
+  ; local: Op.addr  (** [Local_addr]. *)
   ; tcp: bool  (** A TCP socket, not a Unix socket or a pipe. *) }
 
 (* [pending] counts the connections that the latency still holds, so that they
@@ -94,7 +95,8 @@ type listener =
   ; backlog: conn Queue.t
   ; limit: int
   ; mutable pending: int
-  ; ltcp: bool }
+  ; ltcp: bool
+  ; laddr: Op.addr  (** The address, with the port of a listen on port 0. *) }
 
 (* A UDP socket: its address, and the datagrams that came, with their senders.
    [bytes] counts the cost of the queue, against the receive buffer. A datagram
@@ -141,6 +143,8 @@ type net =
   ; mutable next_fd: int
   ; names: (string, int) Hashtbl.t  (** The listeners, by address. *)
   ; udp_names: (string, int) Hashtbl.t  (** The UDP sockets, by address. *)
+  ; client_ports: (int, int) Hashtbl.t
+        (** The ports of the TCP clients that are not closed, with their fds. *)
   ; opts: (int, opts) Hashtbl.t
         (** The options of each socket, after its first [Set_option] or
             [Get_option]. *)
@@ -338,7 +342,13 @@ let fresh_port n used =
   let rec go tries =
     let p = n.next_port in
     n.next_port <- (if p >= 65535 then 40000 else p + 1) ;
-    if used p && tries > 0 then go (tries - 1) else p
+    if
+      used p
+      && ( tries > 0 )
+         [@mutate
+           off "the count of tries matters only when all ports are in use"]
+    then go ((tries - 1) [@mutate off "the same reason"])
+    else p
   in
   (go (65535 - 40000)
    [@mutate off "the count of tries matters only when all ports are in use"] )
@@ -781,6 +791,7 @@ let new_pipe n =
     ; refused= false
     ; cfd= new_fd n
     ; remote= Op.Unix ""
+    ; local= Op.Unix ""
     ; tcp= false }
   in
   let r = mk Rd_end and w = mk Wr_end in
@@ -859,6 +870,15 @@ let submit : type a. t -> a Op.t -> (a, Op.error) result =
   in
   match op with
   | Op.Listen (addr, backlog) ->
+      (* A listen on port 0 gets a free port, as on Linux. *)
+      let addr =
+        match addr with
+        | Op.Tcp (h, 0) ->
+            let used p = Hashtbl.mem n.names (key (Op.Tcp (h, p))) in
+            Op.Tcp (h, fresh_port n used)
+        | a ->
+            a
+      in
       let k = key addr in
       if Hashtbl.mem n.names k then Error Op.In_use
       else
@@ -866,8 +886,12 @@ let submit : type a. t -> a Op.t -> (a, Op.error) result =
         let ltcp = match addr with Op.Tcp _ -> true | Op.Unix _ -> false in
         Hashtbl.replace n.fds fd
           (Lsn
-             {key= k; backlog= Queue.create (); limit= backlog; pending= 0; ltcp}
-          ) ;
+             { key= k
+             ; backlog= Queue.create ()
+             ; limit= backlog
+             ; pending= 0
+             ; ltcp
+             ; laddr= addr } ) ;
         Hashtbl.replace n.names k fd ;
         Ok fd
   | Op.Connect addr -> (
@@ -877,10 +901,21 @@ let submit : type a. t -> a Op.t -> (a, Op.error) result =
           refused ()
       | Some lfd -> (
         match Hashtbl.find_opt n.fds lfd with
+        | Some (Lsn {ltcp= true; _})
+          when Hashtbl.length n.client_ports > 65535 - 40000 ->
+            (* Each port of the counter has an open client, as Linux gives
+               EADDRNOTAVAIL when it has no free port. *)
+            Error (Op.Other "EADDRNOTAVAIL")
         | Some (Lsn l) when Queue.length l.backlog + l.pending < l.limit ->
             l.pending <- l.pending + 1 ;
-            let port = fresh_port n (fun _ -> false) in
-            let mk remote =
+            (* The client has the host "client" and a port from the counter that
+               no open client has. A Unix client has no path. *)
+            let client =
+              if l.ltcp then
+                Op.Tcp ("client", fresh_port n (Hashtbl.mem n.client_ports))
+              else Op.Unix ""
+            in
+            let mk ~local remote =
               { role= Sock
               ; inbox= Buffer.create 64
               ; rpos= 0
@@ -895,14 +930,20 @@ let submit : type a. t -> a Op.t -> (a, Op.error) result =
               ; refused= false
               ; cfd= -1
               ; remote
+              ; local
               ; tcp= l.ltcp }
             in
-            let c = mk addr and s = mk (Op.Tcp ("client", port)) in
+            let c = mk ~local:client addr and s = mk ~local:l.laddr client in
             c.peer <- Some s ;
             s.peer <- Some c ;
             s.established <- true ;
             c.cfd <- new_fd n ;
             Hashtbl.replace n.fds c.cfd (Conn c) ;
+            ( match client with
+            | Op.Tcp (_, p) ->
+                Hashtbl.replace n.client_ports p c.cfd
+            | Op.Unix _ ->
+                () ) ;
             later t (fun () ->
                 l.pending <- l.pending - 1 ;
                 match Hashtbl.find_opt n.fds lfd with
@@ -923,6 +964,18 @@ let submit : type a. t -> a Op.t -> (a, Op.error) result =
           if c.refused then Error Op.Refused
           else if c.established then Ok ()
           else Error Op.Would_block )
+  | Op.Local_addr fd -> (
+    match Hashtbl.find_opt n.fds fd with
+    | Some (Lsn l) ->
+        Ok l.laddr
+    | Some (Conn {role= Sock; local; _}) ->
+        Ok local
+    | Some (Dgm g) ->
+        Ok (Op.Tcp (g.host, g.port))
+    | Some (Conn _ | Fil _ | Pfd _) ->
+        Error (Op.Other "ENOTSOCK")
+    | None ->
+        Error Op.Bad_fd )
   | Op.Accept lfd -> (
     match Hashtbl.find_opt n.fds lfd with
     | Some (Lsn l) -> (
@@ -962,11 +1015,7 @@ let submit : type a. t -> a Op.t -> (a, Op.error) result =
         else port
       in
       let k = key port in
-      if
-        (port < 0) [@mutate off "the port 0 got a free port before this check"]
-        || port > 65535
-      then Error (Op.Other "EINVAL")
-      else if Hashtbl.mem n.udp_names k then Error Op.In_use
+      if Hashtbl.mem n.udp_names k then Error Op.In_use
       else
         let fd = new_fd n in
         Hashtbl.replace n.fds fd
@@ -1098,6 +1147,12 @@ let submit : type a. t -> a Op.t -> (a, Op.error) result =
           Hashtbl.remove n.opts fd ;
           ( match sfd with
           | Conn c ->
+              ( match c.local with
+              | Op.Tcp (_, p) when Hashtbl.find_opt n.client_ports p = Some fd
+                ->
+                  Hashtbl.remove n.client_ports p
+              | Op.Tcp _ | Op.Unix _ ->
+                  () ) ;
               (* Linux also sends a reset at the close of a TCP or Unix stream
                  socket with unread data. *)
               if c.abort || (c.role = Sock && avail c > 0) then reset_conn t c
@@ -1476,6 +1531,7 @@ let run ?(seed = 0) ?(domains = 1) ?(auto = true) ?(signals = [])
         ; next_fd= 3
         ; names= Hashtbl.create ~random:false 8
         ; udp_names= Hashtbl.create ~random:false 8
+        ; client_ports= Hashtbl.create ~random:false 8
         ; opts= Hashtbl.create ~random:false 8
         ; regs= Hashtbl.create ~random:false 16
         ; edges= []

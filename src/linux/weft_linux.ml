@@ -173,10 +173,8 @@ module World = struct
    fun t op ->
     match op with
     | Op.Spawn sp ->
-        if spawn_has_nul sp then nul_error
-        else
-          (* The world ignores only SIGPIPE: it blocks the watched signals. *)
-          spawned_of (spawn_child (spawn_args sp) [|number_of Op.SIGPIPE|])
+        (* The world ignores only SIGPIPE: it blocks the watched signals. *)
+        spawned_of (spawn_child (spawn_args sp) [|number_of Op.SIGPIPE|])
     | Op.Wait_child fd ->
         status_of (wait_child fd)
     | Op.Kill (fd, s) ->
@@ -262,7 +260,5 @@ let run ?slack ?domains ?signals ?(watchdog = Some (Weft.Span.ms 10)) main =
     (module World)
     (create ~domains ?signals ())
     ~close ?slack ~domains ~watchdog main
-
-let local_port fd = local_port ~name:"Weft_linux.local_port" fd
 
 let alarm_sets () = Atomic.get alarm_sets
