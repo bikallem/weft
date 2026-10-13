@@ -296,8 +296,16 @@ let pool_max = 16
 
 let pool_limit = 8
 
-(* A writer opens the FIFO, and each open that blocks on it ends. *)
-let release fifo = Unix.close (Unix.openfile fifo [O_WRONLY; O_NONBLOCK] 0)
+(* A writer opens the FIFO, and each open that blocks on it ends. Then the
+   fibers close the files of [held]. The writer stays open until these opens
+   end: on a busy host, an open can start after the open of the writer. A writer
+   that closed at once gave an open that never ended. On Linux, an open of a
+   FIFO with O_RDWR does not block, also with no reader. *)
+let release fifo held =
+  let w = Unix.openfile fifo [O_RDWR] 0 in
+  Fun.protect
+    ~finally:(fun () -> Unix.close w)
+    (fun () -> List.iter (fun p -> File.close (Promise.await p)) held)
 
 (* [n] fibers that each hold a thread of the pool. *)
 let hold s fifo n =
@@ -324,8 +332,7 @@ let detach_queued () =
           raises Fiber.Timeout (fun () ->
               Fiber.with_timeout Mono (Span.ms 50) (fun () ->
                   File.openfile [Write; Create] file ) ) ;
-          release fifo ;
-          List.iter (fun p -> File.close (Promise.await p)) held ;
+          release fifo held ;
           (* The pool has threads again: the job would run now. *)
           ignore (File.stat "/") ;
           Time.sleep Mono (Span.ms 20) ) ) ;
@@ -353,8 +360,7 @@ let detached_threads () =
           let held = held @ hold s fifo 1 in
           raises Fiber.Timeout (fun () ->
               Fiber.with_timeout Mono (Span.ms 50) (fun () -> File.stat "/") ) ;
-          release fifo ;
-          List.iter (fun p -> File.close (Promise.await p)) held ) ) ;
+          release fifo held ) ) ;
   equal int before (open_fds ())
 
 (* A pool that is full for more than 1 s writes one warning to stderr. *)
@@ -377,8 +383,7 @@ let full_warning () =
               raises Fiber.Timeout (fun () ->
                   Fiber.with_timeout Mono (Span.ms 1300) (fun () ->
                       File.stat "/" ) ) ;
-              release fifo ;
-              List.iter (fun p -> File.close (Promise.await p)) held ) ) ) ;
+              release fifo held ) ) ) ;
   Unix.close fd ;
   equal int before (open_fds ()) ;
   equal int (w0 + 1) (Weft_linux.pool_warnings ()) ;
