@@ -16,6 +16,9 @@ on:
 jobs:
   tla:
     runs-on: ubuntu-24.04
+    # A normal run takes about 1.5 h. check.sh stops each case after
+    # 1.5 h, and this limit stops the job if the script hangs.
+    timeout-minutes: 240
     steps:
       - uses: actions/checkout@v4
       - uses: cachix/install-nix-action@v31

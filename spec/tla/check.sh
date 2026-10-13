@@ -16,6 +16,10 @@
 # A "fail" case plants one bug, and TLC must find a violation or a deadlock.
 # The script gives exit status 1 if a result is not the expected one.
 # JOBS (default 4), WORKERS and HEAP (default 2g) control the parallel runs.
+# LIMIT (default 5400) is the maximum time of one case, in seconds. A case
+# that is longer stops with an error, so that a hang does not stop the script.
+# Each result goes to stderr when its case ends, and the list of all results
+# goes to stdout at the end.
 set -u
 cd "$(dirname "$0")"
 work=$(mktemp -d)
@@ -27,6 +31,7 @@ n=0
 JOBS=${JOBS:-4}
 WORKERS=${WORKERS:-$(( $(nproc) / JOBS > 0 ? $(nproc) / JOBS : 1 ))}
 export JAVA_TOOL_OPTIONS="-Xmx${HEAP:-2g}"
+LIMIT=${LIMIT:-5400}
 MODELS=${MODELS:-"Commit Scope Ivar Wake Fd Semaphore Signal"}
 want() { case " $MODELS " in *" $1 "*) return 0 ;; *) return 1 ;; esac; }
 
@@ -55,24 +60,35 @@ runone() {
   local i=$1 module expect scen bugs
   { read -r module; read -r expect; read -r scen; read -r bugs; } < "$work/case$i.meta"
   local out="$work/out$i.txt"
-  local t0=$SECONDS try
+  local t0=$SECONDS try rc=0
+  # TLC copies the standard modules (Integers.tla and the others) from its jar
+  # to java.io.tmpdir, /tmp by default, and deletes them at its exit. With one
+  # directory for all cases, a case truncates or deletes the file that another
+  # case parses. Thus each case has its own directory.
+  mkdir -p "$work/tmp$i"
   for try in 1 2; do
     rm -rf "$work/states$i"
-    tlc -workers "$WORKERS" -lncheck final -metadir "$work/states$i" \
+    JAVA_TOOL_OPTIONS="$JAVA_TOOL_OPTIONS -Djava.io.tmpdir=$work/tmp$i" \
+      timeout -k 30 "$LIMIT" tlc -workers "$WORKERS" -lncheck final -metadir "$work/states$i" \
       -config "$work/case$i.cfg" "$module.tla" > "$out" 2>&1
+    rc=$?
+    # A timeout is not a race of the start, so do not try again.
+    [ "$rc" = 124 ] || [ "$rc" = 137 ] && break
     # TLC gave a result: a pass, a violation or a deadlock.
     grep -qE "No error has been found|^Error: (Invariant|Deadlock|Temporal)" "$out" && break
   done
   local result=error why states
   why=$(grep -m1 -E "^Error: (Invariant [A-Za-z]+ is violated|Deadlock reached|Temporal properties were violated)" "$out" | sed 's/^Error: //')
   if grep -q "No error has been found" "$out"; then result=pass
-  elif [ -n "$why" ]; then result=fail; fi
-  states=$(grep -oE "[0-9]+ distinct states found" "$out" | tail -1)
+  elif [ -n "$why" ]; then result=fail
+  elif [ "$rc" = 124 ] || [ "$rc" = 137 ]; then why="no result in $LIMIT s"; fi
+  states=$(grep -oE "[0-9,]+ distinct states found" "$out" | tail -1)
   printf '%-6s %-6s %-6s %-20s -> %s %s (%s, %ss)\n' "$module" "$expect" "$scen" "$bugs" \
     "$result" "${why:-}" "${states:-?}" "$((SECONDS - t0))" > "$work/res$i"
   [ "$result" = "$expect" ] || echo "unexpected" >> "$work/res$i"
+  head -1 "$work/res$i" >&2
   [ "$result" = error ] && head -20 "$out" >> "$work/res$i"
-  rm -rf "$work/states$i"
+  rm -rf "$work/states$i" "$work/tmp$i"
 }
 
 commit() { want Commit || return 0 # expect scenario noParked noIdOrder dropOnClaimed noLock
@@ -196,7 +212,7 @@ sig fail   linux    FALSE FALSE FALSE  FALSE FALSE   TRUE
 
 # Run the cases. The slow cases come first, so that they start early.
 export -f runone
-export work WORKERS
+export work WORKERS LIMIT
 t0=$SECONDS
 for i in $(seq 1 "$n"); do
   # Wake cases have the largest state space.

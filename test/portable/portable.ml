@@ -23,6 +23,14 @@ module Log = struct
   let get l = List.rev (Atomic.get l)
 end
 
+(* A failure report gives the error of a [Net.Error], not "_". *)
+let () =
+  Printexc.register_printer (function
+    | Net.Error (e, name) ->
+        Some (Format.asprintf "Net.Error (%a, %S)" Private.Op.pp_error e name)
+    | _ ->
+        None )
+
 let read_n c n =
   let buf = Bytes.create n in
   let rec loop off =
@@ -46,14 +54,14 @@ let drain read r =
 
 let read_all = drain Net.read
 
-let echo_server l =
+let echo_server ?(reset = false) l =
   Fiber.scope (fun s ->
       while true do
         let c, _ = Net.accept l in
         Fiber.fork ~name:"echo" s (fun () ->
             (* Close the socket also on a cancel. *)
             Fun.protect
-              ~finally:(fun () -> Net.close c)
+              ~finally:(fun () -> if reset then Net.reset c else Net.close c)
               (fun () ->
                 let buf = Bytes.create 4096 in
                 let rec loop () =
@@ -70,6 +78,15 @@ let echo_server l =
                 in
                 loop () ) )
       done )
+
+let connect_fast a =
+  match Fiber.with_timeout Mono (Span.s 10) (fun () -> Net.connect a) with
+  | c ->
+      c
+  | exception Fiber.Timeout ->
+      fail
+        "a connect took more than 10 s: the conntrack table or the ports of \
+         the host can be full, or weft lost the wakeup of the connect"
 
 let error_of f =
   match f () with

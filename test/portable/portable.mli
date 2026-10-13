@@ -34,7 +34,17 @@ val reset_details : world -> Windtrap.test
 
 (**/**)
 
-val echo_server : Weft.Net.t -> unit
+val echo_server : ?reset:bool -> Weft.Net.t -> unit
+(** [echo_server l] echoes the bytes of each client of [l]. At the end of the
+    stream, it closes the connection. With [~reset:true], it closes the
+    connection with [Net.reset]: then no side of the connection keeps a
+    TIME_WAIT socket. *)
+
+val connect_fast : Weft.Net.addr -> Weft.Net.t
+(** [connect_fast a] is [Net.connect a], but if the connect takes more than 10
+    s, the test gives a failure with a clear message. When the conntrack table
+    of the host is full, the host drops each SYN, and a connect waits for 127 s.
+    A lost wakeup of the connect in weft also gives this failure. *)
 
 val read_n : Weft.Net.t -> int -> string
 

@@ -770,3 +770,20 @@ value weft_pool_warnings(value unit) {
   (void)unit;
   return Val_long(__atomic_load_n(&warnings, __ATOMIC_RELAXED));
 }
+
+/* The jobs of a pool that wait in the queue or run. A thread that is not idle
+   runs a job, or it starts or ends. Under the pool mutex. */
+static intnat busy(struct pool *p) { return p->queued + p->threads - p->idle; }
+
+/* The jobs of all pools that wait or run, for the tests. At 0, each job is
+   done, and the pool closed each fd of a detached job and of each close. */
+value weft_pool_busy(value unit) {
+  (void)unit;
+  pthread_mutex_lock(&file_pool.m);
+  intnat n = busy(&file_pool);
+  pthread_mutex_unlock(&file_pool.m);
+  pthread_mutex_lock(&dns_pool.m);
+  n += busy(&dns_pool);
+  pthread_mutex_unlock(&dns_pool.m);
+  return Val_long(n);
+}

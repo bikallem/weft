@@ -340,6 +340,8 @@ let watchdog_reports = watchdog_reports
 
 let pool_warnings = pool_warnings
 
+let pool_busy = pool_busy
+
 let run ?slack ?domains ?signals ?(watchdog = Some (Weft.Span.ms 10)) main =
   let domains = match domains with Some n -> n | None -> default_domains () in
   Weft_posix.run ~name:"Weft_kqueue.run"

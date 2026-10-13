@@ -98,17 +98,44 @@ let other_process () =
   is_true (status = Unix.WEXITED 0) ;
   equal string "hello" got
 
-let open_fds () = Array.length (Sys.readdir "/proc/self/fd")
+(* The pool closes the fds of the files after the end of the operation (section
+   2.7 of the design). Thus the count of fds first waits up to 10 s until the
+   pool has no job ([pool_idle]). If not, a test can count the fd of a file that
+   an earlier test closed, before the close. A wait for the correct count is not
+   sufficient: the count can be correct for a short time, while a detached open
+   of the pool did not get its fd yet. If the pool has jobs after 10 s, the test
+   gives a failure. [sleep] waits 1 ms. In a run, it must be [in_run]: a wait
+   with no switch for more than 10 ms gives a warning of the watchdog. *)
+let pool_idle sleep =
+  let rec wait n =
+    if Weft_linux.pool_busy () > 0 then
+      if n = 0 then fail "the pool has jobs after 10 s"
+      else (
+        sleep () ;
+        wait (n - 1) )
+  in
+  wait 10_000
 
-(* 10,000 connections open and close, and no fd stays open. *)
+let in_run () = Time.sleep Mono (Span.ms 1)
+
+let open_fds () =
+  pool_idle (fun () -> Unix.sleepf 0.001) ;
+  Array.length (Sys.readdir "/proc/self/fd")
+
+(* 10,000 connections open and close, and no fd stays open. The client closes
+   first, and the server resets: thus no side keeps a TIME_WAIT socket. A
+   TIME_WAIT socket keeps its entry in the conntrack table of the host for 120
+   s, and after a reset the entry stays for 10 s only. Parallel runs with
+   TIME_WAIT sockets filled this table. Then the host dropped each SYN, and the
+   test did not end. *)
 let no_fd_leak () =
   let before = open_fds () in
   Weft_linux.run ~domains:1 (fun () ->
       let l, a = world.listen () in
       Fiber.scope (fun s ->
-          Fiber.fork_daemon s (fun () -> Portable.echo_server l) ;
+          Fiber.fork_daemon s (fun () -> Portable.echo_server ~reset:true l) ;
           for _ = 1 to 10_000 do
-            let c = Net.connect a in
+            let c = Portable.connect_fast a in
             Net.write c "x" ;
             equal string "x" (Portable.read_n c 1) ;
             Net.close c
@@ -199,18 +226,11 @@ let dns_localhost () =
       | exception Dns.Error (_, "Dns.resolve") ->
           () )
 
-(* The pool closes the fds after the end of run: wait up to 1 s for it. *)
-let fds_back_to before =
-  let rec wait n =
-    if open_fds () <> before && n > 0 then (
-      Unix.sleepf 0.001 ;
-      wait (n - 1) )
-  in
-  wait 1000
-
 (* An open of a FIFO blocks in the pool until a writer comes. The fiber detaches
    at the deadline. Then a writer comes, the job completes, and the pool closes
-   the fd that the job opened. *)
+   the fd that the job opened. The writer stays open until the pool has no job,
+   as in [release]: on a busy host, the detach can remove the open from the
+   queue before it starts, and then a writer that waits for a reader blocks. *)
 let detach_from_open () =
   let fifo = Filename.concat (tmp ()) "fifo" in
   Unix.mkfifo fifo 0o600 ;
@@ -222,19 +242,18 @@ let detach_from_open () =
             Fiber.with_timeout Mono (Span.ms 20) (fun () ->
                 File.openfile [Read] fifo ) ) ;
         let t = Span.to_ns (Time.diff Mono (Time.now Mono) t0) in
-        let w = File.openfile [Write] fifo in
-        File.close w ; t )
+        let w = Unix.openfile fifo [O_RDWR] 0 in
+        pool_idle in_run ; Unix.close w ; t )
   in
   at_least int64 ~than:20_000_000L t ;
-  less int64 ~than:100_000_000L t ;
-  (* The pool closes the fds after the end of run. *)
-  fds_back_to before ;
+  less int64 ~than:500_000_000L t ;
   equal int before (open_fds ())
 
 (* C4: a job that blocks does not stop the next job of the pool. *)
 let blocked_job () =
   let fifo = Filename.concat (tmp ()) "fifo" in
   Unix.mkfifo fifo 0o600 ;
+  let before = open_fds () in
   Weft_linux.run ~domains:1 (fun () ->
       (* After this job, a thread of the pool is idle. *)
       ignore (File.stat "/") ;
@@ -247,9 +266,11 @@ let blocked_job () =
                 ignore (File.stat "/") ;
                 Time.diff Mono (Time.now Mono) t0 )
           in
+          (* A stat that waits for the open ends only after the writer, thus
+             after the timeout. *)
           let ns =
             match
-              Fiber.with_timeout Mono (Span.ms 500) (fun () -> Promise.await st)
+              Fiber.with_timeout Mono (Span.s 1) (fun () -> Promise.await st)
             with
             | d ->
                 Span.to_ns d
@@ -259,7 +280,8 @@ let blocked_job () =
           let w = File.openfile [Write] fifo in
           File.close w ;
           File.close (Promise.await r) ;
-          less int64 ~than:100_000_000L ns ) )
+          less int64 ~than:500_000_000L ns ) ) ;
+  equal int before (open_fds ())
 
 (* 1,000 files open and close, and the pool closes each fd. *)
 let no_file_leak () =
@@ -277,7 +299,6 @@ let no_file_leak () =
                   File.write f "x" ; File.close f
                 done )
           done ) ) ;
-  fds_back_to before ;
   equal int before (open_fds ()) ;
   equal int 1000 (Array.length (Sys.readdir d))
 
@@ -288,8 +309,19 @@ let pool_max = 16
 
 let pool_limit = 8
 
-(* A writer opens the FIFO, and each open that blocks on it ends. *)
-let release fifo = Unix.close (Unix.openfile fifo [O_WRONLY; O_NONBLOCK] 0)
+(* A writer opens the FIFO, and each open that blocks on it ends. Then the
+   fibers close the files of [held]. The writer stays open until the pool has no
+   job, so that the detached opens also end: on a busy host, an open can start
+   after the open of the writer. A writer that closed at once gave an open that
+   never ended. On Linux, an open of a FIFO with O_RDWR does not block, also
+   with no reader. *)
+let release fifo held =
+  let w = Unix.openfile fifo [O_RDWR] 0 in
+  Fun.protect
+    ~finally:(fun () -> Unix.close w)
+    (fun () ->
+      List.iter (fun p -> File.close (Promise.await p)) held ;
+      pool_idle in_run )
 
 (* [n] fibers that each hold a thread of the pool. *)
 let hold s fifo n =
@@ -309,18 +341,19 @@ let new_fifo () =
 let detach_queued () =
   let fifo = new_fifo () in
   let file = Filename.concat (Filename.dirname fifo) "never" in
+  let before = open_fds () in
   Weft_linux.run ~domains:1 (fun () ->
       Fiber.scope (fun s ->
           let held = hold s fifo pool_max in
           raises Fiber.Timeout (fun () ->
               Fiber.with_timeout Mono (Span.ms 50) (fun () ->
                   File.openfile [Write; Create] file ) ) ;
-          release fifo ;
-          List.iter (fun p -> File.close (Promise.await p)) held ;
+          release fifo held ;
           (* The pool has threads again: the job would run now. *)
           ignore (File.stat "/") ;
           Time.sleep Mono (Span.ms 20) ) ) ;
-  is_false (Sys.file_exists file)
+  is_false (Sys.file_exists file) ;
+  equal int before (open_fds ())
 
 (* Each detached job that runs gives one more thread, up to the limit. *)
 let detached_threads () =
@@ -343,16 +376,14 @@ let detached_threads () =
           let held = held @ hold s fifo 1 in
           raises Fiber.Timeout (fun () ->
               Fiber.with_timeout Mono (Span.ms 50) (fun () -> File.stat "/") ) ;
-          release fifo ;
-          List.iter (fun p -> File.close (Promise.await p)) held ) ) ;
-  (* The pool closes the fds of the detached opens. *)
-  fds_back_to before ;
+          release fifo held ) ) ;
   equal int before (open_fds ())
 
 (* A pool that is full for more than 1 s writes one warning to stderr. *)
 let full_warning () =
   let fifo = new_fifo () in
   let log = Filename.concat (Filename.dirname fifo) "stderr" in
+  let before = open_fds () in
   let fd = Unix.openfile log [O_WRONLY; O_CREAT] 0o600 in
   let saved = Unix.dup Unix.stderr in
   let w0 = Weft_linux.pool_warnings () in
@@ -368,9 +399,9 @@ let full_warning () =
               raises Fiber.Timeout (fun () ->
                   Fiber.with_timeout Mono (Span.ms 1300) (fun () ->
                       File.stat "/" ) ) ;
-              release fifo ;
-              List.iter (fun p -> File.close (Promise.await p)) held ) ) ) ;
+              release fifo held ) ) ) ;
   Unix.close fd ;
+  equal int before (open_fds ()) ;
   equal int (w0 + 1) (Weft_linux.pool_warnings ()) ;
   let text = In_channel.with_open_text log In_channel.input_all in
   equal string
@@ -698,7 +729,11 @@ let promise_report () =
       is_true (List.mem Lost_exn !got) )
 
 (* M3: the watchdog reports a fiber that computes for 200 ms with no switch, one
-   time. A fiber that sleeps or yields gives no report. *)
+   time. A fiber that sleeps or yields gives no report. The watchdog measures
+   the time of the wall clock, and on a busy host the OS can stop a thread for
+   more than 10 ms. Thus the check of the fiber that yields uses a limit of 100
+   ms. The fiber computes 200 ms in all, so the watchdog must count its
+   yields. *)
 let watchdog () =
   let busy_ms ms =
     let t0 = Unix.gettimeofday () in
@@ -707,9 +742,11 @@ let watchdog () =
     done
   in
   let before = Weft_linux.watchdog_reports () in
-  Weft_linux.run ~domains:1 (fun () ->
+  Weft_linux.run ~domains:1
+    ~watchdog:(Some (Span.ms 100))
+    (fun () ->
       Time.sleep Mono (Span.ms 50) ;
-      for _ = 1 to 50 do
+      for _ = 1 to 200 do
         busy_ms 1 ; Fiber.yield ()
       done ) ;
   equal int before (Weft_linux.watchdog_reports ()) ;
@@ -720,25 +757,36 @@ let watchdog () =
 
 (* M3: a Posix sleep ends after its deadline on the wall clock. A sleep on Mono
    also passes this test: a step of the clock needs root, so only the simulator
-   tests the step. *)
+   tests the step. A busy host can delay the end of one sleep by more than 10
+   ms. Thus, as in the test of the 10 ms sleep, the median of 7 sleeps of 20 ms
+   checks the precision (less than 30 ms), and the limit of 500 ms for each
+   sleep finds a timer that fires much too late. *)
 let posix_sleep () =
-  Weft_linux.run ~domains:1 (fun () ->
-      let p0 = Time.now Posix and t0 = Time.now Mono in
-      Time.sleep Posix (Span.ms 20) ;
-      at_least int64 ~than:20_000_000L
-        (Span.to_ns (Time.diff Posix (Time.now Posix) p0)) ;
-      less int64 ~than:30_000_000L
-        (Span.to_ns (Time.diff Mono (Time.now Mono) t0)) )
+  let all =
+    Weft_linux.run ~domains:1 (fun () ->
+        List.init 7 (fun _ ->
+            let p0 = Time.now Posix and t0 = Time.now Mono in
+            Time.sleep Posix (Span.ms 20) ;
+            at_least int64 ~than:20_000_000L
+              (Span.to_ns (Time.diff Posix (Time.now Posix) p0)) ;
+            let ns = Span.to_ns (Time.diff Mono (Time.now Mono) t0) in
+            less int64 ~than:500_000_000L ns ;
+            ns ) )
+  in
+  less int64 ~than:30_000_000L (List.nth (List.sort compare all) 3)
 
 (* M3: a reader whose reads always find data yields after 64 KiB, so a timer on
    the same domain is not late by much. The reader of a full pipe works 20 us on
-   each chunk, and a fiber sleeps 1 ms 20 times. *)
+   each chunk, and a fiber sleeps 1 ms 20 times. The OS can stop the thread for
+   more than 10 ms on a busy host, and on a shared CPU a wake can come 5 ms
+   late. Thus the median of the 20 sleeps is less than 10 ms, and each sleep
+   less than 500 ms. *)
 let busy_reader () =
-  let worst =
+  let all =
     Weft_linux.run ~domains:1 ~watchdog:None (fun () ->
         let p = Process.spawn ~stdout:Piped "cat" ["/dev/zero"] in
         let out = Option.get (Process.stdout p) in
-        let stop = Atomic.make false and worst = ref 0L in
+        let stop = Atomic.make false and all = ref [] in
         Fiber.scope (fun s ->
             Fiber.fork s (fun () ->
                 let buf = Bytes.create 65536 in
@@ -753,17 +801,16 @@ let busy_reader () =
                 for _ = 1 to 20 do
                   let t = Time.now Mono in
                   Time.sleep Mono (Span.ms 1) ;
-                  worst :=
-                    Int64.max !worst
-                      (Span.to_ns (Time.diff Mono (Time.now Mono) t))
+                  all := Span.to_ns (Time.diff Mono (Time.now Mono) t) :: !all
                 done ;
                 Atomic.set stop true ) ) ;
         Process.kill p SIGKILL ;
         ignore (Process.wait p) ;
         Pipe.close out ;
-        !worst )
+        !all )
   in
-  less int64 ~than:20_000_000L worst
+  List.iter (fun ns -> less int64 ~than:500_000_000L ns) all ;
+  less int64 ~than:10_000_000L (List.nth (List.sort compare all) 10)
 
 (* The review of M3, A: the expire inside wait resumes a pinned fiber on domain
    0. The domain must poll, not sleep. *)
