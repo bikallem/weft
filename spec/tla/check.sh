@@ -8,6 +8,7 @@
 #   Wake.tla    the loop of a domain: idle and wake, steal, next slot, pinned
 #   Fd.tla      the fd record: Rcfd, the registrations, the close notices
 #   Semaphore.tla  Fiber.Semaphore: the acquire event, the release, FIFO
+#   Signal.tla  Signal.unwatch: the end of a watch, on Linux and kqueue
 #
 # MODELS selects the models, for example: MODELS="Ivar Scope" check.sh
 #
@@ -26,7 +27,7 @@ n=0
 JOBS=${JOBS:-4}
 WORKERS=${WORKERS:-$(( $(nproc) / JOBS > 0 ? $(nproc) / JOBS : 1 ))}
 export JAVA_TOOL_OPTIONS="-Xmx${HEAP:-2g}"
-MODELS=${MODELS:-"Commit Scope Ivar Wake Fd Semaphore"}
+MODELS=${MODELS:-"Commit Scope Ivar Wake Fd Semaphore Signal"}
 want() { case " $MODELS " in *" $1 "*) return 0 ;; *) return 1 ;; esac; }
 
 # run MODULE EXPECT "INVARIANTS" NAME=VALUE...
@@ -176,6 +177,22 @@ sem fail   choose   TRUE   FALSE     FALSE  FALSE
 sem fail   cancel   FALSE  TRUE      FALSE  FALSE
 sem fail   choose   FALSE  FALSE     TRUE   FALSE
 sem fail   cancel   FALSE  FALSE     FALSE  TRUE
+
+sig() { want Signal || return 0 # expect scenario dropAfterMark noCountTake waiterStays leafNoCheck takeWatched noMainUnblock
+  run Signal "$1" "Conserved NoEarlyAction EndState" \
+    "Scenario=\"$2\"" BugDropAfterMark="$3" BugNoCountTake="$4" BugWaiterStays="$5" \
+    BugLeafNoCheck="$6" BugTakeWatched="$7" BugNoMainUnblock="$8"
+}
+#   expect scenario drop  count waiter leaf  watched main
+sig pass   linux    FALSE FALSE FALSE  FALSE FALSE   FALSE
+sig pass   kqueue   FALSE FALSE FALSE  FALSE FALSE   FALSE
+sig fail   linux    TRUE  FALSE FALSE  FALSE FALSE   FALSE
+sig fail   kqueue   TRUE  FALSE FALSE  FALSE FALSE   FALSE
+sig fail   linux    FALSE TRUE  FALSE  FALSE FALSE   FALSE
+sig fail   linux    FALSE FALSE TRUE   FALSE FALSE   FALSE
+sig fail   kqueue   FALSE FALSE FALSE  TRUE  FALSE   FALSE
+sig fail   kqueue   FALSE FALSE FALSE  FALSE TRUE    FALSE
+sig fail   linux    FALSE FALSE FALSE  FALSE FALSE   TRUE
 
 # Run the cases. The slow cases come first, so that they start early.
 export -f runone

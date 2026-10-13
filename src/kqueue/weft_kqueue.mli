@@ -11,12 +11,16 @@ val create : ?domains:int -> ?signals:Weft.Signal.t list -> unit -> t
 (** [create ~domains ()] makes the poller of each domain, 1 by default.
 
     [~signals] (none by default) are the signals that [Signal.received] can wait
-    for. Domain 0 gets them with [EVFILT_SIGNAL]. Each of them except SIGCHLD
-    gets the action "ignore", so the process does not end: [close] restores the
-    actions. SIGPIPE is ignored, so a write with no reader gives EPIPE.
+    for. Each of them gets a handler of the world, which counts it and wakes
+    domain 0, so the process does not end. [Signal.unwatch] and [close] restore
+    the actions. SIGPIPE is ignored, so a write with no reader gives EPIPE.
 
     A [Posix] timer can end up to 1 s late after a step of the wall clock: the
-    world examines the clock again at least each second. *)
+    world examines the clock again at least each second.
+
+    @raise Invalid_argument
+      if [~signals] is not empty and another world of the process holds signals:
+      only one world at a time can watch signals. *)
 
 val close : t -> unit
 (** [close t] stops the thread pools, closes the fds of the world, also the exit

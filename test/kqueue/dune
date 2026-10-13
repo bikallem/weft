@@ -7,7 +7,17 @@
   (or
    (= %{system} macosx)
    (= %{system} freebsd)))
+ (modules test_kqueue)
  (libraries weft weft.kqueue windtrap portable unix))
+
+(executable
+ (name unwatch)
+ (enabled_if
+  (or
+   (= %{system} macosx)
+   (= %{system} freebsd)))
+ (modules unwatch)
+ (libraries weft weft.kqueue unix))
 
 (rule
  (alias runtest)
@@ -16,4 +26,7 @@
    (= %{system} macosx)
    (= %{system} freebsd)))
  (action
-  (run %{exe:test_kqueue.exe})))
+  (setenv
+   WEFT_UNWATCH
+   %{dep:unwatch.exe}
+   (run %{exe:test_kqueue.exe}))))

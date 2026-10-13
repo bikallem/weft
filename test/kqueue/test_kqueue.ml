@@ -117,6 +117,180 @@ let signal_restored () =
   Weft_kqueue.run ~domains:1 ~signals:[SIGUSR1] ignore ;
   is_true (Sys.signal Sys.sigusr1 Sys.Signal_default = Sys.Signal_default)
 
+(* The end of a watch (issue 6), as in test/linux. The helper must end by SIGINT
+   in each mode. *)
+let unwatch_helper () =
+  match Sys.getenv_opt "WEFT_UNWATCH" with
+  | Some c ->
+      if Filename.is_relative c then Filename.concat (Sys.getcwd ()) c else c
+  | None ->
+      skip ~reason:"WEFT_UNWATCH is not set" ()
+
+let unwatch_modes () =
+  let helper = unwatch_helper () in
+  with_default_sigint (fun () ->
+      Weft_kqueue.run ~domains:1 (fun () ->
+          List.iter
+            (fun mode ->
+              let p = Process.spawn helper [mode] in
+              let st =
+                Fiber.with_timeout Mono (Span.s 10) (fun () -> Process.wait p)
+              in
+              if st <> Process.Signaled SIGINT then failwith mode )
+            ["taken"; "count"; "pending"] ) )
+
+(* After the unwatch, a SIGINT ends the process also when its only domain
+   computes with no switch. *)
+let unwatch_busy () =
+  let helper = unwatch_helper () in
+  with_default_sigint (fun () ->
+      Weft_kqueue.run ~domains:1 (fun () ->
+          let p = Process.spawn ~stdout:Piped helper ["busy"] in
+          let out = Option.get (Process.stdout p) in
+          let buf = Bytes.create 6 in
+          equal int 6 (Pipe.read out buf 0 6) ;
+          equal string "ready\n" (Bytes.to_string buf) ;
+          Process.kill p SIGINT ;
+          let st =
+            Fiber.with_timeout Mono (Span.s 10) (fun () -> Process.wait p)
+          in
+          Pipe.close out ;
+          is_true (st = Process.Signaled SIGINT) ) )
+
+(* In the process of the test: the waiter raises, a later received and a second
+   unwatch raise, and SIGTERM stays an event. After the unwatch, SIGUSR2 has its
+   old action, and the end of the run does not change it. *)
+let unwatch_waiter () =
+  let not_watched = "Signal.received: the world does not watch this signal" in
+  let old = Sys.signal Sys.sigusr2 Sys.Signal_ignore in
+  Fun.protect
+    ~finally:(fun () -> Sys.set_signal Sys.sigusr2 old)
+    (fun () ->
+      Weft_kqueue.run ~domains:2 ~signals:[SIGUSR2; SIGTERM] (fun () ->
+          Fiber.scope (fun s ->
+              let p =
+                Fiber.fork_promise s (fun () ->
+                    match sync (Signal.received SIGUSR2) with
+                    | _ ->
+                        "no error"
+                    | exception Invalid_argument m ->
+                        m )
+              in
+              Time.sleep Mono (Span.ms 10) ;
+              Signal.unwatch SIGUSR2 ;
+              equal string not_watched (Promise.await p) ) ;
+          raises (Invalid_argument not_watched) (fun () ->
+              sync (Signal.received SIGUSR2) ) ;
+          raises
+            (Invalid_argument
+               "Signal.unwatch: the world does not watch this signal" )
+            (fun () -> Signal.unwatch SIGUSR2 ) ;
+          (* The old action ignores it. *)
+          Unix.kill (Unix.getpid ()) Sys.sigusr2 ;
+          Unix.kill (Unix.getpid ()) Sys.sigterm ;
+          at_least int ~than:1 (sync (Signal.received SIGTERM)) ;
+          Sys.set_signal Sys.sigusr2 Sys.Signal_default ) ;
+      is_true (Sys.signal Sys.sigusr2 Sys.Signal_ignore = Sys.Signal_default) )
+
+(* A storm of signals while fibers run on small stacks (issue 6). The handler of
+   the world must run on the signal stack (SA_ONSTACK): on a stack of a fiber,
+   it corrupts the stack and the heap. A child shell sends SIGUSR1 in a loop for
+   2 s, and 8 fibers on 2 domains run effect handlers. Then the test counts the
+   signals of the storm. A copy of this test on Linux, with the handler with no
+   SA_ONSTACK, crashed in each run. *)
+type _ Effect.t += Step : int -> int Effect.t
+
+let rec items n acc = if n = 0 then acc else items (n - 1) (n :: acc)
+
+let small_fiber i =
+  Effect.Deep.match_with
+    (fun () ->
+      let x = ref 0 in
+      for j = 1 to 20 do
+        x := !x + Effect.perform (Step j) + List.length (items 50 [])
+      done ;
+      !x + i )
+    ()
+    { retc= Fun.id
+    ; exnc= raise
+    ; effc=
+        (fun (type a) (e : a Effect.t) ->
+          match e with
+          | Step j ->
+              Some
+                (fun (k : (a, _) Effect.Deep.continuation) ->
+                  Effect.Deep.continue k j )
+          | _ ->
+              None ) }
+
+let signal_storm () =
+  let got =
+    Weft_kqueue.run ~domains:2 ~watchdog:None ~signals:[SIGUSR1] (fun () ->
+        let pid = string_of_int (Unix.getpid ()) in
+        let sender =
+          Process.spawn ~stderr:Null "sh"
+            ["-c"; "while kill -USR1 " ^ pid ^ "; do :; done"]
+        in
+        let t0 = Time.now Mono in
+        let late () =
+          Int64.compare
+            (Span.to_ns (Time.diff Mono (Time.now Mono) t0))
+            2_000_000_000L
+          >= 0
+        in
+        let got = Atomic.make 0 in
+        Fiber.scope (fun s ->
+            Fiber.fork s (fun () ->
+                while not (late ()) do
+                  sync
+                    (choose
+                       [ wrap (Signal.received SIGUSR1) (fun n ->
+                             ignore (Atomic.fetch_and_add got n) )
+                       ; Time.after Mono (Span.ms 10) ] )
+                done ) ;
+            for _ = 1 to 8 do
+              Fiber.fork s (fun () ->
+                  while not (late ()) do
+                    for i = 1 to 100 do
+                      if small_fiber i <> 1210 + i then failwith "a bad value"
+                    done ;
+                    Fiber.yield ()
+                  done )
+            done ) ;
+        Process.kill sender SIGKILL ;
+        ignore (Process.wait sender) ;
+        (* Domain 0 takes the counts only when it polls, and a busy domain polls
+           each 61 switches. On a slow runner, domain 0 can make fewer switches
+           in the 2 s, and the fiber then gets no signal. Thus take the counts
+           of the storm that remain, until no signal comes in 100 ms. *)
+        let rec rest () =
+          match
+            sync
+              (choose
+                 [ Signal.received SIGUSR1
+                 ; wrap (Time.after Mono (Span.ms 100)) (fun () -> 0) ] )
+          with
+          | 0 ->
+              ()
+          | n ->
+              ignore (Atomic.fetch_and_add got n) ;
+              rest ()
+        in
+        rest () ; Atomic.get got )
+  in
+  at_least int ~than:100 got
+
+(* Only one world at a time can watch signals: the handler is for the process. A
+   world with no signals does not need it. *)
+let one_signal_world () =
+  Weft_kqueue.run ~domains:1 ~signals:[SIGUSR1] (fun () ->
+      raises
+        (Invalid_argument "Weft_kqueue.create: another world watches signals")
+        (fun () -> ignore (Weft_kqueue.create ~signals:[SIGUSR2] ()) ) ;
+      Weft_kqueue.close (Weft_kqueue.create ()) ) ;
+  (* After the close, a new world can watch signals. *)
+  Weft_kqueue.close (Weft_kqueue.create ~signals:[SIGUSR2] ())
+
 let () =
   exit
     (Windtrap.run "kqueue"
@@ -128,4 +302,13 @@ let () =
              ; test "a child that exits at once" child_fast_exit
              ; test "a child stops at SIGINT" child_kill
              ; test "SIGTERM to the process is an event" sigterm
-             ; test "run restores the action of a signal" signal_restored ] ] ) )
+             ; test "run restores the action of a signal" signal_restored
+             ; test ~timeout:60. "after Signal.unwatch, SIGINT ends the process"
+                 unwatch_modes
+             ; test ~timeout:30.
+                 "after Signal.unwatch, SIGINT ends a busy process" unwatch_busy
+             ; test "a waiter at Signal.unwatch raises" unwatch_waiter
+             ; test ~timeout:60.
+                 "a storm of signals while fibers use small stacks" signal_storm
+             ; test "only one world at a time watches signals" one_signal_world
+             ] ] ) )

@@ -64,6 +64,16 @@ value weft_sigmask_block(value sigs) {
   CAMLreturn(old);
 }
 
+/* Unblock the signals in the thread that calls it (design section 2.7, The end
+   of a watch). A signal of the process that is pending comes to this thread at
+   once. */
+value weft_sigmask_unblock(value sigs) {
+  sigset_t set;
+  set_of(sigs, &set);
+  pthread_sigmask(SIG_UNBLOCK, &set, NULL);
+  return Val_unit;
+}
+
 value weft_sigmask_restore(value old) {
   sigset_t set;
   memcpy(&set, Bytes_val(old), sizeof set);
@@ -71,10 +81,12 @@ value weft_sigmask_restore(value old) {
   return Val_unit;
 }
 
-value weft_signalfd(value sigs) {
+/* [weft_signalfd fd sigs] makes a signalfd with [fd] -1. With an fd, it
+   changes the signals of that signalfd. */
+value weft_signalfd(value fd0, value sigs) {
   sigset_t set;
   set_of(sigs, &set);
-  int fd = signalfd(-1, &set, SFD_NONBLOCK | SFD_CLOEXEC);
+  int fd = signalfd(Int_val(fd0), &set, SFD_NONBLOCK | SFD_CLOEXEC);
   return Val_int(fd < 0 ? ERR : fd);
 }
 

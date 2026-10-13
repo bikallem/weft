@@ -1,7 +1,8 @@
 (* The kqueue world: macOS and FreeBSD (design section 2.7). Each domain has a
    kqueue and a wake pipe. The alarm is the timeout of kevent. Domain 0 gets the
-   signals (EVFILT_SIGNAL) and the exits of the children (EVFILT_PROC). The
-   parts that the POSIX worlds share are in Weft_posix. *)
+   signals (a handler of the world writes its wake pipe) and the exits of the
+   children (EVFILT_PROC). The parts that the POSIX worlds share are in
+   Weft_posix. *)
 
 open Weft.Private
 open Weft_posix
@@ -14,12 +15,19 @@ external kq_add_in : int -> int -> int -> int = "weft_kq_add_in"
 
 external kq_del : int -> int -> int = "weft_kq_del"
 
-external kq_signal : int -> int -> int -> int = "weft_kq_signal"
+external sig_claim : int -> bool = "weft_kq_sig_claim"
+
+external sig_release : unit -> unit = "weft_kq_sig_release"
+
+external sig_catch : int -> bytes = "weft_kq_sig_catch"
+
+external sig_restore : int -> bytes -> unit = "weft_kq_sig_restore"
+
+external sig_take : int -> int = "weft_kq_sig_take"
 
 external kq_proc : int -> int -> int -> int = "weft_kq_proc"
 
-external kq_wait : int -> int64 -> (int * bool * bool * int) array
-  = "weft_kq_wait"
+external kq_wait : int -> int64 -> (int * bool * bool) array = "weft_kq_wait"
 
 external kq_wait_child : int -> int * int = "weft_kq_wait_child"
 
@@ -34,12 +42,6 @@ external kq_kill : int -> int -> int = "weft_kq_kill"
 (* The tokens of the world. A token of an fd is (slot lsl 32) lor gen, so it is
    never negative. *)
 let wake_token = -2
-
-let signal_token n = -100 - n
-
-let is_signal token = token <= -100 && token > -1000
-
-let signal_of_token token = -100 - token
 
 let proc_token pid = -1000 - pid
 
@@ -62,9 +64,11 @@ type t =
   { doms: dom array
   ; rng: int Atomic.t
   ; pool: pool
-  ; watched: Op.signal list  (** The signals of [run ~signals]. *)
-  ; old_actions: (int * Sys.signal_behavior) list
-        (** The actions of the signals before [create]. *)
+  ; watched: Op.signal list Atomic.t
+        (** The signals of [run ~signals], with no signal of an unwatch. *)
+  ; old_actions: (int * bytes) list
+        (** The numbers of the signals of [run ~signals], and their actions
+            before [create]. *)
   ; lock: Mutex.t
   ; procs: (int, proc) Hashtbl.t  (** By the read end of the exit pipe. *)
   ; pids: (int, proc) Hashtbl.t  (** By pid. *) }
@@ -76,22 +80,22 @@ let make_dom () =
   ignore (check "kevent" (kq_add_in kq wake_r wake_token)) ;
   {kq; wake_r; wake_w= w}
 
-(* A watched signal gets the action "ignore": EVFILT_SIGNAL records it, and the
-   process does not end. SIGCHLD keeps its action, because an ignored SIGCHLD
-   reaps the children, and EVFILT_SIGNAL does not record it. *)
 let close_dom d =
   ignore (close_fd d.wake_r) ;
   ignore (close_fd d.wake_w) ;
   ignore (close_fd d.kq)
 
-(* After an error, [create] closes what it made and restores the actions that it
+(* A watched signal gets the handler of the world (weft_kqueue_stubs.c), which
+   counts it and wakes domain 0. Only one world at a time can hold the handler.
+   After an error, [create] closes what it made and restores the actions that it
    changed. *)
 let create ?(domains = 1) ?(signals = []) () =
   Sys.set_signal Sys.sigpipe Sys.Signal_ignore ;
   let nums = List.sort_uniq compare (List.map number_of signals) in
-  let doms = ref [] and old_actions = ref [] in
+  let doms = ref [] and old_actions = ref [] and claimed = ref false in
   let undo () =
-    List.iter (fun (n, a) -> Sys.set_signal n a) !old_actions ;
+    List.iter (fun (n, a) -> sig_restore n a) !old_actions ;
+    if !claimed then sig_release () ;
     List.iter close_dom !doms
   in
   match
@@ -99,13 +103,11 @@ let create ?(domains = 1) ?(signals = []) () =
       doms := make_dom () :: !doms
     done ;
     let doms = Array.of_list (List.rev !doms) in
-    let chld = number_of Op.SIGCHLD in
-    List.iter
-      (fun n ->
-        ignore (check "kevent" (kq_signal doms.(0).kq n (signal_token n))) ;
-        if n <> chld then
-          old_actions := (n, Sys.signal n Sys.Signal_ignore) :: !old_actions )
-      nums ;
+    if nums <> [] then (
+      if not (sig_claim doms.(0).wake_w) then
+        invalid_arg "Weft_kqueue.create: another world watches signals" ;
+      claimed := true ) ;
+    List.iter (fun n -> old_actions := (n, sig_catch n) :: !old_actions) nums ;
     (doms, create_pool (Array.map (fun d -> d.wake_w) doms))
   with
   | exception e ->
@@ -116,15 +118,22 @@ let create ?(domains = 1) ?(signals = []) () =
       { doms
       ; rng= new_rng ()
       ; pool
-      ; watched= List.map (fun s -> signal_of (number_of s)) signals
+      ; watched=
+          Atomic.make (List.map (fun s -> signal_of (number_of s)) signals)
       ; old_actions= !old_actions
       ; lock= Mutex.create ()
       ; procs= Hashtbl.create ~random:false 8
       ; pids= Hashtbl.create ~random:false 8 }
 
+(* The actions come back first. Then the release waits until no handler can
+   write the wake pipe, and the pipe can close. *)
 let close t =
+  let watched = List.map number_of (Atomic.get t.watched) in
+  List.iter
+    (fun (n, a) -> if List.mem n watched then sig_restore n a)
+    t.old_actions ;
+  if t.old_actions <> [] then sig_release () ;
   close_pool t.pool ;
-  List.iter (fun (n, a) -> Sys.set_signal n a) t.old_actions ;
   Hashtbl.iter
     (fun _ p ->
       ignore (close_fd p.exit_r) ;
@@ -142,35 +151,32 @@ let exit_seen p =
 (* The exit fd of a child is a pipe, made before the child, so that a failure of
    the pipe leaves no child. The tables have the child before domain 0 can get
    its exit. If the child already exited, EVFILT_PROC refuses it. The child gets
-   the default action for SIGPIPE and for each watched signal, which the world
-   ignores. *)
+   the default action for SIGPIPE, which the world ignores. The exec gives the
+   default action to each signal with a handler, so to each watched signal. *)
 let spawn t sp =
   let r, w = pipe () in
   match result r with
   | Error e ->
       Error e
   | Ok r -> (
-      let defaults =
-        Array.of_list (number_of Op.SIGPIPE :: List.map fst t.old_actions)
-      in
-      match spawned_of (spawn_child (spawn_args sp) defaults) with
-      | Error _ as e ->
-          ignore (close_fd r) ;
-          ignore (close_fd w) ;
-          e
-      | Ok (s : Op.spawned) ->
-          let p =
-            { pid= s.pid
-            ; exit_r= r
-            ; exit_w= w
-            ; exit_seen= Atomic.make false
-            ; reaped= false }
-          in
-          Mutex.protect t.lock (fun () ->
-              Hashtbl.replace t.procs r p ;
-              Hashtbl.replace t.pids s.pid p ) ;
-          if kq_proc t.doms.(0).kq s.pid (proc_token s.pid) < 0 then exit_seen p ;
-          Ok {s with pidfd= r} )
+    match spawned_of (spawn_child (spawn_args sp) [|number_of Op.SIGPIPE|]) with
+    | Error _ as e ->
+        ignore (close_fd r) ;
+        ignore (close_fd w) ;
+        e
+    | Ok (s : Op.spawned) ->
+        let p =
+          { pid= s.pid
+          ; exit_r= r
+          ; exit_w= w
+          ; exit_seen= Atomic.make false
+          ; reaped= false }
+        in
+        Mutex.protect t.lock (fun () ->
+            Hashtbl.replace t.procs r p ;
+            Hashtbl.replace t.pids s.pid p ) ;
+        if kq_proc t.doms.(0).kq s.pid (proc_token s.pid) < 0 then exit_seen p ;
+        Ok {s with pidfd= r} )
 
 let proc t fd = Mutex.protect t.lock (fun () -> Hashtbl.find_opt t.procs fd)
 
@@ -209,6 +215,33 @@ let wait_child t p =
         (match r with Ok (Some _) -> p.reaped <- true | _ -> ()) ;
         r )
 
+(* The end of a watch (design section 2.7). The old action comes back first:
+   after it, the kernel gives each new signal its action. Then the world takes
+   the count of the signals that came before and that domain 0 did not take, and
+   it sends them again, so they get the action. A handler that started before
+   the restore can add to the count later: domain 0 takes it, and the scheduler
+   sends it again. *)
+let unwatch t s =
+  let s = signal_of (number_of s) in
+  Mutex.protect t.lock (fun () ->
+      let watched = Atomic.get t.watched in
+      if not (List.mem s watched) then
+        Error (Op.Other "the world does not watch this signal")
+      else
+        let n = number_of s in
+        Atomic.set t.watched (List.filter (fun x -> x <> s) watched) ;
+        sig_restore n (List.assoc n t.old_actions) ;
+        if sig_take n > 0 then ignore (resend n) ;
+        Ok s )
+
+(* The signals that came since the last take, for the wait of domain 0. *)
+let signals t acc =
+  List.fold_left
+    (fun acc (n, _) ->
+      let c = sig_take n in
+      if c > 0 then World.Ready.Signal (signal_of n, c) :: acc else acc )
+    acc t.old_actions
+
 let kill t p s =
   Mutex.protect t.lock (fun () ->
       if p.reaped then esrch else unit (kq_kill p.pid (number_of s)) )
@@ -229,8 +262,10 @@ module World = struct
       match proc t fd with Some p -> kill t p s | None -> Error Op.Bad_fd )
     | Op.Watch s ->
         let s = signal_of (number_of s) in
-        if List.mem s t.watched then Ok s
+        if List.mem s (Atomic.get t.watched) then Ok s
         else Error (Op.Other "the world does not watch this signal")
+    | Op.Unwatch s ->
+        unwatch t s
     | Op.Register (d, fd, token) ->
         unit (kq_add t.doms.(d).kq fd token)
     | Op.Deregister (d, fd) ->
@@ -280,14 +315,13 @@ module World = struct
   let wait t ~domain (w : World.Wait.t) =
     let d = t.doms.(domain) in
     Array.fold_right
-      (fun (token, read, write, data) acc ->
+      (fun (token, read, write) acc ->
         if token = wake_token then (
+          (* The drain comes before the take of the counts: a handler adds to a
+             count before it writes the pipe. *)
           drain_all d.wake_r ;
+          let acc = if domain = 0 then signals t acc else acc in
           World.Ready.Woken :: completions t.pool domain acc )
-        else if is_signal token then
-          if data > 0 then
-            World.Ready.Signal (signal_of (signal_of_token token), data) :: acc
-          else acc
         else if token <= -1000 then (exited t token ; acc)
         else World.Ready.Fd {token; read; write} :: acc )
       (kq_wait d.kq (timeout_ns w))

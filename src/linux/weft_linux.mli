@@ -16,7 +16,9 @@ val create : ?domains:int -> ?signals:Weft.Signal.t list -> unit -> t
     world copy this mask. A signalfd in the poller of domain 0 gets them.
     [create] writes a warning to [stderr] for each thread that does not block
     them, because the OS can give a signal to that thread. [close] restores the
-    mask. SIGPIPE is ignored, so a write with no reader gives EPIPE. *)
+    mask. [Signal.unwatch] removes a signal from the signalfd and unblocks it in
+    the thread of the domain that calls it. SIGPIPE is ignored, so a write with
+    no reader gives EPIPE. *)
 
 val close : t -> unit
 (** [close t] stops the thread pools, closes the fds of the world and restores

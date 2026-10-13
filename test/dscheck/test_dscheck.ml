@@ -158,14 +158,15 @@ type world =
   ; registers: int Atomic.t
   ; dels: int Atomic.t
   ; early_close: bool Atomic.t  (** A close(2) before the DEL of a Register. *)
-  }
+  ; resends: int Atomic.t  (** The signals that went to the process again. *) }
 
 let world () =
   { closes= Atomic.make 0
   ; wakes= Atomic.make 0
   ; registers= Atomic.make 0
   ; dels= Atomic.make 0
-  ; early_close= Atomic.make false }
+  ; early_close= Atomic.make false
+  ; resends= Atomic.make 0 }
 
 let in_world w f () =
   Effect.Deep.match_with f ()
@@ -188,6 +189,11 @@ let in_world w f () =
               Some
                 (fun k ->
                   Atomic.incr w.dels ;
+                  Effect.Deep.continue k (Ok ()) )
+          | World.Submit (Op.Resend _) ->
+              Some
+                (fun k ->
+                  Atomic.incr w.resends ;
                   Effect.Deep.continue k (Ok ()) )
           | World.Wake _ ->
               Some (fun k -> Atomic.incr w.wakes ; Effect.Deep.continue k ())
@@ -662,6 +668,38 @@ let signal_delivery () =
         Atomic.get continued + queued t s = 1
         && if got then !cell = 1 && count = 0 else count = 1 )
 
+(* The end of a watch (design section 2.7, The end of a watch, and
+   spec/tla/Signal.tla): a delivery on domain 0, a waiter on domain 1, and the
+   mark of the unwatch on domain 2. The waiter gets the signal, or the signal
+   goes to the process again exactly one time: from the delivery after the mark,
+   or from the count that the mark takes. The waiter continues one time, with
+   the signal or with -1. *)
+let signal_unwatch () =
+  trace (fun () ->
+      let t = S.create ~domains:3 () in
+      let w = world () in
+      let s = new_sync (scope_node ()) and cell = ref 0 in
+      let continued = Atomic.make 0 in
+      spawn_in w (fun () -> S.deliver t.S.doms.(0) Op.SIGUSR1 1) ;
+      spawn_in w (fun () ->
+          S.signal_leaf Op.SIGUSR1 cell t.S.doms.(1) s 0 ;
+          match C.park s.S.word with
+          | `Done _ ->
+              Atomic.incr continued
+          | `Parked ->
+              () ) ;
+      spawn_in w (fun () ->
+          let n = S.unwatch_signal t.S.doms.(2) Op.SIGUSR1 in
+          if n > 0 then Atomic.incr w.resends ) ;
+      fun () ->
+        let st = S.sigstate t Op.SIGUSR1 in
+        let got = if !cell = 1 then 1 else 0 in
+        Atomic.get continued + queued t s = 1
+        && C.state s.S.word = C.Done 0
+        && (!cell = 1 || !cell = -1)
+        && got + Atomic.get w.resends = 1
+        && st.S.count = 0 && st.S.swait = [] )
+
 (* The semaphore (design section 2.5, Locks for fiber code, and
    spec/tla/Semaphore.tla). [sem free] has an initial count of 2 and [free] free
    permits: the other permits are with holders. *)
@@ -1021,6 +1059,7 @@ let () =
   case "fd: a Register and a close at the same time" register_and_close ;
   case "jobs: a completion and a cancel of its waiter" job_completion ;
   case "signals: a delivery and a cancel of the waiter" signal_delivery ;
+  case "signals: a delivery, a waiter and an unwatch" signal_unwatch ;
   case "semaphore: an acquire and a release at the same time"
     sem_acquire_release ;
   case "semaphore: an acquire with a free permit and a cancel"

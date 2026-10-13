@@ -56,6 +56,8 @@ exception Livelock of string list
 
 exception Unawaited of string list
 
+exception Killed of Op.signal
+
 (* The in-memory network (design section 2.8). *)
 
 (* The capacity of the receive buffer of a connection. *)
@@ -201,7 +203,11 @@ type t =
         (** The limit of the time cost of a job (open question 2). *)
   ; dns: (string, dns_answer) Hashtbl.t
   ; programs: (string, string list -> program) Hashtbl.t
-  ; watched: Op.signal list  (** The signals of [run ~signals]. *)
+  ; mutable watched: Op.signal list
+        (** The signals of [run ~signals], with no signal of an unwatch. *)
+  ; mutable killed: Op.signal option
+        (** A signal with an action that ends the process. The run ends at once
+            with [Killed]. *)
   ; fills: (Sched.dom -> unit) list Atomic.t
         (** The fills from outside a fiber that wait for the quiescence, the
             newest first. A finaliser can push, so the list is atomic. *)
@@ -877,6 +883,29 @@ let spawn t (sp : Op.spawn) =
         ; from_stdout= fd from_stdout
         ; from_stderr= fd from_stderr }
 
+(* The signals with a default action that does not end the process: a stop, a
+   continue or an ignore. 21, 22 and 23 are SIGTTIN, SIGTTOU and SIGURG on
+   Linux. The simulator has no stop of a process. The signal 0 only tells that
+   the process exists. *)
+let no_end = function
+  | Op.SIGSTOP
+  | SIGTSTP
+  | SIGCONT
+  | SIGCHLD
+  | SIGWINCH
+  | Other_signal (0 | 21 | 22 | 23) ->
+      true
+  | _ ->
+      false
+
+(* A signal to the program itself (design section 2.7, The end of a watch).
+   Domain 0 gets a watched signal at its next [Wait]. Each other signal gets the
+   default action, and the world ignores SIGPIPE. *)
+let send_self t sg =
+  if List.mem sg t.watched then
+    t.net.edges <- (0, World.Ready.Signal (sg, 1)) :: t.net.edges
+  else if not (sg = Op.SIGPIPE || no_end sg) then t.killed <- Some sg
+
 let submit : type a. t -> a Op.t -> (a, Op.error) result =
  fun t op ->
   let n = t.net in
@@ -1107,11 +1136,7 @@ let submit : type a. t -> a Op.t -> (a, Op.error) result =
         ( match (p.status, sg) with
         | Some _, _ ->
             ()
-        | None, (Op.SIGSTOP | SIGTSTP | SIGCONT | SIGCHLD | SIGWINCH) ->
-            (* The default action of these signals does not end the process, and
-               signal 0 only tells that the process exists. *)
-            ()
-        | None, Op.Other_signal 0 ->
+        | None, _ when no_end sg ->
             ()
         | None, _ when sg <> Op.SIGKILL && List.mem sg p.prog.ignores ->
             ()
@@ -1125,6 +1150,13 @@ let submit : type a. t -> a Op.t -> (a, Op.error) result =
   | Op.Watch sg ->
       if List.mem sg t.watched then Ok sg
       else Error (Op.Other "the world does not watch this signal")
+  | Op.Unwatch sg ->
+      if List.mem sg t.watched then (
+        t.watched <- List.filter (fun x -> x <> sg) t.watched ;
+        Ok sg )
+      else Error (Op.Other "the world does not watch this signal")
+  | Op.Resend sg ->
+      send_self t sg ; Ok ()
   | Op.Fd_read (fd, buf, off, len) -> (
     match Hashtbl.find_opt n.fds fd with
     | Some (Conn ({role= Rd_end | Sock; _} as c)) ->
@@ -1422,8 +1454,14 @@ let step t st d =
       match e with
       | World.Now line ->
           go (now_of t line)
-      | World.Submit op ->
-          go (submit t op)
+      | World.Submit op -> (
+          let v = submit t op in
+          (* A signal ended the process: no domain continues. *)
+          match t.killed with
+          | Some sg ->
+              raise (Killed sg)
+          | None ->
+              go v )
       | World.Random n ->
           go (Prng.int t.prng n)
       | World.Random_bytes b ->
@@ -1586,6 +1624,7 @@ let run ?(seed = 0) ?(domains = 1) ?(auto = true) ?(signals = [])
     ; dns= Hashtbl.create ~random:false 8
     ; programs= Hashtbl.create ~random:false 8
     ; watched= signals
+    ; killed= None
     ; fills= Atomic.make []
     ; refused_fill= Atomic.make false
     ; resumes_seen= Array.make domains 0
@@ -1747,13 +1786,12 @@ let program ?runs ?(code = 0) ?(output = "") ?(ignores = []) () =
 
 let add_program t name f = Hashtbl.replace t.programs name f
 
-(* Domain 0 gets the signal at its next [Wait] (design section 2.7). A signal
-   that the program does not watch has its default action on Linux, which ends
-   the process for most signals. *)
+(* A signal that the program does not watch, or no more, gets its action at
+   once: [send_self] sets [killed] in the [Resend] of a world effect, and the
+   step that answers the effect raises [Killed]. *)
 let signal t sg =
-  if not (List.mem sg t.watched) then
-    model_error "Sim.signal: the program does not watch this signal" ;
-  t.net.edges <- (0, World.Ready.Signal (sg, 1)) :: t.net.edges
+  if List.mem sg t.watched then send_self t sg
+  else ignore (World.perform "Sim.signal" (World.Submit (Op.Resend sg)))
 
 let addr _ s =
   match String.index_opt s ':' with
