@@ -100,17 +100,23 @@ let other_process () =
 
 (* The pool closes the fds of the files after the end of the operation (section
    2.7 of the design). Thus the count of fds first waits up to 10 s until the
-   pool has no job. If not, a test can count the fd of a file that an earlier
-   test closed, before the close. A wait for the correct count is not
+   pool has no job ([pool_idle]). If not, a test can count the fd of a file that
+   an earlier test closed, before the close. A wait for the correct count is not
    sufficient: the count can be correct for a short time, while a detached open
-   of the pool did not get its fd yet. *)
-let open_fds () =
+   of the pool did not get its fd yet. If the pool has jobs after 10 s, the test
+   gives a failure. *)
+let pool_idle () =
   let rec wait n =
-    if Weft_linux.pool_busy () > 0 && n > 0 then (
-      Unix.sleepf 0.001 ;
-      wait (n - 1) )
+    if Weft_linux.pool_busy () > 0 then
+      if n = 0 then fail "the pool has jobs after 10 s"
+      else (
+        Unix.sleepf 0.001 ;
+        wait (n - 1) )
   in
-  wait 10_000 ;
+  wait 10_000
+
+let open_fds () =
+  pool_idle () ;
   Array.length (Sys.readdir "/proc/self/fd")
 
 (* 10,000 connections open and close, and no fd stays open. The client closes
@@ -219,7 +225,9 @@ let dns_localhost () =
 
 (* An open of a FIFO blocks in the pool until a writer comes. The fiber detaches
    at the deadline. Then a writer comes, the job completes, and the pool closes
-   the fd that the job opened. *)
+   the fd that the job opened. The writer stays open until the pool has no job,
+   as in [release]: on a busy host, the detach can remove the open from the
+   queue before it starts, and then a writer that waits for a reader blocks. *)
 let detach_from_open () =
   let fifo = Filename.concat (tmp ()) "fifo" in
   Unix.mkfifo fifo 0o600 ;
@@ -231,8 +239,8 @@ let detach_from_open () =
             Fiber.with_timeout Mono (Span.ms 20) (fun () ->
                 File.openfile [Read] fifo ) ) ;
         let t = Span.to_ns (Time.diff Mono (Time.now Mono) t0) in
-        let w = File.openfile [Write] fifo in
-        File.close w ; t )
+        let w = Unix.openfile fifo [O_RDWR] 0 in
+        pool_idle () ; Unix.close w ; t )
   in
   at_least int64 ~than:20_000_000L t ;
   less int64 ~than:500_000_000L t ;
@@ -299,15 +307,18 @@ let pool_max = 16
 let pool_limit = 8
 
 (* A writer opens the FIFO, and each open that blocks on it ends. Then the
-   fibers close the files of [held]. The writer stays open until these opens
-   end: on a busy host, an open can start after the open of the writer. A writer
-   that closed at once gave an open that never ended. On Linux, an open of a
-   FIFO with O_RDWR does not block, also with no reader. *)
+   fibers close the files of [held]. The writer stays open until the pool has no
+   job, so that the detached opens also end: on a busy host, an open can start
+   after the open of the writer. A writer that closed at once gave an open that
+   never ended. On Linux, an open of a FIFO with O_RDWR does not block, also
+   with no reader. *)
 let release fifo held =
   let w = Unix.openfile fifo [O_RDWR] 0 in
   Fun.protect
     ~finally:(fun () -> Unix.close w)
-    (fun () -> List.iter (fun p -> File.close (Promise.await p)) held)
+    (fun () ->
+      List.iter (fun p -> File.close (Promise.await p)) held ;
+      pool_idle () )
 
 (* [n] fibers that each hold a thread of the pool. *)
 let hold s fifo n =
