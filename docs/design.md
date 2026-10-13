@@ -1646,6 +1646,14 @@ The tests use windtrap 0.2.0 (decision 9). The flake builds windtrap and `ppx_wi
 
 **The commit protocol (M0).** `Commit.Make (A : ATOMIC)` in `src/core/commit.ml` has no effects, and it does not resume a fiber. Each function gives the caller its part of the resume: `claim` gives `Committed { resume_partner }`, `notify` gives `Resume`, `In_scan` or `Lost`, and `park` gives `` `Parked `` or `` `Done ``. The stateful test of `test/core` compares the protocol with a sequential model. Its invariant on each sync is the property of `Commit.tla`: at most one resume, and a suspended fiber always has a `Parked` word. Thus a lost wakeup fails the test at the call that caused it. In M1, the same commands run with `stateful ~domains:2`.
 
+**Tests on a busy host.** Parallel runs of the suites on a busy host found tests that failed only under load. These rules keep the tests correct on such a host:
+
+- A test that closes a file waits until the count of fds comes back (`fds_back_to` in `test/linux`). The pool closes a file after the end of the operation (section 2.7). If the test does not wait, a later test counts the fd before its close and not after it.
+- The tests with many connections (10,000 in `test/linux`, 2,000 in `test/linux_md`) close each connection with a reset at the server, after the client closed (`Portable.echo_server ~reset:true`). Thus no side keeps a TIME_WAIT socket. A TIME_WAIT socket keeps its entry in the conntrack table of the host for 120 s, and an entry after a reset stays for 10 s. The parallel runs filled this table (262,144 entries). Then the host dropped packets: a connect waited for 127 s and gave `ETIMEDOUT`, and `Net.sendto` gave `EPERM`. The client keeps `Net.close`, because the test is for this function.
+- A connect of these tests that takes more than 10 s fails the test with a message (`Portable.connect_fast`). Thus a table that other programs fill gives a clear failure, not a hang.
+- A limit on the time of a sleep finds only a timer that fires much too late (500 ms). The check of the watchdog with a fiber that yields uses a limit of 100 ms, because the OS can stop a thread for more than 10 ms.
+- The report of a failure gives the error of a `Net.Error`, for example `Net.Error (EPERM, "Net.sendto")`. Without the printer of `test/portable`, the report gives `_`.
+
 **The commands:**
 
 - `dune runtest`: all suites.
