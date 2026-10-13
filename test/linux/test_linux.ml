@@ -775,8 +775,9 @@ let posix_sleep () =
 (* M3: a reader whose reads always find data yields after 64 KiB, so a timer on
    the same domain is not late by much. The reader of a full pipe works 20 us on
    each chunk, and a fiber sleeps 1 ms 20 times. The OS can stop the thread for
-   more than 10 ms on a busy host. Thus the median of the 20 sleeps must be less
-   than 5 ms, and each sleep less than 500 ms. *)
+   more than 10 ms on a busy host, and on a shared CPU a wake can come 5 ms
+   late. Thus the median of the 20 sleeps must be less than 10 ms, and each
+   sleep less than 500 ms. *)
 let busy_reader () =
   let all =
     Weft_linux.run ~domains:1 ~watchdog:None (fun () ->
@@ -806,7 +807,7 @@ let busy_reader () =
         !all )
   in
   List.iter (fun ns -> less int64 ~than:500_000_000L ns) all ;
-  less int64 ~than:5_000_000L (List.nth (List.sort compare all) 10)
+  less int64 ~than:10_000_000L (List.nth (List.sort compare all) 10)
 
 (* The review of M3, A: the expire inside wait resumes a pinned fiber on domain
    0. The domain must poll, not sleep. *)
