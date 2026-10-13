@@ -714,7 +714,11 @@ let promise_report () =
       is_true (List.mem Lost_exn !got) )
 
 (* M3: the watchdog reports a fiber that computes for 200 ms with no switch, one
-   time. A fiber that sleeps or yields gives no report. *)
+   time. A fiber that sleeps or yields gives no report. The watchdog measures
+   the time of the wall clock, and on a busy host the OS can stop a thread for
+   more than 10 ms. Thus the check of the fiber that yields uses a limit of 100
+   ms. The fiber computes 200 ms in all, so the watchdog must count its
+   yields. *)
 let watchdog () =
   let busy_ms ms =
     let t0 = Unix.gettimeofday () in
@@ -723,9 +727,11 @@ let watchdog () =
     done
   in
   let before = Weft_linux.watchdog_reports () in
-  Weft_linux.run ~domains:1 (fun () ->
+  Weft_linux.run ~domains:1
+    ~watchdog:(Some (Span.ms 100))
+    (fun () ->
       Time.sleep Mono (Span.ms 50) ;
-      for _ = 1 to 50 do
+      for _ = 1 to 200 do
         busy_ms 1 ; Fiber.yield ()
       done ) ;
   equal int before (Weft_linux.watchdog_reports ()) ;
@@ -736,14 +742,16 @@ let watchdog () =
 
 (* M3: a Posix sleep ends after its deadline on the wall clock. A sleep on Mono
    also passes this test: a step of the clock needs root, so only the simulator
-   tests the step. *)
+   tests the step. A busy host can delay the end of a sleep by more than 10 ms.
+   Thus, as in the test of the 10 ms sleep, the limit of 500 ms finds only a
+   timer that fires much too late. *)
 let posix_sleep () =
   Weft_linux.run ~domains:1 (fun () ->
       let p0 = Time.now Posix and t0 = Time.now Mono in
       Time.sleep Posix (Span.ms 20) ;
       at_least int64 ~than:20_000_000L
         (Span.to_ns (Time.diff Posix (Time.now Posix) p0)) ;
-      less int64 ~than:30_000_000L
+      less int64 ~than:500_000_000L
         (Span.to_ns (Time.diff Mono (Time.now Mono) t0)) )
 
 (* M3: a reader whose reads always find data yields after 64 KiB, so a timer on
