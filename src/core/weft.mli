@@ -342,6 +342,14 @@ module Net : sig
     | Not_dir  (** [ENOTDIR]. *)
     | Is_dir  (** [EISDIR]. *)
     | Not_empty  (** [ENOTEMPTY]. *)
+    | No_resources of string
+        (** The OS has no resource for the operation at this time: [EMFILE],
+            [ENFILE], [ENOBUFS] or [ENOMEM]. A spawn gives [EAGAIN] at the limit
+            of processes. A [File], [Dir] or [Dns] operation gives [EAGAIN] when
+            the thread pool cannot start a thread. The string is the name of the
+            errno, for example ["EMFILE"]. A program can pause, then try again.
+            The simulator gives ["EMFILE"] at the limit of
+            [Weft_sim.set_fd_limit]. *)
     | Other of string
 
   (** The error, and the name of the function. It is [Private.Net.Error]. *)
@@ -350,6 +358,20 @@ module Net : sig
   val listen : ?backlog:int -> addr -> t
 
   val accept : t -> t * addr
+  (** Waits for a connection, and gives its socket and the address of the
+      client. A connection that the client reset before the accept gives no
+      error. On FreeBSD, the OS gives [ECONNABORTED], and [accept] takes the
+      next connection. Linux, macOS and the simulator give the connection. On
+      Linux and in the simulator, its first read gets [Error (Reset, _)]. On
+      macOS, its address is [Tcp ("", 0)].
+
+      @raise Error
+        with [No_resources] if the process or the system has no free fd or no
+        memory. On Linux, FreeBSD and the simulator, the connection stays in the
+        backlog, and the next [accept] can get it. macOS closes it. Thus an
+        accept loop pauses, then calls [accept] again. The facts about macOS and
+        the backlog of FreeBSD come from a read of their source, not from a
+        test. *)
 
   val connect : addr -> t
 
@@ -658,7 +680,9 @@ module Process : sig
       no [/] is found in [PATH]. The child gets the default action for each
       signal, and no blocked signals. Each stdio is [Inherit] by default.
 
-      @raise Error with [No_entry] if the program does not exist. *)
+      @raise Error
+        with [No_entry] if the program does not exist, or [No_resources] if the
+        OS cannot make the process or its pipes. *)
 
   val pid : t -> int
 

@@ -212,6 +212,8 @@ static void name_error(struct job *j, int e) {
 #endif
   ) {
     j->err = ENOENT;
+  } else if (e == EAI_MEMORY) {
+    j->err = ENOMEM;
   } else if (e == EAI_SYSTEM) {
     j->err = errno;
   } else {

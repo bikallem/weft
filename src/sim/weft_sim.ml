@@ -158,7 +158,8 @@ type net =
   ; mutable extra_edges: bool
   ; mutable udp_loss: bool
   ; mutable resets: bool
-  ; mutable next_port: int }
+  ; mutable next_port: int
+  ; mutable fd_limit: int option  (** [Sim.set_fd_limit]. *) }
 
 (* The result of a job, before [Finish] gives it with its type. *)
 type raw =
@@ -353,6 +354,16 @@ let fresh_port n used =
   (go (65535 - 40000)
    [@mutate off "the count of tries matters only when all ports are in use"] )
 
+(* The limit of open fds, as RLIMIT_NOFILE. An operation that makes [k] fds
+   gives EMFILE if the open fds and [k] are more than the limit. As on Linux,
+   the check comes before the other checks of the operation. *)
+let room n k =
+  match n.fd_limit with
+  | Some limit when Hashtbl.length n.fds + k > limit ->
+      Error (Op.No_resources "EMFILE")
+  | _ ->
+      Ok ()
+
 let new_fd n =
   let fd = n.next_fd in
   n.next_fd <- (fd + 1) [@mutate off "a counter that goes down is unique too"] ;
@@ -386,7 +397,8 @@ let perform : type a. t -> a Op.blocking -> (raw, Op.error) result option =
   match op with
   | Op.Open (path, flags, perm) ->
       Some
-        (let* h = Sim_fs.open_ fs path flags perm ~now in
+        (let* () = room n 1 in
+         let* h = Sim_fs.open_ fs path flags perm ~now in
          let fd = new_fd n in
          Hashtbl.replace n.fds fd (Fil h) ;
          Ok (R_int fd) )
@@ -421,7 +433,10 @@ let perform : type a. t -> a Op.blocking -> (raw, Op.error) result option =
   | Op.Mkdir (path, perm) ->
       unit (Sim_fs.mkdir fs path perm ~now)
   | Op.Readdir path ->
-      Some (Result.map (fun l -> R_names l) (Sim_fs.readdir fs path))
+      (* opendir uses an fd. *)
+      Some
+        (let* () = room n 1 in
+         Result.map (fun l -> R_names l) (Sim_fs.readdir fs path) )
   | Op.Rename (src, dst) ->
       unit (Sim_fs.rename fs src dst)
   | Op.Unlink path ->
@@ -808,12 +823,22 @@ let exit_proc t pidfd p status =
     p.child_ends <- [] ;
     edge t.net pidfd ~read:true ~write:false )
 
+(* The fds of a spawn, as on Linux: the two ends of each pipe, then the pidfd.
+   They come before the search of the program. *)
+let spawn_fds (sp : Op.spawn) =
+  List.fold_left
+    (fun k s -> if s = Op.Piped then k + 2 else k)
+    1
+    [sp.stdin; sp.stdout; sp.stderr]
+
 let spawn t (sp : Op.spawn) =
   let n = t.net in
-  match Hashtbl.find_opt t.programs sp.prog with
-  | None ->
+  match (room n (spawn_fds sp), Hashtbl.find_opt t.programs sp.prog) with
+  | Error e, _ ->
+      Error e
+  | Ok (), None ->
       Error Op.No_entry
-  | Some f ->
+  | Ok (), Some f ->
       let prog = f (List.tl sp.argv) in
       let p = {prog; status= None; reaped= false; child_ends= []} in
       (* The parent gets one end of each pipe, and the child keeps the other. *)
@@ -868,8 +893,10 @@ let submit : type a. t -> a Op.t -> (a, Op.error) result =
     | None ->
         Error Op.Bad_fd
   in
+  let ( let* ) = Result.bind in
   match op with
   | Op.Listen (addr, backlog) ->
+      let* () = room n 1 in
       (* A listen on port 0 gets a free port, as on Linux. *)
       let addr =
         match addr with
@@ -895,6 +922,7 @@ let submit : type a. t -> a Op.t -> (a, Op.error) result =
         Hashtbl.replace n.names k fd ;
         Ok fd
   | Op.Connect addr -> (
+      let* () = room n 1 in
       let refused () = Error Op.Refused in
       match Hashtbl.find_opt n.names (key addr) with
       | None ->
@@ -979,17 +1007,20 @@ let submit : type a. t -> a Op.t -> (a, Op.error) result =
   | Op.Accept lfd -> (
     match Hashtbl.find_opt n.fds lfd with
     | Some (Lsn l) -> (
-      match Queue.take_opt l.backlog with
-      | Some s ->
-          s.cfd <- new_fd n ;
-          Hashtbl.replace n.fds s.cfd (Conn s) ;
-          (* An accepted socket gets the options of its listener. *)
-          Option.iter
-            (fun o -> Hashtbl.replace n.opts s.cfd (copy_opts o))
-            (Hashtbl.find_opt n.opts lfd) ;
-          Ok (s.cfd, s.remote)
-      | None ->
-          Error Op.Would_block )
+        (* As on Linux, the check comes before the backlog, and the connection
+           stays in the backlog. *)
+        let* () = room n 1 in
+        match Queue.take_opt l.backlog with
+        | Some s ->
+            s.cfd <- new_fd n ;
+            Hashtbl.replace n.fds s.cfd (Conn s) ;
+            (* An accepted socket gets the options of its listener. *)
+            Option.iter
+              (fun o -> Hashtbl.replace n.opts s.cfd (copy_opts o))
+              (Hashtbl.find_opt n.opts lfd) ;
+            Ok (s.cfd, s.remote)
+        | None ->
+            Error Op.Would_block )
     | Some (Dgm _) ->
         Error (Op.Other "EOPNOTSUPP")
     | Some (Conn _ | Fil _ | Pfd _) ->
@@ -1009,6 +1040,7 @@ let submit : type a. t -> a Op.t -> (a, Op.error) result =
     | _ ->
         conn fd (fun c -> write_conn t c buf off len) )
   | Op.Udp (host, port) ->
+      let* () = room n 1 in
       let key p = Printf.sprintf "%s:%d" host p in
       let port =
         if port = 0 then fresh_port n (fun p -> Hashtbl.mem n.udp_names (key p))
@@ -1047,6 +1079,7 @@ let submit : type a. t -> a Op.t -> (a, Op.error) result =
   | Op.Get_option (fd, opt) ->
       with_opts t fd opt (fun o -> get_opt o opt)
   | Op.Pipe ->
+      let* () = room n 2 in
       let r, w = new_pipe n in
       Hashtbl.replace n.fds r.cfd (Conn r) ;
       Hashtbl.replace n.fds w.cfd (Conn w) ;
@@ -1541,7 +1574,8 @@ let run ?(seed = 0) ?(domains = 1) ?(auto = true) ?(signals = [])
         ; extra_edges= false
         ; udp_loss= false
         ; resets= false
-        ; next_port= 40000 }
+        ; next_port= 40000
+        ; fd_limit= None }
     ; agenda= []
     ; next_id= 0
     ; settles= []
@@ -1692,6 +1726,14 @@ let net_faults t (f : net_faults) =
   t.net.extra_edges <- f.extra_edges ;
   t.net.udp_loss <- f.udp_loss ;
   t.net.resets <- f.resets
+
+let set_fd_limit t limit =
+  ( match limit with
+  | Some l when l < 0 ->
+      invalid_arg "Sim.set_fd_limit: the limit is negative"
+  | _ ->
+      () ) ;
+  t.net.fd_limit <- limit
 
 let set_blocking_cost t span =
   if Int64.compare (Weft.Span.to_ns span) 0L < 0 then

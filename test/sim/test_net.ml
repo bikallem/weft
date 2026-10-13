@@ -882,6 +882,98 @@ let random_resets () =
   at_least int ~than:20 !resets ;
   at_least int ~than:20 !complete
 
+(* The limit of open fds (issue 3). At the limit, accept gives EMFILE, also with
+   an empty backlog, and the connection stays in the backlog. *)
+let fd_limit_accept () =
+  Sim.run (fun sim ->
+      let a = Sim.addr sim "server:30" in
+      let l = Net.listen a in
+      Sim.set_fd_limit sim (Some (Sim.open_fds sim)) ;
+      equal string "EMFILE" (error_of (fun () -> Net.accept l)) ;
+      Sim.set_fd_limit sim (Some (Sim.open_fds sim + 1)) ;
+      let c = Net.connect a in
+      Net.write c "hi" ;
+      equal string "EMFILE" (error_of (fun () -> Net.accept l)) ;
+      Sim.set_fd_limit sim None ;
+      let s, _ = Net.accept l in
+      equal string "hi" (read_n s 2) )
+
+(* Each operation that makes an fd gives EMFILE at the limit, before its other
+   errors, as on Linux. A close makes an fd free again. *)
+let fd_limit_each_op () =
+  Sim.run (fun sim ->
+      Sim.add_program sim "p" (fun _ -> Sim.program ~runs:(Span.ms 1) ()) ;
+      let a = Sim.addr sim "server:31" in
+      let _l = Net.listen a in
+      let emfile f = equal string "EMFILE" (error_of f) in
+      Sim.set_fd_limit sim (Some (Sim.open_fds sim)) ;
+      emfile (fun () -> Net.listen (Sim.addr sim "server:32")) ;
+      emfile (fun () -> Net.connect a) ;
+      emfile (fun () -> Net.udp ("a", 1)) ;
+      emfile Pipe.create ;
+      emfile (fun () -> File.openfile [Read] "/missing") ;
+      emfile (fun () -> Dir.readdir "/") ;
+      emfile (fun () -> Process.spawn "missing" []) ;
+      (* With one free fd, a pipe and a spawn with a pipe fail. *)
+      Sim.set_fd_limit sim (Some (Sim.open_fds sim + 1)) ;
+      emfile Pipe.create ;
+      emfile (fun () -> Process.spawn ~stdout:Piped "p" []) ;
+      Sim.set_fd_limit sim (Some (Sim.open_fds sim + 2)) ;
+      emfile (fun () -> Process.spawn ~stdout:Piped "p" []) ;
+      Sim.set_fd_limit sim (Some (Sim.open_fds sim + 1)) ;
+      is_true (Process.wait (Process.spawn "p" []) = Process.Exited 0) ;
+      let u = Net.udp ("a", 1) in
+      emfile (fun () -> Net.udp ("a", 2)) ;
+      Net.close u ;
+      Net.close (Net.udp ("a", 2)) ;
+      Sim.set_fd_limit sim None ;
+      let r, w = Pipe.create () in
+      Pipe.close r ;
+      Pipe.close w ;
+      Sim.set_fd_limit sim (Some 0) ;
+      emfile Pipe.create ;
+      raises_match
+        (function Invalid_argument _ -> true | _ -> false)
+        (fun () -> Sim.set_fd_limit sim (Some (-1))) )
+
+(* The accept loop of caravan: on EMFILE, it pauses for 100 ms, then tries
+   again. A fiber that waits in accept gets EMFILE when a connection comes. A
+   timeout during the pause ends the loop at once. *)
+let accept_loop_pauses () =
+  Sim.run (fun sim ->
+      let a = Sim.addr sim "server:33" in
+      let l = Net.listen a in
+      let tries = ref 0 in
+      let rec loop () =
+        match Net.accept l with
+        | c, _ ->
+            c
+        | exception Net.Error (No_resources _, _) ->
+            incr tries ;
+            Time.sleep Mono (Span.ms 100) ;
+            loop ()
+      in
+      let t0 = Time.now Mono in
+      Fiber.scope (fun s ->
+          let got = Fiber.fork_promise s loop in
+          Fiber.yield () ;
+          Sim.set_fd_limit sim (Some (Sim.open_fds sim + 1)) ;
+          let c = Net.connect a in
+          Time.sleep Mono (Span.ms 250) ;
+          Sim.set_fd_limit sim None ;
+          let s = Promise.await got in
+          equal int 300 (ms_since t0) ;
+          equal int 3 !tries ;
+          Net.close s ;
+          Net.close c ) ;
+      let c = Net.connect a in
+      Sim.set_fd_limit sim (Some (Sim.open_fds sim)) ;
+      let t1 = Time.now Mono in
+      raises Fiber.Timeout (fun () ->
+          ignore (Fiber.with_timeout Mono (Span.ms 150) loop) ) ;
+      equal int 150 (ms_since t1) ;
+      Net.close c )
+
 let tests =
   [ group "net"
       [ slow "echo: the client gets hello back, with 1000 seeds" echo_1000_seeds
@@ -922,6 +1014,12 @@ let tests =
       ; test "a reset of the fault wakes a reader on the same socket"
           reset_wakes_reader
       ; slow "10,000 connections use the fd slots again" many_connections ]
+  ; group "fd limit"
+      [ test "accept gives EMFILE and leaves the connection in the backlog"
+          fd_limit_accept
+      ; test "each operation that makes an fd gives EMFILE" fd_limit_each_op
+      ; test "an accept loop pauses on EMFILE, and a timeout ends the pause"
+          accept_loop_pauses ]
   ; group "udp"
       [ test "udp_loss loses about one datagram in 8" udp_loss
       ; test "the jitter can reorder datagrams" udp_order

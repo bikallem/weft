@@ -621,6 +621,37 @@ let now_and_reset w =
                   Net.reset c ;
                   Net.reset c ;
                   equal string "EBADF" (read_error c) ) ) )
+    ; test "a client that resets before the accept does not stop the accepts"
+        (fun () ->
+          w.run (fun () ->
+              let l, a = w.listen () in
+              let go = Ivar.create () in
+              (* Linux and the simulator give the connection that reset, and its
+                 read gives ECONNRESET. macOS and FreeBSD give ECONNABORTED, and
+                 accept takes the next connection. *)
+              let first c =
+                match read_n c 1 with s -> s | exception Net.Error _ -> ""
+              in
+              let rec accept_b () =
+                let c, _ = Net.accept l in
+                let s = first c in
+                Net.close c ;
+                if s <> "b" then accept_b ()
+              in
+              Fiber.scope (fun s ->
+                  let got =
+                    Fiber.fork_promise s (fun () ->
+                        sync (Ivar.read go) ;
+                        accept_b () )
+                  in
+                  Net.reset (Net.connect a) ;
+                  let c = Net.connect a in
+                  Net.write c "b" ;
+                  Time.sleep Mono (Span.ms 10) ;
+                  Ivar.fill go () ;
+                  Promise.await got ;
+                  Net.close c ) ;
+              Net.close l ) )
     ; test "a reset of a listener closes it" (fun () ->
           w.run (fun () ->
               let l, _ = w.listen () in
