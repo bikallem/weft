@@ -16,8 +16,10 @@
 # A "fail" case plants one bug, and TLC must find a violation or a deadlock.
 # The script gives exit status 1 if a result is not the expected one.
 # JOBS (default 4), WORKERS and HEAP (default 2g) control the parallel runs.
-# LIMIT (default 5400) is the maximum time of one TLC run, in seconds. A run
-# that is longer gives an error, so that a hang does not stop the script.
+# LIMIT (default 5400) is the maximum time of one case, in seconds. A case
+# that is longer stops with an error, so that a hang does not stop the script.
+# Each result goes to stderr when its case ends, and the list of all results
+# goes to stdout at the end.
 set -u
 cd "$(dirname "$0")"
 work=$(mktemp -d)
@@ -70,6 +72,8 @@ runone() {
       timeout -k 30 "$LIMIT" tlc -workers "$WORKERS" -lncheck final -metadir "$work/states$i" \
       -config "$work/case$i.cfg" "$module.tla" > "$out" 2>&1
     rc=$?
+    # A timeout is not a race of the start, so do not try again.
+    [ "$rc" = 124 ] || [ "$rc" = 137 ] && break
     # TLC gave a result: a pass, a violation or a deadlock.
     grep -qE "No error has been found|^Error: (Invariant|Deadlock|Temporal)" "$out" && break
   done
@@ -82,6 +86,7 @@ runone() {
   printf '%-6s %-6s %-6s %-20s -> %s %s (%s, %ss)\n' "$module" "$expect" "$scen" "$bugs" \
     "$result" "${why:-}" "${states:-?}" "$((SECONDS - t0))" > "$work/res$i"
   [ "$result" = "$expect" ] || echo "unexpected" >> "$work/res$i"
+  head -1 "$work/res$i" >&2
   [ "$result" = error ] && head -20 "$out" >> "$work/res$i"
   rm -rf "$work/states$i" "$work/tmp$i"
 }
