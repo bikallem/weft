@@ -86,7 +86,7 @@ let connect_fast a =
   | exception Fiber.Timeout ->
       fail
         "a connect took more than 10 s: the conntrack table or the ports of \
-         the host can be full"
+         the host can be full, or weft lost the wakeup of the connect"
 
 let error_of f =
   match f () with
