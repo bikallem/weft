@@ -100,15 +100,20 @@ let other_process () =
 
 let open_fds () = Array.length (Sys.readdir "/proc/self/fd")
 
-(* 10,000 connections open and close, and no fd stays open. *)
+(* 10,000 connections open and close, and no fd stays open. The client closes
+   first, and the server resets: thus no side keeps a TIME_WAIT socket. A
+   TIME_WAIT socket keeps its entry in the conntrack table of the host for 120
+   s, and after a reset the entry stays for 10 s only. Parallel runs with
+   TIME_WAIT sockets filled this table. Then the host dropped each SYN, and the
+   test did not end. *)
 let no_fd_leak () =
   let before = open_fds () in
   Weft_linux.run ~domains:1 (fun () ->
       let l, a = world.listen () in
       Fiber.scope (fun s ->
-          Fiber.fork_daemon s (fun () -> Portable.echo_server l) ;
+          Fiber.fork_daemon s (fun () -> Portable.echo_server ~reset:true l) ;
           for _ = 1 to 10_000 do
-            let c = Net.connect a in
+            let c = Portable.connect_fast a in
             Net.write c "x" ;
             equal string "x" (Portable.read_n c 1) ;
             Net.close c

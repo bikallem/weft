@@ -54,14 +54,14 @@ let drain read r =
 
 let read_all = drain Net.read
 
-let echo_server l =
+let echo_server ?(reset = false) l =
   Fiber.scope (fun s ->
       while true do
         let c, _ = Net.accept l in
         Fiber.fork ~name:"echo" s (fun () ->
             (* Close the socket also on a cancel. *)
             Fun.protect
-              ~finally:(fun () -> Net.close c)
+              ~finally:(fun () -> if reset then Net.reset c else Net.close c)
               (fun () ->
                 let buf = Bytes.create 4096 in
                 let rec loop () =
@@ -78,6 +78,15 @@ let echo_server l =
                 in
                 loop () ) )
       done )
+
+let connect_fast a =
+  match Fiber.with_timeout Mono (Span.s 10) (fun () -> Net.connect a) with
+  | c ->
+      c
+  | exception Fiber.Timeout ->
+      fail
+        "a connect took more than 10 s: the conntrack table or the ports of \
+         the host can be full"
 
 let error_of f =
   match f () with

@@ -45,18 +45,19 @@ let timers () =
 
 let open_fds () = Array.length (Sys.readdir "/proc/self/fd")
 
-(* 2,000 connections on 4 domains, and no fd stays open. *)
+(* 2,000 connections on 4 domains, and no fd stays open. The server resets each
+   connection, as in the test of 10,000 connections in test/linux. *)
 let no_fd_leak () =
   let before = open_fds () in
   Weft_linux.run ~domains (fun () ->
       let l, a = world.listen () in
       Fiber.scope (fun s ->
-          Fiber.fork_daemon s (fun () -> Portable.echo_server l) ;
+          Fiber.fork_daemon s (fun () -> Portable.echo_server ~reset:true l) ;
           Fiber.scope (fun clients ->
               for _ = 1 to 8 do
                 Fiber.fork clients (fun () ->
                     for _ = 1 to 250 do
-                      let c = Net.connect a in
+                      let c = Portable.connect_fast a in
                       Net.write c "x" ;
                       equal string "x" (Portable.read_n c 1) ;
                       Net.close c
