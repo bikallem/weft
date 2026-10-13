@@ -208,6 +208,50 @@ module Fiber : sig
     val broadcast : t -> unit
     (** Wakes all waiters. *)
   end
+
+  (** A counting semaphore for fiber code. The acquire is an event, so a
+      [choose] can wait for a permit and for other events (design section 2.5,
+      Locks for fiber code). A lock is [create 1]. *)
+  module Semaphore : sig
+    type t
+
+    val create : ?max:int -> int -> t
+    (** [create ?max n] is a semaphore with [n] free permits. A release never
+        makes more than [max] permits free. The default [max] is [n]. A count
+        with no limit, as [Semaphore.Counting.make 0] of the stdlib, is
+        [create ~max:max_int 0].
+
+        @raise Invalid_argument if [n < 0] or [max < n]. *)
+
+    val acquire : t -> unit event
+    (** An event that takes one permit. The sync gets the permit only if it
+        commits to this branch. If the [choose] commits to another branch, or a
+        cancel ends the sync, the permit goes to the next waiter. The waiters
+        get the permits in the order in which they started to wait (FIFO). *)
+
+    val try_acquire : t -> bool
+    (** Takes a free permit and gives [true], or gives [false] if no permit is
+        free. It does not wait, and it is not a cancellation point. A [choose]
+        of [acquire] and [always] is not a try: if a permit is free, the
+        [choose] selects one of the two ready branches at random. *)
+
+    val release : t -> unit
+    (** Returns one permit to the semaphore: to the oldest waiter, or to the
+        free permits.
+
+        @raise Invalid_argument
+          if the free permits are already at the [max] of [create]. *)
+
+    val try_release : t -> bool
+    (** As [release], but it gives [false] and changes nothing if the free
+        permits are already at the [max] of [create]. For example, the refill of
+        a rate limit with [create ~max:m 0] uses it, because a refill of a full
+        bucket is normal. *)
+
+    val use : t -> (unit -> 'a) -> 'a
+    (** [use t f] acquires a permit, runs [f] and releases the permit, also if
+        [f] raises. The acquire is a cancellation point. *)
+  end
 end
 
 module Ivar : sig

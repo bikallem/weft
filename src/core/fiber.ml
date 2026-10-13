@@ -48,6 +48,7 @@ module Mutex = struct
 end
 
 module Condition = Locks.Condition
+module Semaphore = Locks.Semaphore
 
 (* A new scope T and a deadline on T: an entry in the heap of the domain, with
    no fiber (design section 2.5, Timeouts, the deadline form of M3). At the

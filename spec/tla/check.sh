@@ -7,6 +7,7 @@
 #   Ivar.tla    the atomic register of an Ivar, and fill_from_outside
 #   Wake.tla    the loop of a domain: idle and wake, steal, next slot, pinned
 #   Fd.tla      the fd record: Rcfd, the registrations, the close notices
+#   Semaphore.tla  Fiber.Semaphore: the acquire event, the release, FIFO
 #
 # MODELS selects the models, for example: MODELS="Ivar Scope" check.sh
 #
@@ -25,7 +26,7 @@ n=0
 JOBS=${JOBS:-4}
 WORKERS=${WORKERS:-$(( $(nproc) / JOBS > 0 ? $(nproc) / JOBS : 1 ))}
 export JAVA_TOOL_OPTIONS="-Xmx${HEAP:-2g}"
-MODELS=${MODELS:-"Commit Scope Ivar Wake Fd"}
+MODELS=${MODELS:-"Commit Scope Ivar Wake Fd Semaphore"}
 want() { case " $MODELS " in *" $1 "*) return 0 ;; *) return 1 ;; esac; }
 
 # run MODULE EXPECT "INVARIANTS" NAME=VALUE...
@@ -161,6 +162,20 @@ fd fail   TRUE  TRUE  FALSE  FALSE    FALSE
 fd pass   TRUE  FALSE TRUE   FALSE    FALSE
 fd fail   TRUE  FALSE FALSE  TRUE     FALSE
 fd fail   TRUE  FALSE FALSE  FALSE    TRUE
+
+sem() { want Semaphore || return 0 # expect scenario noLock takeFirst takeOnLost anyWaiter
+  run Semaphore "$1" \
+    "TypeOK Conserved HeldAcquired AtMostOneResume NoIdlePermit Fifo EndState" \
+    "Scenario=\"$2\"" BugNoLock="$3" BugTakeFirst="$4" BugTakeOnLost="$5" BugAnyWaiter="$6"
+}
+#   expect scenario noLock takeFirst onLost anyWaiter
+sem pass   choose   FALSE  FALSE     FALSE  FALSE
+sem pass   cancel   FALSE  FALSE     FALSE  FALSE
+sem pass   two      FALSE  FALSE     FALSE  FALSE
+sem fail   choose   TRUE   FALSE     FALSE  FALSE
+sem fail   cancel   FALSE  TRUE      FALSE  FALSE
+sem fail   choose   FALSE  FALSE     TRUE   FALSE
+sem fail   cancel   FALSE  FALSE     FALSE  TRUE
 
 # Run the cases. The slow cases come first, so that they start early.
 export -f runone

@@ -16,6 +16,9 @@ val tests : world -> Windtrap.test list
 val layers : world -> Windtrap.test
 (** The tests of the fiber layer (milestone M2), also in [tests]. *)
 
+val semaphores : world -> Windtrap.test
+(** The tests of [Fiber.Semaphore] (issue 4), also in [tests]. *)
+
 val files : world -> Windtrap.test
 (** The tests of [File] and [Dir] (milestone M2), also in [tests]. *)
 
