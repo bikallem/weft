@@ -56,9 +56,15 @@ runone() {
   { read -r module; read -r expect; read -r scen; read -r bugs; } < "$work/case$i.meta"
   local out="$work/out$i.txt"
   local t0=$SECONDS try
+  # TLC copies the standard modules (Integers.tla and the others) from its jar
+  # to java.io.tmpdir, /tmp by default, and deletes them at its exit. With one
+  # directory for all cases, a case truncates or deletes the file that another
+  # case parses. Thus each case has its own directory.
+  mkdir -p "$work/tmp$i"
   for try in 1 2; do
     rm -rf "$work/states$i"
-    tlc -workers "$WORKERS" -lncheck final -metadir "$work/states$i" \
+    JAVA_TOOL_OPTIONS="$JAVA_TOOL_OPTIONS -Djava.io.tmpdir=$work/tmp$i" \
+      tlc -workers "$WORKERS" -lncheck final -metadir "$work/states$i" \
       -config "$work/case$i.cfg" "$module.tla" > "$out" 2>&1
     # TLC gave a result: a pass, a violation or a deadlock.
     grep -qE "No error has been found|^Error: (Invariant|Deadlock|Temporal)" "$out" && break
@@ -72,7 +78,7 @@ runone() {
     "$result" "${why:-}" "${states:-?}" "$((SECONDS - t0))" > "$work/res$i"
   [ "$result" = "$expect" ] || echo "unexpected" >> "$work/res$i"
   [ "$result" = error ] && head -20 "$out" >> "$work/res$i"
-  rm -rf "$work/states$i"
+  rm -rf "$work/states$i" "$work/tmp$i"
 }
 
 commit() { want Commit || return 0 # expect scenario noParked noIdOrder dropOnClaimed noLock
