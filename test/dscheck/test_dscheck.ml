@@ -858,6 +858,141 @@ let sem_self_commit_claimed () =
         && got x 0 + got y 0 = 1
         && Atomic.get continued + queued t x + in_next t x = 1 )
 
+(* The variable (design section 2.4, A variable). [var_sync dom seen x got] is
+   the sync of [x] on [changed seen] on [dom]: the leaf and the end of the scan.
+   [seen] gives the view at the start of the thread. [got] gets the result of
+   the event. *)
+let var_sync dom seen x got continued () =
+  let seen = seen () in
+  let leaves, results, _ = Event.flatten (Var.changed seen) in
+  got := Some (seen, results.(0)) ;
+  leaves.(0) dom x 0 ;
+  match C.park x.S.word with `Done _ -> Atomic.incr continued | `Parked -> ()
+
+let var_set dom t v () = List.iter (S.resume dom) (Var.change t v)
+
+(* The view of the event, if the sync committed. *)
+let var_result x got =
+  match (C.state x.S.word, !got) with
+  | C.Done 0, Some (_, r) ->
+      Some (r ())
+  | _ ->
+      None
+
+(* The end of a sync of [x] on [changed seen]. If the sync committed, it
+   continued one time, and its view is not [seen] and has a value of [values].
+   If not, [x] is parked, and the state of [t] is [seen]. Thus each state that a
+   fiber waits on has a set that fills its Ivar. *)
+let var_end t v x got continued values =
+  match (var_result x got, !got) with
+  | Some r, Some (seen, _) ->
+      r.Var.st != seen.Var.st
+      && List.mem (Var.value r) values
+      && Atomic.get continued + queued t x = 1
+  | None, Some (seen, _) ->
+      C.state x.S.word = C.Parked
+      && Atomic.get v == seen.Var.st
+      && queued t x = 0
+  | _, None ->
+      false
+
+(* A sync on a view of [t] while a set of 1 runs on another domain. The register
+   finds the Ivar of the view full, or the set fills it and commits the sync (no
+   lost wake). *)
+let var_set_changed () =
+  trace (fun () ->
+      let t = S.create ~domains:2 () in
+      let w = world () in
+      let v = Var.create 0 and x = new_sync (scope_node ()) in
+      let s0 = Var.view v in
+      let got = ref None and continued = Atomic.make 0 in
+      spawn_in w (var_sync t.S.doms.(0) (fun () -> s0) x got continued) ;
+      spawn_in w (var_set t.S.doms.(1) v 1) ;
+      fun () -> var_end t v x got continued [1] && C.state x.S.word = C.Done 0 )
+
+(* Two sets on two domains, and a view and a sync on a third domain. The view
+   can be the state of the first set. The fiber waits only while its view is the
+   state of [t]. *)
+let var_two_sets () =
+  trace (fun () ->
+      let t = S.create ~domains:3 () in
+      let w = world () in
+      let v = Var.create 0 and x = new_sync (scope_node ()) in
+      let got = ref None and continued = Atomic.make 0 in
+      spawn_in w (var_sync t.S.doms.(0) (fun () -> Var.view v) x got continued) ;
+      spawn_in w (var_set t.S.doms.(1) v 1) ;
+      spawn_in w (var_set t.S.doms.(2) v 2) ;
+      fun () -> List.mem (Var.get v) [1; 2] && var_end t v x got continued [1; 2] )
+
+(* A set of 1 and a set of 0 again on one domain, while a fiber syncs on its
+   first view. The value is 0 again, but the state is new: the sync commits. *)
+let var_set_back () =
+  trace (fun () ->
+      let t = S.create ~domains:2 () in
+      let w = world () in
+      let v = Var.create 0 and x = new_sync (scope_node ()) in
+      let s0 = Var.view v in
+      let got = ref None and continued = Atomic.make 0 in
+      spawn_in w (var_sync t.S.doms.(0) (fun () -> s0) x got continued) ;
+      spawn_in w (fun () ->
+          var_set t.S.doms.(1) v 1 () ;
+          var_set t.S.doms.(1) v 0 () ) ;
+      fun () ->
+        Var.get v = 0
+        && var_end t v x got continued [0; 1]
+        && C.state x.S.word = C.Done 0 )
+
+(* A sync on an old view, with no set during the sync, and a cancel at the same
+   time. The Ivar of the view is full: the sync commits itself to the event, or
+   the cancel wins. *)
+let var_old_view_cancel () =
+  trace (fun () ->
+      let t = S.create ~domains:2 () in
+      let w = world () in
+      let v = Var.create 0 and x = new_sync (scope_node ()) in
+      let s0 = Var.view v in
+      ignore (Var.change v 1) ;
+      let got = ref None and continued = Atomic.make 0 in
+      spawn_in w (var_sync t.S.doms.(0) (fun () -> s0) x got continued) ;
+      spawn_in w (fun () ->
+          match C.notify x.S.word (-1) with
+          | C.Resume ->
+              S.resume t.S.doms.(1) x
+          | C.In_scan | C.Lost _ ->
+              () ) ;
+      fun () ->
+        ( match var_result x got with
+          | Some r ->
+              r.Var.st == Atomic.get v
+          | None ->
+              C.state x.S.word = C.Done (-1) )
+        && C.state x.S.word <> C.Parked
+        && Atomic.get continued + queued t x = 1 )
+
+(* A set while a cancel ends the sync of the waiter. One of them wins, and the
+   fiber continues one time. *)
+let var_set_cancel () =
+  trace (fun () ->
+      let t = S.create ~domains:2 () in
+      let w = world () in
+      let d0 = t.S.doms.(0) and d1 = t.S.doms.(1) in
+      let v = Var.create 0 and x = new_sync (scope_node ()) in
+      let s0 = Var.view v in
+      let got = ref None and continued = Atomic.make 0 in
+      var_sync d0 (fun () -> s0) x got continued () ;
+      spawn_in w (var_set d0 v 1) ;
+      spawn_in w (fun () ->
+          match C.notify x.S.word (-1) with
+          | C.Resume ->
+              S.resume d1 x
+          | C.In_scan | C.Lost _ ->
+              () ) ;
+      fun () ->
+        Var.get v = 1
+        && ( Option.map Var.value (var_result x got) = Some 1
+           || C.state x.S.word = C.Done (-1) )
+        && queued t x = 1 )
+
 let () =
   print_endline "dscheck" ;
   case "commit: a commit during the scan" commit_during_scan ;
@@ -899,6 +1034,11 @@ let () =
     sem_two_branches ;
   case "semaphore: a free permit while a send claims the sync"
     sem_self_commit_claimed ;
+  case "variable: a set and a sync on changed at the same time" var_set_changed ;
+  case "variable: two sets, and a view and a sync" var_two_sets ;
+  case "variable: a set and a set back during a sync" var_set_back ;
+  case "variable: a sync on an old view and a cancel" var_old_view_cancel ;
+  case "variable: a set and a cancel of the waiter" var_set_cancel ;
   case "commit: two fibers that sync on each other, liveness" (fun () ->
       live cross_setup ) ;
   if !failures > 0 then exit 1

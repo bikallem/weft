@@ -317,6 +317,83 @@ Three scenarios pass: two fibers that sync on each other, a stale offer with a t
 
 When more than one branch is ready, `choose` uses `Random` from the world to select a branch. In production this prevents starvation. In the simulator, the seed controls it, so a failed run can run again with the same result.
 
+### A variable (issue 5)
+
+`Var` is a value that can change, with an event for its change:
+
+```ocaml
+module Var : sig
+  type 'a t
+  type 'a view                        (* a variable and the state that a fiber saw *)
+  val create : 'a -> 'a t
+  val get : 'a t -> 'a
+  val view : 'a t -> 'a view
+  val value : 'a view -> 'a
+  val set : 'a t -> 'a -> unit
+  val changed : 'a view -> 'a view event   (* ready when the state is not the state of the view *)
+end
+```
+
+caravan will use it for a deadline that changes during a wait. For example, the close of a WebSocket sets a close deadline on a read that waits. Other uses are a reload of the configuration and a state machine that other fibers watch.
+
+**The event compares states.** Each set makes a new state. A view holds a variable and one of its states. `changed seen` is ready when the state of the variable is not the state of `seen`. It gives a view of the same variable, with its state when the fiber continues. That state is never the state of `seen`.
+
+The issue proposed `changed : 'a t -> 'a event`, an event for the next set after the sync starts. That form has a race: a set between the `get` and the sync is lost, and the fiber waits for a later set. In the deadline loop of caravan, the fiber then waits with the old deadline. With `seen`, the event finds that set, and it is ready at once. The loop gives the result of each `changed` to the next one, and the first call gives `Var.view d`:
+
+```ocaml
+let rec wait s seen =
+  match sync (choose [ wrap (Net.readable s) (fun () -> `Ready)
+                     ; wrap (Var.changed seen) (fun v -> `Changed v)
+                     ; timeout (Var.value seen) ]) with
+  | `Changed v -> wait s v
+  | ...
+```
+
+**Each set is a change.** A set of an equal value also makes a new state and wakes the waiters. A value that goes from `a` to `b` and back to `a` is a change too. A program that wants no wake for an equal value compares the values before the set. Only the last value counts, as in the watch channel of tokio. Thus a fiber can miss the values between two of its syncs.
+
+**A compare of values gives a busy loop.** The first form of this design compared the values with `==`: `changed : 'a t -> 'a -> 'a event`. The review found that OCaml makes a new box at each read of some values:
+
+- A field of a record of floats only (a flat record)
+- An element of a float array
+- A local ref that holds a `float`, `int64`, `int32` or `nativeint`, which the compiler unboxes.
+
+If a fiber keeps `seen` in one of these places, `seen` is never `==` to the value of the variable. Then the event is ready at each sync and gives an equal value. The review measured 100,000 wakes in 10 ms with no set in each of these cases. A copy of the value, for example a new `Some t`, gives the same loop. A local ref is the normal style of a `while` loop.
+
+The type of `changed` prevents this busy loop. The event takes a view, not a value, and it compares no values: it waits on the `Ivar` of the state of `seen`. A copy of a view, if a compiler made one, holds the same `Ivar`.
+
+**The alternatives that we did not select:**
+
+- A version: `get : 'a t -> 'a * version` and `changed : 'a t -> version -> 'a event`. It has the same safety, but the program must keep two items for one state. A view holds the value and the identity of the state together.
+- `changed : 'a t -> 'a view -> 'a view event`, the form before the second review. A view of another variable of the same type type-checks, for example the read deadline and the write deadline of a connection. The event then waits on the other variable, and a set of `t` does not wake it.
+- A function `equal` at `create`, for a set that skips an equal value. A program can do this compare before the set with its own function. The compare and the set are then not one atomic step, but the cost is only one more wake.
+
+**The place.** The module is a top-level `Var`, next to `Ivar`. The stdlib has no module `Var`, so `open Weft` hides no stdlib module (decision 16). A program with its own module `Var` uses `Weft.Var` with no `open Weft`, as for the other top-level names of weft, for example `Time` and `File`.
+
+**The code is a composition.** A variable is an `Atomic.t` that holds its state, a record: the value, and a `unit Ivar.t`. A view is a record with the variable and one state. Thus an old view holds no later state.
+
+1. `set t v` makes a new state and puts it in the `Atomic.t` with `Atomic.exchange`. Then it fills the `Ivar` of the state that it replaced.
+2. `changed seen` is `Ivar.read` on the `Ivar` of the state of `seen`. Its `wrap` reads the state of the variable of `seen`.
+
+The form of caravan in the issue is the same. `changed` has no guard. If a set replaced the state of `seen`, its fill comes at once after its exchange, and the register of the `Ivar` finds it full. `set` performs `Self` first, as `Ivar.fill` does: outside a fiber, it raises `Fiber.Not_in_fiber` before it changes the state.
+
+**Why no TLA+ model.** The code adds no protocol to the commit. Its event is `Ivar.read`, and `Commit.tla` and `Ivar.tla` examine it with a `choose` and a cancel. The new part is one exchange on the state, and this order: the exchange, then the fill. The proof depends on one fact: each record that the exchange puts is new, and no code puts a record in the `Atomic.t` again. Thus:
+
+- Each state has one replacer: the set whose exchange gave it. That set fills the `Ivar` of the state.
+- The `Ivar` of a state is full only after a set replaced the state. A state never comes back, so the event never gives the state of `seen`.
+- If a set replaces the state of `seen`, the atomic register of the `Ivar` (The atomic register, above) makes sure that the fiber gets the fill. The fill commits the fiber, or the register finds the `Ivar` full. If no set replaces it, the fiber must wait.
+
+The fill comes after the exchange, so a waiter never continues before `get` gives the new value. A sync that commits to another branch leaves a stale waiter in the `Ivar`. The `Ivar` drops the stale waiters when its list doubles (review of M0, K4). Thus a wait loop on a variable that does not change does not grow the list.
+
+**The tests.** Five `dscheck` tests examine the exchange and the fill against the register:
+
+- A set and a sync at the same time
+- Two sets on two domains, and a view and a sync on a third domain
+- A set and a set back to the old value
+- A sync on an old view with no set, and a cancel
+- A set with a cancel of the waiter.
+
+Each of four changes to the code makes a test fail. The changes are a read and a write in place of the exchange, a fill of the new `Ivar`, a `wrap` that gives `seen`, and a set with no `Self`. The tests of the public API run in the simulator, also with 200 seeds on 4 virtual domains, and in the Linux world. They include the deadline loop of caravan, an old view, a view with no set, which gives no wake, and a set of another variable, which does not wake a view.
+
 ## 2.5 The scheduler
 
 Each domain runs one scheduler instance inside the world handler. Milestone M0 has one domain. From milestone M1, `run ~domains:n` starts `n` domains. The default is `min 4 (Domain.recommended_domain_count ())`. In OCaml 5, each minor GC stops all domains, so more domains do not always give more throughput to an I/O server. Measurements after M3 kept the value 4 (open question 6). In the simulator, the domains are virtual domains (section 2.8).
@@ -1142,7 +1219,7 @@ The cost of an effect is a perform and a handler call for each world operation. 
 
 ## 2.12 Decisions
 
-Decisions 1 to 6 were made on 2026-10-09, decisions 7 to 9 on 2026-10-10, decisions 10 and 11 on 2026-10-12 (issue 1), decision 12 on 2026-10-12 (issue 2), decisions 13 and 14 on 2026-10-12 (issue 3), and decisions 15 to 17 on 2026-10-12 (issue 4).
+Decisions 1 to 6 were made on 2026-10-09, decisions 7 to 9 on 2026-10-10, decisions 10 and 11 on 2026-10-12 (issue 1), decision 12 on 2026-10-12 (issue 2), decisions 13 and 14 on 2026-10-12 (issue 3), decisions 15 to 17 on 2026-10-12 (issue 4), and decisions 18 to 20 on 2026-10-12 (issue 5).
 
 | No. | Question | Decision |
 |---|---|---|
@@ -1163,6 +1240,9 @@ Decisions 1 to 6 were made on 2026-10-09, decisions 7 to 9 on 2026-10-10, decisi
 | 15 | The acquire of a semaphore in a `choose` | `Fiber.Semaphore.acquire` is a base event with the commit protocol, as `Chan.recv` is (section 2.5, Locks for fiber code). A release commits the word of the oldest waiter, so the commit and the transfer of the permit are one atomic step. A composition of `guard` and `with_nack` needs a fiber that waits for the nack, and a cancel of that fiber loses the permit. |
 | 16 | The place of the semaphore | `Fiber.Semaphore`, next to `Fiber.Mutex`. A top-level `Semaphore` hides `Stdlib.Semaphore` after `open Weft`. `Fiber.Mutex` keeps its own code, because a semaphore has no poison state and no shield node for `Condition.wait`. |
 | 17 | A release above the maximum | `create ?max n`, with `max` = `n` by default. A release above `max` raises `Invalid_argument`, as `Fiber.Mutex.unlock` does for a mutex that is not locked. A free increase hides a second release, and a lock then lets two fibers hold it. A count that starts at 0 uses `create ~max:m 0`, and its refill uses `try_release`, which gives `false` at the maximum. Without `max`, a semaphore from `create 0` never has a permit, and without `try_release`, a refill must catch `Invalid_argument`. |
+| 18 | The event of a variable | `Var.changed seen`, with a view: the variable and the state that the fiber saw. It is ready when the state of the variable is not the state of `seen` (section 2.4, A variable). An event for the next set loses a set between the read and the sync. A compare of the values with `==` gives a busy loop: OCaml makes a new box at each read of a float field of a flat record, of an element of a float array and of an unboxed local ref. A view holds its variable, so a view of another variable cannot go to the event. |
+| 19 | A set of an equal value | Each set is a change, also for an equal value and for a value that comes back. A program that wants no wake for an equal value compares the values before the set. A compare inside `set` adds a function of the user for a task that the program can do itself. |
+| 20 | The place and the code of a variable | A top-level `Var`, next to `Ivar`, because no stdlib module has this name. The code is a composition of an `Atomic.exchange` and `Ivar.read`, with no new protocol, so it has no TLA+ model. `dscheck` examines the exchange and the fill. |
 
 Also on 2026-10-10, the user accepted the milestone plan of section 2.14. Decisions 4, 7 and 8 stay, and they come in milestone M1. Milestone M0 has one domain.
 
@@ -1398,7 +1478,7 @@ Run all of the models with `nix develop -c spec/tla/check.sh`. `MODELS="Ivar Fd"
 
 **A correction from the review of M0.** In `Scope.tla`, the fork of K checked only the flag of S. The design and the code read the flags of the whole chain of S, because the nested scopes have no flags of their own. The fork step now reads `FirstFlag("S")`, and the 16 cases of `Scope.tla` give the expected results.
 
-**The limits.** The models are small: two or three fibers or domains in each scenario, a few work items, and one fd. Each model takes some details as one atomic step, and another model examines them, for example the commit in `Scope.tla` and `Ivar.tla`. The models do not cover the simulator, the OS facts, the handoff of `Fiber.Mutex`, promises or signals. `dscheck` still examines the OCaml code, because the OCaml code can differ from the model. In M2, two `dscheck` tests examine the completion of a job and the delivery of a signal, each with a cancel from another domain (section 3.8).
+**The limits.** The models are small: two or three fibers or domains in each scenario, a few work items, and one fd. Each model takes some details as one atomic step, and another model examines them, for example the commit in `Scope.tla` and `Ivar.tla`. The models do not cover the simulator, the OS facts, the handoff of `Fiber.Mutex`, promises or signals. `Var` has no model, because it is a composition of `Ivar.read` and one exchange (section 2.4, A variable). `dscheck` still examines the OCaml code, because the OCaml code can differ from the model. In M2, two `dscheck` tests examine the completion of a job and the delivery of a signal, each with a cancel from another domain (section 3.8).
 
 ## 2.17 Tests with windtrap
 

@@ -1773,6 +1773,195 @@ let semaphores w =
                       Sem.use s ignore ) ) ;
               all_free s 1 ) ) ]
 
+(* The variable (issue 5). *)
+
+(* [Some v] if [changed seen] is ready in 1 ms, with the value of its view. A
+   ready event commits during the scan, before the timer is ready. *)
+let try_changed seen =
+  sync
+    (choose
+       [ wrap (Var.changed seen) (fun v -> Some (Var.value v))
+       ; wrap (Time.after Mono (Span.ms 1)) (fun () -> None) ] )
+
+(* The wait of a caravan connection: data, or the deadline in the variable of
+   [seen], the first of the two. A change of the deadline starts the wait
+   again. *)
+let rec wait_data data seen =
+  let deadline =
+    match Var.value seen with Some t -> Time.at Mono t | None -> never
+  in
+  match
+    sync
+      (choose
+         [ wrap (Ivar.read data) (fun () -> `Data)
+         ; wrap (Var.changed seen) (fun v -> `Changed v)
+         ; wrap deadline (fun () -> `Timeout) ] )
+  with
+  | `Changed v ->
+      wait_data data v
+  | (`Data | `Timeout) as r ->
+      r
+
+let vars w =
+  group "variables"
+    [ test "changed is ready when the state is not the view that the fiber saw"
+        (fun () ->
+          w.run (fun () ->
+              let t = Var.create 1 in
+              let s1 = Var.view t in
+              equal int 1 (Var.value s1) ;
+              equal int 1 (Var.get t) ;
+              equal (option int) None (try_changed s1) ;
+              Var.set t 2 ;
+              equal int 2 (Var.get t) ;
+              (* A set between the view and the sync is not lost. *)
+              equal (option int) (Some 2) (try_changed s1) ;
+              equal (option int) None (try_changed (Var.view t)) ) )
+    ; test
+        "an old view makes the event ready, and the event never gives the view"
+        (fun () ->
+          w.run (fun () ->
+              let t = Var.create 0 in
+              let s0 = Var.view t in
+              (* A change and a change back: the state is new. *)
+              Var.set t 1 ;
+              Var.set t 0 ;
+              (* No set while the fiber waits: the Ivar of [s0] is full. *)
+              let v = sync (Var.changed s0) in
+              equal int 0 (Var.value v) ;
+              (* The view of the event is the last state, not [s0]. *)
+              equal (option int) None (try_changed v) ;
+              equal (option int) (Some 0) (try_changed s0) ) )
+    ; test "a view ties the event to its variable" (fun () ->
+          w.run (fun () ->
+              let a = Var.create 1 and b = Var.create 1 in
+              let sb = Var.view b in
+              Var.set a 2 ;
+              equal (option int) None (try_changed sb) ;
+              Var.set b 3 ;
+              equal (option int) (Some 3) (try_changed sb) ) )
+    ; test "a set wakes each waiter with the new value" (fun () ->
+          w.run (fun () ->
+              let t = Var.create 0 in
+              let s0 = Var.view t in
+              Fiber.scope (fun sc ->
+                  let ps =
+                    List.init 5 (fun _ ->
+                        Fiber.fork_promise sc (fun () ->
+                            Var.value (sync (Var.changed s0)) ) )
+                  in
+                  Time.sleep Mono (Span.ms 1) ;
+                  Var.set t 7 ;
+                  List.iter (fun p -> equal int 7 (Promise.await p)) ps ) ) )
+    ; test "a set of an equal value is a change" (fun () ->
+          w.run (fun () ->
+              let t = Var.create 5 in
+              let s = Var.view t in
+              Fiber.scope (fun sc ->
+                  let p =
+                    Fiber.fork_promise sc (fun () ->
+                        Var.value (sync (Var.changed s)) )
+                  in
+                  Time.sleep Mono (Span.ms 1) ;
+                  Var.set t 5 ;
+                  equal int 5 (Promise.await p) ) ) )
+    ; test "a view with no set gives no wake" (fun () ->
+          w.run (fun () ->
+              let t = Var.create 1.5 in
+              (* A loop keeps the view in a local ref. *)
+              let seen = ref (Var.view t) and wakes = ref 0 in
+              for _ = 1 to 5 do
+                match try_changed !seen with
+                | Some _ ->
+                    incr wakes ;
+                    seen := Var.view t
+                | None ->
+                    ()
+              done ;
+              equal int 0 !wakes ;
+              equal float_exact 1.5 (Var.value !seen) ) )
+    ; test "the wait of caravan uses the last deadline" (fun () ->
+          w.run (fun () ->
+              let d = Var.create None in
+              let after s = Time.add Mono (Time.now Mono) s in
+              (* A deadline that comes during the wait ends it. *)
+              let data = Ivar.create () in
+              Fiber.scope (fun sc ->
+                  let p =
+                    Fiber.fork_promise sc (fun () ->
+                        wait_data data (Var.view d) )
+                  in
+                  Time.sleep Mono (Span.ms 1) ;
+                  Var.set d (after (Span.ms 5)) ;
+                  is_true (Promise.await p = `Timeout) ) ;
+              (* Two changes: the wait uses the last one. *)
+              Var.set d None ;
+              Fiber.scope (fun sc ->
+                  let p =
+                    Fiber.fork_promise sc (fun () ->
+                        wait_data data (Var.view d) )
+                  in
+                  Time.sleep Mono (Span.ms 1) ;
+                  Var.set d (after (Span.ms 20)) ;
+                  Var.set d None ;
+                  Time.sleep Mono (Span.ms 30) ;
+                  Ivar.fill data () ;
+                  is_true (Promise.await p = `Data) ) ) )
+    ; test "a waiter that loses a choose or a cancel stops no later set"
+        (fun () ->
+          w.run (fun () ->
+              let t = Var.create 0 in
+              let s0 = Var.view t in
+              for _ = 1 to 20 do
+                equal (option int) None (try_changed s0)
+              done ;
+              Fiber.scope (fun sc ->
+                  Fiber.cancel sc (Boom "stop") ;
+                  raises (Fiber.Cancelled (Boom "stop")) (fun () ->
+                      sync (Var.changed s0) ) ) ;
+              Fiber.scope (fun sc ->
+                  let wait () =
+                    Fiber.fork_promise sc (fun () ->
+                        Var.value (sync (Var.changed s0)) )
+                  in
+                  let p = wait () and q = wait () in
+                  Time.sleep Mono (Span.ms 1) ;
+                  Promise.cancel p ;
+                  raises Promise.Cancelled (fun () -> Promise.await p) ;
+                  Var.set t 1 ;
+                  equal int 1 (Promise.await q) ) ) )
+    ; test "setters and waiters on many domains lose no change" (fun () ->
+          w.run (fun () ->
+              let last = 1_000_000 in
+              let t = Var.create (-1) in
+              (* A lost wake makes a waiter wait forever. *)
+              let rec watch seen =
+                if Var.value seen <> last then
+                  let v = sync (Var.changed seen) in
+                  watch v
+              in
+              Fiber.scope (fun sc ->
+                  for _ = 1 to 8 do
+                    Fiber.fork sc (fun () -> watch (Var.view t))
+                  done ;
+                  Fiber.scope (fun setters ->
+                      for i = 0 to 3 do
+                        Fiber.fork setters (fun () ->
+                            for j = 1 to 50 do
+                              Var.set t ((i * 100) + j) ;
+                              if j mod 7 = 0 then Fiber.yield ()
+                            done )
+                      done ) ;
+                  Var.set t last ) ;
+              equal int last (Var.get t) ) )
+    ; test "a set outside a fiber raises Not_in_fiber and changes nothing"
+        (fun () ->
+          let t = Var.create 1 in
+          raises_match
+            (function Fiber.Not_in_fiber _ -> true | _ -> false)
+            (fun () -> Var.set t 2) ;
+          equal int 1 (Var.get t) ) ]
+
 (* Files and directories (milestone M2). *)
 
 (* [File.Error] is [Net.Error]. *)
@@ -2034,6 +2223,7 @@ let tests w =
         ; overflow_runs w
         ; layers w
         ; semaphores w
+        ; vars w
         ; files w
         ; pipes w ]
       @ many w ) ]

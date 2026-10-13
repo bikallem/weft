@@ -462,6 +462,7 @@ let tests =
   [ Windtrap.group "200 seeds"
       [ Portable.layers seeds_200
       ; Portable.semaphores seeds_200
+      ; Portable.vars seeds_200
       ; Portable.files seeds_200 ]
   ; jobs
   ; processes
