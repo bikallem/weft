@@ -49,3 +49,8 @@ val watchdog_reports : unit -> int
 
 val pool_warnings : unit -> int
 (** The number of warnings of the thread pools, for the tests. *)
+
+val pool_busy : unit -> int
+(** The jobs of the thread pools that wait or run, for the tests. At 0, the
+    pools closed each fd of their jobs, also of the detached jobs and of the
+    closes of files. *)

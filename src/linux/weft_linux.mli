@@ -52,6 +52,11 @@ val pool_warnings : unit -> int
 (** The number of warnings of the thread pools that were full for more than 1 s,
     for the tests. *)
 
+val pool_busy : unit -> int
+(** The jobs of the thread pools that wait or run, for the tests. At 0, the
+    pools closed each fd of their jobs, also of the detached jobs and of the
+    closes of files. *)
+
 val unblocked_threads : Weft.Signal.t list -> string list
 (** The threads of the process that do not block each of these signals. For the
     tests. *)

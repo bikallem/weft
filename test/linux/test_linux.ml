@@ -98,7 +98,20 @@ let other_process () =
   is_true (status = Unix.WEXITED 0) ;
   equal string "hello" got
 
-let open_fds () = Array.length (Sys.readdir "/proc/self/fd")
+(* The pool closes the fds of the files after the end of the operation (section
+   2.7 of the design). Thus the count of fds first waits up to 10 s until the
+   pool has no job. If not, a test can count the fd of a file that an earlier
+   test closed, before the close. A wait for the correct count is not
+   sufficient: the count can be correct for a short time, while a detached open
+   of the pool did not get its fd yet. *)
+let open_fds () =
+  let rec wait n =
+    if Weft_linux.pool_busy () > 0 && n > 0 then (
+      Unix.sleepf 0.001 ;
+      wait (n - 1) )
+  in
+  wait 10_000 ;
+  Array.length (Sys.readdir "/proc/self/fd")
 
 (* 10,000 connections open and close, and no fd stays open. The client closes
    first, and the server resets: thus no side keeps a TIME_WAIT socket. A
@@ -204,17 +217,6 @@ let dns_localhost () =
       | exception Dns.Error (_, "Dns.resolve") ->
           () )
 
-(* The pool closes the fds of the files after the end of run: wait up to 10 s
-   for it. A test that closes a file must wait for the close before it ends. If
-   not, a later test can count the fd before its close and not after it. *)
-let fds_back_to before =
-  let rec wait n =
-    if open_fds () <> before && n > 0 then (
-      Unix.sleepf 0.001 ;
-      wait (n - 1) )
-  in
-  wait 10_000
-
 (* An open of a FIFO blocks in the pool until a writer comes. The fiber detaches
    at the deadline. Then a writer comes, the job completes, and the pool closes
    the fd that the job opened. *)
@@ -234,8 +236,6 @@ let detach_from_open () =
   in
   at_least int64 ~than:20_000_000L t ;
   less int64 ~than:100_000_000L t ;
-  (* The pool closes the fds after the end of run. *)
-  fds_back_to before ;
   equal int before (open_fds ())
 
 (* C4: a job that blocks does not stop the next job of the pool. *)
@@ -268,7 +268,6 @@ let blocked_job () =
           File.close w ;
           File.close (Promise.await r) ;
           less int64 ~than:100_000_000L ns ) ) ;
-  fds_back_to before ;
   equal int before (open_fds ())
 
 (* 1,000 files open and close, and the pool closes each fd. *)
@@ -287,7 +286,6 @@ let no_file_leak () =
                   File.write f "x" ; File.close f
                 done )
           done ) ) ;
-  fds_back_to before ;
   equal int before (open_fds ()) ;
   equal int 1000 (Array.length (Sys.readdir d))
 
@@ -332,7 +330,6 @@ let detach_queued () =
           ignore (File.stat "/") ;
           Time.sleep Mono (Span.ms 20) ) ) ;
   is_false (Sys.file_exists file) ;
-  fds_back_to before ;
   equal int before (open_fds ())
 
 (* Each detached job that runs gives one more thread, up to the limit. *)
@@ -358,8 +355,6 @@ let detached_threads () =
               Fiber.with_timeout Mono (Span.ms 50) (fun () -> File.stat "/") ) ;
           release fifo ;
           List.iter (fun p -> File.close (Promise.await p)) held ) ) ;
-  (* The pool closes the fds of the detached opens. *)
-  fds_back_to before ;
   equal int before (open_fds ())
 
 (* A pool that is full for more than 1 s writes one warning to stderr. *)
@@ -385,7 +380,6 @@ let full_warning () =
               release fifo ;
               List.iter (fun p -> File.close (Promise.await p)) held ) ) ) ;
   Unix.close fd ;
-  fds_back_to before ;
   equal int before (open_fds ()) ;
   equal int (w0 + 1) (Weft_linux.pool_warnings ()) ;
   let text = In_channel.with_open_text log In_channel.input_all in

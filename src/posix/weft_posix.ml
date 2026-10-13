@@ -94,6 +94,8 @@ external close_async : int -> unit = "weft_close_async"
 
 external pool_warnings : unit -> int = "weft_pool_warnings"
 
+external pool_busy : unit -> int = "weft_pool_busy"
+
 (* The watchdog (weft_watchdog.c). *)
 
 external watchdog_start :
