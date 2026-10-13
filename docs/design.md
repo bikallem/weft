@@ -1113,6 +1113,8 @@ module Sim : sig
   val set_blocking_cost : t -> Span.t -> unit  (* open question 2 *)
   val open_fds : t -> int                      (* issue 3 *)
   val set_fd_limit : t -> int option -> unit
+  val socket_pair : t -> Net.t * Net.t        (* issue 8 *)
+  val fault : t -> Net.t -> Net.error -> unit
   val set_dns : t -> string -> dns_answer -> unit
   val add_program : t -> string -> (string list -> program) -> unit
   val signal : t -> Signal.t -> unit
@@ -1144,6 +1146,34 @@ Work stealing between virtual domains is thus deterministic, and the seed sets t
 Fiber code must obey the same rules (section 2.5, Locks for fiber code).
 
 The simulator finds errors in the order of events between domains, at the level of world effects and fiber switches. It does not try the other orders of the atomic operations between two switch points, because a virtual domain does not stop between them. For the lock-free parts, a model checker such as `dscheck` is necessary (section 2.14, milestone M1).
+
+### The fork rule (issue 8)
+
+`Sim.run` starts no OS domain and no OS thread, for each value of `~domains`. The virtual domains run on the thread that calls `run` (section Virtual domains, above). A `Blocking` job of `File`, `Dir` or `Dns` runs in the agenda of the simulator, not in a pool of threads (section The wait steps, below). A fake process of `Process.spawn` is a record, not a child of the OS. The timers and the faults are also events of the agenda.
+
+Thus a process can call `Unix.fork` before, between and after runs. A tool for mutation tests needs this rule, because it forks one process for each mutant. OCaml 5 refuses `Unix.fork` after a `Domain.spawn`, also after its `Domain.join`. A test on OCaml 5.5.0 verified this. Thus other code of the process must not start a domain, for example `Weft_linux.run` with more than one domain.
+
+The test `test/sim_fork` makes sure of the rule. It does a run with each part of the simulator on 1, 2, 4, 8 and 16 domains, and it forks after each run. On Linux, it also counts the threads of the process in `/proc/self/task`. Its control spawns a domain at the end, and then the fork must fail. The build of the test refuses the `threads` library (`forbidden_libraries`), so `weft` and `weft.sim` cannot start a thread. The only `Domain.spawn` of the library is in `run_world` of the core, and only the production worlds call it.
+
+### A socket pair (issue 8)
+
+`Sim.socket_pair sim` gives the two sides of a TCP connection with no listener. A test of a protocol thus needs no listener, no fiber for the accept and no connect. The pair is a connection of the in-memory network, as after a connect and an accept. Thus it has the latency, the faults of `Sim.net_faults`, the reset of `Net.reset` and the faults of `Sim.fault`. It is established at once, with no latency for the connect.
+
+The first side has the address `Tcp ("client", p)`, and the second side has `Tcp ("server", q)`. The ports `p` and `q` come from the counter of ports (section The model of the fds, below). The pair makes 2 fds, so `Sim.set_fd_limit` counts it as a pipe.
+
+The pair is only in the simulator, not in the core `Net` (decision 28). Linux has `socketpair(2)`, but it gives Unix sockets, not TCP sockets. A Unix socket has no `TCP_NODELAY`, and its reset and its address are different.
+
+A pair of TCP sockets on loopback in production needs a listen on port 0, a connect, an accept and a close. Another process of the host can connect to the port first, so the code must compare the peer of the accept with `Net.local_addr` of the client. Portable code can do this with the API of today, so a core function adds no power. But it adds an operation of the world, code in three worlds and tests in each of them, for a function that only tests use.
+
+### A fault of one connection (issue 8)
+
+`Sim.net_faults` acts on all of the network. `Sim.fault sim s e` breaks one connection at the side of `s`, at the time of the call (decision 29). The model is the error of a socket on Linux (`SO_ERROR`). The next write of `s`, or the next read of `s` after the data that `s` already has, gives `e` one time. Then `s` has the end of the stream and no peer, so a later read gives 0 and a write gives `EPIPE`. A fiber that waits on `s` wakes, as at each change of an fd.
+
+The socket has one slot for its error, as `SO_ERROR` on Linux. Thus a second fault replaces an error that `s` did not give, also a reset that came from the peer. After the fault, no data, no end of the stream and no reset of the peer comes to `s`. A side with no peer ignores a reset that comes late, as a closed TCP socket ignores an RST. For the same reason, the close of a listener gives no reset to a client after a fault.
+
+With `Reset`, the fault is a reset of the two sides, as from a middlebox. It sets the reset flag of `s` (issue 1), and it sends a reset to the peer after the delay and after the data that `s` sent before. The peer then gets the results of section 2.7, What a reset gives on Linux. On a Unix socket, the results are those of the reset of a Unix socket: a write gives `EPIPE`, and a read gives `ECONNRESET`. With another error, for example `Other "ETIMEDOUT"`, the link is lost, and the peer gets nothing. Its data stays in flight with no acknowledgment, so its window stays full. Its writes fill the window, then they wait until its own timeout, as on Linux.
+
+The fault keeps the simulator deterministic. It occurs at the call, between two switch points, and the delay of the reset comes from the seed. `Sim.fault` takes only the errors that a connection can give: `Reset`, `Broken_pipe`, `Refused`, `No_resources _` and `Other _`. `Net.read` hides `Would_block`, because it waits again, and `Bad_fd` is a state of the fd: a test closes a socket to get it.
 
 ### The model of the fds
 
@@ -1220,7 +1250,7 @@ For a manual check point, `Sim.settle sim` waits until the program is quiescent.
 
 ## 2.9 What makes the simulator deterministic
 
-- **One OS thread.** The virtual domains run on one thread, and the seed sets their order.
+- **One OS thread.** The virtual domains run on one thread, and the seed sets their order. A run starts no OS domain and no OS thread (section 2.8, The fork rule).
 - **Every input of the library comes from the world.** Time, I/O, random numbers, the `choose` order and the domain order go through world effects. The I/O modules cover the full Unix I/O API, so fiber code has no reason to call `Unix`.
 - **Other inputs that the simulator does not control.** A direct call to `Unix`, the stdlib I/O (section 2.3), `Random.self_init`, a `Hashtbl` with a random seed, `Sys.time` and environment variables. A test must not use them, or must give them a fixed value.
 - **The GC.** A fill from a finaliser (milestone M3) depends on the time of the GC. Such a test gives the same result only in the same binary with the same history (section 2.5).
@@ -1272,7 +1302,7 @@ The cost of an effect is a perform and a handler call for each world operation. 
 
 ## 2.12 Decisions
 
-Decisions 1 to 6 were made on 2026-10-09, decisions 7 to 9 on 2026-10-10, decisions 10 and 11 on 2026-10-12 (issue 1), decision 12 on 2026-10-12 (issue 2), decisions 13 and 14 on 2026-10-12 (issue 3), decisions 15 to 17 on 2026-10-12 (issue 4), decisions 18 to 20 on 2026-10-12 (issue 5), decisions 21 to 25 on 2026-10-13 (issue 6), and decision 26 on 2026-10-13 (issue 7).
+Decisions 1 to 6 were made on 2026-10-09, decisions 7 to 9 on 2026-10-10, decisions 10 and 11 on 2026-10-12 (issue 1), decision 12 on 2026-10-12 (issue 2), decisions 13 and 14 on 2026-10-12 (issue 3), decisions 15 to 17 on 2026-10-12 (issue 4), decisions 18 to 20 on 2026-10-12 (issue 5), decisions 21 to 25 on 2026-10-13 (issue 6), decision 26 on 2026-10-13 (issue 7), and decisions 27 to 29 on 2026-10-13 (issue 8).
 
 | No. | Question | Decision |
 |---|---|---|
@@ -1302,6 +1332,9 @@ Decisions 1 to 6 were made on 2026-10-09, decisions 7 to 9 on 2026-10-10, decisi
 | 24 | A waiter at the end of a watch | Its `sync` raises `Invalid_argument`, as a later `received` does. A waiter that waits forever hides the error, and the close of an fd also ends its waiters with an error. |
 | 25 | The action of a signal in the simulator | The run ends with `Sim.Killed s` at an action that ends the process, so a test can examine it. `Sim.signal` of a signal that the program does not watch gives the default action, as on Linux, and not a `Model_error`. |
 | 26 | The UTC date of a `Clock.posix` | `Time.to_utc` and `Time.of_utc` in the core, with a record with no fraction of a second, as the issue proposes (section 2.6). A date of the full range of `Clock.posix` fits in an `int`. The code is the algorithm of Hinnant, not a table or a loop on years, and the Linux tests compare it with `Unix.gmtime`. |
+| 27 | Threads in the simulator | None. `Sim.run` starts no OS domain and no OS thread (section 2.8, The fork rule). A tool for mutation tests forks after a run, and OCaml 5 refuses a fork after a `Domain.spawn`. A pool of threads for the jobs also gives completions in an order that the seed does not control. `test/sim_fork` makes sure of the rule. |
+| 28 | The place of a socket pair | `Sim.socket_pair`, only in the simulator (section 2.8, A socket pair). `socketpair(2)` gives Unix sockets. Thus a core function gives TCP in the simulator and Unix in production, or Unix sockets in the two, with no TCP behavior for the tests. A TCP pair on loopback needs a listener, and another process can connect to it first. Portable code can make it with `listen`, `connect` and `accept`. |
+| 29 | A fault of one connection | `Sim.fault s e` breaks the connection (section 2.8, A fault of one connection). The next read or write gets `e` one time, then `s` has the end of the stream. A `Reset` also goes to the peer. After another error, the link is lost, and the window of the peer stays full. A second fault replaces an error that `s` did not give, because `SO_ERROR` has one slot. An error that comes one time and keeps the connection open gives states that the OS never gives, for example a write that succeeds after `EPIPE`. A fault for one direction only adds a parameter, but the error of a socket on Linux goes to the first read or write. An error until the close is also not the behavior of Linux. |
 
 Also on 2026-10-10, the user accepted the milestone plan of section 2.14. Decisions 4, 7 and 8 stay, and they come in milestone M1. Milestone M0 has one domain.
 

@@ -974,6 +974,349 @@ let accept_loop_pauses () =
       equal int 150 (ms_since t1) ;
       Net.close c )
 
+(* A socket pair (issue 8) is a TCP connection with no listener: the data goes
+   in the two directions, and each side has its address. *)
+let pair_echo () =
+  Sim.run (fun sim ->
+      let fds = Sim.open_fds sim in
+      let a, b = Sim.socket_pair sim in
+      equal int (fds + 2) (Sim.open_fds sim) ;
+      is_true (Net.local_addr a = Net.Tcp ("client", 40000)) ;
+      is_true (Net.local_addr b = Net.Tcp ("server", 40001)) ;
+      Net.write a "ping" ;
+      equal string "ping" (read_n b 4) ;
+      Net.write b "pong" ;
+      equal string "pong" (read_n a 4) ;
+      Net.shutdown a ;
+      equal string "" (read_all b) ;
+      Net.close a ;
+      Net.close b ;
+      equal int fds (Sim.open_fds sim) )
+
+(* The pair has the latency of the network. *)
+let pair_latency () =
+  Sim.run (fun sim ->
+      Sim.set_latency sim (Span.ms 5) ;
+      let a, b = Sim.socket_pair sim in
+      let t0 = Time.now Mono in
+      Net.write a "x" ;
+      equal string "x" (read_n b 1) ;
+      equal int 5 (ms_since t0) ;
+      Net.close a ;
+      Net.close b )
+
+(* [Net.reset] of one side gives the reset to the other side, as on a connection
+   of [connect]. *)
+let pair_reset () =
+  Sim.run (fun sim ->
+      let a, b = Sim.socket_pair sim in
+      Net.write a "bye" ;
+      Net.reset a ;
+      equal string "bye" (read_n b 3) ;
+      equal string "ECONNRESET"
+        (error_of (fun () -> Net.read b (Bytes.create 1) 0 1)) ;
+      equal string "" (read_all b) ;
+      Net.close b )
+
+(* The pair counts 2 fds against the limit. *)
+let pair_fd_limit () =
+  Sim.run (fun sim ->
+      Sim.set_fd_limit sim (Some (Sim.open_fds sim + 1)) ;
+      equal string "EMFILE" (error_of (fun () -> Sim.socket_pair sim)) ;
+      equal int 0 (Sim.open_fds sim) ;
+      Sim.set_fd_limit sim (Some 2) ;
+      let a, b = Sim.socket_pair sim in
+      Net.close a ; Net.close b )
+
+(* The pair has the faults of the network: with [short_io] and [jitter], the
+   data comes complete and in order, and with [resets], a write can reset the
+   connection. *)
+let pair_faults () =
+  let resets = ref 0 in
+  for seed = 1 to 20 do
+    Sim.run ~seed ~domains:2 (fun sim ->
+        Sim.net_faults sim
+          {Sim.no_faults with jitter= Span.ms 3; short_io= true; resets= true} ;
+        let a, b = Sim.socket_pair sim in
+        Fiber.scope (fun s ->
+            let got = Fiber.fork_promise s (fun () -> read_all b) in
+            ( try
+                for i = 1 to 50 do
+                  Net.write a (Printf.sprintf "%02d" i)
+                done ;
+                Net.close a
+              with Net.Error (Reset, _) -> incr resets ; Net.close a ) ;
+            match Promise.await got with
+            | data ->
+                equal string
+                  (String.concat ""
+                     (List.init 50 (fun i -> Printf.sprintf "%02d" (i + 1))) )
+                  data
+            | exception Net.Error (Reset, _) ->
+                () ) ;
+        Net.close b )
+  done ;
+  at_least int ~than:1 !resets
+
+(* [Sim.fault] with an error that is not a reset: the next operation gets the
+   error one time, then the side has the end of the stream and no peer. The peer
+   gets nothing. *)
+let fault_error () =
+  Sim.run (fun sim ->
+      let a, b = Sim.socket_pair sim in
+      let timeout = Net.Other "ETIMEDOUT" in
+      Net.write a "sent" ;
+      Sim.fault sim a timeout ;
+      equal string "ETIMEDOUT" (error_of (fun () -> Net.write a "x")) ;
+      equal string "EPIPE" (error_of (fun () -> Net.write a "x")) ;
+      equal string "" (read_all a) ;
+      (* The peer gets the data from before the fault, and its own data is
+         lost. *)
+      equal string "sent" (read_n b 4) ;
+      Net.write b "lost" ;
+      Sim.settle sim ;
+      is_true (Net.read_now b (Bytes.create 4) 0 4 = None) ;
+      (* A reset of the peer does not come to [a]. *)
+      Net.reset b ;
+      Sim.settle sim ;
+      equal int 0 (Net.read a (Bytes.create 1) 0 1) ;
+      Net.close a )
+
+(* A read gets the error after the data that the side already has. *)
+let fault_read_after_data () =
+  Sim.run (fun sim ->
+      let a, b = Sim.socket_pair sim in
+      Net.write b "data" ;
+      Sim.settle sim ;
+      Sim.fault sim a Net.Broken_pipe ;
+      equal string "data" (read_n a 4) ;
+      equal string "EPIPE" (error_of (fun () -> Net.read a (Bytes.create 1) 0 1)) ;
+      equal int 0 (Net.read a (Bytes.create 1) 0 1) ;
+      Net.close a ;
+      Net.close b )
+
+(* A fiber that waits on the side of the fault wakes with the error. *)
+let fault_wakes_reader () =
+  Sim.run ~domains:2 (fun sim ->
+      let a, b = Sim.socket_pair sim in
+      Fiber.scope (fun s ->
+          let r =
+            Fiber.fork_promise s (fun () ->
+                error_of (fun () -> Net.read a (Bytes.create 1) 0 1) )
+          in
+          Time.sleep Mono (Span.ms 10) ;
+          Sim.fault sim a (Net.No_resources "ENOBUFS") ;
+          equal string "ENOBUFS" (Promise.await r) ) ;
+      Net.close a ;
+      Net.close b )
+
+(* A [Reset] fault resets the two sides. The side of the fault gets ECONNRESET
+   at once. The peer reads the data from before the fault, then gets the reset
+   after the latency, as from [Net.reset]. *)
+let fault_reset () =
+  Sim.run (fun sim ->
+      Sim.set_latency sim (Span.ms 5) ;
+      let a, b = Sim.socket_pair sim in
+      Net.write a "last" ;
+      let t0 = Time.now Mono in
+      Sim.fault sim a Net.Reset ;
+      equal string "ECONNRESET" (error_of (fun () -> Net.write a "x")) ;
+      equal string "EPIPE" (error_of (fun () -> Net.write a "x")) ;
+      equal string "" (read_all a) ;
+      equal string "last" (read_n b 4) ;
+      equal string "ECONNRESET"
+        (error_of (fun () -> Net.read b (Bytes.create 1) 0 1)) ;
+      equal int 5 (ms_since t0) ;
+      equal string "" (read_all b) ;
+      equal string "EPIPE" (error_of (fun () -> Net.write b "x")) ;
+      Net.close a ;
+      Net.close b )
+
+(* A [Reset] fault on a TCP connection of [connect], at the side of the server,
+   and on a Unix connection. On a Unix socket, a write gives EPIPE and does not
+   clear the reset, as after the reset of a Unix socket. *)
+let fault_reset_connect () =
+  Sim.run (fun sim ->
+      List.iter
+        (fun name ->
+          let addr = Sim.addr sim name in
+          let l = Net.listen addr in
+          let c = Net.connect addr in
+          let s, _ = Net.accept l in
+          Sim.fault sim s Net.Reset ;
+          equal string "ECONNRESET"
+            (error_of (fun () -> Net.read c (Bytes.create 1) 0 1)) ;
+          ( match addr with
+          | Net.Unix _ ->
+              equal string "EPIPE" (error_of (fun () -> Net.write s "x")) ;
+              equal string "ECONNRESET"
+                (error_of (fun () -> Net.read s (Bytes.create 1) 0 1))
+          | Net.Tcp _ ->
+              equal string "ECONNRESET" (error_of (fun () -> Net.write s "x")) ;
+              equal int 0 (Net.read s (Bytes.create 1) 0 1) ) ;
+          List.iter Net.close [c; s; l] )
+        ["server:40"; "unix:/run/fault"] ;
+      equal int 0 (Sim.open_fds sim) )
+
+(* [Sim.fault] refuses an error that is not an error of a connection, a socket
+   that is not connected, and a closed socket. *)
+let fault_bad_args () =
+  Sim.run (fun sim ->
+      let a, b = Sim.socket_pair sim in
+      raises_match invalid (fun () -> Sim.fault sim a Net.Would_block) ;
+      raises_match invalid (fun () -> Sim.fault sim a Net.Bad_fd) ;
+      raises_match invalid (fun () -> Sim.fault sim a Net.No_entry) ;
+      raises_match invalid (fun () -> Sim.fault sim a Net.In_use) ;
+      let l = Net.listen (Sim.addr sim "server:41") in
+      raises_match invalid (fun () -> Sim.fault sim l Net.Reset) ;
+      let u = Net.udp ("client", 0) in
+      raises_match invalid (fun () -> Sim.fault sim u Net.Reset) ;
+      List.iter Net.close [a; b; l; u] ;
+      raises
+        (Net.Error (Bad_fd, "Sim.fault"))
+        (fun () -> Sim.fault sim a Net.Reset) )
+
+(* A seed gives the same run with a fault and the jitter. *)
+let fault_deterministic () =
+  let trace seed =
+    Sim.run ~seed (fun sim ->
+        Sim.net_faults sim {Sim.no_faults with jitter= Span.ms 10} ;
+        let a, b = Sim.socket_pair sim in
+        let t0 = Time.now Mono in
+        Net.write a "x" ;
+        Sim.fault sim a Net.Reset ;
+        let got = read_n b 1 in
+        let e = error_of (fun () -> Net.read b (Bytes.create 1) 0 1) in
+        Net.close a ;
+        Net.close b ;
+        (got, e, ms_since t0) )
+  in
+  let traces = List.init 10 (fun i -> trace (i + 1)) in
+  is_true (traces = List.init 10 (fun i -> trace (i + 1))) ;
+  (* The jitter gives the reset different delays with different seeds. *)
+  at_least int ~than:2 (List.length (List.sort_uniq compare traces)) ;
+  List.iter
+    (fun (got, e, ms) ->
+      equal string "x" got ;
+      equal string "ECONNRESET" e ;
+      at_most int ~than:10 ms )
+    traces
+
+(* After a lost link, the window of the peer stays full: its writes fill the
+   window, then they wait until a timeout, with and with no latency. The
+   simulator finds no lost wakeup. *)
+let fault_lost_window () =
+  List.iter
+    (fun latency ->
+      Sim.run (fun sim ->
+          Sim.set_latency sim (Span.ms latency) ;
+          let a, b = Sim.socket_pair sim in
+          Sim.fault sim a (Net.Other "ETIMEDOUT") ;
+          let chunk = Bytes.create 16384 in
+          let rec fill total =
+            match Net.write_now b chunk 0 16384 with
+            | Some k ->
+                if total + k > 65536 then failwith "the window grows" ;
+                fill (total + k)
+            | None ->
+                total
+          in
+          equal int 65536 (fill 0) ;
+          let t0 = Time.now Mono in
+          raises Fiber.Timeout (fun () ->
+              Fiber.with_timeout Mono (Span.ms 100) (fun () ->
+                  Net.write b "more" ) ) ;
+          equal int 100 (ms_since t0) ;
+          Net.close a ;
+          Net.close b ) )
+    [0; 5]
+
+(* After a lost link, the reads of the side of the fault do not free the window
+   of the peer. A writer of the peer fills the window and waits. The side of the
+   fault reads its data, then gets its error, and the writer still waits: the
+   simulator finds no lost wakeup, and [write_now] gives None. *)
+let fault_lost_reads () =
+  Sim.run (fun sim ->
+      Sim.set_latency sim (Span.ms 1) ;
+      let a, b = Sim.socket_pair sim in
+      let chunk = Bytes.make 65536 'x' in
+      Fiber.scope (fun s ->
+          Fiber.fork_daemon s (fun () ->
+              try
+                while true do
+                  ignore (Net.write_sub b chunk 0 65536)
+                done
+              with Net.Error _ -> () ) ;
+          Time.sleep Mono (Span.ms 10) ;
+          Sim.fault sim a (Net.Other "ETIMEDOUT") ;
+          let buf = Bytes.create 65536 in
+          let rec drain total =
+            match Net.read a buf 0 65536 with
+            | k ->
+                drain (total + k)
+            | exception Net.Error (Other "ETIMEDOUT", _) ->
+                total
+          in
+          equal int 65536 (drain 0) ;
+          Time.sleep Mono (Span.s 1) ;
+          is_true (Net.write_now b chunk 0 65536 = None) ) ;
+      Net.close a ;
+      Net.close b )
+
+(* A fiber that waits in a write, with a full window, wakes at the fault. *)
+let fault_wakes_writer () =
+  Sim.run ~domains:2 (fun sim ->
+      let a, b = Sim.socket_pair sim in
+      Fiber.scope (fun s ->
+          let w =
+            Fiber.fork_promise s (fun () ->
+                error_of (fun () -> Net.write a (String.make 200_000 'x')) )
+          in
+          Time.sleep Mono (Span.ms 10) ;
+          Sim.fault sim a (Net.Other "ETIMEDOUT") ;
+          equal string "ETIMEDOUT" (Promise.await w) ) ;
+      Net.close a ;
+      Net.close b )
+
+(* The socket has one slot for its error: a second fault replaces an error that
+   the socket did not give, also a reset from the peer. *)
+let fault_one_slot () =
+  Sim.run (fun sim ->
+      let read c = error_of (fun () -> Net.read c (Bytes.create 1) 0 1) in
+      let a, b = Sim.socket_pair sim in
+      Sim.fault sim a (Net.Other "ETIMEDOUT") ;
+      Sim.fault sim a Net.Reset ;
+      equal string "ECONNRESET" (read a) ;
+      equal string "no error" (read a) ;
+      List.iter Net.close [a; b] ;
+      let a, b = Sim.socket_pair sim in
+      Sim.fault sim a Net.Reset ;
+      Sim.fault sim a (Net.Other "ETIMEDOUT") ;
+      equal string "ETIMEDOUT" (read a) ;
+      equal string "no error" (read a) ;
+      List.iter Net.close [a; b] ;
+      (* A reset from the peer, then a fault. *)
+      let a, b = Sim.socket_pair sim in
+      Net.reset b ;
+      Sim.settle sim ;
+      Sim.fault sim a (Net.Other "ETIMEDOUT") ;
+      equal string "ETIMEDOUT" (read a) ;
+      equal string "no error" (read a) ;
+      Net.close a )
+
+(* The close of a listener gives no reset to a client after a fault. *)
+let fault_then_listener_close () =
+  Sim.run (fun sim ->
+      let addr = Sim.addr sim "server:42" in
+      let l = Net.listen addr in
+      let c = Net.connect addr in
+      Sim.fault sim c (Net.Other "ETIMEDOUT") ;
+      Net.close l ;
+      let read () = error_of (fun () -> Net.read c (Bytes.create 1) 0 1) in
+      equal string "ETIMEDOUT" (read ()) ;
+      equal string "no error" (read ()) ;
+      Net.close c )
+
 let tests =
   [ group "net"
       [ slow "echo: the client gets hello back, with 1000 seeds" echo_1000_seeds
@@ -1020,6 +1363,29 @@ let tests =
       ; test "each operation that makes an fd gives EMFILE" fd_limit_each_op
       ; test "an accept loop pauses on EMFILE, and a timeout ends the pause"
           accept_loop_pauses ]
+  ; group "socket pair"
+      [ test "the data goes in the two directions" pair_echo
+      ; test "the pair has the latency of the network" pair_latency
+      ; test "a reset of one side goes to the other side" pair_reset
+      ; test "the pair counts 2 fds against the limit" pair_fd_limit
+      ; test "the pair has the faults of the network" pair_faults ]
+  ; group "fault of one connection"
+      [ test "the next write gets the error, then EPIPE" fault_error
+      ; test "a read gets the error after the data" fault_read_after_data
+      ; test "a fiber that waits on the socket gets the error"
+          fault_wakes_reader
+      ; test "a reset goes to the peer after the latency" fault_reset
+      ; test "a reset of a TCP and of a Unix connection" fault_reset_connect
+      ; test "Sim.fault refuses bad arguments" fault_bad_args
+      ; test "a seed gives the same run with a fault" fault_deterministic
+      ; test "after a lost link, the window of the peer stays full"
+          fault_lost_window
+      ; test "after a lost link, the reads do not free the window of the peer"
+          fault_lost_reads
+      ; test "a fiber that waits in a write gets the error" fault_wakes_writer
+      ; test "a second fault replaces the error" fault_one_slot
+      ; test "the close of a listener gives no reset after a fault"
+          fault_then_listener_close ]
   ; group "udp"
       [ test "udp_loss loses about one datagram in 8" udp_loss
       ; test "the jitter can reorder datagrams" udp_order

@@ -81,6 +81,13 @@ type conn =
         (** A reset came: the next read with no data, or on TCP the next write,
             gives [Reset]. *)
   ; mutable abort: bool  (** [Reset_on_close]: the close sends a reset. *)
+  ; mutable err: Op.error option
+        (** [Sim.fault]: the next read with no data, or the next write, gives
+            this error one time. *)
+  ; mutable lost: bool
+        (** [Sim.fault] with an error that is not [Reset]: the link is lost. The
+            data of the peer stays in flight, and a read of this side frees no
+            space, so the window of the peer stays full. *)
   ; mutable established: bool
   ; mutable refused: bool
   ; mutable cfd: int  (** [-1] until the server side is accepted. *)
@@ -558,7 +565,8 @@ let start_job : type a. t -> int -> a Op.blocking -> int =
         complete ) ;
   id
 
-(* A read of a socket or of the read end of a pipe. *)
+(* A read of a socket or of the read end of a pipe. An error of [Sim.fault]
+   comes after the data, as the error of a socket on Linux. *)
 let read_conn t c buf off len =
   let n = t.net in
   let a = avail c in
@@ -566,6 +574,9 @@ let read_conn t c buf off len =
     let k = part t (Int.min a len) in
     Buffer.blit c.inbox c.rpos buf off k ;
     c.rpos <- c.rpos + k ;
+    (* After a lost link, the space stays in use: the peer gets no
+       acknowledgment, so its window stays full. *)
+    if c.lost then c.inflight <- c.inflight + k ;
     if c.rpos = Buffer.length c.inbox then (
       Buffer.clear c.inbox ;
       c.rpos <- 0 ) ;
@@ -576,6 +587,10 @@ let read_conn t c buf off len =
     | None ->
         () ) ;
     Ok k )
+  else if Option.is_some c.err then (
+    let e = Option.get c.err in
+    c.err <- None ;
+    Error e )
   else if c.reset then (
     c.reset <- false ;
     Error Op.Reset )
@@ -596,6 +611,17 @@ let close_conn t c =
   | None ->
       ()
 
+(* The reset from [c] comes to [p] after the delay. If [p] has no peer at that
+   time, after its own reset or a [Sim.fault], it ignores the reset, as a closed
+   TCP socket ignores an RST. *)
+let send_reset t c p =
+  deliver t c p (fun () ->
+      if Option.is_some p.peer then (
+        p.reset <- true ;
+        p.eof <- true ;
+        p.peer <- None ;
+        edge t.net p.cfd ~read:true ~write:true ) )
+
 (* A reset from [c] to its peer, as on Linux. The peer reads the data that came
    before the reset. Then its next read with no data gives ECONNRESET, and later
    reads give the end of the stream. On TCP (an RST), the next write also gives
@@ -608,11 +634,7 @@ let reset_conn t c =
   match c.peer with
   | Some p when reset ->
       c.peer <- None ;
-      deliver t c p (fun () ->
-          p.reset <- true ;
-          p.eof <- true ;
-          p.peer <- None ;
-          edge t.net p.cfd ~read:true ~write:true )
+      send_reset t c p
   | _ ->
       close_conn t c
 
@@ -623,7 +645,11 @@ let reset_conn t c =
    the peer gets the reset after the delay. *)
 let write_conn t c buf off len =
   let n = t.net in
-  if c.reset && c.tcp then (
+  if Option.is_some c.err then (
+    let e = Option.get c.err in
+    c.err <- None ;
+    Error e )
+  else if c.reset && c.tcp then (
     c.reset <- false ;
     Error Op.Reset )
   else if c.shut then Error Op.Broken_pipe
@@ -651,8 +677,10 @@ let write_conn t c buf off len =
           let k = if atomic then len else part t (Int.min len space) in
           let data = Bytes.sub_string buf off k in
           p.inflight <- p.inflight + k ;
+          (* After a lost link, the data never comes, and the peer gets no space
+             again, as when no acknowledgment comes. *)
           deliver t c p (fun () ->
-              p.inflight <- p.inflight - k ;
+              if not p.lost then p.inflight <- p.inflight - k ;
               if Option.is_some p.peer then (
                 Buffer.add_string p.inbox data ;
                 edge n p.cfd ~read:true ~write:false ) ) ;
@@ -808,6 +836,8 @@ let new_pipe n =
     ; shut= false
     ; reset= false
     ; abort= false
+    ; err= None
+    ; lost= false
     ; established= true
     ; refused= false
     ; cfd= new_fd n
@@ -819,6 +849,27 @@ let new_pipe n =
   r.peer <- Some w ;
   w.peer <- Some r ;
   (r, w)
+
+(* One side of a connection, before the connect completes. *)
+let new_sock ~tcp ~local remote =
+  { role= Sock
+  ; inbox= Buffer.create 64
+  ; rpos= 0
+  ; inflight= 0
+  ; last_at= 0L
+  ; peer= None
+  ; eof= false
+  ; shut= false
+  ; reset= false
+  ; abort= false
+  ; err= None
+  ; lost= false
+  ; established= false
+  ; refused= false
+  ; cfd= -1
+  ; remote
+  ; local
+  ; tcp }
 
 (* The exit of a fake process: it closes the ends of its pipes, and its pidfd
    becomes readable. *)
@@ -972,25 +1023,8 @@ let submit : type a. t -> a Op.t -> (a, Op.error) result =
                 Op.Tcp ("client", fresh_port n (Hashtbl.mem n.client_ports))
               else Op.Unix ""
             in
-            let mk ~local remote =
-              { role= Sock
-              ; inbox= Buffer.create 64
-              ; rpos= 0
-              ; inflight= 0
-              ; last_at= 0L
-              ; peer= None
-              ; eof= false
-              ; shut= false
-              ; reset= false
-              ; abort= false
-              ; established= false
-              ; refused= false
-              ; cfd= -1
-              ; remote
-              ; local
-              ; tcp= l.ltcp }
-            in
-            let c = mk ~local:client addr and s = mk ~local:l.laddr client in
+            let c = new_sock ~tcp:l.ltcp ~local:client addr
+            and s = new_sock ~tcp:l.ltcp ~local:l.laddr client in
             c.peer <- Some s ;
             s.peer <- Some c ;
             s.established <- true ;
@@ -1229,14 +1263,15 @@ let submit : type a. t -> a Op.t -> (a, Op.error) result =
               Queue.iter
                 (fun s ->
                   match s.peer with
-                  | Some c ->
+                  | Some c when Option.is_some c.peer ->
                       (* The connection is established: it gets a reset, as from
                          [reset_conn]. *)
                       c.reset <- true ;
                       c.eof <- true ;
                       c.peer <- None ;
                       edge n c.cfd ~read:true ~write:true
-                  | None ->
+                  | _ ->
+                      (* The client has no peer after a [Sim.fault]. *)
                       () )
                 l.backlog
           | Fil _ | Pfd _ ->
@@ -1773,6 +1808,75 @@ let set_fd_limit t limit =
   | _ ->
       () ) ;
   t.net.fd_limit <- limit
+
+(* A connection with no listener, as after a connect and an accept (design
+   section 2.8, A socket pair). It has no latency for the connect, and it counts
+   2 fds against the limit. The pair is not a world effect: the simulator runs
+   one virtual domain at a time, so the change of the network has no race. *)
+let socket_pair t =
+  let n = t.net in
+  ( match room n 2 with
+  | Error e ->
+      raise (Net.Error (e, "Sim.socket_pair"))
+  | Ok () ->
+      () ) ;
+  let client = Op.Tcp ("client", fresh_port n (fun _ -> false)) in
+  let server =
+    let used p = Hashtbl.mem n.names (key (Op.Tcp ("server", p))) in
+    Op.Tcp ("server", fresh_port n used)
+  in
+  let c = new_sock ~tcp:true ~local:client server
+  and s = new_sock ~tcp:true ~local:server client in
+  c.peer <- Some s ;
+  s.peer <- Some c ;
+  List.iter
+    (fun x ->
+      x.established <- true ;
+      x.cfd <- new_fd n ;
+      Hashtbl.replace n.fds x.cfd (Conn x) )
+    [c; s] ;
+  (Sched.Fdtab.alloc c.cfd, Sched.Fdtab.alloc s.cfd)
+
+(* A fault of one connection (design section 2.8, A fault of one connection).
+   The connection breaks at the side of [fd]: its next read with no data, or its
+   next write, gives [e] one time, as the error of a socket on Linux. Then it
+   has the end of the stream and no peer. A [Reset] also goes to the peer after
+   the delay, as from a middlebox. After another error, the link is lost: the
+   peer gets nothing, and its window stays full. *)
+let fault t (fd : Net.t) e =
+  ( match e with
+  | Op.Reset | Broken_pipe | Refused | No_resources _ | Other _ ->
+      ()
+  | _ ->
+      invalid_arg "Sim.fault: the error is not an error of a connection" ) ;
+  if not (Sched.Rc.acquire fd) then raise (Net.Error (Op.Bad_fd, "Sim.fault")) ;
+  Fun.protect
+    ~finally:(fun () -> Sched.Rc.release fd)
+    (fun () ->
+      let n = t.net in
+      match Hashtbl.find_opt n.fds fd.os with
+      | Some (Conn ({role= Sock; _} as c)) ->
+          (* The socket has one slot for its error, as on Linux: the fault
+             replaces an error that the socket did not give. *)
+          ( match e with
+          | Op.Reset ->
+              c.err <- None ;
+              c.reset <- true
+          | e ->
+              c.reset <- false ;
+              c.err <- Some e ;
+              c.lost <- true ) ;
+          ( match c.peer with
+          | Some p ->
+              c.peer <- None ;
+              if e = Op.Reset then send_reset t c p
+          | None ->
+              () ) ;
+          c.eof <- true ;
+          (* A fiber that waits on this side gets the error. *)
+          edge n c.cfd ~read:true ~write:true
+      | _ ->
+          invalid_arg "Sim.fault: the fd is not a connected socket" )
 
 let set_blocking_cost t span =
   if Int64.compare (Weft.Span.to_ns span) 0L < 0 then

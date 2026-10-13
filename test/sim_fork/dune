@@ -1,0 +1,9 @@
+; The fork rule (issue 8): Weft_sim.run starts no OS domain and no OS
+; thread, so the process can fork after a run. The test calls Unix.fork,
+; so it is not in test/sim, where the test code must not call Unix. The
+; guard makes sure that weft and weft.sim do not link the threads library.
+
+(test
+ (name sim_fork)
+ (libraries weft weft.sim unix)
+ (forbidden_libraries threads.posix))
