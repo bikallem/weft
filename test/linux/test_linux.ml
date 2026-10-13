@@ -104,19 +104,22 @@ let other_process () =
    an earlier test closed, before the close. A wait for the correct count is not
    sufficient: the count can be correct for a short time, while a detached open
    of the pool did not get its fd yet. If the pool has jobs after 10 s, the test
-   gives a failure. *)
-let pool_idle () =
+   gives a failure. [sleep] waits 1 ms. In a run, it must be [in_run]: a wait
+   with no switch for more than 10 ms gives a warning of the watchdog. *)
+let pool_idle sleep =
   let rec wait n =
     if Weft_linux.pool_busy () > 0 then
       if n = 0 then fail "the pool has jobs after 10 s"
       else (
-        Unix.sleepf 0.001 ;
+        sleep () ;
         wait (n - 1) )
   in
   wait 10_000
 
+let in_run () = Time.sleep Mono (Span.ms 1)
+
 let open_fds () =
-  pool_idle () ;
+  pool_idle (fun () -> Unix.sleepf 0.001) ;
   Array.length (Sys.readdir "/proc/self/fd")
 
 (* 10,000 connections open and close, and no fd stays open. The client closes
@@ -240,7 +243,7 @@ let detach_from_open () =
                 File.openfile [Read] fifo ) ) ;
         let t = Span.to_ns (Time.diff Mono (Time.now Mono) t0) in
         let w = Unix.openfile fifo [O_RDWR] 0 in
-        pool_idle () ; Unix.close w ; t )
+        pool_idle in_run ; Unix.close w ; t )
   in
   at_least int64 ~than:20_000_000L t ;
   less int64 ~than:500_000_000L t ;
@@ -318,7 +321,7 @@ let release fifo held =
     ~finally:(fun () -> Unix.close w)
     (fun () ->
       List.iter (fun p -> File.close (Promise.await p)) held ;
-      pool_idle () )
+      pool_idle in_run )
 
 (* [n] fibers that each hold a thread of the pool. *)
 let hold s fifo n =
@@ -776,8 +779,8 @@ let posix_sleep () =
    the same domain is not late by much. The reader of a full pipe works 20 us on
    each chunk, and a fiber sleeps 1 ms 20 times. The OS can stop the thread for
    more than 10 ms on a busy host, and on a shared CPU a wake can come 5 ms
-   late. Thus the median of the 20 sleeps must be less than 10 ms, and each
-   sleep less than 500 ms. *)
+   late. Thus the median of the 20 sleeps is less than 10 ms, and each sleep
+   less than 500 ms. *)
 let busy_reader () =
   let all =
     Weft_linux.run ~domains:1 ~watchdog:None (fun () ->
