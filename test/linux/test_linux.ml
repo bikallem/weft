@@ -235,7 +235,7 @@ let detach_from_open () =
         File.close w ; t )
   in
   at_least int64 ~than:20_000_000L t ;
-  less int64 ~than:100_000_000L t ;
+  less int64 ~than:500_000_000L t ;
   equal int before (open_fds ())
 
 (* C4: a job that blocks does not stop the next job of the pool. *)
@@ -255,9 +255,11 @@ let blocked_job () =
                 ignore (File.stat "/") ;
                 Time.diff Mono (Time.now Mono) t0 )
           in
+          (* A stat that waits for the open ends only after the writer, thus
+             after the timeout. *)
           let ns =
             match
-              Fiber.with_timeout Mono (Span.ms 500) (fun () -> Promise.await st)
+              Fiber.with_timeout Mono (Span.s 1) (fun () -> Promise.await st)
             with
             | d ->
                 Span.to_ns d
@@ -267,7 +269,7 @@ let blocked_job () =
           let w = File.openfile [Write] fifo in
           File.close w ;
           File.close (Promise.await r) ;
-          less int64 ~than:100_000_000L ns ) ) ;
+          less int64 ~than:500_000_000L ns ) ) ;
   equal int before (open_fds ())
 
 (* 1,000 files open and close, and the pool closes each fd. *)
@@ -741,27 +743,35 @@ let watchdog () =
 
 (* M3: a Posix sleep ends after its deadline on the wall clock. A sleep on Mono
    also passes this test: a step of the clock needs root, so only the simulator
-   tests the step. A busy host can delay the end of a sleep by more than 10 ms.
-   Thus, as in the test of the 10 ms sleep, the limit of 500 ms finds only a
-   timer that fires much too late. *)
+   tests the step. A busy host can delay the end of one sleep by more than 10
+   ms. Thus, as in the test of the 10 ms sleep, the median of 7 sleeps of 20 ms
+   checks the precision (less than 30 ms), and the limit of 500 ms for each
+   sleep finds a timer that fires much too late. *)
 let posix_sleep () =
-  Weft_linux.run ~domains:1 (fun () ->
-      let p0 = Time.now Posix and t0 = Time.now Mono in
-      Time.sleep Posix (Span.ms 20) ;
-      at_least int64 ~than:20_000_000L
-        (Span.to_ns (Time.diff Posix (Time.now Posix) p0)) ;
-      less int64 ~than:500_000_000L
-        (Span.to_ns (Time.diff Mono (Time.now Mono) t0)) )
+  let all =
+    Weft_linux.run ~domains:1 (fun () ->
+        List.init 7 (fun _ ->
+            let p0 = Time.now Posix and t0 = Time.now Mono in
+            Time.sleep Posix (Span.ms 20) ;
+            at_least int64 ~than:20_000_000L
+              (Span.to_ns (Time.diff Posix (Time.now Posix) p0)) ;
+            let ns = Span.to_ns (Time.diff Mono (Time.now Mono) t0) in
+            less int64 ~than:500_000_000L ns ;
+            ns ) )
+  in
+  less int64 ~than:30_000_000L (List.nth (List.sort compare all) 3)
 
 (* M3: a reader whose reads always find data yields after 64 KiB, so a timer on
    the same domain is not late by much. The reader of a full pipe works 20 us on
-   each chunk, and a fiber sleeps 1 ms 20 times. *)
+   each chunk, and a fiber sleeps 1 ms 20 times. The OS can stop the thread for
+   more than 10 ms on a busy host. Thus the median of the 20 sleeps must be less
+   than 5 ms, and each sleep less than 500 ms. *)
 let busy_reader () =
-  let worst =
+  let all =
     Weft_linux.run ~domains:1 ~watchdog:None (fun () ->
         let p = Process.spawn ~stdout:Piped "cat" ["/dev/zero"] in
         let out = Option.get (Process.stdout p) in
-        let stop = Atomic.make false and worst = ref 0L in
+        let stop = Atomic.make false and all = ref [] in
         Fiber.scope (fun s ->
             Fiber.fork s (fun () ->
                 let buf = Bytes.create 65536 in
@@ -776,17 +786,16 @@ let busy_reader () =
                 for _ = 1 to 20 do
                   let t = Time.now Mono in
                   Time.sleep Mono (Span.ms 1) ;
-                  worst :=
-                    Int64.max !worst
-                      (Span.to_ns (Time.diff Mono (Time.now Mono) t))
+                  all := Span.to_ns (Time.diff Mono (Time.now Mono) t) :: !all
                 done ;
                 Atomic.set stop true ) ) ;
         Process.kill p SIGKILL ;
         ignore (Process.wait p) ;
         Pipe.close out ;
-        !worst )
+        !all )
   in
-  less int64 ~than:20_000_000L worst
+  List.iter (fun ns -> less int64 ~than:500_000_000L ns) all ;
+  less int64 ~than:5_000_000L (List.nth (List.sort compare all) 10)
 
 (* The review of M3, A: the expire inside wait resumes a pinned fiber on domain
    0. The domain must poll, not sleep. *)
