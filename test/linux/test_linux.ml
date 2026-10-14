@@ -878,6 +878,21 @@ let utc_against_gmtime () =
     check ((d * 86400) - 1)
   done
 
+(* A send of 0 bytes on a full TCP socket gives 0 at once. The simulator gives
+   the same result. *)
+let zero_write () =
+  Weft_linux.run ~domains:1 (fun () ->
+      let l = Net.listen (Net.Tcp ("127.0.0.1", 0)) in
+      let c = Net.connect (Net.local_addr l) in
+      let s, _ = Net.accept l in
+      let chunk = Bytes.create 65536 in
+      while Net.write_now c chunk 0 65536 <> None do
+        ()
+      done ;
+      equal (option int) (Some 0) (Net.write_now c chunk 0 0) ;
+      equal int 0 (Net.write_sub c chunk 0 0) ;
+      List.iter Net.close [c; s; l] )
+
 let linux =
   group "linux"
     [ test "a Unix domain socket echoes" unix_socket
@@ -885,6 +900,7 @@ let linux =
         register_failure
     ; test "L2: the peer of a Unix socket has a Unix address" unix_peer_addr
     ; test "L3: a port out of range gives an error" port_range
+    ; test "a write of 0 bytes on a full socket gives 0" zero_write
     ; test "Time.now Posix is the time of the system" posix_time
     ; test "an address that is not an IP address gives an error" invalid_address
     ; test "a 10 ms sleep ends between 10 ms and 12 ms" sleep_10ms

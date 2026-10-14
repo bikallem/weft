@@ -642,7 +642,9 @@ let reset_conn t c =
    at once, and the data of a socket after the latency. Data that arrives after
    the close or the reset of the peer, or after a lost link, is lost. With
    [resets], one write of a TCP socket in 64 resets the connection: this side
-   gets ECONNRESET at once, and the peer gets the reset after the delay. *)
+   gets ECONNRESET at once, and the peer gets the reset after the delay. A write
+   of 0 bytes to a peer gives 0 at once, also on a full socket, as on Linux. It
+   sends nothing, so it does not reset the connection. *)
 let write_conn t c buf off len =
   let n = t.net in
   if Option.is_some c.err then (
@@ -657,6 +659,8 @@ let write_conn t c buf off len =
     match c.peer with
     | None ->
         Error Op.Broken_pipe
+    | Some _ when len = 0 ->
+        Ok 0
     | Some _ when c.tcp && n.resets && Prng.int t.prng 64 = 0 ->
         reset_conn t c ;
         c.eof <- true ;

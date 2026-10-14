@@ -801,6 +801,28 @@ let reset_latency () =
       Net.close l ;
       equal int 0 (Sim.open_fds sim) )
 
+(* A write of 0 bytes on a full socket gives 0 at once, as on Linux. With
+   [resets], it never resets the connection, because it sends nothing. *)
+let zero_write () =
+  for seed = 1 to 20 do
+    Sim.run ~seed (fun sim ->
+        Sim.net_faults sim {Sim.no_faults with resets= true} ;
+        let a, b = Sim.socket_pair sim in
+        let chunk = Bytes.create 16384 in
+        for _ = 1 to 200 do
+          equal (option int) (Some 0) (Net.write_now a chunk 0 0)
+        done ;
+        (* Fill the window with no reset. *)
+        Sim.net_faults sim Sim.no_faults ;
+        while Net.write_now a chunk 0 16384 <> None do
+          ()
+        done ;
+        equal (option int) (Some 0) (Net.write_now a chunk 0 0) ;
+        equal int 0 (Net.write_sub a chunk 0 0) ;
+        Net.close a ;
+        Net.close b )
+  done
+
 (* With [resets], a reset at the write of one fiber wakes a reader fiber on the
    same socket. *)
 let reset_wakes_reader () =
@@ -1370,6 +1392,7 @@ let tests =
       ; test "a reset comes to the peer after the latency" reset_latency
       ; test "the fault resets ends some connections with ECONNRESET"
           random_resets
+      ; test "a write of 0 bytes gives 0 at once and never resets" zero_write
       ; test "a reset of the fault wakes a reader on the same socket"
           reset_wakes_reader
       ; slow "10,000 connections use the fd slots again" many_connections ]
