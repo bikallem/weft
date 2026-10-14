@@ -90,6 +90,9 @@ type conn =
             space, so the window of the peer stays full. *)
   ; mutable established: bool
   ; mutable refused: bool
+        (** The listener closed while the connect was in flight. Only
+            [Connect_result] and [writable] examine it: [Net.connect] then
+            closes the fd, so no read or write gets this connection. *)
   ; mutable cfd: int  (** [-1] until the server side is accepted. *)
   ; remote: Op.addr
   ; local: Op.addr  (** [Local_addr]. *)
@@ -239,7 +242,7 @@ let readable n fd =
   | Some (Lsn l) ->
       not (Queue.is_empty l.backlog)
   | Some (Conn c) ->
-      avail c > 0 || c.eof || c.refused
+      avail c > 0 || c.eof
   | Some (Dgm g) ->
       not (Queue.is_empty g.queue)
   | Some (Pfd p) ->
@@ -605,7 +608,6 @@ let read_conn t c buf off len =
     c.reset <- false ;
     Error Op.Reset )
   else if c.eof then Ok 0
-  else if c.refused then Error Op.Reset
   else Error Op.Would_block
 
 (* The close of a socket or of an end of a pipe: the peer reads the end of the
