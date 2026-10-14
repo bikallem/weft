@@ -32,6 +32,15 @@ val reset_details : world -> Windtrap.test
 (** The details of [Net.reset] that follow Linux. The simulator and the Linux
     world run them. They are not in [tests]. *)
 
+val unwatch_modes : world -> unit -> unit
+(** The end of a watch in the program of [WEFT_UNWATCH] (issue 6), in the modes
+    "taken", "count" and "pending". The production worlds run it with one
+    domain. It is not in [tests]. *)
+
+val unwatch_busy : world -> unit -> unit
+(** As [unwatch_modes], in the mode "busy": a SIGINT ends a process whose only
+    domain computes with no switch. It is not in [tests]. *)
+
 (**/**)
 
 val echo_server : ?reset:bool -> Weft.Net.t -> unit

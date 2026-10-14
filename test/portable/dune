@@ -3,4 +3,13 @@
 
 (library
  (name portable)
+ (modules portable)
  (libraries weft windtrap))
+
+; The program of the unwatch tests of the production worlds. Each world has
+; an unwatch.ml that calls Unwatch_main.main with its run.
+
+(library
+ (name unwatch_main)
+ (modules unwatch_main)
+ (libraries weft unix))

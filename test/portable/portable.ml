@@ -696,6 +696,52 @@ let unix_unread w close client =
       Net.close c ) ;
   Net.close l
 
+(* The end of a watch in another process (issue 6). The program of
+   [WEFT_UNWATCH] is the unwatch.ml of the world
+   (test/portable/unwatch_main.ml). A test with no program skips. *)
+let unwatch_helper () =
+  match Sys.getenv_opt "WEFT_UNWATCH" with
+  | Some c ->
+      if Filename.is_relative c then Filename.concat (Sys.getcwd ()) c else c
+  | None ->
+      skip ~reason:"WEFT_UNWATCH is not set" ()
+
+let with_default_sigint f =
+  let old = Sys.signal Sys.sigint Sys.Signal_default in
+  Fun.protect ~finally:(fun () -> Sys.set_signal Sys.sigint old) f
+
+(* The helper must end by SIGINT in each mode. *)
+let unwatch_modes w () =
+  let helper = unwatch_helper () in
+  with_default_sigint (fun () ->
+      w.run (fun () ->
+          List.iter
+            (fun mode ->
+              let p = Process.spawn helper [mode] in
+              let st =
+                Fiber.with_timeout Mono (Span.s 10) (fun () -> Process.wait p)
+              in
+              if st <> Process.Signaled SIGINT then failwith mode )
+            ["taken"; "count"; "pending"] ) )
+
+(* After the unwatch, a SIGINT ends the process also when its only domain
+   computes with no switch. *)
+let unwatch_busy w () =
+  let helper = unwatch_helper () in
+  with_default_sigint (fun () ->
+      w.run (fun () ->
+          let p = Process.spawn ~stdout:Piped helper ["busy"] in
+          let out = Option.get (Process.stdout p) in
+          let buf = Bytes.create 6 in
+          equal int 6 (Pipe.read out buf 0 6) ;
+          equal string "ready\n" (Bytes.to_string buf) ;
+          Process.kill p SIGINT ;
+          let st =
+            Fiber.with_timeout Mono (Span.s 10) (fun () -> Process.wait p)
+          in
+          Pipe.close out ;
+          is_true (st = Process.Signaled SIGINT) ) )
+
 (* The details of a reset that follow Linux. The simulator and the Linux world
    run them. *)
 let reset_details w =
