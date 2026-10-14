@@ -28,9 +28,23 @@ val fiber_ids : world -> Windtrap.test
 val files : world -> Windtrap.test
 (** The tests of [File] and [Dir] (milestone M2), also in [tests]. *)
 
+val zero_writes : world -> Windtrap.test
+(** The writes of 0 bytes, as on Linux: on a full socket, on a pipe with no
+    reader, and on TCP and Unix sockets after a close or a reset of the peer.
+    The simulator and the Linux world run them. They are not in [tests]. *)
+
 val reset_details : world -> Windtrap.test
 (** The details of [Net.reset] that follow Linux. The simulator and the Linux
     world run them. They are not in [tests]. *)
+
+val unwatch_modes : world -> unit -> unit
+(** The end of a watch in the program of [WEFT_UNWATCH] (issue 6), in the modes
+    "taken", "count" and "pending". The production worlds run it with one
+    domain. It is not in [tests]. *)
+
+val unwatch_busy : world -> unit -> unit
+(** As [unwatch_modes], in the mode "busy": a SIGINT ends a process whose only
+    domain computes with no switch. It is not in [tests]. *)
 
 (**/**)
 
@@ -56,3 +70,9 @@ val error_of : (unit -> 'a) -> string
 
 val host_port : Weft.Net.t -> string * int
 (** The local host and port of a TCP or UDP socket. *)
+
+val with_default_sigint : (unit -> 'a) -> 'a
+(** [with_default_sigint f] runs [f] with the default action of SIGINT, and then
+    restores the old action. A shell starts a background job with SIGINT
+    ignored, and a child inherits this action. A test that spawns a child that
+    must end by SIGINT uses it. *)

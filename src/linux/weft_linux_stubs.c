@@ -22,17 +22,22 @@
 
 /* The poller of a domain */
 
-value weft_epoll_create(value unit) { return Val_int(epoll_create1(EPOLL_CLOEXEC)); }
+value weft_epoll_create(value unit) {
+  int fd = epoll_create1(EPOLL_CLOEXEC);
+  return Val_int(fd < 0 ? ERR : fd);
+}
 
 value weft_eventfd(value unit) {
-  return Val_int(eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC));
+  int fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+  return Val_int(fd < 0 ? ERR : fd);
 }
 
 /* A timerfd on CLOCK_MONOTONIC, or on CLOCK_REALTIME for the Posix alarm
    (M3). */
 value weft_timerfd(value posix) {
   clockid_t c = Bool_val(posix) ? CLOCK_REALTIME : CLOCK_MONOTONIC;
-  return Val_int(timerfd_create(c, TFD_NONBLOCK | TFD_CLOEXEC));
+  int fd = timerfd_create(c, TFD_NONBLOCK | TFD_CLOEXEC);
+  return Val_int(fd < 0 ? ERR : fd);
 }
 
 /* Arm a timerfd at an absolute time. A time <= 0 disarms it. The Posix alarm

@@ -17,12 +17,21 @@ val create : ?domains:int -> ?signals:Weft.Signal.t list -> unit -> t
     [create] writes a warning to [stderr] for each thread that does not block
     them, because the OS can give a signal to that thread. [close] restores the
     mask. [Signal.unwatch] removes a signal from the signalfd and unblocks it in
-    the thread of the domain that calls it. SIGPIPE is ignored, so a write with
-    no reader gives EPIPE. *)
+    the thread of the domain that calls it. The thread of [run] (domain 0) also
+    unblocks it at its next wait. SIGPIPE is ignored, so a write with no reader
+    gives EPIPE.
+
+    After an error, [create] closes the fds that it made and restores the signal
+    mask.
+
+    @raise Invalid_argument
+      if [~domains] is not in the range 1 to 62. [create] with [~signals] also
+      raises [Invalid_argument] if another world of the process watches signals.
+      Only one world at a time can watch signals. [close] releases the claim. *)
 
 val close : t -> unit
 (** [close t] stops the thread pools, closes the fds of the world and restores
-    the signal mask of [create]. *)
+    the signal mask of [create]. A second close does nothing. *)
 
 val run :
      ?slack:Weft.Span.t

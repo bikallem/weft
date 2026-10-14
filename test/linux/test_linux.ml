@@ -515,17 +515,10 @@ let few_fds () =
 
 let read_pipe = Portable.drain Pipe.read
 
-(* A shell starts a background job with SIGINT ignored, and a child inherits
-   this action. Thus the test gives SIGINT its default action for the time of
-   the spawn. *)
-let with_default_sigint f =
-  let old = Sys.signal Sys.sigint Sys.Signal_default in
-  Fun.protect ~finally:(fun () -> Sys.set_signal Sys.sigint old) f
-
 (* The child gets no blocked signals, also when run blocks SIGINT. *)
 let child_sigint () =
   let before = open_fds () in
-  with_default_sigint (fun () ->
+  Portable.with_default_sigint (fun () ->
       Weft_linux.run ~domains:1 ~signals:[SIGINT] (fun () ->
           let p = Process.spawn "sleep" ["10"] in
           Time.sleep Mono (Span.ms 20) ;
@@ -596,45 +589,6 @@ let blocked_threads () =
       equal (list string) [] (Weft_linux.unblocked_threads [SIGUSR2]) ;
       (* No thread blocks SIGHUP. *)
       is_true (Weft_linux.unblocked_threads [SIGUSR2; SIGHUP] <> []) )
-
-(* The end of a watch (issue 6). The helper must end by SIGINT in each mode. *)
-let unwatch_helper () =
-  match Sys.getenv_opt "WEFT_UNWATCH" with
-  | Some c ->
-      if Filename.is_relative c then Filename.concat (Sys.getcwd ()) c else c
-  | None ->
-      skip ~reason:"WEFT_UNWATCH is not set" ()
-
-let unwatch_modes () =
-  let helper = unwatch_helper () in
-  with_default_sigint (fun () ->
-      Weft_linux.run ~domains:1 (fun () ->
-          List.iter
-            (fun mode ->
-              let p = Process.spawn helper [mode] in
-              let st =
-                Fiber.with_timeout Mono (Span.s 10) (fun () -> Process.wait p)
-              in
-              if st <> Process.Signaled SIGINT then failwith mode )
-            ["taken"; "count"; "pending"] ) )
-
-(* After the unwatch, a SIGINT ends the process also when its only domain
-   computes with no switch. *)
-let unwatch_busy () =
-  let helper = unwatch_helper () in
-  with_default_sigint (fun () ->
-      Weft_linux.run ~domains:1 (fun () ->
-          let p = Process.spawn ~stdout:Piped helper ["busy"] in
-          let out = Option.get (Process.stdout p) in
-          let buf = Bytes.create 6 in
-          equal int 6 (Pipe.read out buf 0 6) ;
-          equal string "ready\n" (Bytes.to_string buf) ;
-          Process.kill p SIGINT ;
-          let st =
-            Fiber.with_timeout Mono (Span.s 10) (fun () -> Process.wait p)
-          in
-          Pipe.close out ;
-          is_true (st = Process.Signaled SIGINT) ) )
 
 (* Run [f] in a fiber on domain 1. If the caller runs on domain 0, it computes,
    so domain 1 takes the new fiber. The caller can also run on domain 1, for
@@ -878,6 +832,55 @@ let utc_against_gmtime () =
     check ((d * 86400) - 1)
   done
 
+(* A Unix path of 107 bytes fits in sun_path with its NUL byte, and a path of
+   108 bytes gives ENAMETOOLONG. The simulator has the same limit. *)
+let unix_path_limit () =
+  let dir = tmp () in
+  let path n =
+    Filename.concat dir (String.make (n - String.length dir - 1) 'p')
+  in
+  Weft_linux.run ~domains:1 (fun () ->
+      let too_long f = equal string "ENAMETOOLONG" (Portable.error_of f) in
+      too_long (fun () -> Net.listen (Net.Unix (path 108))) ;
+      too_long (fun () -> Net.connect (Net.Unix (path 108))) ;
+      let l = Net.listen (Net.Unix (path 107)) in
+      let c = Net.connect (Net.Unix (path 107)) in
+      List.iter Net.close [c; l] )
+
+(* Only one world at a time can watch signals, as on kqueue. For a world with no
+   signals, the claim is not necessary. A refused create does not release the
+   claim of the open world, so a second try also raises. *)
+let one_signal_world () =
+  let another =
+    Invalid_argument "Weft_linux.create: another world watches signals"
+  in
+  Weft_linux.run ~domains:1 ~signals:[SIGUSR1] (fun () ->
+      raises another (fun () ->
+          ignore (Weft_linux.create ~signals:[SIGUSR2] ()) ) ;
+      raises another (fun () ->
+          ignore (Weft_linux.create ~signals:[SIGUSR2] ()) ) ;
+      Weft_linux.close (Weft_linux.create ()) ) ;
+  (* After the close, a new world can watch signals. *)
+  Weft_linux.close (Weft_linux.create ~signals:[SIGUSR2] ()) ;
+  (* A second close of a world does nothing: it does not release the claim of a
+     later world. *)
+  let a = Weft_linux.create ~signals:[SIGUSR1] () in
+  Weft_linux.close a ;
+  let b = Weft_linux.create ~signals:[SIGUSR2] () in
+  Weft_linux.close a ;
+  raises another (fun () -> ignore (Weft_linux.create ~signals:[SIGUSR1] ())) ;
+  Weft_linux.close b ;
+  (* A number of domains out of the range raises before the claim. *)
+  List.iter
+    (fun domains ->
+      raises
+        (Invalid_argument
+           "Weft_linux.create: the number of domains is not in the range 1 to \
+            62" ) (fun () ->
+          ignore (Weft_linux.create ~domains ~signals:[SIGUSR1] ()) ) )
+    [0; 63] ;
+  Weft_linux.close (Weft_linux.create ~signals:[SIGUSR1] ())
+
 let linux =
   group "linux"
     [ test "a Unix domain socket echoes" unix_socket
@@ -885,6 +888,7 @@ let linux =
         register_failure
     ; test "L2: the peer of a Unix socket has a Unix address" unix_peer_addr
     ; test "L3: a port out of range gives an error" port_range
+    ; test "a Unix path of 108 bytes gives ENAMETOOLONG" unix_path_limit
     ; test "Time.now Posix is the time of the system" posix_time
     ; test "an address that is not an IP address gives an error" invalid_address
     ; test "a 10 ms sleep ends between 10 ms and 12 ms" sleep_10ms
@@ -913,10 +917,11 @@ let linux =
     ; test "C7: Other_signal 10 is SIGUSR1" signal_number
     ; test "each thread of run ~signals blocks the signals" blocked_threads
     ; test ~timeout:60. "after Signal.unwatch, SIGINT ends the process"
-        unwatch_modes
+        (Portable.unwatch_modes world)
     ; test ~timeout:30. "after Signal.unwatch, SIGINT ends a busy process"
-        unwatch_busy
+        (Portable.unwatch_busy world)
     ; test "a waiter at Signal.unwatch raises" unwatch_waiter
+    ; test "only one world at a time watches signals" one_signal_world
     ; test "a finaliser fills an Ivar from outside a fiber" finaliser_fill
     ; test "a failed promise that nobody awaits gives a report" promise_report
     ; test "the watchdog reports a fiber that computes 200 ms" watchdog
@@ -934,6 +939,7 @@ let () =
     (Windtrap.run "linux"
        ( Portable.tests world
        @ [ Portable.reset_details world
+         ; Portable.zero_writes world
          ; group "linux on 4 domains"
              [ Portable.fiber_ids
                  { world with

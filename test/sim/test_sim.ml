@@ -991,4 +991,6 @@ let () =
        @ Portable.tests portable_world
        @ Portable.tests portable_world_4
        @ [ Portable.reset_details portable_world
-         ; Portable.reset_details portable_world_4 ] ) )
+         ; Portable.reset_details portable_world_4
+         ; Portable.zero_writes portable_world
+         ; Portable.zero_writes portable_world_4 ] ) )

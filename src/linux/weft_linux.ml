@@ -75,13 +75,21 @@ type t =
         (** The signals of an unwatch that the thread of domain 0 must unblock.
         *)
   ; sigfd: int  (** The signalfd in the poller of domain 0, or [-1]. *)
-  ; old_mask: bytes option  (** The signal mask before [create]. *) }
+  ; old_mask: bytes option  (** The signal mask before [create]. *)
+  ; closed: bool Atomic.t  (** [close] sets it, one time. *) }
 
-let make_dom () =
-  let epfd = check "epoll_create1" (epoll_create ()) in
-  let evfd = check "eventfd" (eventfd ()) in
-  let tfd = check "timerfd_create" (timerfd false) in
-  let ptfd = check "timerfd_create" (timerfd true) in
+(* The poller of a domain. [undo] gets the close of each fd when [make_dom]
+   opens it. Thus an error in the middle leaves no fd open. *)
+let make_dom ~undo () =
+  let fd name r =
+    let fd = check name r in
+    undo := (fun () -> ignore (close_fd fd)) :: !undo ;
+    fd
+  in
+  let epfd = fd "epoll_create1" (epoll_create ()) in
+  let evfd = fd "eventfd" (eventfd ()) in
+  let tfd = fd "timerfd_create" (timerfd false) in
+  let ptfd = fd "timerfd_create" (timerfd true) in
   ignore (check "epoll_ctl" (epoll_add_in epfd evfd wake_token)) ;
   ignore (check "epoll_ctl" (epoll_add_in epfd tfd timer_token)) ;
   ignore (check "epoll_ctl" (epoll_add_in epfd ptfd posix_token)) ;
@@ -124,20 +132,30 @@ let unblocked_numbers sigs =
 
 let unblocked_threads sigs = unblocked_numbers (List.map number_of sigs)
 
-(* A write to a pipe with no reader then gives EPIPE (design section 2.7,
-   Signals). The signals of [~signals] are blocked in the calling thread before
-   any other thread of the world starts, so each thread copies the mask. *)
-let create ?(domains = 1) ?(signals = []) () =
-  Sys.set_signal Sys.sigpipe Sys.Signal_ignore ;
-  let nums = Array.of_list (List.map number_of signals) in
+let close_dom d =
+  ignore (close_fd d.tfd) ;
+  ignore (close_fd d.ptfd) ;
+  ignore (close_fd d.evfd) ;
+  ignore (close_fd d.epfd)
+
+(* [true] while a world with [~signals] is open. With two such worlds, each
+   signal goes to one of the two signalfds. Also, an unwatch in one world
+   unblocks the signal in a thread that the other world uses. The kqueue world
+   has the same rule. *)
+let signal_world = Atomic.make false
+
+(* The body of [create], after the claim. [undo] gets a function for each part
+   that [make] makes, the newest first, so that an error can free the parts. *)
+let make ~domains ~nums ~undo signals =
   let old_mask, sigfd =
     if signals = [] then (None, -1)
     else
       let old = sigmask_block nums in
+      undo := (fun () -> sigmask_restore old) :: !undo ;
       let fd = signalfd (-1) nums in
-      if (fd < 0) [@mutate off "fd 0 is the stdin of the process"] then (
-        sigmask_restore old ;
-        failwith ("signalfd: " ^ strerror (-fd)) ) ;
+      if (fd < 0) [@mutate off "fd 0 is the stdin of the process"] then
+        failwith ("signalfd: " ^ strerror (-fd)) ;
+      undo := (fun () -> ignore (close_fd fd)) :: !undo ;
       List.iter
         (fun task ->
           Printf.eprintf
@@ -148,7 +166,7 @@ let create ?(domains = 1) ?(signals = []) () =
         (unblocked_numbers (Array.to_list nums)) ;
       (Some old, fd)
   in
-  let doms = Array.init domains (fun _ -> make_dom ()) in
+  let doms = Array.init domains (fun _ -> make_dom ~undo ()) in
   if sigfd >= 0 then
     ignore (check "epoll_ctl" (epoll_add_in doms.(0).epfd sigfd signal_token)) ;
   { doms
@@ -158,19 +176,40 @@ let create ?(domains = 1) ?(signals = []) () =
   ; unwatch_lock= Mutex.create ()
   ; unblock0= Atomic.make []
   ; sigfd
-  ; old_mask }
+  ; old_mask
+  ; closed= Atomic.make false }
 
+(* A write to a pipe with no reader then gives EPIPE (design section 2.7,
+   Signals). The signals of [~signals] are blocked in the calling thread before
+   any other thread of the world starts, so each thread copies the mask. A world
+   with [~signals] claims [signal_world], and [close] releases it. After an
+   error, [create] closes what it made, restores the mask and releases the
+   claim, as the kqueue world does. *)
+let create ?(domains = 1) ?(signals = []) () =
+  Sched.check_domains "Weft_linux.create" domains ;
+  Sys.set_signal Sys.sigpipe Sys.Signal_ignore ;
+  let nums = Array.of_list (List.map number_of signals) in
+  if signals <> [] && not (Atomic.compare_and_set signal_world false true) then
+    invalid_arg "Weft_linux.create: another world watches signals" ;
+  let undo = ref [] in
+  match make ~domains ~nums ~undo signals with
+  | t ->
+      t
+  | exception e ->
+      let bt = Printexc.get_raw_backtrace () in
+      List.iter (fun f -> f ()) !undo ;
+      if signals <> [] then Atomic.set signal_world false ;
+      Printexc.raise_with_backtrace e bt
+
+(* A second close does nothing. Thus it cannot release the claim of a later
+   world. *)
 let close t =
-  close_pool t.pool ;
-  if t.sigfd >= 0 then ignore (close_fd t.sigfd) ;
-  Option.iter sigmask_restore t.old_mask ;
-  Array.iter
-    (fun d ->
-      ignore (close_fd d.tfd) ;
-      ignore (close_fd d.ptfd) ;
-      ignore (close_fd d.evfd) ;
-      ignore (close_fd d.epfd) )
-    t.doms
+  if Atomic.compare_and_set t.closed false true then (
+    close_pool t.pool ;
+    if t.sigfd >= 0 then ignore (close_fd t.sigfd) ;
+    Option.iter sigmask_restore t.old_mask ;
+    if Option.is_some t.old_mask then Atomic.set signal_world false ;
+    Array.iter close_dom t.doms )
 
 (* The end of a watch (design section 2.7). First, the signalfd does not take
    [s] any more. Then the calling thread unblocks [s], and each later signal
@@ -254,7 +293,10 @@ module World = struct
 
   let wait t ~domain (w : World.Wait.t) =
     let d = t.doms.(domain) in
-    ( if domain = 0 then
+    (* The wait does a get before the exchange. An unwatch is rare, and a get
+       costs less than an exchange on each wait. An unwatch adds to [unblock0]
+       before it wakes domain 0, so the next wait sees it. *)
+    ( if domain = 0 && Atomic.get t.unblock0 <> [] then
         match Atomic.exchange t.unblock0 [] with
         | [] ->
             ()

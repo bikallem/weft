@@ -24,7 +24,7 @@
  (enabled_if
   (= %{system} linux))
  (modules unwatch)
- (libraries weft weft.linux unix))
+ (libraries weft.linux unwatch_main))
 
 ; An executable and a rule, not a test stanza: on another system, dune
 ; builds the executable of a test stanza also if its enabled_if is false.

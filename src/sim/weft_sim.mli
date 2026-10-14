@@ -19,7 +19,9 @@ val run :
     that continues at each world effect. With [~auto:true] (the default), the
     time moves to the next deadline at each quiescence. With [~auto:false], only
     {!advance_until} moves the time. [~signals] are the signals that the program
-    watches, as for [Weft_linux.run ~signals]: none by default.
+    watches, as for [Weft_linux.run ~signals]: none by default. The simulator
+    uses the signal numbers of Linux: [Other_signal 10] is [SIGUSR1] in each
+    function of the simulator and in [Signal].
 
     [~outside_fills:true] accepts [Ivar.fill_from_outside]. The simulator gives
     each such fill at the next quiescence. The GC selects when a finaliser runs,
@@ -38,7 +40,7 @@ val run :
     timers and the faults also run on this thread. Thus a process can call
     [Unix.fork] before, between and after runs, for example a tool that forks
     one process for each mutant. OCaml 5 refuses [Unix.fork] after a
-    [Domain.spawn], also after its [Domain.join], so other code of the process
+    [Domain.spawn], also after its [Domain.join]. Thus other code of the process
     must not start a domain, for example [Weft_linux.run] with more than one
     domain.
 
@@ -69,7 +71,10 @@ val advance_until : t -> Weft.Clock.mono -> unit
 
 val addr : t -> string -> Weft.Net.addr
 (** [addr t "server:80"] is the address of a name and a port in the in-memory
-    network. [addr t "unix:/run/s"] is a Unix socket. *)
+    network. [addr t "unix:/run/s"] is a Unix socket. As on Linux, a listen or a
+    connect with a Unix path of 108 bytes or more gives
+    [Weft.Net.Error (Other "ENAMETOOLONG", _)]. The limit is 104 bytes on macOS
+    and FreeBSD. *)
 
 val set_latency : t -> Weft.Span.t -> unit
 (** The latency of each packet. It is 0 by default. *)
@@ -118,7 +123,7 @@ val set_fd_limit : t -> int option -> unit
     [Net.accept], [Net.udp], [File.openfile], [Dir.readdir] (1 fd),
     [Pipe.create] (2 fds) and [Process.spawn] (1 fd, and 2 fds for each
     [Piped]). [Dir.readdir] closes its fd at the end, as [opendir] on Linux. As
-    on Linux, [accept] gives the error also with an empty backlog, it leaves the
+    on Linux, [accept] gives the error also with an empty backlog. It leaves the
     connection in the backlog, and the listener gets no new edge. [None] (the
     default) removes the limit. A limit below {!open_fds} closes no fd. To make
     the next [accept] fail, set the limit to {!open_fds}.
@@ -131,12 +136,14 @@ val socket_pair : t -> Weft.Net.t * Weft.Net.t
     once. It has the latency and the faults of each TCP connection. [Net.reset]
     and {!fault} act on it as on a connection of [connect]. The first socket has
     the address [Tcp ("client", p)], and the second [Tcp ("server", q)], with
-    [p] and [q] from the counter of ports (as for [Net.local_addr]). The peer of
-    each socket is the address of the other socket.
+    [p] and [q] from the counter of ports (as for [Net.local_addr]). The first
+    socket is a TCP client, as a client of [connect]: [p] is a port that no open
+    client has. The peer of each socket is the address of the other socket.
 
     @raise Weft.Net.Error
       with [No_resources "EMFILE"] if the two fds are more than the limit of
-      {!set_fd_limit}. *)
+      {!set_fd_limit}, or with [Other "EADDRNOTAVAIL"] if each port of the
+      counter has an open client. *)
 
 val fault : t -> Weft.Net.t -> Weft.Net.error -> unit
 (** [fault t s e] breaks the connection of [s] at the side of [s]. The next
@@ -154,9 +161,10 @@ val fault : t -> Weft.Net.t -> Weft.Net.error -> unit
     middlebox. The peer gets the reset after the delay, after the data that [s]
     sent before, as from [Net.reset]. On a Unix socket, the writes of [s] give
     [Broken_pipe] and its next read gives [Reset], as after a reset of a Unix
-    socket. With another error, the link is lost. The peer gets nothing, and its
-    data stays in flight, so its writes fill the window and then wait. The peer
-    can thus wait until its own timeout.
+    socket. With another error, the link is lost. The peer gets nothing, also
+    not the data of [s] that is in flight at the fault. The data of the peer
+    stays in flight, so its writes fill the window and then wait. The peer can
+    thus wait until its own timeout.
 
     The fault occurs at the call, and the delay of a reset comes from the seed,
     as each delay. Thus a seed gives the same run.
@@ -218,6 +226,8 @@ exception Deadlock of string list
 (** The problems that the check found. *)
 exception Lost_wakeup of string list
 
+(** The program broke the order of the OS, for example a close(2) before a
+    Deregister. *)
 exception Model_error of string
 
 (** The fibers that are not parked. *)

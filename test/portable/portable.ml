@@ -696,6 +696,146 @@ let unix_unread w close client =
       Net.close c ) ;
   Net.close l
 
+(* The end of a watch in another process (issue 6). The program of
+   [WEFT_UNWATCH] is the unwatch.ml of the world
+   (test/portable/unwatch_main.ml). A test with no program skips. *)
+let unwatch_helper () =
+  match Sys.getenv_opt "WEFT_UNWATCH" with
+  | Some c ->
+      if Filename.is_relative c then Filename.concat (Sys.getcwd ()) c else c
+  | None ->
+      skip ~reason:"WEFT_UNWATCH is not set" ()
+
+(* A shell starts a background job with SIGINT ignored, and a child inherits
+   this action. Thus the test gives SIGINT its default action for the time of
+   the spawn. *)
+let with_default_sigint f =
+  let old = Sys.signal Sys.sigint Sys.Signal_default in
+  Fun.protect ~finally:(fun () -> Sys.set_signal Sys.sigint old) f
+
+(* The helper must end by SIGINT in each mode. *)
+let unwatch_modes w () =
+  let helper = unwatch_helper () in
+  with_default_sigint (fun () ->
+      w.run (fun () ->
+          List.iter
+            (fun mode ->
+              let p = Process.spawn helper [mode] in
+              let st =
+                Fiber.with_timeout Mono (Span.s 10) (fun () -> Process.wait p)
+              in
+              if st <> Process.Signaled SIGINT then failwith mode )
+            ["taken"; "count"; "pending"] ) )
+
+(* After the unwatch, a SIGINT ends the process also when its only domain
+   computes with no switch. *)
+let unwatch_busy w () =
+  let helper = unwatch_helper () in
+  with_default_sigint (fun () ->
+      w.run (fun () ->
+          let p = Process.spawn ~stdout:Piped helper ["busy"] in
+          let out = Option.get (Process.stdout p) in
+          let buf = Bytes.create 6 in
+          equal int 6 (Pipe.read out buf 0 6) ;
+          equal string "ready\n" (Bytes.to_string buf) ;
+          Process.kill p SIGINT ;
+          let st =
+            Fiber.with_timeout Mono (Span.s 10) (fun () -> Process.wait p)
+          in
+          Pipe.close out ;
+          is_true (st = Process.Signaled SIGINT) ) )
+
+(* The writes of 0 bytes, as on Linux 7.1. The simulator and the Linux world run
+   them. I am not sure that FreeBSD and macOS give the same results. *)
+let zero_writes w =
+  let pause () = Time.sleep Mono (Span.ms 10) in
+  let b = Bytes.create 65536 in
+  (* The result of a write of 0 bytes, or the text of its error. *)
+  let zero c =
+    match Net.write_sub c b 0 0 with
+    | k ->
+        string_of_int k
+    | exception Net.Error (e, _) ->
+        Format.asprintf "%a" Private.Op.pp_error e
+  in
+  let conn (l, a) =
+    let c = Net.connect a in
+    let s, _ = Net.accept l in
+    Net.close l ; (c, s)
+  in
+  let tcp () = conn (w.listen ()) in
+  group
+    (w.name ^ ": a write of 0 bytes, as on Linux")
+    [ test "a full socket gives 0" (fun () ->
+          w.run (fun () ->
+              let c, s = tcp () in
+              while Net.write_now c b 0 65536 <> None do
+                ()
+              done ;
+              equal (option int) (Some 0) (Net.write_now c b 0 0) ;
+              equal string "0" (zero c) ;
+              List.iter Net.close [c; s] ) )
+    ; test "a pipe with no reader gives 0" (fun () ->
+          w.run (fun () ->
+              let r, wr = Pipe.create () in
+              Pipe.close r ;
+              equal int 0 (Pipe.write_sub wr b 0 0) ;
+              equal string "EPIPE" (error_of (fun () -> Pipe.write_sub wr b 0 1)) ;
+              Pipe.close wr ) )
+    ; test "TCP after a close of the peer gives 0" (fun () ->
+          w.run (fun () ->
+              let c, s = tcp () in
+              Net.close s ;
+              pause () ;
+              equal string "0" (zero c) ;
+              equal string "0" (zero c) ;
+              Net.close c ) )
+    ; test "TCP after a reset gives ECONNRESET, then EPIPE" (fun () ->
+          w.run (fun () ->
+              let c, s = tcp () in
+              Net.reset s ;
+              pause () ;
+              equal string "ECONNRESET" (zero c) ;
+              equal string "EPIPE" (zero c) ;
+              Net.close c ) )
+    ; test "TCP after a shutdown and a reset of the peer gives EPIPE" (fun () ->
+          w.run (fun () ->
+              (* The reset comes in CLOSE_WAIT, so the error is EPIPE. *)
+              let c, s = tcp () in
+              Net.shutdown s ;
+              Net.reset s ;
+              pause () ;
+              equal string "EPIPE" (zero c) ;
+              equal string "EPIPE" (zero c) ;
+              Net.close c ) )
+    ; test "TCP after a write to a closed peer gives EPIPE" (fun () ->
+          w.run (fun () ->
+              (* Linux takes the first write, and the closed peer answers it
+                 with a reset. The simulator gives EPIPE at once. *)
+              let c, s = tcp () in
+              Net.close s ;
+              pause () ;
+              ( try ignore (Net.write_sub c b 0 1)
+                with Net.Error (Broken_pipe, _) -> () ) ;
+              pause () ;
+              equal string "EPIPE" (error_of (fun () -> Net.write_sub c b 0 1)) ;
+              equal string "EPIPE" (zero c) ;
+              Net.close c ) )
+    ; test "after a shutdown, TCP gives EPIPE" (fun () ->
+          w.run (fun () ->
+              let c, s = tcp () in
+              Net.shutdown c ;
+              equal string "EPIPE" (zero c) ;
+              List.iter Net.close [c; s] ) )
+    ; test "Unix after a close of the peer gives EPIPE" (fun () ->
+          w.run (fun () ->
+              let a = Net.Unix (Filename.concat (w.tmp ()) "z") in
+              let c, s = conn (Net.listen a, a) in
+              Net.close s ;
+              pause () ;
+              equal string "EPIPE" (zero c) ;
+              Net.close c ) ) ]
+
 (* The details of a reset that follow Linux. The simulator and the Linux world
    run them. *)
 let reset_details w =
@@ -944,6 +1084,16 @@ let local_addr w =
               equal string "EBADF"
                 (error_of (fun () -> Net.sendto u b 0 1 (host, up))) ;
               Net.close l ) )
+    ; test "a Unix path that is too long gives ENAMETOOLONG" (fun () ->
+          w.run (fun () ->
+              (* The limit is 108 bytes on Linux and 104 on macOS and
+                 FreeBSD. *)
+              let a =
+                Net.Unix (Filename.concat (w.tmp ()) (String.make 200 'a'))
+              in
+              let too_long f = equal string "ENAMETOOLONG" (error_of f) in
+              too_long (fun () -> Net.listen a) ;
+              too_long (fun () -> Net.connect a) ) )
     ; test "a closed socket gives EBADF" (fun () ->
           w.run (fun () ->
               let l, _ = w.listen () and u, _ = w.udp () in
@@ -1548,6 +1698,31 @@ let fork_parked sc f =
   done ;
   p
 
+(* The receivers of a channel get the values in the order in which they started
+   to wait (FIFO), also when receivers come after a send. Then the queue has
+   offers in its two lists. If a different receiver gets a value, the receiver
+   [p] waits, and the timeout stops the test. *)
+let chan_order w =
+  test "the receivers of a channel get the values in FIFO order" (fun () ->
+      w.run (fun () ->
+          let c = Chan.create () in
+          Fiber.scope (fun sc ->
+              let wait () = fork_parked sc (fun () -> sync (Chan.recv c)) in
+              let next p v =
+                sync (Chan.send c v) ;
+                equal int v
+                  (Fiber.with_timeout Mono (Span.ms 1000) (fun () ->
+                       Promise.await p ) )
+              in
+              let p1 = wait () in
+              let p2 = wait () in
+              let p3 = wait () in
+              next p1 1 ;
+              (* Receivers 2 and 3 are older than receivers 4 and 5. *)
+              let p4 = wait () in
+              let p5 = wait () in
+              List.iteri (fun i p -> next p (i + 2)) [p2; p3; p4; p5] ) ) )
+
 let semaphores w =
   group "semaphores"
     [ test "a semaphore lets at most n fibers in at a time" (fun () ->
@@ -1583,6 +1758,32 @@ let semaphores w =
                   Sem.release s ; List.iter Promise.await ps ) ;
               equal (list int) [1; 2; 3; 4; 5] (Log.get log) ;
               all_free s 1 ) )
+    ; test "the FIFO order stays when waiters come after a release" (fun () ->
+          w.run (fun () ->
+              let s = Sem.create 1 in
+              is_true (Sem.try_acquire s) ;
+              Fiber.scope (fun sc ->
+                  let wait () =
+                    fork_parked sc (fun () -> sync (Sem.acquire s))
+                  in
+                  (* Give one permit, then make sure that the waiter [p] gets
+                     it. If a different waiter gets it, [p] waits and the
+                     timeout stops the test. *)
+                  let next p =
+                    Sem.release s ;
+                    Fiber.with_timeout Mono (Span.ms 1000) (fun () ->
+                        Promise.await p )
+                  in
+                  let p1 = wait () in
+                  let p2 = wait () in
+                  let p3 = wait () in
+                  next p1 ;
+                  (* Waiters 2 and 3 are older than waiters 4 and 5. *)
+                  let p4 = wait () in
+                  let p5 = wait () in
+                  List.iter next [p2; p3; p4; p5] ) ;
+              (* Each waiter holds its permit. *)
+              equal bool false (Sem.try_acquire s) ) )
     ; test "a cancel of a waiter gives the permit to the next waiter" (fun () ->
           w.run (fun () ->
               let s = Sem.create 1 and log = Log.create () in
@@ -1705,10 +1906,17 @@ let semaphores w =
               Sem.release s ;
               raises above (fun () -> Sem.release s) ;
               all_free s 2 ;
-              (* A semaphore with no permit never gives one. *)
-              let z = Sem.create 0 in
+              (* A semaphore with no permit and no maximum is a bug. *)
+              let zero =
+                Invalid_argument
+                  "Fiber.Semaphore.create: the maximum is 0 (give a ~max of 1 \
+                   or more)"
+              in
+              raises zero (fun () -> Sem.create 0) ;
+              raises zero (fun () -> Sem.create ~max:0 0) ;
+              (* A semaphore with no free permit at the start gives none. *)
+              let z = Sem.create ~max:1 0 in
               equal bool false (acquire_in_1ms z) ;
-              raises above (fun () -> Sem.release z) ;
               (* A count that starts at 0 and grows to its maximum. *)
               let g = Sem.create ~max:2 0 in
               equal bool false (Sem.try_acquire g) ;
@@ -2318,6 +2526,7 @@ let tests w =
   [ group w.name
       ( [ events w
         ; chans w
+        ; chan_order w
         ; scopes w
         ; net w
         ; now_and_reset w

@@ -226,6 +226,11 @@ module Semaphore = struct
     if n < 0 then invalid_arg "Fiber.Semaphore.create: the count is negative" ;
     if max < n then
       invalid_arg "Fiber.Semaphore.create: the maximum is less than the count" ;
+    (* With a maximum of 0, no release can ever make a permit free. This occurs
+       for [create 0] with no [~max], and for [create ~max:0 0]. *)
+    if max = 0 then
+      invalid_arg
+        "Fiber.Semaphore.create: the maximum is 0 (give a ~max of 1 or more)" ;
     {slock= Spin.make (); max; free= Atomic.make n; waiters= Chan.side ()}
 
   (* The leaf of [acquire]. A free permit goes to the sync only if the sync
@@ -259,25 +264,24 @@ module Semaphore = struct
      maximum. *)
   let give t =
     Spin.with_lock t.slock (fun () ->
-        let rec first = function
-          | [] ->
+        let rec first () =
+          match Chan.pop t.waiters with
+          | None ->
               None
-          | (o : unit Chan.offer) :: rest -> (
+          | Some (o : unit Chan.offer) -> (
             match C.notify o.osync.word o.obranch with
             | C.Resume ->
-                Some (rest, [o.osync])
+                Some [o.osync]
             | C.In_scan ->
-                Some (rest, [])
+                Some []
             | C.Lost _ ->
-                first rest )
+                first () )
         in
-        match first (Chan.offers t.waiters) with
-        | Some (rest, resumed) ->
-            Atomic.set t.waiters.front rest ;
+        match first () with
+        | Some resumed ->
             Some resumed
         | None ->
             (* Each offer was stale. *)
-            Atomic.set t.waiters.front [] ;
             let n = Atomic.get t.free in
             if n >= t.max then None
             else (

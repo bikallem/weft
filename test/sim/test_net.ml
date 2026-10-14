@@ -483,6 +483,98 @@ let no_free_port () =
       Net.close c ;
       is_true (Net.local_addr (Net.connect a) = p) )
 
+(* The client of a socket pair is a TCP client: after the counter goes around,
+   it skips the port of an open client, and a client of [connect] skips the port
+   of an open pair. The pairs count for EADDRNOTAVAIL. *)
+let pair_client_ports () =
+  Sim.run (fun sim ->
+      let a = Net.Tcp ("server", 1) in
+      let l = Net.listen ~backlog:30_000 a in
+      let c = Net.connect a in
+      is_true (Net.local_addr c = Net.Tcp ("client", 40000)) ;
+      (* Take the ports of the counter up to 65535. *)
+      let rec go_around () =
+        let u = Net.udp ("x", 0) in
+        let a = Net.local_addr u in
+        Net.close u ;
+        if a <> Net.Tcp ("x", 65535) then go_around ()
+      in
+      go_around () ;
+      let x, y = Sim.socket_pair sim in
+      is_true (Net.local_addr x = Net.Tcp ("client", 40001)) ;
+      Net.close c ;
+      go_around () ;
+      let c = Net.connect a in
+      is_true (Net.local_addr c = Net.Tcp ("client", 40000)) ;
+      let c2 = Net.connect a in
+      (* The pair has 40001. *)
+      is_true (Net.local_addr c2 = Net.Tcp ("client", 40002)) ;
+      List.iter Net.close [c; c2; y] ;
+      (* Each other port of the counter has an open client. *)
+      let clients = List.init (65535 - 40000) (fun _ -> Net.connect a) in
+      raises_match
+        (function
+          | Net.Error (Other "EADDRNOTAVAIL", "Sim.socket_pair") ->
+              true
+          | _ ->
+              false )
+        (fun () -> Sim.socket_pair sim) ;
+      raises_match
+        (function
+          | Net.Error (Other "EADDRNOTAVAIL", "Net.connect") ->
+              true
+          | _ ->
+              false )
+        (fun () -> Net.connect a) ;
+      (* The close of the client of the pair frees its port. *)
+      Net.close x ;
+      is_true (Net.local_addr (Net.connect a) = Net.Tcp ("client", 40001)) ;
+      ignore clients ;
+      Net.close l )
+
+(* A Unix path of 108 bytes or more gives ENAMETOOLONG, as on Linux. The check
+   comes before the check of the fd limit, as in the POSIX worlds. *)
+let unix_path_limit () =
+  Sim.run (fun sim ->
+      let path n = "/" ^ String.make (n - 1) 'p' in
+      let too_long f = equal string "ENAMETOOLONG" (error_of f) in
+      too_long (fun () -> Net.listen (Net.Unix (path 108))) ;
+      too_long (fun () -> Net.connect (Net.Unix (path 108))) ;
+      let l = Net.listen (Net.Unix (path 107)) in
+      let c = Net.connect (Net.Unix (path 107)) in
+      Sim.set_fd_limit sim (Some (Sim.open_fds sim)) ;
+      too_long (fun () -> Net.listen (Net.Unix (path 108))) ;
+      too_long (fun () -> Net.connect (Net.Unix (path 108))) ;
+      Sim.set_fd_limit sim None ;
+      List.iter Net.close [c; l] )
+
+(* A TCP connect takes its port before the check of the backlog, as Linux takes
+   a port before the SYN. A refused connect thus uses a port of the counter.
+   With no free port, a connect to a full backlog gives EADDRNOTAVAIL, not
+   ECONNREFUSED. *)
+let port_before_backlog () =
+  Sim.run (fun _ ->
+      let full = Net.Tcp ("server", 2) in
+      let lf = Net.listen ~backlog:1 full in
+      let c1 = Net.connect full in
+      is_true (Net.local_addr c1 = Net.Tcp ("client", 40000)) ;
+      equal string "ECONNREFUSED" (error_of (fun () -> Net.connect full)) ;
+      (* The refused connect used the port 40001. *)
+      let a = Net.Tcp ("server", 1) in
+      let l = Net.listen ~backlog:30_000 a in
+      is_true (Net.local_addr (Net.connect a) = Net.Tcp ("client", 40002)) ;
+      (* Each other port of the counter gets an open client. *)
+      let rec fill () =
+        match Net.connect a with
+        | _ ->
+            fill ()
+        | exception Net.Error (Other "EADDRNOTAVAIL", _) ->
+            ()
+      in
+      fill () ;
+      equal string "EADDRNOTAVAIL" (error_of (fun () -> Net.connect full)) ;
+      ignore (lf, l) )
+
 (* The bytes that the latency holds count against the buffer of the peer. *)
 let inflight_backpressure () =
   Sim.run (fun sim ->
@@ -801,6 +893,28 @@ let reset_latency () =
       Net.close l ;
       equal int 0 (Sim.open_fds sim) )
 
+(* A write of 0 bytes on a full socket gives 0 at once, as on Linux. With
+   [resets], it never resets the connection, because it sends nothing. *)
+let zero_write () =
+  for seed = 1 to 20 do
+    Sim.run ~seed (fun sim ->
+        Sim.net_faults sim {Sim.no_faults with resets= true} ;
+        let a, b = Sim.socket_pair sim in
+        let chunk = Bytes.create 16384 in
+        for _ = 1 to 200 do
+          equal (option int) (Some 0) (Net.write_now a chunk 0 0)
+        done ;
+        (* Fill the window with no reset. *)
+        Sim.net_faults sim Sim.no_faults ;
+        while Net.write_now a chunk 0 16384 <> None do
+          ()
+        done ;
+        equal (option int) (Some 0) (Net.write_now a chunk 0 0) ;
+        equal int 0 (Net.write_sub a chunk 0 0) ;
+        Net.close a ;
+        Net.close b )
+  done
+
 (* With [resets], a reset at the write of one fiber wakes a reader fiber on the
    same socket. *)
 let reset_wakes_reader () =
@@ -1082,6 +1196,22 @@ let fault_error () =
       equal int 0 (Net.read a (Bytes.create 1) 0 1) ;
       Net.close a )
 
+(* After a lost link, the peer does not get the data that was in flight. *)
+let fault_lost_in_flight () =
+  Sim.run (fun sim ->
+      Sim.set_latency sim (Span.ms 10) ;
+      let a, b = Sim.socket_pair sim in
+      Net.write a "abc" ;
+      Sim.fault sim a (Net.Other "ETIMEDOUT") ;
+      Sim.settle sim ;
+      Time.sleep Mono (Span.ms 20) ;
+      is_true (Net.read_now b (Bytes.create 3) 0 3 = None) ;
+      (* The peer can fill its window, as after a fault with no data in
+         flight. *)
+      equal (option int) (Some 3) (Net.write_now b (Bytes.of_string "xyz") 0 3) ;
+      Net.close a ;
+      Net.close b )
+
 (* A read gets the error after the data that the side already has. *)
 let fault_read_after_data () =
   Sim.run (fun sim ->
@@ -1342,6 +1472,9 @@ let tests =
       ; test "a listen on port 0 skips the ports in use" listen_port_0
       ; test "a client skips the port of an open client" client_port_wraps
       ; test "a connect with no free port gives EADDRNOTAVAIL" no_free_port
+      ; test "a connect takes its port before the check of the backlog"
+          port_before_backlog
+      ; test "a Unix path of 108 bytes gives ENAMETOOLONG" unix_path_limit
       ; test "the bytes in flight count against the buffer"
           inflight_backpressure
       ; test "a Register of a ready fd gives an edge at once" register_ready_fd
@@ -1354,6 +1487,7 @@ let tests =
       ; test "a reset comes to the peer after the latency" reset_latency
       ; test "the fault resets ends some connections with ECONNRESET"
           random_resets
+      ; test "a write of 0 bytes gives 0 at once and never resets" zero_write
       ; test "a reset of the fault wakes a reader on the same socket"
           reset_wakes_reader
       ; slow "10,000 connections use the fd slots again" many_connections ]
@@ -1368,9 +1502,13 @@ let tests =
       ; test "the pair has the latency of the network" pair_latency
       ; test "a reset of one side goes to the other side" pair_reset
       ; test "the pair counts 2 fds against the limit" pair_fd_limit
+      ; test "the client of a pair has a port that no open client has"
+          pair_client_ports
       ; test "the pair has the faults of the network" pair_faults ]
   ; group "fault of one connection"
       [ test "the next write gets the error, then EPIPE" fault_error
+      ; test "after a lost link, the data in flight does not come"
+          fault_lost_in_flight
       ; test "a read gets the error after the data" fault_read_after_data
       ; test "a fiber that waits on the socket gets the error"
           fault_wakes_reader

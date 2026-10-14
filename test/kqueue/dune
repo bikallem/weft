@@ -17,7 +17,7 @@
    (= %{system} macosx)
    (= %{system} freebsd)))
  (modules unwatch)
- (libraries weft weft.kqueue unix))
+ (libraries weft.kqueue unwatch_main))
 
 (rule
  (alias runtest)

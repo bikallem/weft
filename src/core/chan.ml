@@ -37,6 +37,21 @@ let offers side =
       Atomic.set side.back [] ) ;
   Atomic.get side.front
 
+(* Remove the oldest offer and give it. [back] goes to [front] only when [front]
+   is empty. Thus each offer moves one time, and a pop costs O(1) on average. *)
+let rec pop side =
+  match Atomic.get side.front with
+  | o :: rest ->
+      Atomic.set side.front rest ; Some o
+  | [] -> (
+    match Atomic.get side.back with
+    | [] ->
+        None
+    | back ->
+        Atomic.set side.front (List.rev back) ;
+        Atomic.set side.back [] ;
+        pop side )
+
 let add side o =
   Atomic.set side.back (o :: Atomic.get side.back) ;
   side.len <- side.len + 1 ;
@@ -71,14 +86,28 @@ let rec meet dom s l ~commit =
         (l, true) )
 
 (* The leaf of one side. [move o] moves the value between the own cell and the
-   cell of the partner [o]. *)
+   cell of the partner [o]. The scan takes the offers in the order of [offers],
+   but it does not copy the queue. It scans [front] first. It scans [back] only
+   if no partner in [front] stops the scan. After a scan of [front] that does
+   not stop, [rest] holds only the offers of the own sync, so it is short. Thus
+   a send or a recv costs O(1) on average, not O(N) in the offers. The lists
+   change only after the scans, so an exception in a scan loses no offer.
+   [meet], [commit] and [resume] do not change [other]. *)
 let leaf c ~mine ~other ~cell ~move : leaf =
  fun dom s i ->
   Spin.with_lock c.lock (fun () ->
+      let commit o =
+        C.claim s.word i o.osync.word o.obranch ~on_commit:(fun () -> move o)
+      in
+      let rest, stop = meet dom s (Atomic.get other.front) ~commit in
       let rest, stop =
-        meet dom s (offers other) ~commit:(fun o ->
-            C.claim s.word i o.osync.word o.obranch ~on_commit:(fun () ->
-                move o ) )
+        match Atomic.get other.back with
+        | back when (not stop) && back <> [] ->
+            let rest2, stop = meet dom s (List.rev back) ~commit in
+            Atomic.set other.back [] ;
+            (rest @ rest2, stop)
+        | _ ->
+            (rest, stop)
       in
       Atomic.set other.front rest ;
       if not stop then add mine {osync= s; obranch= i; cell} )
