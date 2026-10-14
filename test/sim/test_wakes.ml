@@ -213,7 +213,7 @@ let tests =
   ; group "close notices"
       [ test "the last close notices close the fds, with 200 seeds" (fun () ->
             Helpers.seeds 200 last_notices )
-      ; test "a close notice goes before the fiber of the same Wait, 200 seeds"
+      ; test "a close notice goes before the fiber of its Wait, with 200 seeds"
           (fun () ->
             let late = ref 0 in
             Helpers.seeds 200 (fun seed ->

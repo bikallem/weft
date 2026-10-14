@@ -1676,9 +1676,9 @@ The tests use windtrap from the fork `bikallem/windtrap` (decision 9). The fork 
 
 **Survivors of a mutation run.** A survivor is a mutant that no test kills. These rules apply to each survivor:
 
-- If a single-domain suite (`test/core` or `test/sim`) can see the mutant, kill it with a test of a behavior. When the effect is internal, use the debug interfaces: `Sched_debug`, the counters of `Sim` and the counters of the measurements.
+- If a suite that runs on one real domain (`test/core` or `test/sim`) can see the mutant, kill it with a test of a behavior. When the effect is internal, use the debug interfaces: `Sched_debug`, the counters of `Sim` and the counters of the measurements.
 - Dismiss only an equivalent mutant, with `[@mutate off "reason"]`. The reason tells in one sentence why no result, resource, effect or debug value changes.
-- Do not dismiss a mutant that only real domains or another world can see. Name the test that covers its behavior, for example a `dscheck` test or `test/linux_md`, or tell that no test covers it.
+- Do not dismiss a mutant that only more than one real domain or another world can see. Name the test that covers its behavior, for example a `dscheck` test or `test/linux_md`, or tell that no test covers it.
 - Put a test for a mutant in the group of its behavior, not in a group of mutants.
 - `make mutate-arm MUTANT=<id>` runs a suite with one mutant armed. It shows that a new test kills the mutant, and it refuses a dismissed mutant.
 

@@ -946,7 +946,7 @@ let deliver dom sg n =
               | (ws
                  [@mutate
                    off
-                     "the count is 1 or more after the add, and the give stops \
+                     "the count is 1 or more after the add, and [give] stops \
                       at the first commit, so the count is not 0 here"] )
                 when st.count = 0 ->
                   (resumed, ws)
