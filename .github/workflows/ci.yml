@@ -35,6 +35,33 @@ jobs:
       - name: Test
         run: nix develop -c dune runtest --force
 
+  # The mutation gate of a pull request (design section 2.17). make mutate
+  # tests the mutants on the lines that the pull request changes. It gives a
+  # failure if one of these mutants survives, and it passes if these lines
+  # have no mutant. The checkout is the merge of the pull request into its
+  # base branch, so the diff from the base branch has only the lines of the
+  # pull request. The base branch can be other than main, for example in a
+  # stack of pull requests.
+  mutation:
+    name: mutation (changed lines)
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      BASE_REF: ${{ github.base_ref }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      # With fetch-depth 0, the checkout fetches all branches. This step makes
+      # sure that the base branch is a remote ref, also without that behavior
+      # of the checkout.
+      - name: Fetch the base branch
+        run: git fetch --no-tags origin "+refs/heads/$BASE_REF:refs/remotes/origin/$BASE_REF"
+      - uses: cachix/install-nix-action@v31
+      - name: Test the mutants of the changed lines
+        run: nix develop -c make mutate BASE="origin/$BASE_REF"
+
   # FreeBSD in a VM. OCaml 5.5 and the test tools come from opam.
   freebsd:
     runs-on: ubuntu-24.04

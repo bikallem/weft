@@ -1695,6 +1695,15 @@ The known survivors of `make mutate-all`:
 | `process.ml`, `wait`: the `Ivar.read` branch | The mutant does more effects only in some seeds with more than one virtual domain. | None. Only a test with one fixed seed can see it. |
 | `weft_sim.ml`, the end of a run: the second `Gc.full_major` | Only a chain of finalisers needs it, and the number of GC cycles that a test needs depends on the runtime. | None. A test that counts GC cycles breaks with a change of the runtime. |
 
+**The mutation gate of a pull request.** The CI job `mutation (changed lines)` runs `make mutate BASE=origin/<base branch>` on each pull request. The base branch can be other than `main`, for example in a stack of pull requests. The checkout is the merge of the pull request into its base branch. Thus the diff from the base branch has only the lines of the pull request. These rules apply to the gate:
+
+- The gate is strict. It gives a failure if a mutant on a changed line survives. It has no `MIN_SCORE`.
+- A pull request that changes no line with a mutant passes, for example a change to a comment, a test or this document.
+- A change to the line of a known survivor puts that survivor in scope again, and the gate gives a failure. The author must examine the survivor with the rules of this section.
+- A mutant is on the line where its expression starts. A change to a later line of a long expression does not put the mutant in scope. `make mutate-all` finds such a survivor.
+
+On a machine with 16 CPUs, `make mutate` took 45 s for a change to a comment, 105 s for a change with 3 mutants that the tests kill, and 572 s for a change to the line of the `Gc.full_major` survivor. The last one gave exit status 2. The job has a limit of 90 minutes.
+
 **Two facts for M1.** I read them in the source of windtrap 0.2.0, but I did not do a test of them with domains:
 
 - The runner of windtrap can run tests on worker domains (`Domain.spawn` in `lib/workers.ml`). A test that calls `run ~domains:n` then has more domains than `n` in the process.
