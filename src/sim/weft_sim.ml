@@ -77,13 +77,12 @@ type conn =
   ; mutable peer: conn option  (** [None] after the peer closed. *)
   ; mutable eof: bool  (** The peer ended its send side. *)
   ; mutable shut: bool  (** This side ended its send side. *)
-  ; mutable reset: bool
-        (** A reset came: the next read with no data, or on TCP the next write,
-            gives [Reset]. *)
   ; mutable abort: bool  (** [Reset_on_close]: the close sends a reset. *)
   ; mutable err: Op.error option
-        (** [Sim.fault]: the next read with no data, or the next write, gives
-            this error one time. *)
+        (** The one error slot of the socket, as [SO_ERROR] on Linux: a reset
+            that came ([Some Reset]), or the error of [Sim.fault]. The next read
+            with no data, or the next write, gives this error one time. On a
+            Unix socket, a write gives [Broken_pipe] and keeps [Some Reset]. *)
   ; mutable lost: bool
         (** [Sim.fault] with an error that is not [Reset]: the link is lost. The
             data of the peer stays in flight, and a read of this side frees no
@@ -600,15 +599,13 @@ let read_conn t c buf off len =
     | None ->
         () ) ;
     Ok k )
-  else if Option.is_some c.err then (
-    let e = Option.get c.err in
-    c.err <- None ;
-    Error e )
-  else if c.reset then (
-    c.reset <- false ;
-    Error Op.Reset )
-  else if c.eof then Ok 0
-  else Error Op.Would_block
+  else
+    match c.err with
+    | Some e ->
+        c.err <- None ;
+        Error e
+    | None ->
+        if c.eof then Ok 0 else Error Op.Would_block
 
 (* The close of a socket or of an end of a pipe: the peer reads the end of the
    stream, and a write of the peer gives EPIPE. *)
@@ -623,16 +620,19 @@ let close_conn t c =
   | None ->
       ()
 
+(* A reset comes to [p]: [p] has the error [Reset], the end of the stream and no
+   peer. *)
+let take_reset n p =
+  p.err <- Some Op.Reset ;
+  p.eof <- true ;
+  p.peer <- None ;
+  edge n p.cfd ~read:true ~write:true
+
 (* The reset from [c] comes to [p] after the delay. If [p] has no peer at that
    time, after its own reset or a [Sim.fault], it ignores the reset, as a closed
    TCP socket ignores an RST. *)
 let send_reset t c p =
-  deliver t c p (fun () ->
-      if Option.is_some p.peer then (
-        p.reset <- true ;
-        p.eof <- true ;
-        p.peer <- None ;
-        edge t.net p.cfd ~read:true ~write:true ) )
+  deliver t c p (fun () -> if Option.is_some p.peer then take_reset t.net p)
 
 (* A reset from [c] to its peer, as on Linux. The peer reads the data that came
    before the reset. Then its next read with no data gives ECONNRESET, and later
@@ -659,13 +659,12 @@ let reset_conn t c =
    sends nothing, so it does not reset the connection. *)
 let write_conn t c buf off len =
   let n = t.net in
-  if Option.is_some c.err then (
+  (* On a Unix socket, a write gives EPIPE and keeps a reset for the next
+     read. *)
+  if Option.is_some c.err && (c.tcp || c.err <> Some Op.Reset) then (
     let e = Option.get c.err in
     c.err <- None ;
     Error e )
-  else if c.reset && c.tcp then (
-    c.reset <- false ;
-    Error Op.Reset )
   else if c.shut then Error Op.Broken_pipe
   else
     match c.peer with
@@ -852,7 +851,6 @@ let new_pipe n =
     ; peer= None
     ; eof= false
     ; shut= false
-    ; reset= false
     ; abort= false
     ; err= None
     ; lost= false
@@ -878,7 +876,6 @@ let new_sock ~tcp ~local remote =
   ; peer= None
   ; eof= false
   ; shut= false
-  ; reset= false
   ; abort= false
   ; err= None
   ; lost= false
@@ -1322,10 +1319,7 @@ let submit : type a. t -> a Op.t -> (a, Op.error) result =
                   | Some c when Option.is_some c.peer ->
                       (* The connection is established: it gets a reset, as from
                          [reset_conn]. *)
-                      c.reset <- true ;
-                      c.eof <- true ;
-                      c.peer <- None ;
-                      edge n c.cfd ~read:true ~write:true
+                      take_reset n c
                   | _ ->
                       (* The client has no peer after a [Sim.fault]. *)
                       () )
@@ -1921,14 +1915,8 @@ let fault t (fd : Net.t) e =
       | Some (Conn ({role= Sock; _} as c)) ->
           (* The socket has one slot for its error, as on Linux: the fault
              replaces an error that the socket did not give. *)
-          ( match e with
-          | Op.Reset ->
-              c.err <- None ;
-              c.reset <- true
-          | e ->
-              c.reset <- false ;
-              c.err <- Some e ;
-              c.lost <- true ) ;
+          c.err <- Some e ;
+          if e <> Op.Reset then c.lost <- true ;
           ( match c.peer with
           | Some p ->
               c.peer <- None ;
