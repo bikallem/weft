@@ -52,11 +52,11 @@ let files =
               let f = File.openfile [Read; Write; Create] "/f" in
               File.write f "abc" ;
               equal int 1
-                (File.pwrite f ~file_offset:100 (Bytes.of_string "x") 0 1) ;
-              let buf = Bytes.create 101 in
-              equal int 101 (File.pread f ~file_offset:0 buf 0 101) ;
+                (File.pwrite f ~file_offset:1000 (Bytes.of_string "x") 0 1) ;
+              let buf = Bytes.create 1001 in
+              equal int 1001 (File.pread f ~file_offset:0 buf 0 1001) ;
               equal string
-                ("abc" ^ String.make 97 '\000' ^ "x")
+                ("abc" ^ String.make 997 '\000' ^ "x")
                 (Bytes.to_string buf) ;
               File.close f ) )
     ; test "a truncate past the end gives zeros" (fun () ->
@@ -93,6 +93,22 @@ let jobs =
                       (submit
                          (Op.Start (0, Op.Pread (fd, Bytes.create 4, 0, 4, 0))) ) ) ;
                  ignore (submit (Op.Close fd)) ) ) )
+    ; test "a detach after the completion of an open closes its fd" (fun () ->
+          Sim.run (fun sim ->
+              let n0 = Sim.open_fds sim in
+              let id =
+                ok
+                  (submit (Op.Start (0, Op.Open ("/f", [O_read; O_create], 0))))
+              in
+              ok (submit (Op.Detach id)) ;
+              equal int n0 (Sim.open_fds sim) ) )
+    ; test "a Finish after a detach gives Model_error" (fun () ->
+          contains ~sub:"Finish of job"
+            (model_error (fun _ ->
+                 let j = Op.Stat "/" in
+                 let id = ok (submit (Op.Start (0, j))) in
+                 ok (submit (Op.Detach id)) ;
+                 ignore (submit (Op.Finish (id, j))) ) ) )
     ; test "a second Finish of a job gives Model_error" (fun () ->
           contains ~sub:"Finish of job"
             (model_error (fun _ ->

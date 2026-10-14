@@ -221,6 +221,15 @@ let world_error_of_domain_0 () =
     (function Failure m -> m = "the program sleeps forever" | _ -> false)
     (fun () -> run w (fun () -> sync (Ivar.read (Ivar.create ()))))
 
+(* After a run that ended with an error of the world, no run takes a fill from
+   outside. *)
+let no_fill_after_error () =
+  let w = Manual.make () in
+  raises_match
+    (function Failure _ -> true | _ -> false)
+    (fun () -> run w (fun () -> sync (Ivar.read (Ivar.create ())))) ;
+  is_false (Ivar.fill_from_outside (Ivar.create ()) 1)
+
 (* The minor words of one sync of [ev], on average. *)
 let words_of_sync ev =
   let w = Manual.make () in
@@ -272,6 +281,8 @@ let world =
         fill_from_outside_in_run
     ; test "after the end of run, a fill from outside gives false"
         no_fill_after_run
+    ; test "after an error of the world, a fill from outside gives false"
+        no_fill_after_error
     ; test "an error of the world on domain 0 goes to the caller"
         world_error_of_domain_0 ]
 

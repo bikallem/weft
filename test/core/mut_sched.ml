@@ -114,7 +114,9 @@ let pinned_expire_before_sleep () =
       Fiber.scope (fun s ->
           Fiber.fork ~pinned:true s (fun () -> Time.sleep Mono (Span.us 1300)) ) )
 
-(* A Register that the world refuses gives its error to the waiter. *)
+(* A Register that the world refuses gives its error to the waiter. The waiter
+   holds no user of the fd after the error, and its domain is not in the set of
+   the fd. *)
 let register_error () =
   let w = Manual.make () in
   Test_world.run w (fun () ->
@@ -122,6 +124,8 @@ let register_error () =
       raises
         (Net.Error (Other "no network", "Net"))
         (fun () -> Private.Event.sync (Private.Net.readable fd)) ;
+      is_true (Atomic.get fd.S.rc = S.Open 0) ;
+      equal int 0 (Atomic.get fd.S.doms) ;
       S.Fdtab.release fd )
 
 (* A fill from outside reaches its waiter while another fiber yields: the domain
