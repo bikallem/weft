@@ -184,6 +184,43 @@ let alarm_saturates () =
       sync (Time.at Mono (Clock.of_ns Mono (Int64.sub Int64.max_int 10L))) ) ;
   equal (list int64) [Int64.max_int] w.alarms
 
+(* [on_create] gets the scheduler before [main] starts. *)
+let on_create_runs_first () =
+  let w = Manual.make () and created = ref false in
+  is_true
+    (Private.run_world
+       ~on_create:(fun _ -> created := true)
+       (module Manual)
+       w
+       (fun () -> !created) )
+
+(* A finaliser runs outside a fiber. Its fill from outside reaches the run. *)
+let fill_from_outside_in_run () =
+  let w = Manual.make () in
+  equal string "gc"
+    (run w (fun () ->
+         let iv = Ivar.create () and filled = ref false in
+         let () =
+           let x = ref 1 in
+           Gc.finalise (fun _ -> filled := Ivar.fill_from_outside iv "gc") x
+         in
+         Gc.full_major () ;
+         is_true !filled ;
+         sync (Ivar.read iv) ) )
+
+(* After the end of [run], no run takes a fill from outside. *)
+let no_fill_after_run () =
+  let w = Manual.make () in
+  run w (fun () -> ()) ;
+  is_false (Ivar.fill_from_outside (Ivar.create ()) 1)
+
+(* An exception of the world in the loop of domain 0 goes to the caller. *)
+let world_error_of_domain_0 () =
+  let w = Manual.make () in
+  raises_match
+    (function Failure m -> m = "the program sleeps forever" | _ -> false)
+    (fun () -> run w (fun () -> sync (Ivar.read (Ivar.create ()))))
+
 let world =
   group "Weft.run"
     [ test "run gives the value of main" run_gives_value
@@ -204,7 +241,14 @@ let world =
     ; test ~timeout:5. "K1: a deadline between the poll and the sleep fires"
         expire_before_sleep
     ; test ~timeout:5. "C4: the alarm near the largest time saturates"
-        alarm_saturates ]
+        alarm_saturates
+    ; test "on_create gets the scheduler before main" on_create_runs_first
+    ; test "a fill from outside a fiber reaches the run"
+        fill_from_outside_in_run
+    ; test "after the end of run, a fill from outside gives false"
+        no_fill_after_run
+    ; test "an error of the world on domain 0 goes to the caller"
+        world_error_of_domain_0 ]
 
 (* Span *)
 
@@ -407,6 +451,44 @@ let utc_months () =
   is_false (ok (1900, 2, 29, 0, 0, 0, 0)) ;
   is_true (ok (2000, 2, 29, 0, 0, 0, 0))
 
+(* Each day of the range of [Clock.posix], against a slow reference: a walk of
+   the calendar one day at a time, from 1677-09-22. The walk crosses each era,
+   each century and each leap day of the algorithm. *)
+let utc_each_day () =
+  let leap y = y mod 4 = 0 && (y mod 100 <> 0 || y mod 400 = 0) in
+  let month_days y m =
+    match m with
+    | 2 ->
+        if leap y then 29 else 28
+    | 4 | 6 | 9 | 11 ->
+        30
+    | _ ->
+        31
+  in
+  let next (y, m, d, wd) =
+    let wd = (wd + 1) mod 7 in
+    if d < month_days y m then (y, m, d + 1, wd)
+    else if m < 12 then (y, m + 1, 1, wd)
+    else (y + 1, 1, 1, wd)
+  in
+  let date = ref (1677, 9, 22, 3) in
+  for days = -106_751 to 106_751 do
+    let y, m, d, wd = !date in
+    (* Noon of the day. *)
+    let secs = (days * 86400) + 43200 in
+    let u = utc (y, m, d, 12, 0, 0, wd) in
+    if Time.to_utc (posix secs) <> u then
+      fail (Printf.sprintf "to_utc differs from the walk at day %d" days) ;
+    ( match Time.of_utc u with
+    | Some t when Clock.to_ns Posix t = Clock.to_ns Posix (posix secs) ->
+        ()
+    | _ ->
+        fail (Printf.sprintf "of_utc differs from the walk at day %d" days) ) ;
+    if days = 0 then is_true ((y, m, d, wd) = (1970, 1, 1, 4)) ;
+    date := next !date
+  done ;
+  is_true (!date = (2262, 4, 12, 6))
+
 let utc_invalid () =
   let none f = Time.of_utc (utc f) = None in
   is_true (none (2026, 0, 1, 0, 0, 0, 0)) ;
@@ -442,6 +524,7 @@ let time =
     ; test "to_utc cuts the fraction of a second" utc_fraction
     ; test "to_utc: the months of a leap year and a common year" utc_months
     ; test "of_utc: a date out of range gives None" utc_invalid
+    ; test "to_utc and of_utc agree with a walk of each day" utc_each_day
     ; test "Time.now outside run raises Not_in_fiber" time_outside_fiber ]
 
 let tests = [world; span; time]
