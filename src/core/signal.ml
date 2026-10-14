@@ -51,7 +51,11 @@ let received s =
           ; result=
               (fun () ->
                 (* -1: an unwatch ended the watch while the fiber waited. *)
-                if !cell < 0 then invalid_arg not_watched else !cell ) } ) )
+                if
+                  ( !cell < 0 )
+                  [@mutate off "a commit gives -1 or a count of 1 or more"]
+                then invalid_arg not_watched
+                else !cell ) } ) )
 
 (* The world stops the watch first, so a signal that it reads later is not lost:
    [deliver] sends it again (design section 2.7, The end of a watch). *)
