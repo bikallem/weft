@@ -360,6 +360,81 @@ let last_notices seed =
     int 0
     (Sim.open_fds (Option.get !sim_of))
 
+(* A Wait resumes a fiber and brings a close notice. The domain takes the notice
+   before the fiber runs, so the fiber sees the fd closed. A pinned fiber
+   registers [xr] on domain 0 and waits on [pr]. A fiber that can run on domain
+   1 closes [xr], then writes to [pr]. It gives 1 if the fd of [xr] was open
+   when the reader woke. *)
+let notice_before_resume seed =
+  Sim.run ~seed ~domains:2 (fun sim ->
+      let xr, xw = Pipe.create () in
+      let pr, pw = Pipe.create () in
+      let registered = Atomic.make false in
+      let late = ref 0 in
+      Fiber.scope (fun s ->
+          Fiber.fork ~pinned:true s (fun () ->
+              ignore (Pipe.read xr (Bytes.create 1) 0 1) ;
+              Atomic.set registered true ;
+              let n0 = Sim.open_fds sim in
+              ignore (Pipe.read pr (Bytes.create 1) 0 1) ;
+              if Sim.open_fds sim <> n0 - 1 then late := 1 ) ;
+          Fiber.fork s (fun () ->
+              Time.sleep Mono (Span.ms 1) ;
+              Pipe.write xw "a" ;
+              while not (Atomic.get registered) do
+                Time.sleep Mono (Span.ms 1)
+              done ;
+              (* The time moves only when the reader waits on [pr]. *)
+              Time.sleep Mono (Span.ms 1) ;
+              Pipe.close xr ;
+              Pipe.write pw "b" ) ) ;
+      Pipe.close xw ;
+      Pipe.close pr ;
+      Pipe.close pw ;
+      !late )
+
+(* A close notice in the mailbox before a Wait: the domain takes it before the
+   Wait, so a later edge of the closed fd does not count in [edges]. With no
+   poll of a busy domain, a pinned fiber registers [xr] on domain 0 and yields
+   until a stop. A fiber on domain 1 writes to [xr] and closes it. It gives the
+   pair: the fiber ran on domain 1, and the count of edges on domain 0 after the
+   first write. *)
+let stale_edge seed =
+  let k = !S.k_poll in
+  S.k_poll := max_int ;
+  Fun.protect
+    ~finally:(fun () -> S.k_poll := k)
+    (fun () ->
+      Sim.run ~seed ~domains:2 (fun sim ->
+          let xr, xw = Pipe.create () in
+          let registered = Atomic.make false and stop = Atomic.make false in
+          let before = ref 0 and on1 = ref false in
+          let d0 () = (Sim.sched sim).S.doms.(0).S.stats.S.edges in
+          Fiber.scope (fun s ->
+              Fiber.fork ~pinned:true s (fun () ->
+                  ( try ignore (Pipe.read xr (Bytes.create 1) 0 1)
+                    with Net.Error _ -> () ) ;
+                  Atomic.set registered true ;
+                  while not (Atomic.get stop) do
+                    Fiber.yield ()
+                  done ) ;
+              Fiber.fork s (fun () ->
+                  Time.sleep Mono (Span.ms 1) ;
+                  Pipe.write xw "a" ;
+                  let dom () = S.prog "test" S.Dom_index in
+                  while (not (Atomic.get registered)) && dom () = 1 do
+                    Fiber.yield ()
+                  done ;
+                  on1 := Atomic.get registered && dom () = 1 ;
+                  before := d0 () ;
+                  Pipe.write xw "b" ;
+                  Pipe.close xr ;
+                  Atomic.set stop true ) ) ;
+          (* Each domain waits before the count. *)
+          Time.sleep Mono (Span.ms 1) ;
+          Pipe.close xw ;
+          (!on1, d0 () - !before) ) )
+
 let tests =
   [ group "scheduler details"
       [ test "a woken fiber goes to the next slot" woken_goes_next
@@ -396,4 +471,19 @@ let tests =
       ; test "a domain that looks for work finds a fork, with 20 seeds"
           (fun () -> seeds 20 forks_in_sequence )
       ; test "the last close notices close the fds, with 200 seeds" (fun () ->
-            seeds 200 last_notices ) ] ]
+            seeds 200 last_notices )
+      ; test "a close notice goes before the fiber of the same Wait, 200 seeds"
+          (fun () ->
+            let late = ref 0 in
+            seeds 200 (fun seed -> late := !late + notice_before_resume seed) ;
+            equal int 0 !late )
+      ; test "an edge after a close notice does not count, with 200 seeds"
+          (fun () ->
+            let hits = ref 0 and counted = ref 0 in
+            seeds 200 (fun seed ->
+                let on1, d = stale_edge seed in
+                if on1 then (
+                  incr hits ;
+                  counted := !counted + d ) ) ;
+            greater int ~than:0 !hits ;
+            equal int 0 !counted ) ] ]

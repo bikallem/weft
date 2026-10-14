@@ -148,6 +148,26 @@ let cancel_outside () =
     (function Fiber.Not_in_fiber _ -> true | _ -> false)
     (fun () -> Fiber.cancel (Option.get !sc) Exit)
 
+(* A handler of the user sees each effect that the fibers of its scope perform.
+   A fill with no waiter performs only [Self]: it resumes no fiber, so it
+   performs no [Enqueue]. *)
+let fill_effects () =
+  let n = ref 0 in
+  let handler =
+    { Fiber.handle=
+        (fun f ->
+          Effect.Deep.match_with f ()
+            { retc= Fun.id
+            ; exnc= raise
+            ; effc= (fun (type c) (_ : c Effect.t) -> incr n ; None) } ) }
+  in
+  Test_world.run (Manual.make ()) (fun () ->
+      Fiber.scope ~handler (fun _ ->
+          let iv = Ivar.create () in
+          let before = !n in
+          Ivar.fill iv () ;
+          equal int 1 (!n - before) ) )
+
 let tests =
   [ group "scheduler details"
       [ test "a drop takes the stale entries at the head" drop_stale
@@ -165,4 +185,5 @@ let tests =
       ; test "a Register that fails raises in the waiter" register_error
       ; test "a fill from outside reaches a waiter while a fiber yields"
           inject_while_busy
-      ; test "a cancel outside a fiber raises Not_in_fiber" cancel_outside ] ]
+      ; test "a cancel outside a fiber raises Not_in_fiber" cancel_outside
+      ; test "a fill with no waiter performs one effect" fill_effects ] ]

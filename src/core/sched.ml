@@ -1354,11 +1354,7 @@ let posix_alarm dom = Option.map (Clock.of_ns Posix) (alarm_of dom dom.pheap)
 (* A poll or a sleep. The time can pass after the last poll: if the mailbox or
    an expired entry made a fiber ready, the domain polls instead of a sleep. *)
 let wait dom timeout =
-  take_mail dom
-  [@mutate
-    off
-      "a close notice comes with a wake, so this wait ends at once, and the \
-       take after it gets the notice"] ;
+  take_mail dom ;
   expire dom ;
   flush_wake dom ;
   (* The expire can resume a pinned fiber on domain 0 with no wake. *)
@@ -1374,11 +1370,7 @@ let wait dom timeout =
     {World.Wait.timeout; deadline= alarm dom; posix_deadline= posix_alarm dom}
   in
   List.iter (on_ready dom) (World.perform "sched" (World.Wait (dom.index, w))) ;
-  take_mail dom
-  [@mutate
-    off
-      "the take at the start of the next wait gets the notice, and this domain \
-       does not sleep before that take"] ;
+  take_mail dom ;
   expire dom ;
   flush_wake dom
 
@@ -1643,15 +1635,7 @@ let all_count c = c lsr 32
 
 let self () = prog "Fiber.self" Self
 
-let enqueue = function
-  | ([]
-     [@mutate
-       off
-         "each caller is in a fiber, and an Enqueue of no fiber resumes \
-          nothing: only a marked wake can come earlier"] ) ->
-      ()
-  | l ->
-      prog "Fiber" (Enqueue l)
+let enqueue = function [] -> () | l -> prog "Fiber" (Enqueue l)
 
 (* Fill an Ivar and resume its waiters. *)
 let fill_resume iv v =

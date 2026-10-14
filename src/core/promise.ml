@@ -48,8 +48,8 @@ let rec start p inner =
       Atomic.set p.state (Running inner)
       [@mutate
         off
-          "a sync in a cancelled scope commits at once, so a second cancel \
-           does nothing"] ;
+          "cancel_node on a node that has its flag finds no cancellable sync \
+           that is not done"] ;
       Fiber.cancel inner Cancel_request
   | Running _ ->
       assert false (* Only the fiber of the promise starts it. *)

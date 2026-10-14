@@ -77,10 +77,17 @@ let spin_unlocks_on_raise () =
   raises Exit (fun () -> S.Spin.with_lock lock (fun () -> raise Exit)) ;
   equal int 1 (S.Spin.with_lock lock (fun () -> 1))
 
+(* The lock is held while [f] runs, and free after. *)
+let spin_held () =
+  let lock = S.Spin.make () in
+  is_true (S.Spin.with_lock lock (fun () -> Atomic.get lock)) ;
+  is_false (Atomic.get lock)
+
 let spin =
   group "spin lock"
     [ test "two domains do not enter the lock at the same time" spin_excludes
-    ; test "the lock is free after a raise" spin_unlocks_on_raise ]
+    ; test "the lock is free after a raise" spin_unlocks_on_raise
+    ; test "the lock is held while f runs" spin_held ]
 
 module Ring = Weft.Private.Ring
 
