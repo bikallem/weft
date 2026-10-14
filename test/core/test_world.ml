@@ -173,10 +173,14 @@ let one_seed_for_each_domain () =
   equal int 1 w.randoms
 
 (* K1: a deadline that passes between the poll and the sleep. The domain must
-   not sleep with the fiber in its queue. *)
-let expire_before_sleep () =
+   not sleep with the fiber in its queue. With [~pinned:true], the expire puts
+   the fiber in the pinned queue, and domain 0 must not sleep. *)
+let expire_before_sleep ~pinned () =
   let w = Manual.make ~tick:(us 400) () in
-  run ~slack:Span.zero w (fun () -> Time.sleep Mono (Span.us 1300))
+  let sleep () = Time.sleep Mono (Span.us 1300) in
+  run ~slack:Span.zero w (fun () ->
+      if pinned then Fiber.scope (fun s -> Fiber.fork ~pinned s sleep)
+      else sleep () )
 
 (* C4: the slack rounding of a deadline near the largest time saturates. *)
 let alarm_saturates () =
@@ -255,14 +259,6 @@ let base_needs_no_flatten () =
       (Printf.sprintf "a base sync allocates %.1f words, a choose %.1f" base
          choice )
 
-(* K1 with a pinned fiber: its deadline passes between the poll and the sleep.
-   The expire puts it in the pinned queue, and domain 0 must not sleep. *)
-let pinned_expire_before_sleep () =
-  let w = Manual.make ~tick:(us 400) () in
-  run ~slack:Span.zero w (fun () ->
-      Fiber.scope (fun s ->
-          Fiber.fork ~pinned:true s (fun () -> Time.sleep Mono (Span.us 1300)) ) )
-
 (* A Register that the world refuses gives its error to the waiter. The waiter
    holds no user of the fd after the error, and its domain is not in the set of
    the fd. *)
@@ -322,10 +318,10 @@ let world =
         idle_poll_finds_timer
     ; test "the world gives one seed for each domain" one_seed_for_each_domain
     ; test ~timeout:5. "K1: a deadline between the poll and the sleep fires"
-        expire_before_sleep
+        (expire_before_sleep ~pinned:false)
     ; test ~timeout:5.
         "K1: a pinned deadline between the poll and the sleep fires"
-        pinned_expire_before_sleep
+        (expire_before_sleep ~pinned:true)
     ; test "a Register that fails raises in the waiter" register_error
     ; test "a fill from outside reaches a waiter while a fiber yields"
         inject_while_busy

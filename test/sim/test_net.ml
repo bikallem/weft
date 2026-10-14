@@ -1481,9 +1481,9 @@ let other_ranges () =
           ignore (Net.read_now c b 0 0) ) ;
       raises (Invalid_argument "Net.write_now") (fun () ->
           ignore (Net.write_now c b 5 0) ) ;
-      let u = Net.udp ("mut_io", 1) in
+      let u = Net.udp ("io", 1) in
       raises (Invalid_argument "Net.sendto") (fun () ->
-          Net.sendto u b 5 0 ("mut_io", 1) ) ;
+          Net.sendto u b 5 0 ("io", 1) ) ;
       raises (Invalid_argument "Net.recvfrom") (fun () ->
           ignore (Net.recvfrom u b 0 0) ) ;
       let r, w = Pipe.create () in

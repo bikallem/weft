@@ -131,10 +131,10 @@ let stream_reader_yields () =
 let datagram_reader_yields () =
   with_yield_bytes 10 (fun () ->
       Sim.run (fun _ ->
-          let u1 = Net.udp ("mut_io", 2) and u2 = Net.udp ("mut_io", 3) in
+          let u1 = Net.udp ("io", 2) and u2 = Net.udp ("io", 3) in
           let buf = Bytes.create 1 in
           for _ = 1 to 50 do
-            Net.sendto u1 buf 0 0 ("mut_io", 3)
+            Net.sendto u1 buf 0 0 ("io", 3)
           done ;
           Time.sleep Mono (Span.ms 1) ;
           let n =
