@@ -1563,9 +1563,7 @@ let tests =
       ; test "a Register of a ready fd gives an edge at once" register_ready_fd
       ; test "a listener that closes resets the connections in its backlog"
           reset_by_listener
-      ; test
-          "a listener that closes refuses a connect in flight, and the connect \
-           closes its socket"
+      ; test "a listener that closes refuses a connect in flight"
           refused_while_connecting
       ; test "a loop of readable and read_now does not spin with extra edges"
           read_now_no_spin
