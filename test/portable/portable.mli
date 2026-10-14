@@ -70,3 +70,9 @@ val error_of : (unit -> 'a) -> string
 
 val host_port : Weft.Net.t -> string * int
 (** The local host and port of a TCP or UDP socket. *)
+
+val with_default_sigint : (unit -> 'a) -> 'a
+(** [with_default_sigint f] runs [f] with the default action of SIGINT, and then
+    restores the old action. A shell starts a background job with SIGINT
+    ignored, and a child inherits this action. A test that spawns a child that
+    must end by SIGINT uses it. *)

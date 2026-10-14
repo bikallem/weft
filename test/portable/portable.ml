@@ -706,6 +706,9 @@ let unwatch_helper () =
   | None ->
       skip ~reason:"WEFT_UNWATCH is not set" ()
 
+(* A shell starts a background job with SIGINT ignored, and a child inherits
+   this action. Thus the test gives SIGINT its default action for the time of
+   the spawn. *)
 let with_default_sigint f =
   let old = Sys.signal Sys.sigint Sys.Signal_default in
   Fun.protect ~finally:(fun () -> Sys.set_signal Sys.sigint old) f

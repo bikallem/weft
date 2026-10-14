@@ -83,15 +83,8 @@ let child_fast_exit () =
         is_true (Process.wait p = Process.Exited 0)
       done )
 
-(* A shell starts a background job with SIGINT ignored, and a child inherits
-   this action. Thus the test gives SIGINT its default action for the time of
-   the spawn. *)
-let with_default_sigint f =
-  let old = Sys.signal Sys.sigint Sys.Signal_default in
-  Fun.protect ~finally:(fun () -> Sys.set_signal Sys.sigint old) f
-
 let child_kill () =
-  with_default_sigint (fun () ->
+  Portable.with_default_sigint (fun () ->
       Weft_kqueue.run ~domains:1 (fun () ->
           let p = Process.spawn "sleep" ["10"] in
           Time.sleep Mono (Span.ms 20) ;
