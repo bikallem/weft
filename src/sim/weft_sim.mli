@@ -40,7 +40,7 @@ val run :
     timers and the faults also run on this thread. Thus a process can call
     [Unix.fork] before, between and after runs, for example a tool that forks
     one process for each mutant. OCaml 5 refuses [Unix.fork] after a
-    [Domain.spawn], also after its [Domain.join], so other code of the process
+    [Domain.spawn], also after its [Domain.join]. Thus other code of the process
     must not start a domain, for example [Weft_linux.run] with more than one
     domain.
 
@@ -123,7 +123,7 @@ val set_fd_limit : t -> int option -> unit
     [Net.accept], [Net.udp], [File.openfile], [Dir.readdir] (1 fd),
     [Pipe.create] (2 fds) and [Process.spawn] (1 fd, and 2 fds for each
     [Piped]). [Dir.readdir] closes its fd at the end, as [opendir] on Linux. As
-    on Linux, [accept] gives the error also with an empty backlog, it leaves the
+    on Linux, [accept] gives the error also with an empty backlog. It leaves the
     connection in the backlog, and the listener gets no new edge. [None] (the
     default) removes the limit. A limit below {!open_fds} closes no fd. To make
     the next [accept] fail, set the limit to {!open_fds}.
@@ -226,6 +226,8 @@ exception Deadlock of string list
 (** The problems that the check found. *)
 exception Lost_wakeup of string list
 
+(** The program broke the order of the OS, for example a close(2) before a
+    Deregister. *)
 exception Model_error of string
 
 (** The fibers that are not parked. *)

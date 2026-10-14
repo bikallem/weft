@@ -17,8 +17,9 @@ val create : ?domains:int -> ?signals:Weft.Signal.t list -> unit -> t
     [create] writes a warning to [stderr] for each thread that does not block
     them, because the OS can give a signal to that thread. [close] restores the
     mask. [Signal.unwatch] removes a signal from the signalfd and unblocks it in
-    the thread of the domain that calls it. SIGPIPE is ignored, so a write with
-    no reader gives EPIPE.
+    the thread of the domain that calls it. The thread of [run] (domain 0) also
+    unblocks it at its next wait. SIGPIPE is ignored, so a write with no reader
+    gives EPIPE.
 
     @raise Invalid_argument
       if [~signals] is not empty and another world of the process watches

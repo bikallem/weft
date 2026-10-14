@@ -192,8 +192,8 @@ module Fiber : sig
   (** The id of the fiber that calls it. The body of [scope], [shield] and
       [with_timeout] runs in the fiber of the caller, so it has the id of the
       caller. Each [fork] makes a new fiber with a new id, also [fork_promise].
-      For example, a writer fiber can keep its id, and a function can then
-      refuse a call from that fiber that waits for the end of the writer.
+      For example, a writer fiber can keep its id. A function can then refuse a
+      call from that fiber that waits for the end of the writer.
 
       @raise Not_in_fiber outside a fiber. *)
 
@@ -293,7 +293,7 @@ module Fiber : sig
         [choose] selects one of the two ready branches at random. *)
 
     val release : t -> unit
-    (** Returns one permit to the semaphore: to the oldest waiter, or to the
+    (** Gives one permit back to the semaphore: to the oldest waiter, or to the
         free permits.
 
         @raise Invalid_argument
@@ -558,9 +558,11 @@ module Net : sig
   val read_now : t -> bytes -> int -> int -> int option
   (** [read_now t buf off len] does one read with no wait. It gives [None] if no
       byte is ready, [Some 0] at the end of the stream, and [Some n] if it read
-      [n] bytes. After [None], the next [readable] waits for a new event of the
-      OS. An event can be stale, so read again, and on [None] wait again. Use it
-      after [readable] in a [choose], so that a stale event does not block.
+      [n] bytes. On a UDP socket, [Some 0] is an empty datagram, as for [read]
+      (see [udp]). After [None], the next [readable] waits for a new event of
+      the OS. An event can be stale, so read again, and on [None] wait again.
+      Use it after [readable] in a [choose], so that a stale event does not
+      block.
 
       @raise Invalid_argument if [len < 1] or the range is not in [buf]. *)
 
