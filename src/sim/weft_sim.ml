@@ -950,6 +950,38 @@ let spawn t (sp : Op.spawn) =
         ; from_stdout= fd from_stdout
         ; from_stderr= fd from_stderr }
 
+(* The numbers of the named signals on Linux. *)
+let linux_numbers =
+  Op.
+    [ (1, SIGHUP)
+    ; (2, SIGINT)
+    ; (3, SIGQUIT)
+    ; (4, SIGILL)
+    ; (6, SIGABRT)
+    ; (7, SIGBUS)
+    ; (8, SIGFPE)
+    ; (9, SIGKILL)
+    ; (10, SIGUSR1)
+    ; (11, SIGSEGV)
+    ; (12, SIGUSR2)
+    ; (13, SIGPIPE)
+    ; (14, SIGALRM)
+    ; (15, SIGTERM)
+    ; (17, SIGCHLD)
+    ; (18, SIGCONT)
+    ; (19, SIGSTOP)
+    ; (20, SIGTSTP)
+    ; (28, SIGWINCH) ]
+
+(* The normal form of a signal, with the numbers of Linux: [Other_signal 10] is
+   [SIGUSR1]. The Linux and kqueue worlds do the same with [signal_of (number_of
+   s)]. The simulator cannot use their code, because it comes from C. *)
+let normal = function
+  | Op.Other_signal n as sg ->
+      Option.value (List.assoc_opt n linux_numbers) ~default:sg
+  | sg ->
+      sg
+
 (* The signals with a default action that does not end the process: a stop, a
    continue or an ignore. 21, 22 and 23 are SIGTTIN, SIGTTOU and SIGURG on
    Linux. The simulator has no stop of a process. The signal 0 only tells that
@@ -969,6 +1001,7 @@ let no_end = function
    Domain 0 gets a watched signal at its next [Wait]. Each other signal gets the
    default action, and the world ignores SIGPIPE. *)
 let send_self t sg =
+  let sg = normal sg in
   if List.mem sg t.watched then
     t.net.edges <- (0, World.Ready.Signal (sg, 1)) :: t.net.edges
   else if not (sg = Op.SIGPIPE || no_end sg) then t.killed <- Some sg
@@ -1183,26 +1216,29 @@ let submit : type a. t -> a Op.t -> (a, Op.error) result =
     | None ->
         Error Op.Bad_fd )
   | Op.Kill (fd, sg) -> (
-    match Hashtbl.find_opt n.fds fd with
-    | Some (Pfd p) ->
-        ( match (p.status, sg) with
-        | Some _, _ ->
-            ()
-        | None, _ when no_end sg ->
-            ()
-        | None, _ when sg <> Op.SIGKILL && List.mem sg p.prog.ignores ->
-            ()
-        | None, _ ->
-            exit_proc t fd p (Op.Signaled sg) ) ;
-        Ok ()
-    | Some _ ->
-        Error (Op.Other "EINVAL")
-    | None ->
-        Error Op.Bad_fd )
+      let sg = normal sg in
+      match Hashtbl.find_opt n.fds fd with
+      | Some (Pfd p) ->
+          ( match (p.status, sg) with
+          | Some _, _ ->
+              ()
+          | None, _ when no_end sg ->
+              ()
+          | None, _ when sg <> Op.SIGKILL && List.mem sg p.prog.ignores ->
+              ()
+          | None, _ ->
+              exit_proc t fd p (Op.Signaled sg) ) ;
+          Ok ()
+      | Some _ ->
+          Error (Op.Other "EINVAL")
+      | None ->
+          Error Op.Bad_fd )
   | Op.Watch sg ->
+      let sg = normal sg in
       if List.mem sg t.watched then Ok sg
       else Error (Op.Other "the world does not watch this signal")
   | Op.Unwatch sg ->
+      let sg = normal sg in
       if List.mem sg t.watched then (
         t.watched <- List.filter (fun x -> x <> sg) t.watched ;
         Ok sg )
@@ -1676,7 +1712,7 @@ let run ?(seed = 0) ?(domains = 1) ?(auto = true) ?(signals = [])
     ; blocking_cost= 0L
     ; dns= Hashtbl.create ~random:false 8
     ; programs= Hashtbl.create ~random:false 8
-    ; watched= signals
+    ; watched= List.map normal signals
     ; killed= None
     ; fills= Atomic.make []
     ; refused_fill= Atomic.make false
@@ -1911,7 +1947,10 @@ let set_blocking_cost t span =
 let set_dns t name answer = Hashtbl.replace t.dns name answer
 
 let program ?runs ?(code = 0) ?(output = "") ?(ignores = []) () =
-  {runs= Option.map Weft.Span.to_ns runs; code; output; ignores}
+  { runs= Option.map Weft.Span.to_ns runs
+  ; code
+  ; output
+  ; ignores= List.map normal ignores }
 
 let add_program t name f = Hashtbl.replace t.programs name f
 
@@ -1919,7 +1958,7 @@ let add_program t name f = Hashtbl.replace t.programs name f
    once: [send_self] sets [killed] in the [Resend] of a world effect, and the
    step that answers the effect raises [Killed]. *)
 let signal t sg =
-  if List.mem sg t.watched then send_self t sg
+  if List.mem (normal sg) t.watched then send_self t sg
   else ignore (World.perform "Sim.signal" (World.Submit (Op.Resend sg)))
 
 let addr _ s =

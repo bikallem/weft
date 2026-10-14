@@ -559,6 +559,39 @@ let unwatch =
               Sim.signal sim (Other_signal 21) ;
               Sim.signal sim (Other_signal 23) ;
               Time.sleep Mono (Span.ms 1) ) )
+    ; test "a signal number is the signal with its Linux name" (fun () ->
+          (* SIGPIPE, SIGCHLD and SIGWINCH do not end the run. *)
+          Sim.run (fun sim ->
+              Sim.signal sim (Other_signal 13) ;
+              Sim.signal sim (Other_signal 17) ;
+              Sim.signal sim (Other_signal 28) ;
+              Time.sleep Mono (Span.ms 1) ) ;
+          (* SIGUSR1 is 10, for a watch, an event and an unwatch. *)
+          Sim.run ~signals:[SIGUSR1; Other_signal 12] (fun sim ->
+              Sim.signal sim (Other_signal 10) ;
+              equal int 1 (sync (Signal.received SIGUSR1)) ;
+              Sim.signal sim SIGUSR2 ;
+              equal int 1 (sync (Signal.received (Other_signal 12))) ;
+              Signal.unwatch (Other_signal 10) ;
+              Signal.unwatch SIGUSR2 ) ;
+          (* The signal of the end of the run has its name. *)
+          raises (Sim.Killed SIGTERM) (fun () ->
+              Sim.run (fun sim -> Sim.signal sim (Other_signal 15)) ) ;
+          (* A fake program that ignores SIGTERM also ignores signal 15, and
+             signal 9 ends it as SIGKILL. *)
+          Sim.run (fun sim ->
+              Sim.add_program sim "p" (fun _ ->
+                  Sim.program ~ignores:[Other_signal 15] () ) ;
+              let p = Process.spawn "p" [] in
+              Process.kill p SIGTERM ;
+              Process.kill p (Other_signal 17) ;
+              Time.sleep Mono (Span.ms 1) ;
+              is_true
+                (sync
+                   (choose
+                      [wrap (Process.exited p) (fun _ -> false); always true] ) ) ;
+              Process.kill p (Other_signal 9) ;
+              equal string "SIGKILL" (status_text (Process.wait p)) ) )
     ; test "an unwatch of a signal that is not watched raises" (fun () ->
           Sim.run (fun _ ->
               raises

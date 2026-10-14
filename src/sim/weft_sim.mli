@@ -19,7 +19,9 @@ val run :
     that continues at each world effect. With [~auto:true] (the default), the
     time moves to the next deadline at each quiescence. With [~auto:false], only
     {!advance_until} moves the time. [~signals] are the signals that the program
-    watches, as for [Weft_linux.run ~signals]: none by default.
+    watches, as for [Weft_linux.run ~signals]: none by default. The simulator
+    uses the signal numbers of Linux: [Other_signal 10] is [SIGUSR1] in each
+    function of the simulator and in [Signal].
 
     [~outside_fills:true] accepts [Ivar.fill_from_outside]. The simulator gives
     each such fill at the next quiescence. The GC selects when a finaliser runs,
