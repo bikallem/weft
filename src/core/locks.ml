@@ -259,25 +259,24 @@ module Semaphore = struct
      maximum. *)
   let give t =
     Spin.with_lock t.slock (fun () ->
-        let rec first = function
-          | [] ->
+        let rec first () =
+          match Chan.pop t.waiters with
+          | None ->
               None
-          | (o : unit Chan.offer) :: rest -> (
+          | Some (o : unit Chan.offer) -> (
             match C.notify o.osync.word o.obranch with
             | C.Resume ->
-                Some (rest, [o.osync])
+                Some [o.osync]
             | C.In_scan ->
-                Some (rest, [])
+                Some []
             | C.Lost _ ->
-                first rest )
+                first () )
         in
-        match first (Chan.offers t.waiters) with
-        | Some (rest, resumed) ->
-            Atomic.set t.waiters.front rest ;
+        match first () with
+        | Some resumed ->
             Some resumed
         | None ->
             (* Each offer was stale. *)
-            Atomic.set t.waiters.front [] ;
             let n = Atomic.get t.free in
             if n >= t.max then None
             else (

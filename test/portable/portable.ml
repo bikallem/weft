@@ -1583,6 +1583,32 @@ let semaphores w =
                   Sem.release s ; List.iter Promise.await ps ) ;
               equal (list int) [1; 2; 3; 4; 5] (Log.get log) ;
               all_free s 1 ) )
+    ; test "the FIFO order stays when waiters come after a release" (fun () ->
+          w.run (fun () ->
+              let s = Sem.create 1 in
+              is_true (Sem.try_acquire s) ;
+              Fiber.scope (fun sc ->
+                  let wait () =
+                    fork_parked sc (fun () -> sync (Sem.acquire s))
+                  in
+                  (* Give one permit, then make sure that the waiter [p] gets
+                     it. If a different waiter gets it, [p] waits and the
+                     timeout stops the test. *)
+                  let next p =
+                    Sem.release s ;
+                    Fiber.with_timeout Mono (Span.ms 1000) (fun () ->
+                        Promise.await p )
+                  in
+                  let p1 = wait () in
+                  let p2 = wait () in
+                  let p3 = wait () in
+                  next p1 ;
+                  (* Waiters 2 and 3 are older than waiters 4 and 5. *)
+                  let p4 = wait () in
+                  let p5 = wait () in
+                  List.iter next [p2; p3; p4; p5] ) ;
+              (* Each waiter holds its permit. *)
+              equal bool false (Sem.try_acquire s) ) )
     ; test "a cancel of a waiter gives the permit to the next waiter" (fun () ->
           w.run (fun () ->
               let s = Sem.create 1 and log = Log.create () in

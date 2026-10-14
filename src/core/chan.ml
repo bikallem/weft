@@ -37,6 +37,21 @@ let offers side =
       Atomic.set side.back [] ) ;
   Atomic.get side.front
 
+(* Remove the oldest offer and give it. [back] goes to [front] only when [front]
+   is empty. Thus each offer moves one time, and a pop costs O(1) on average. *)
+let rec pop side =
+  match Atomic.get side.front with
+  | o :: rest ->
+      Atomic.set side.front rest ; Some o
+  | [] -> (
+    match Atomic.get side.back with
+    | [] ->
+        None
+    | back ->
+        Atomic.set side.front (List.rev back) ;
+        Atomic.set side.back [] ;
+        pop side )
+
 let add side o =
   Atomic.set side.back (o :: Atomic.get side.back) ;
   side.len <- side.len + 1 ;
