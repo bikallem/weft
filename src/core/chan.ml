@@ -86,16 +86,33 @@ let rec meet dom s l ~commit =
         (l, true) )
 
 (* The leaf of one side. [move o] moves the value between the own cell and the
-   cell of the partner [o]. *)
+   cell of the partner [o]. The scan takes the offers in the order of [offers],
+   but it does not copy the queue: it scans [front] first, and [back] only if no
+   partner in [front] stops the scan. After a scan of [front] that does not
+   stop, [rest] holds only the offers of the own sync, so it is short. Thus a
+   send or a recv costs O(1) on average, not O(N) in the offers. *)
 let leaf c ~mine ~other ~cell ~move : leaf =
  fun dom s i ->
   Spin.with_lock c.lock (fun () ->
-      let rest, stop =
-        meet dom s (offers other) ~commit:(fun o ->
-            C.claim s.word i o.osync.word o.obranch ~on_commit:(fun () ->
-                move o ) )
+      let commit o =
+        C.claim s.word i o.osync.word o.obranch ~on_commit:(fun () -> move o)
       in
-      Atomic.set other.front rest ;
+      let rest, stop = meet dom s (Atomic.get other.front) ~commit in
+      let stop =
+        if stop then (
+          Atomic.set other.front rest ;
+          true )
+        else
+          match Atomic.get other.back with
+          | [] ->
+              Atomic.set other.front rest ;
+              false
+          | back ->
+              let rest2, stop = meet dom s (List.rev back) ~commit in
+              Atomic.set other.front (rest @ rest2) ;
+              Atomic.set other.back [] ;
+              stop
+      in
       if not stop then add mine {osync= s; obranch= i; cell} )
 
 let send c v =

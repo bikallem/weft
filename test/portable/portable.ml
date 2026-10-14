@@ -1675,6 +1675,31 @@ let fork_parked sc f =
   done ;
   p
 
+(* The receivers of a channel get the values in the order in which they started
+   to wait (FIFO), also when receivers come after a send. Then the queue has
+   offers in its two lists. If a different receiver gets a value, the receiver
+   [p] waits, and the timeout stops the test. *)
+let chan_order w =
+  test "the receivers of a channel get the values in FIFO order" (fun () ->
+      w.run (fun () ->
+          let c = Chan.create () in
+          Fiber.scope (fun sc ->
+              let wait () = fork_parked sc (fun () -> sync (Chan.recv c)) in
+              let next p v =
+                sync (Chan.send c v) ;
+                equal int v
+                  (Fiber.with_timeout Mono (Span.ms 1000) (fun () ->
+                       Promise.await p ) )
+              in
+              let p1 = wait () in
+              let p2 = wait () in
+              let p3 = wait () in
+              next p1 1 ;
+              (* Receivers 2 and 3 are older than receivers 4 and 5. *)
+              let p4 = wait () in
+              let p5 = wait () in
+              List.iteri (fun i p -> next p (i + 2)) [p2; p3; p4; p5] ) ) )
+
 let semaphores w =
   group "semaphores"
     [ test "a semaphore lets at most n fibers in at a time" (fun () ->
@@ -2478,6 +2503,7 @@ let tests w =
   [ group w.name
       ( [ events w
         ; chans w
+        ; chan_order w
         ; scopes w
         ; net w
         ; now_and_reset w
