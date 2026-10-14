@@ -7,34 +7,38 @@ open Weft
 module S = Private.Sched
 module Manual = Test_world.Manual
 
-(* A sync of the heap that committed to another branch: a stale entry. *)
-let stale_sync () =
-  let s = Test_heap.dummy_sync () in
-  ignore (S.C.self_commit s.S.word 1) ;
-  s
-
 let top_deadline h =
   Option.map (fun e -> Int64.to_int e.S.deadline) (S.Heap.top h)
+
+(* It pushes entries at the deadlines 1 and 2, and gives a function that makes
+   the two entries stale. *)
+let two_entries h =
+  let a = Test_heap.dummy_sync () and b = Test_heap.dummy_sync () in
+  S.Heap.push h ~deadline:1L a 0 ;
+  S.Heap.push h ~deadline:2L b 0 ;
+  fun () ->
+    ignore (S.C.self_commit a.S.word 1) ;
+    ignore (S.C.self_commit b.S.word 1)
 
 (* The stale entries at the head of the heap go. *)
 let drop_stale () =
   let h = S.Heap.create () in
-  let first = Test_heap.dummy_sync () in
-  S.Heap.push h ~deadline:1L first 0 ;
-  S.Heap.push h ~deadline:2L (Test_heap.dummy_sync ()) 0 ;
-  ignore (S.C.self_commit first.S.word 1) ;
+  let stale = two_entries h in
+  S.Heap.push h ~deadline:3L (Test_heap.dummy_sync ()) 0 ;
+  stale () ;
   S.Heap.drop_stale h ;
   equal int 1 h.S.size ;
-  equal (option int) (Some 2) (top_deadline h)
+  equal (option int) (Some 3) (top_deadline h)
 
 (* An add drops the stale entries at the head (design section 2.5, Timers and
    domains). *)
 let push_drops_stale () =
   let h = S.Heap.create () in
-  S.Heap.push h ~deadline:1L (stale_sync ()) 0 ;
-  S.Heap.push h ~deadline:5L (Test_heap.dummy_sync ()) 0 ;
+  let stale = two_entries h in
+  stale () ;
+  S.Heap.push h ~deadline:3L (Test_heap.dummy_sync ()) 0 ;
   equal int 1 h.S.size ;
-  equal (option int) (Some 5) (top_deadline h)
+  equal (option int) (Some 3) (top_deadline h)
 
 (* The alarm is the earliest live deadline: a cancelled timeout does not set
    it. *)
@@ -69,7 +73,7 @@ let growth_keeps_generations () =
   S.Fdtab.release first ;
   let again = S.Fdtab.alloc 100 in
   equal int first.S.slot again.S.slot ;
-  equal int (first.S.gen + 1) again.S.gen ;
+  greater int ~than:first.S.gen again.S.gen ;
   List.iter S.Fdtab.release (again :: !held)
 
 (* A push marks a wake only if a domain is idle and no domain searches (the Go

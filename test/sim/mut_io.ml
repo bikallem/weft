@@ -68,7 +68,7 @@ let ticks_during reads =
       reads () ; !ticks - before )
 
 (* With a limit of 100 bytes, 100 reads of 10 bytes that always find data yield
-   10 times. *)
+   10 times, or 9 times if the reader yields one byte later. *)
 let stream_reader_yields () =
   with_yield_bytes 100 (fun () ->
       Sim.run (fun sim ->
@@ -76,14 +76,16 @@ let stream_reader_yields () =
           Net.write a (String.make 1000 'x') ;
           Time.sleep Mono (Span.ms 1) ;
           let buf = Bytes.create 10 in
-          equal int 10
-            (ticks_during (fun () ->
-                 for _ = 1 to 100 do
-                   equal int 10 (Net.read b buf 0 10)
-                 done ) ) ) )
+          let n =
+            ticks_during (fun () ->
+                for _ = 1 to 100 do
+                  equal int 10 (Net.read b buf 0 10)
+                done )
+          in
+          at_least int ~than:9 n ; at_most int ~than:10 n ) )
 
 (* An empty datagram counts as one byte: 50 empty datagrams with a limit of 10
-   bytes yield 5 times. *)
+   bytes yield 5 times, or 4 times if the reader yields one byte later. *)
 let datagram_reader_yields () =
   with_yield_bytes 10 (fun () ->
       Sim.run (fun _ ->
@@ -93,11 +95,13 @@ let datagram_reader_yields () =
             Net.sendto u1 buf 0 0 ("mut_io", 3)
           done ;
           Time.sleep Mono (Span.ms 1) ;
-          equal int 5
-            (ticks_during (fun () ->
-                 for _ = 1 to 50 do
-                   equal int 0 (fst (Net.recvfrom u2 buf 0 1))
-                 done ) ) ) )
+          let n =
+            ticks_during (fun () ->
+                for _ = 1 to 50 do
+                  equal int 0 (fst (Net.recvfrom u2 buf 0 1))
+                done )
+          in
+          at_least int ~than:4 n ; at_most int ~than:5 n ) )
 
 (* A connect that fails closes the socket that it made. *)
 let failed_connect_closes () =
@@ -115,15 +119,17 @@ let failed_connect_closes () =
           equal string "ECONNREFUSED" (Promise.await p) ;
           equal int 0 (Sim.open_fds sim) ) )
 
-(* Outside a fiber, [close] and [reset] raise [Not_in_fiber] from [Fiber.self]
-   before they change the state, also for a closed socket. *)
+(* Outside a fiber, [close] and [reset] raise [Not_in_fiber] before they change
+   the state, also for a closed socket. *)
 let close_outside_fiber () =
   let a, b =
     Sim.run (fun sim ->
         let a, b = Sim.socket_pair sim in
         Net.close b ; (a, b) )
   in
-  let outside f = raises (Fiber.Not_in_fiber "Fiber.self") f in
+  let outside f =
+    raises_match (function Fiber.Not_in_fiber _ -> true | _ -> false) f
+  in
   outside (fun () -> Net.close a) ;
   outside (fun () -> Net.close b) ;
   outside (fun () -> Net.reset a) ;

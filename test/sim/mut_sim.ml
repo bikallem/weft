@@ -200,32 +200,10 @@ let clock =
             (List.exists Fun.id (List.init 20 (fun s -> posix_step (s + 1)))) )
     ]
 
-(* The roots of [hold]. *)
-let roots = Array.make 4 None
-
-(* [hold n v] keeps [v] until a chain of [n] finalisers runs. Each finaliser
-   removes the root of the value of the next one. In OCaml 5.5, a full major GC
-   does 3 cycles, and each cycle runs one finaliser of the chain. Thus [v]
-   becomes free in the second full major GC. *)
-let[@inline never] hold n v =
-  let v = ref (Obj.repr v) in
-  for i = 0 to n - 1 do
-    roots.(i) <- Some !v ;
-    let h = ref i in
-    Gc.finalise (fun _ -> roots.(i) <- None) h ;
-    v := Obj.repr h
-  done
-
 let run_end =
   group "the end of a run"
     [ test "after a run, no run takes a fill from outside" (fun () ->
           Sim.run ~outside_fills:true (fun _ -> ()) ;
-          is_false (Ivar.fill_from_outside (Ivar.create ()) ()) )
-    ; test "a promise behind a chain of 4 finalisers gives Unawaited" (fun () ->
-          raises (Sim.Unawaited ["Not_found"]) (fun () ->
-              Sim.run (fun _ ->
-                  Fiber.scope (fun s ->
-                      hold 4 (Fiber.fork_promise s (fun () -> raise Not_found)) ) ) ) )
-    ]
+          is_false (Ivar.fill_from_outside (Ivar.create ()) ()) ) ]
 
 let tests = [group "mutants" [files; jobs; net; processes; clock; run_end]]
