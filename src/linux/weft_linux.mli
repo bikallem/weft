@@ -18,7 +18,12 @@ val create : ?domains:int -> ?signals:Weft.Signal.t list -> unit -> t
     them, because the OS can give a signal to that thread. [close] restores the
     mask. [Signal.unwatch] removes a signal from the signalfd and unblocks it in
     the thread of the domain that calls it. SIGPIPE is ignored, so a write with
-    no reader gives EPIPE. *)
+    no reader gives EPIPE.
+
+    @raise Invalid_argument
+      if [~signals] is not empty and another world of the process watches
+      signals: only one world at a time can watch signals. [close] releases the
+      claim. *)
 
 val close : t -> unit
 (** [close t] stops the thread pools, closes the fds of the world and restores

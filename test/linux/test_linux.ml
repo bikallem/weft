@@ -908,6 +908,17 @@ let zero_write () =
       equal int 0 (Net.write_sub c chunk 0 0) ;
       List.iter Net.close [c; s; l] )
 
+(* Only one world at a time can watch signals, as on kqueue. A world with no
+   signals does not need the claim. *)
+let one_signal_world () =
+  Weft_linux.run ~domains:1 ~signals:[SIGUSR1] (fun () ->
+      raises
+        (Invalid_argument "Weft_linux.create: another world watches signals")
+        (fun () -> ignore (Weft_linux.create ~signals:[SIGUSR2] ()) ) ;
+      Weft_linux.close (Weft_linux.create ()) ) ;
+  (* After the close, a new world can watch signals. *)
+  Weft_linux.close (Weft_linux.create ~signals:[SIGUSR2] ())
+
 let linux =
   group "linux"
     [ test "a Unix domain socket echoes" unix_socket
@@ -949,6 +960,7 @@ let linux =
     ; test ~timeout:30. "after Signal.unwatch, SIGINT ends a busy process"
         unwatch_busy
     ; test "a waiter at Signal.unwatch raises" unwatch_waiter
+    ; test "only one world at a time watches signals" one_signal_world
     ; test "a finaliser fills an Ivar from outside a fiber" finaliser_fill
     ; test "a failed promise that nobody awaits gives a report" promise_report
     ; test "the watchdog reports a fiber that computes 200 ms" watchdog

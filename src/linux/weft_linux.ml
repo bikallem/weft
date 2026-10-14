@@ -124,46 +124,64 @@ let unblocked_numbers sigs =
 
 let unblocked_threads sigs = unblocked_numbers (List.map number_of sigs)
 
+(* [true] while a world with [~signals] is open. With two such worlds, each
+   signal goes to one of the two signalfds, and an unwatch in one world unblocks
+   the signal in a thread that the other world uses. The kqueue world has the
+   same rule. *)
+let signal_world = Atomic.make false
+
 (* A write to a pipe with no reader then gives EPIPE (design section 2.7,
    Signals). The signals of [~signals] are blocked in the calling thread before
-   any other thread of the world starts, so each thread copies the mask. *)
+   any other thread of the world starts, so each thread copies the mask. A world
+   with [~signals] claims [signal_world], and [close] releases it. *)
 let create ?(domains = 1) ?(signals = []) () =
   Sys.set_signal Sys.sigpipe Sys.Signal_ignore ;
   let nums = Array.of_list (List.map number_of signals) in
-  let old_mask, sigfd =
-    if signals = [] then (None, -1)
-    else
-      let old = sigmask_block nums in
-      let fd = signalfd (-1) nums in
-      if (fd < 0) [@mutate off "fd 0 is the stdin of the process"] then (
-        sigmask_restore old ;
-        failwith ("signalfd: " ^ strerror (-fd)) ) ;
-      List.iter
-        (fun task ->
-          Printf.eprintf
-            "weft: thread %s does not block the signals of run ~signals: a \
-             signal can go to it\n\
-             %!"
-            task )
-        (unblocked_numbers (Array.to_list nums)) ;
-      (Some old, fd)
-  in
-  let doms = Array.init domains (fun _ -> make_dom ()) in
-  if sigfd >= 0 then
-    ignore (check "epoll_ctl" (epoll_add_in doms.(0).epfd sigfd signal_token)) ;
-  { doms
-  ; rng= new_rng ()
-  ; pool= create_pool (Array.map (fun d -> d.evfd) doms)
-  ; watched= Atomic.make (List.map (fun s -> signal_of (number_of s)) signals)
-  ; unwatch_lock= Mutex.create ()
-  ; unblock0= Atomic.make []
-  ; sigfd
-  ; old_mask }
+  if signals <> [] && not (Atomic.compare_and_set signal_world false true) then
+    invalid_arg "Weft_linux.create: another world watches signals" ;
+  match
+    let old_mask, sigfd =
+      if signals = [] then (None, -1)
+      else
+        let old = sigmask_block nums in
+        let fd = signalfd (-1) nums in
+        if (fd < 0) [@mutate off "fd 0 is the stdin of the process"] then (
+          sigmask_restore old ;
+          failwith ("signalfd: " ^ strerror (-fd)) ) ;
+        List.iter
+          (fun task ->
+            Printf.eprintf
+              "weft: thread %s does not block the signals of run ~signals: a \
+               signal can go to it\n\
+               %!"
+              task )
+          (unblocked_numbers (Array.to_list nums)) ;
+        (Some old, fd)
+    in
+    let doms = Array.init domains (fun _ -> make_dom ()) in
+    if sigfd >= 0 then
+      ignore (check "epoll_ctl" (epoll_add_in doms.(0).epfd sigfd signal_token)) ;
+    { doms
+    ; rng= new_rng ()
+    ; pool= create_pool (Array.map (fun d -> d.evfd) doms)
+    ; watched= Atomic.make (List.map (fun s -> signal_of (number_of s)) signals)
+    ; unwatch_lock= Mutex.create ()
+    ; unblock0= Atomic.make []
+    ; sigfd
+    ; old_mask }
+  with
+  | t ->
+      t
+  | exception e ->
+      let bt = Printexc.get_raw_backtrace () in
+      if signals <> [] then Atomic.set signal_world false ;
+      Printexc.raise_with_backtrace e bt
 
 let close t =
   close_pool t.pool ;
   if t.sigfd >= 0 then ignore (close_fd t.sigfd) ;
   Option.iter sigmask_restore t.old_mask ;
+  if Option.is_some t.old_mask then Atomic.set signal_world false ;
   Array.iter
     (fun d ->
       ignore (close_fd d.tfd) ;
