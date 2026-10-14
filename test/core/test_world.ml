@@ -300,6 +300,64 @@ let cancel_outside () =
     (function Fiber.Not_in_fiber _ -> true | _ -> false)
     (fun () -> Fiber.cancel (Option.get !sc) Exit)
 
+(* A world for two domains. Domain 1 sleeps in a spin of at most 2 s of CPU
+   time, and a wake of domain 1 ends the spin early. When domain 1 sleeps, the
+   wait of domain 0 raises "boom". [stuck] tells that domain 1 got no wake. *)
+module Stop = struct
+  type t = {woken: bool Atomic.t; sleeps: bool Atomic.t; stuck: bool Atomic.t}
+
+  let now (type time) _ (line : time Clock.line) : time = Clock.of_ns line 0L
+
+  let submit _ (_ : _ Private.Op.t) = Error (Private.Op.Other "no network")
+
+  let wait t ~domain (w : Private.World.Wait.t) =
+    match w.timeout with
+    | Poll ->
+        []
+    | Sleep ->
+        let t0 = Sys.time () in
+        if domain = 0 then (
+          while (not (Atomic.get t.sleeps)) && Sys.time () -. t0 < 2. do
+            Domain.cpu_relax ()
+          done ;
+          failwith "boom" )
+        else (
+          Atomic.set t.sleeps true ;
+          while (not (Atomic.get t.woken)) && Sys.time () -. t0 < 2. do
+            Domain.cpu_relax ()
+          done ;
+          if Atomic.exchange t.woken false then [Private.World.Ready.Woken]
+          else (Atomic.set t.stuck true ; failwith "stuck") )
+
+  let wake t ~domain = if domain = 1 then Atomic.set t.woken true
+
+  let random _ n = n - 1
+
+  let random_bytes _ b = Bytes.fill b 0 (Bytes.length b) 'x'
+end
+
+(* An error of the world on domain 0 stops the run: domain 1 gets a wake and
+   sees the end, and the error goes to the caller. *)
+let error_stops_others () =
+  (* Mutation testing forks a child for each mutant, and OCaml refuses a fork
+     after a domain started. *)
+  if Option.is_some (Sys.getenv_opt "WINDTRAP_MUTATE") then
+    skip ~reason:"a mutation run cannot start a domain" () ;
+  let w =
+    { Stop.woken= Atomic.make false
+    ; sleeps= Atomic.make false
+    ; stuck= Atomic.make false }
+  in
+  raises_match
+    (function Failure m -> m = "boom" | _ -> false)
+    (fun () ->
+      Weft.run ~domains:2
+        (module Stop)
+        w
+        (fun () -> sync (Ivar.read (Ivar.create ()))) ) ;
+  is_true (Atomic.get w.sleeps) ;
+  is_false (Atomic.get w.stuck)
+
 let world =
   group "Weft.run"
     [ test "run gives the value of main" run_gives_value
@@ -336,7 +394,9 @@ let world =
     ; test "after an error of the world, a fill from outside gives false"
         no_fill_after_error
     ; test "an error of the world on domain 0 goes to the caller"
-        world_error_of_domain_0 ]
+        world_error_of_domain_0
+    ; test "an error of the world on domain 0 stops domain 1" error_stops_others
+    ]
 
 (* A handler of the user sees each effect that the fibers of its scope perform.
    A fill with no waiter performs only [Self]: it resumes no fiber, so it
