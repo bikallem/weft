@@ -25,9 +25,9 @@ val create : ?domains:int -> ?signals:Weft.Signal.t list -> unit -> t
     mask.
 
     @raise Invalid_argument
-      if [~domains] is not in the range 1 to 62, or if [~signals] is not empty
-      and another world of the process watches signals: only one world at a time
-      can watch signals. [close] releases the claim. *)
+      if [~domains] is not in the range 1 to 62. It also raises it if [~signals]
+      is not empty and another world of the process watches signals: only one
+      world at a time can watch signals. [close] releases the claim. *)
 
 val close : t -> unit
 (** [close t] stops the thread pools, closes the fds of the world and restores

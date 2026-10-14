@@ -159,10 +159,10 @@ value weft_kq_sig_restore(value signo, value old) {
   return Val_unit;
 }
 
-/* Take the count of a signal, and set it to 0. A load first: most wakes of
-   domain 0 come with no signal, and a load costs less than an exchange. A
-   handler adds to the count before it writes the pipe, so a count that the
-   load does not see comes with a new wake. */
+/* Take the count of a signal, and set it to 0. The take does a load before the
+   exchange. Most wakes of domain 0 come with no signal, and a load costs less
+   than an exchange. A handler adds to the count before it writes the pipe, so
+   a count that the load does not see comes with a new wake. */
 value weft_kq_sig_take(value signo) {
   atomic_int *count = &sig_counts[Int_val(signo)];
   if (atomic_load(count) == 0) return Val_int(0);

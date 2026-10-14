@@ -480,7 +480,10 @@ module Net : sig
         (** A host and a port. [local_addr] also gives the address of a UDP
             socket as [Tcp]. In the simulator, the host is a name, for example
             ["server"]. *)
-    | Unix of string  (** The path of a Unix domain socket. *)
+    | Unix of string
+        (** The path of a Unix domain socket. A path of 108 bytes or more on
+            Linux and in the simulator (104 on macOS and FreeBSD) gives
+            [Error (Other "ENAMETOOLONG", _)]. *)
 
   (** A socket. *)
   type t = Private.Net.t
