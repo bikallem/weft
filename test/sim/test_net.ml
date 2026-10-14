@@ -1034,6 +1034,7 @@ let fd_limit_each_op () =
       emfile (fun () -> Process.spawn ~stdout:Piped "p" []) ;
       Sim.set_fd_limit sim (Some (Sim.open_fds sim + 2)) ;
       emfile (fun () -> Process.spawn ~stdout:Piped "p" []) ;
+      emfile (fun () -> Process.spawn ~stdin:Piped "p" []) ;
       Sim.set_fd_limit sim (Some (Sim.open_fds sim + 1)) ;
       is_true (Process.wait (Process.spawn "p" []) = Process.Exited 0) ;
       let u = Net.udp ("a", 1) in
