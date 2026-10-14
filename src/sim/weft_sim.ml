@@ -354,12 +354,17 @@ let part t k =
     1 + Prng.int t.prng k
   else k
 
-(* The next port from 40000 to 65535, then from 40000 again, that [used] does
-   not refuse. If all are in use, it gives one in use. *)
+(* The ports of the counter. *)
+let first_port = 40000
+
+let last_port = 65535
+
+(* The next port from [first_port] to [last_port], then from [first_port] again,
+   that [used] does not refuse. If all are in use, it gives one in use. *)
 let fresh_port n used =
   let rec go tries =
     let p = n.next_port in
-    n.next_port <- (if p >= 65535 then 40000 else p + 1) ;
+    n.next_port <- (if p >= last_port then first_port else p + 1) ;
     if
       used p
       && ( tries > 0 )
@@ -368,8 +373,16 @@ let fresh_port n used =
     then go ((tries - 1) [@mutate off "the same reason"])
     else p
   in
-  (go (65535 - 40000)
+  (go (last_port - first_port)
    [@mutate off "the count of tries matters only when all ports are in use"] )
+
+(* The port of a new TCP client of [connect] or [Sim.socket_pair]: a port of the
+   counter that no open client has. If each port of the counter has an open
+   client, the result is EADDRNOTAVAIL, as on Linux. *)
+let client_port n =
+  if Hashtbl.length n.client_ports > last_port - first_port then
+    Error (Op.Other "EADDRNOTAVAIL")
+  else Ok (fresh_port n (Hashtbl.mem n.client_ports))
 
 (* A Unix path must fit in [sun_path] with its NUL byte: 108 bytes on Linux. The
    POSIX worlds check the path before they make the socket, thus before EMFILE.
@@ -1069,48 +1082,46 @@ let submit : type a. t -> a Op.t -> (a, Op.error) result =
       | None ->
           refused ()
       | Some lfd -> (
-        match Hashtbl.find_opt n.fds lfd with
-        | Some (Lsn {ltcp= true; _})
-          when Hashtbl.length n.client_ports > 65535 - 40000 ->
-            (* Each port of the counter has an open client, as Linux gives
-               EADDRNOTAVAIL when it has no free port. *)
-            Error (Op.Other "EADDRNOTAVAIL")
-        | Some (Lsn l) when Queue.length l.backlog + l.pending < l.limit ->
-            l.pending <- l.pending + 1 ;
-            (* The client has the host "client" and a port from the counter that
-               no open client has. A Unix client has no path. *)
-            let client =
-              if l.ltcp then
-                Op.Tcp ("client", fresh_port n (Hashtbl.mem n.client_ports))
-              else Op.Unix ""
-            in
-            let c = new_sock ~tcp:l.ltcp ~local:client addr
-            and s = new_sock ~tcp:l.ltcp ~local:l.laddr client in
-            c.peer <- Some s ;
-            s.peer <- Some c ;
-            s.established <- true ;
-            c.cfd <- new_fd n ;
-            Hashtbl.replace n.fds c.cfd (Conn c) ;
-            ( match client with
-            | Op.Tcp (_, p) ->
-                Hashtbl.replace n.client_ports p c.cfd
-            | Op.Unix _ ->
-                () ) ;
-            later t (fun () ->
-                l.pending <- l.pending - 1 ;
-                match Hashtbl.find_opt n.fds lfd with
-                | Some (Lsn l') when l' == l ->
-                    Queue.push s l.backlog ;
-                    c.established <- true ;
-                    edge n lfd ~read:true ~write:false ;
-                    edge n c.cfd ~read:false ~write:true
-                | _ ->
-                    c.refused <- true ;
-                    c.peer <- None ;
-                    edge n c.cfd ~read:true ~write:true ) ;
-            Ok c.cfd
-        | _ ->
-            refused () ) )
+          (* The client has the host "client" and a port from [client_port]. As
+             on Linux, the port comes before the check of the backlog. A Unix
+             client has no path. *)
+          let* client =
+            match Hashtbl.find_opt n.fds lfd with
+            | Some (Lsn {ltcp= true; _}) ->
+                Result.map (fun p -> Op.Tcp ("client", p)) (client_port n)
+            | _ ->
+                Ok (Op.Unix "")
+          in
+          match Hashtbl.find_opt n.fds lfd with
+          | Some (Lsn l) when Queue.length l.backlog + l.pending < l.limit ->
+              l.pending <- l.pending + 1 ;
+              let c = new_sock ~tcp:l.ltcp ~local:client addr
+              and s = new_sock ~tcp:l.ltcp ~local:l.laddr client in
+              c.peer <- Some s ;
+              s.peer <- Some c ;
+              s.established <- true ;
+              c.cfd <- new_fd n ;
+              Hashtbl.replace n.fds c.cfd (Conn c) ;
+              ( match client with
+              | Op.Tcp (_, p) ->
+                  Hashtbl.replace n.client_ports p c.cfd
+              | Op.Unix _ ->
+                  () ) ;
+              later t (fun () ->
+                  l.pending <- l.pending - 1 ;
+                  match Hashtbl.find_opt n.fds lfd with
+                  | Some (Lsn l') when l' == l ->
+                      Queue.push s l.backlog ;
+                      c.established <- true ;
+                      edge n lfd ~read:true ~write:false ;
+                      edge n c.cfd ~read:false ~write:true
+                  | _ ->
+                      c.refused <- true ;
+                      c.peer <- None ;
+                      edge n c.cfd ~read:true ~write:true ) ;
+              Ok c.cfd
+          | _ ->
+              refused () ) )
   | Op.Connect_result fd ->
       conn fd (fun c ->
           if c.refused then Error Op.Refused
@@ -1707,7 +1718,7 @@ let run ?(seed = 0) ?(domains = 1) ?(auto = true) ?(signals = [])
         ; extra_edges= false
         ; udp_loss= false
         ; resets= false
-        ; next_port= 40000
+        ; next_port= first_port
         ; fd_limit= None }
     ; agenda= []
     ; next_id= 0
@@ -1882,9 +1893,13 @@ let socket_pair t =
       raise (Net.Error (e, "Sim.socket_pair"))
   | Ok () ->
       () ) ;
-  if Hashtbl.length n.client_ports > 65535 - 40000 then
-    raise (Net.Error (Op.Other "EADDRNOTAVAIL", "Sim.socket_pair")) ;
-  let port = fresh_port n (Hashtbl.mem n.client_ports) in
+  let port =
+    match client_port n with
+    | Ok p ->
+        p
+    | Error e ->
+        raise (Net.Error (e, "Sim.socket_pair"))
+  in
   let client = Op.Tcp ("client", port) in
   let server =
     let used p = Hashtbl.mem n.names (key (Op.Tcp ("server", p))) in
