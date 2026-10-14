@@ -623,13 +623,15 @@ let read_conn t c buf off len =
         if c.eof then Ok 0 else Error Op.Would_block
 
 (* The close of a socket or of an end of a pipe: the peer reads the end of the
-   stream, and a write of the peer gives EPIPE. *)
-let close_conn t c =
+   stream, and a write of the peer gives EPIPE. With [~fin:false], the peer does
+   not get [fin]: on Linux, a TCP close after [Shutdown] sends a reset, and the
+   peer is then closed. *)
+let close_conn ?(fin = true) t c =
   match c.peer with
   | Some p ->
       c.peer <- None ;
       deliver t c p (fun () ->
-          if Option.is_some p.peer then p.fin <- true ;
+          if fin && Option.is_some p.peer then p.fin <- true ;
           p.eof <- true ;
           p.peer <- None ;
           edge t.net p.cfd ~read:true ~write:true )
@@ -664,7 +666,9 @@ let reset_conn t c =
       c.peer <- None ;
       send_reset t c p
   | _ ->
-      close_conn t c
+      (* On TCP, this is a reset after [Shutdown]: the peer gets the end of the
+         stream and EPIPE, also for a write of 0 bytes. *)
+      close_conn ~fin:false t c
 
 (* A write of a socket or of the write end of a pipe. The data of a pipe arrives
    at once, and the data of a socket after the latency. Data that arrives after
@@ -691,6 +695,9 @@ let write_conn t c buf off len =
     | None when len = 0 && (c.role = Wr_end || (c.tcp && c.fin)) ->
         Ok 0
     | None ->
+        (* On Linux, the closed peer answers the data with a reset. Then a write
+           of 0 bytes also gives EPIPE. *)
+        c.fin <- false ;
         Error Op.Broken_pipe
     | Some _ when len = 0 ->
         Ok 0

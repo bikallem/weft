@@ -798,6 +798,29 @@ let zero_writes w =
               equal string "ECONNRESET" (zero c) ;
               equal string "EPIPE" (zero c) ;
               Net.close c ) )
+    ; test "TCP after a shutdown and a reset of the peer gives EPIPE" (fun () ->
+          w.run (fun () ->
+              (* The reset comes in CLOSE_WAIT, so the error is EPIPE. *)
+              let c, s = tcp () in
+              Net.shutdown s ;
+              Net.reset s ;
+              pause () ;
+              equal string "EPIPE" (zero c) ;
+              equal string "EPIPE" (zero c) ;
+              Net.close c ) )
+    ; test "TCP after a write to a closed peer gives EPIPE" (fun () ->
+          w.run (fun () ->
+              (* Linux takes the first write, and the closed peer answers it
+                 with a reset. The simulator gives EPIPE at once. *)
+              let c, s = tcp () in
+              Net.close s ;
+              pause () ;
+              ( try ignore (Net.write_sub c b 0 1)
+                with Net.Error (Broken_pipe, _) -> () ) ;
+              pause () ;
+              equal string "EPIPE" (error_of (fun () -> Net.write_sub c b 0 1)) ;
+              equal string "EPIPE" (zero c) ;
+              Net.close c ) )
     ; test "after a shutdown, TCP gives EPIPE" (fun () ->
           w.run (fun () ->
               let c, s = tcp () in
