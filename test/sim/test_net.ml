@@ -483,6 +483,55 @@ let no_free_port () =
       Net.close c ;
       is_true (Net.local_addr (Net.connect a) = p) )
 
+(* The client of a socket pair is a TCP client: after the counter goes around,
+   it skips the port of an open client, and a client of [connect] skips the port
+   of an open pair. The pairs count for EADDRNOTAVAIL. *)
+let pair_client_ports () =
+  Sim.run (fun sim ->
+      let a = Net.Tcp ("server", 1) in
+      let l = Net.listen ~backlog:30_000 a in
+      let c = Net.connect a in
+      is_true (Net.local_addr c = Net.Tcp ("client", 40000)) ;
+      (* Take the ports of the counter up to 65535. *)
+      let rec go_around () =
+        let u = Net.udp ("x", 0) in
+        let a = Net.local_addr u in
+        Net.close u ;
+        if a <> Net.Tcp ("x", 65535) then go_around ()
+      in
+      go_around () ;
+      let x, y = Sim.socket_pair sim in
+      is_true (Net.local_addr x = Net.Tcp ("client", 40001)) ;
+      Net.close c ;
+      go_around () ;
+      let c = Net.connect a in
+      is_true (Net.local_addr c = Net.Tcp ("client", 40000)) ;
+      let c2 = Net.connect a in
+      (* The pair has 40001. *)
+      is_true (Net.local_addr c2 = Net.Tcp ("client", 40002)) ;
+      List.iter Net.close [c; c2; y] ;
+      (* Each other port of the counter has an open client. *)
+      let clients = List.init (65535 - 40000) (fun _ -> Net.connect a) in
+      raises_match
+        (function
+          | Net.Error (Other "EADDRNOTAVAIL", "Sim.socket_pair") ->
+              true
+          | _ ->
+              false )
+        (fun () -> Sim.socket_pair sim) ;
+      raises_match
+        (function
+          | Net.Error (Other "EADDRNOTAVAIL", "Net.connect") ->
+              true
+          | _ ->
+              false )
+        (fun () -> Net.connect a) ;
+      (* The close of the client of the pair frees its port. *)
+      Net.close x ;
+      is_true (Net.local_addr (Net.connect a) = Net.Tcp ("client", 40001)) ;
+      ignore clients ;
+      Net.close l )
+
 (* The bytes that the latency holds count against the buffer of the peer. *)
 let inflight_backpressure () =
   Sim.run (fun sim ->
@@ -1407,6 +1456,8 @@ let tests =
       ; test "the pair has the latency of the network" pair_latency
       ; test "a reset of one side goes to the other side" pair_reset
       ; test "the pair counts 2 fds against the limit" pair_fd_limit
+      ; test "the client of a pair has a port that no open client has"
+          pair_client_ports
       ; test "the pair has the faults of the network" pair_faults ]
   ; group "fault of one connection"
       [ test "the next write gets the error, then EPIPE" fault_error

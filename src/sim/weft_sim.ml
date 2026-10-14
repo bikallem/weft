@@ -1817,8 +1817,10 @@ let set_fd_limit t limit =
 
 (* A connection with no listener, as after a connect and an accept (design
    section 2.8, A socket pair). It has no latency for the connect, and it counts
-   2 fds against the limit. The pair is not a world effect: the simulator runs
-   one virtual domain at a time, so the change of the network has no race. *)
+   2 fds against the limit. Its client is a TCP client, as a client of
+   [connect]: it gets a port that no open client has, or EADDRNOTAVAIL. The pair
+   is not a world effect: the simulator runs one virtual domain at a time, so
+   the change of the network has no race. *)
 let socket_pair t =
   let n = t.net in
   ( match room n 2 with
@@ -1826,7 +1828,10 @@ let socket_pair t =
       raise (Net.Error (e, "Sim.socket_pair"))
   | Ok () ->
       () ) ;
-  let client = Op.Tcp ("client", fresh_port n (fun _ -> false)) in
+  if Hashtbl.length n.client_ports > 65535 - 40000 then
+    raise (Net.Error (Op.Other "EADDRNOTAVAIL", "Sim.socket_pair")) ;
+  let port = fresh_port n (Hashtbl.mem n.client_ports) in
+  let client = Op.Tcp ("client", port) in
   let server =
     let used p = Hashtbl.mem n.names (key (Op.Tcp ("server", p))) in
     Op.Tcp ("server", fresh_port n used)
@@ -1841,6 +1846,8 @@ let socket_pair t =
       x.cfd <- new_fd n ;
       Hashtbl.replace n.fds x.cfd (Conn x) )
     [c; s] ;
+  (* The close of the client removes the port. *)
+  Hashtbl.replace n.client_ports port c.cfd ;
   (Sched.Fdtab.alloc c.cfd, Sched.Fdtab.alloc s.cfd)
 
 (* A fault of one connection (design section 2.8, A fault of one connection).

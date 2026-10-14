@@ -1206,7 +1206,7 @@ The test `test/sim_fork` makes sure of the rule. It does a run with each part of
 
 `Sim.socket_pair sim` gives the two sides of a TCP connection with no listener. A test of a protocol thus needs no listener, no fiber for the accept and no connect. The pair is a connection of the in-memory network, as after a connect and an accept. Thus it has the latency, the faults of `Sim.net_faults`, the reset of `Net.reset` and the faults of `Sim.fault`. It is established at once, with no latency for the connect.
 
-The first side has the address `Tcp ("client", p)`, and the second side has `Tcp ("server", q)`. The ports `p` and `q` come from the counter of ports (section The model of the fds, below). The pair makes 2 fds, so `Sim.set_fd_limit` counts it as a pipe.
+The first side has the address `Tcp ("client", p)`, and the second side has `Tcp ("server", q)`. The ports `p` and `q` come from the counter of ports (section The model of the fds, below). The first side is a TCP client, as a client of a connect: `p` is a port that no open client has, and the pair counts for `EADDRNOTAVAIL`. The pair makes 2 fds, so `Sim.set_fd_limit` counts it as a pipe.
 
 The pair is only in the simulator, not in the core `Net` (decision 28). Linux has `socketpair(2)`, but it gives Unix sockets, not TCP sockets. A Unix socket has no `TCP_NODELAY`, and its reset and its address are different.
 

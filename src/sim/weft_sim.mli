@@ -131,12 +131,14 @@ val socket_pair : t -> Weft.Net.t * Weft.Net.t
     once. It has the latency and the faults of each TCP connection. [Net.reset]
     and {!fault} act on it as on a connection of [connect]. The first socket has
     the address [Tcp ("client", p)], and the second [Tcp ("server", q)], with
-    [p] and [q] from the counter of ports (as for [Net.local_addr]). The peer of
-    each socket is the address of the other socket.
+    [p] and [q] from the counter of ports (as for [Net.local_addr]). The first
+    socket is a TCP client, as a client of [connect]: [p] is a port that no open
+    client has. The peer of each socket is the address of the other socket.
 
     @raise Weft.Net.Error
       with [No_resources "EMFILE"] if the two fds are more than the limit of
-      {!set_fd_limit}. *)
+      {!set_fd_limit}, or with [Other "EADDRNOTAVAIL"] if each port of the
+      counter has an open client. *)
 
 val fault : t -> Weft.Net.t -> Weft.Net.error -> unit
 (** [fault t s e] breaks the connection of [s] at the side of [s]. The next
