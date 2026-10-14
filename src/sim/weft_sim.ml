@@ -1226,23 +1226,22 @@ let submit : type a. t -> a Op.t -> (a, Op.error) result =
     | None ->
         Error Op.Bad_fd )
   | Op.Kill (fd, sg) -> (
-      let sg = normal sg in
-      match Hashtbl.find_opt n.fds fd with
-      | Some (Pfd p) ->
-          ( match (p.status, sg) with
-          | Some _, _ ->
-              ()
-          | None, _ when no_end sg ->
-              ()
-          | None, _ when sg <> Op.SIGKILL && List.mem sg p.prog.ignores ->
-              ()
-          | None, _ ->
-              exit_proc t fd p (Op.Signaled sg) ) ;
-          Ok ()
-      | Some _ ->
-          Error (Op.Other "EINVAL")
-      | None ->
-          Error Op.Bad_fd )
+    match Hashtbl.find_opt n.fds fd with
+    | Some (Pfd p) ->
+        ( match (p.status, normal sg) with
+        | Some _, _ ->
+            ()
+        | None, sg when no_end sg ->
+            ()
+        | None, sg when sg <> Op.SIGKILL && List.mem sg p.prog.ignores ->
+            ()
+        | None, sg ->
+            exit_proc t fd p (Op.Signaled sg) ) ;
+        Ok ()
+    | Some _ ->
+        Error (Op.Other "EINVAL")
+    | None ->
+        Error Op.Bad_fd )
   | Op.Watch sg ->
       let sg = normal sg in
       if List.mem sg t.watched then Ok sg
