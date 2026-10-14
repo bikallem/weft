@@ -93,8 +93,9 @@ type conn =
   ; mutable established: bool
   ; mutable refused: bool
         (** The listener closed while the connect was in flight. Only
-            [Connect_result] and [writable] examine it: [Net.connect] then
-            closes the fd, so no read or write gets this connection. *)
+            [Connect_result] examines it: [Net.connect] then closes the fd, so
+            no read or write gets this connection. The connect also sets [peer]
+            to [None], so [writable] gives [true]. *)
   ; mutable cfd: int  (** [-1] until the server side is accepted. *)
   ; remote: Op.addr
   ; local: Op.addr  (** [Local_addr]. *)
@@ -260,21 +261,19 @@ let writable n fd =
   | Some (Conn {role= Rd_end; _}) ->
       false
   | Some (Conn c) -> (
-      c.refused
-      ||
-      match c.peer with
-      | None ->
-          true
-      | Some p ->
-          (* A pipe is writable with a free page, PIPE_BUF bytes: a write of at
-             most PIPE_BUF bytes can wait for that much space. *)
-          c.established
-          && ( avail p + p.inflight
-             <= capacity - if c.role = Wr_end then pipe_buf else 1 )
-             [@mutate
-               off
-                 "a wrong result here gives a spurious edge: the write gets \
-                  EAGAIN and waits again"] )
+    match c.peer with
+    | None ->
+        true
+    | Some p ->
+        (* A pipe is writable with a free page, PIPE_BUF bytes: a write of at
+           most PIPE_BUF bytes can wait for that much space. *)
+        c.established
+        && ( avail p + p.inflight
+           <= capacity - if c.role = Wr_end then pipe_buf else 1 )
+           [@mutate
+             off
+               "a wrong result here gives a spurious edge: the write gets \
+                EAGAIN and waits again"] )
   | Some (Dgm _) ->
       true
   | Some (Lsn _ | Fil _ | Pfd _) | None ->
