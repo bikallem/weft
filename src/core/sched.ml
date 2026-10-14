@@ -724,7 +724,11 @@ let resume ?(next = false) dom s =
   s.k <- None ;
   dom.stats.resumes <- dom.stats.resumes + 1 ;
   (if next then push_next else push) dom s.owner (fun () ->
-      Atomic.set s.owner.current None ;
+      Atomic.set s.owner.current None
+      [@mutate
+        off
+          "the next sync of the fiber replaces a Done sync, and each reader of \
+           current ignores a Done sync"] ;
       Effect.Deep.continue k i )
 
 (* Commit each waiter, the oldest first. *)
@@ -843,7 +847,12 @@ let external_leaf id : leaf =
   let t = dom.sched in
   Spin.with_lock t.externals_lock (fun () ->
       match Hashtbl.find_opt t.externals id with
-      | Some e when e.arrived ->
+      | ((Some e)
+         [@mutate
+           off
+             "only the domain of the job takes its completion, and it does not \
+              poll between the start of the job and the wait or the detach"] )
+        when e.arrived ->
           Hashtbl.remove t.externals id ;
           ignore (C.self_commit s.word i)
       | Some e ->
@@ -856,7 +865,12 @@ let external_leaf id : leaf =
 let drop_external t id =
   Spin.with_lock t.externals_lock (fun () ->
       match Hashtbl.find_opt t.externals id with
-      | Some e when e.arrived ->
+      | ((Some e)
+         [@mutate
+           off
+             "only the domain of the job takes its completion, and it does not \
+              poll between the start of the job and the wait or the detach"] )
+        when e.arrived ->
           Hashtbl.remove t.externals id
       | Some e ->
           e.dropped <- true
@@ -926,7 +940,12 @@ let deliver dom sg n =
           let rec give resumed = function
             | [] ->
                 (resumed, [])
-            | ws when st.count = 0 ->
+            | (ws
+               [@mutate
+                 off
+                   "each world gives a count of 1 or more, and the give stops \
+                    at the first commit, so the count is not 0 here"] )
+              when st.count = 0 ->
                 (resumed, ws)
             | (s, i, cell) :: rest -> (
                 cell := st.count ;
@@ -1256,7 +1275,11 @@ and sync dom fiber (r : sync_req) (k : (int, step) Effect.Deep.continuation) =
       ()
   | `Done i ->
       s.k <- None ;
-      Atomic.set fiber.current None ;
+      Atomic.set fiber.current None
+      [@mutate
+        off
+          "the next sync of the fiber replaces a Done sync, and each reader of \
+           current ignores a Done sync"] ;
       run_fiber dom fiber (Effect.Deep.continue k i)
 
 (* The loop of one domain (design section 2.5). *)
@@ -1328,7 +1351,11 @@ let posix_alarm dom = Option.map (Clock.of_ns Posix) (alarm_of dom dom.pheap)
 (* A poll or a sleep. The time can pass after the last poll: if the mailbox or
    an expired entry made a fiber ready, the domain polls instead of a sleep. *)
 let wait dom timeout =
-  take_mail dom ;
+  take_mail dom
+  [@mutate
+    off
+      "a close notice comes with a wake, so this wait ends at once, and the \
+       take after it gets the notice"] ;
   expire dom ;
   flush_wake dom ;
   (* The expire can resume a pinned fiber on domain 0 with no wake. *)
@@ -1344,7 +1371,11 @@ let wait dom timeout =
     {World.Wait.timeout; deadline= alarm dom; posix_deadline= posix_alarm dom}
   in
   List.iter (on_ready dom) (World.perform "sched" (World.Wait (dom.index, w))) ;
-  take_mail dom ;
+  take_mail dom
+  [@mutate
+    off
+      "the take at the start of the next wait gets the notice, and this domain \
+       does not sleep before that take"] ;
   expire dom ;
   flush_wake dom
 
@@ -1609,7 +1640,15 @@ let all_count c = c lsr 32
 
 let self () = prog "Fiber.self" Self
 
-let enqueue = function [] -> () | l -> prog "Fiber" (Enqueue l)
+let enqueue = function
+  | ([]
+     [@mutate
+       off
+         "each caller is in a fiber, and an Enqueue of no fiber resumes \
+          nothing: only a marked wake can come earlier"] ) ->
+      ()
+  | l ->
+      prog "Fiber" (Enqueue l)
 
 (* Fill an Ivar and resume its waiters. *)
 let fill_resume iv v =
