@@ -45,7 +45,10 @@ let clear r h =
 let rec pop r =
   let h = Atomic.get r.head in
   if Atomic.get r.tail = h then (
-    if r.clean < h then clear r h ;
+    if
+      ( r.clean < h )
+      [@mutate off "at clean = h, clear writes no slot and keeps clean"]
+    then clear r h ;
     None )
   else
     let x = Atomic.get r.buf.(h land mask) in
