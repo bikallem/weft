@@ -95,8 +95,8 @@ let alarm_skips_stale () =
   ignore (S.C.self_commit first.S.word 1) ;
   equal (option int64) (Some 2L) (S.alarm_of d d.S.heap)
 
-(* A push at the limit rebuilds the heap: it removes the stale entries, and the
-   live entries keep their order. *)
+(* A push at the limit, or the push after it, rebuilds the heap: it removes the
+   stale entries, and the live entries keep their order. *)
 let rebuild_keeps_live () =
   let h = S.Heap.create () in
   let syncs = List.init 64 (fun _ -> dummy_sync ()) in
