@@ -20,7 +20,7 @@
   "Weft runs fibers on OCaml 5 domains. Its events come from Concurrent ML. All operating system calls are effects, so a simulator can run the same program with a virtual clock and network.")
  (depends
   (ocaml
-   (>= 5.3))
+   (>= 5.5))
   (windtrap
    (and
     :with-test
