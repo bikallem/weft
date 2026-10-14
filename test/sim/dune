@@ -13,4 +13,5 @@
    (diff? test_m1.ml test_m1.ml.corrected)
    (diff? test_m2.ml test_m2.ml.corrected)
    (diff? test_m3.ml test_m3.ml.corrected)
-   (diff? test_wakes.ml test_wakes.ml.corrected))))
+   (diff? test_wakes.ml test_wakes.ml.corrected)
+   (diff? test_io.ml test_io.ml.corrected))))

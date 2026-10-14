@@ -387,6 +387,26 @@ let pinned_limit () =
               done ) ) ) ;
   equal string "pppnpppn" (String.concat "" (get ()))
 
+(* A step of the wall clock wakes a domain that sleeps until a Posix deadline.
+   The other domain does not let the program become quiescent. It gives true if
+   the waiter slept on domain 1. *)
+let posix_step seed =
+  Sim.run ~seed ~domains:2 ~livelock:100_000 (fun sim ->
+      let fired = Atomic.make false and on = ref (-1) in
+      let at = Option.get (Time.add Posix (Time.now Posix) (Span.s 10)) in
+      Fiber.scope (fun s ->
+          Fiber.fork s (fun () ->
+              on := S.prog "test" S.Dom_index ;
+              sync (Time.at Posix at) ;
+              Atomic.set fired true ) ;
+          Fiber.fork ~pinned:true s (fun () ->
+              Time.sleep Mono (Span.ms 1) ;
+              Sim.set_posix sim (Option.get (Time.add Posix at (Span.s 1))) ;
+              while not (Atomic.get fired) do
+                Fiber.yield ()
+              done ) ) ;
+      !on = 1 )
+
 let tests =
   [ group "m3"
       [ test "pinned fibers run only on domain 0, with 200 seeds" (fun () ->
@@ -419,6 +439,8 @@ let tests =
       ; test "a run that raises restores the report of promises" restore_report
       ; test "a failed promise that nobody awaits gives Unawaited" unawaited
       ; test "a step of the wall clock moves a Posix timer only" posix_timers
+      ; test "a step of the wall clock wakes a sleeping domain, with 20 seeds"
+          (fun () -> is_true (Helpers.some_seed 20 posix_step) )
       ; test "a finaliser fills an Ivar" finaliser
       ; test "a fill from outside needs ~outside_fills" refused
       ; test "a fill of an Ivar of a run that ended gives false" earlier_run
@@ -430,4 +452,7 @@ let tests =
       ; test "a register of a later run drops the waiters of a run that ended"
           dead_and_live
       ; test "no run: fill_from_outside gives false" (fun () ->
+            is_false (Ivar.fill_from_outside (Ivar.create ()) ()) )
+      ; test "after a run, no run takes a fill from outside" (fun () ->
+            Sim.run ~outside_fills:true (fun _ -> ()) ;
             is_false (Ivar.fill_from_outside (Ivar.create ()) ()) ) ] ]

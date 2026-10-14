@@ -2,6 +2,7 @@
 
 open Weft
 module Sim = Weft_sim
+module Op = Private.Op
 module S = Private.Sched
 
 (* [run f] runs [f] on the simulator. *)
@@ -44,3 +45,32 @@ let spin_until flag =
 (* The sum of a counter of the measurements over the domains of [sim]. *)
 let sum_stats sim f =
   Array.fold_left (fun n d -> n + f d.S.stats) 0 (Sim.sched sim).S.doms
+
+(* A world operation with no check of the core. *)
+let submit op = Private.World.perform "test" (Private.World.Submit op)
+
+let ok = function
+  | Ok v ->
+      v
+  | Error e ->
+      failwith (Format.asprintf "%a" Op.pp_error e)
+
+(* The text of the error of a world operation, or "no error". *)
+let op_error = function
+  | Ok _ ->
+      "no error"
+  | Error e ->
+      Format.asprintf "%a" Op.pp_error e
+
+(* A job that completes at once, with no time cost. *)
+let job j =
+  let id = ok (submit (Op.Start (0, j))) in
+  ok (submit (Op.Finish (id, j)))
+
+(* The model error of [f], or "no model error". *)
+let model_error f =
+  match Sim.run f with
+  | () ->
+      "no model error"
+  | exception Sim.Model_error m ->
+      m

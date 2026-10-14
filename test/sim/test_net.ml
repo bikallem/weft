@@ -4,6 +4,7 @@
 open Windtrap
 open Weft
 module Sim = Weft_sim
+module Op = Private.Op
 
 let ms_since t0 =
   Int64.to_int
@@ -1569,6 +1570,18 @@ let tests =
       ; test "a read that never ends gives Deadlock" read_deadlock
       ; test "close(2) before Deregister gives Model_error"
           close_before_deregister
+      ; test "close(2) of an fd that a job uses gives Model_error" (fun () ->
+            contains ~sub:"while job"
+              (Helpers.model_error (fun sim ->
+                   let fd =
+                     Helpers.job (Op.Open ("/f", [O_read; O_write; O_create], 0))
+                   in
+                   Sim.set_blocking_cost sim (Span.ms 10) ;
+                   ignore
+                     (Helpers.ok
+                        (Helpers.submit
+                           (Op.Start (0, Op.Pread (fd, Bytes.create 4, 0, 4, 0))) ) ) ;
+                   ignore (Helpers.submit (Op.Close fd)) ) ) )
       ; test "L5: a cancel ends advance_until" advance_cancelled
       ; test "L6: the connections in flight count against the backlog"
           backlog_counts_in_flight

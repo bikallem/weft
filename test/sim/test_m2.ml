@@ -4,6 +4,7 @@
 open Windtrap
 open Weft
 module Sim = Weft_sim
+module Op = Private.Op
 module S = Private.Sched
 
 (* Each test of the fiber layer runs with 200 seeds on 4 virtual domains. *)
@@ -191,7 +192,31 @@ let jobs =
     ; test "the name table of Dns" dns
     ; test "a completion leaves no record" no_external_left
     ; test "a detach before the wait leaves no record, with 100 seeds"
-        (fun () -> Helpers.seeds 100 detach_before_wait ) ]
+        (fun () -> Helpers.seeds 100 detach_before_wait )
+    ; test "a detach after the completion of an open closes its fd" (fun () ->
+          Sim.run (fun sim ->
+              let n0 = Sim.open_fds sim in
+              let id =
+                Helpers.ok
+                  (Helpers.submit
+                     (Op.Start (0, Op.Open ("/f", [O_read; O_create], 0))) )
+              in
+              Helpers.ok (Helpers.submit (Op.Detach id)) ;
+              equal int n0 (Sim.open_fds sim) ) )
+    ; test "a Finish after a detach gives Model_error" (fun () ->
+          contains ~sub:"Finish of job"
+            (Helpers.model_error (fun _ ->
+                 let j = Op.Stat "/" in
+                 let id = Helpers.ok (Helpers.submit (Op.Start (0, j))) in
+                 Helpers.ok (Helpers.submit (Op.Detach id)) ;
+                 ignore (Helpers.submit (Op.Finish (id, j))) ) ) )
+    ; test "a second Finish of a job gives Model_error" (fun () ->
+          contains ~sub:"Finish of job"
+            (Helpers.model_error (fun _ ->
+                 let j = Op.Stat "/" in
+                 let id = Helpers.ok (Helpers.submit (Op.Start (0, j))) in
+                 ignore (Helpers.ok (Helpers.submit (Op.Finish (id, j)))) ;
+                 ignore (Helpers.submit (Op.Finish (id, j))) ) ) ) ]
 
 (* Processes and signals (milestone M2). *)
 
@@ -409,7 +434,30 @@ let processes =
               raises
                 (Invalid_argument
                    "Signal.received: this signal cannot be an event" )
-                (fun () -> sync (Signal.received SIGKILL) ) ) ) ]
+                (fun () -> sync (Signal.received SIGKILL) ) ) )
+    ; test "a wait of a child that the parent reaped gives ECHILD" (fun () ->
+          Sim.run (fun sim ->
+              Sim.add_program sim "p" (fun _ ->
+                  Sim.program ~runs:(Span.ms 1) () ) ;
+              let r =
+                Helpers.ok
+                  (Helpers.submit
+                     (Op.Spawn
+                        { prog= "p"
+                        ; argv= ["p"]
+                        ; env= None
+                        ; cwd= None
+                        ; stdin= Inherit
+                        ; stdout= Inherit
+                        ; stderr= Inherit } ) )
+              in
+              Time.sleep Mono (Span.ms 2) ;
+              is_true
+                ( Helpers.ok (Helpers.submit (Op.Wait_child r.pidfd))
+                = Some (Exited 0) ) ;
+              equal string "ECHILD"
+                (Helpers.op_error (Helpers.submit (Op.Wait_child r.pidfd))) ;
+              Helpers.ok (Helpers.submit (Op.Close r.pidfd)) ) ) ]
 
 (* A graceful shutdown: at SIGTERM, the server stops to accept, and each
    connection ends its request. *)
