@@ -3,6 +3,7 @@
 
 open Windtrap
 open Weft
+module S = Private.Sched
 
 (* A world with a manual clock. A sleep moves the clock to the alarm. Each read
    of [Mono] can also move the clock by [tick] nanoseconds, as the time moves
@@ -254,6 +255,55 @@ let base_needs_no_flatten () =
       (Printf.sprintf "a base sync allocates %.1f words, a choose %.1f" base
          choice )
 
+(* K1 with a pinned fiber: its deadline passes between the poll and the sleep.
+   The expire puts it in the pinned queue, and domain 0 must not sleep. *)
+let pinned_expire_before_sleep () =
+  let w = Manual.make ~tick:(us 400) () in
+  run ~slack:Span.zero w (fun () ->
+      Fiber.scope (fun s ->
+          Fiber.fork ~pinned:true s (fun () -> Time.sleep Mono (Span.us 1300)) ) )
+
+(* A Register that the world refuses gives its error to the waiter. The waiter
+   holds no user of the fd after the error, and its domain is not in the set of
+   the fd. *)
+let register_error () =
+  let w = Manual.make () in
+  run w (fun () ->
+      let fd = S.Fdtab.alloc 7 in
+      raises
+        (Net.Error (Other "no network", "Net"))
+        (fun () -> Private.Event.sync (Private.Net.readable fd)) ;
+      is_true (Atomic.get fd.S.rc = S.Open 0) ;
+      equal int 0 (Atomic.get fd.S.doms) ;
+      S.Fdtab.release fd )
+
+(* A fill from outside reaches its waiter while another fiber yields: the domain
+   takes the injection queue at each 61st take. *)
+let inject_while_busy () =
+  let w = Manual.make () in
+  let yields = ref 0 in
+  run w (fun () ->
+      Fiber.scope (fun s ->
+          let iv = Ivar.create () and filled = ref false in
+          Fiber.fork s (fun () ->
+              sync (Ivar.read iv) ;
+              filled := true ) ;
+          Fiber.fork s (fun () ->
+              while (not !filled) && !yields < 1000 do
+                incr yields ; Fiber.yield ()
+              done ) ;
+          Fiber.yield () ;
+          is_true (Ivar.fill_from_outside iv ()) ) ) ;
+  less int ~than:100 !yields
+
+(* Outside a fiber, a cancel raises [Not_in_fiber]. *)
+let cancel_outside () =
+  let sc = ref None in
+  run (Manual.make ()) (fun () -> Fiber.scope (fun s -> sc := Some s)) ;
+  raises_match
+    (function Fiber.Not_in_fiber _ -> true | _ -> false)
+    (fun () -> Fiber.cancel (Option.get !sc) Exit)
+
 let world =
   group "Weft.run"
     [ test "run gives the value of main" run_gives_value
@@ -273,10 +323,16 @@ let world =
     ; test "the world gives one seed for each domain" one_seed_for_each_domain
     ; test ~timeout:5. "K1: a deadline between the poll and the sleep fires"
         expire_before_sleep
+    ; test ~timeout:5.
+        "K1: a pinned deadline between the poll and the sleep fires"
+        pinned_expire_before_sleep
+    ; test "a Register that fails raises in the waiter" register_error
+    ; test "a fill from outside reaches a waiter while a fiber yields"
+        inject_while_busy
+    ; test "a cancel outside a fiber raises Not_in_fiber" cancel_outside
     ; test ~timeout:5. "C4: the alarm near the largest time saturates"
         alarm_saturates
     ; test "on_create gets the scheduler before main" on_create_runs_first
-    ; test "a sync of a base event does not flatten it" base_needs_no_flatten
     ; test "a fill from outside a fiber reaches the run"
         fill_from_outside_in_run
     ; test "after the end of run, a fill from outside gives false"
@@ -285,6 +341,31 @@ let world =
         no_fill_after_error
     ; test "an error of the world on domain 0 goes to the caller"
         world_error_of_domain_0 ]
+
+(* A handler of the user sees each effect that the fibers of its scope perform.
+   A fill with no waiter performs only [Self]: it resumes no fiber, so it
+   performs no [Enqueue]. *)
+let fill_effects () =
+  let n = ref 0 in
+  let handler =
+    { Fiber.handle=
+        (fun f ->
+          Effect.Deep.match_with f ()
+            { retc= Fun.id
+            ; exnc= raise
+            ; effc= (fun (type c) (_ : c Effect.t) -> incr n ; None) } ) }
+  in
+  run (Manual.make ()) (fun () ->
+      Fiber.scope ~handler (fun _ ->
+          let iv = Ivar.create () in
+          let before = !n in
+          Ivar.fill iv () ;
+          equal int 1 (!n - before) ) )
+
+let events =
+  group "events"
+    [ test "a sync of a base event does not flatten it" base_needs_no_flatten
+    ; test "a fill with no waiter performs one effect" fill_effects ]
 
 (* Span *)
 
@@ -624,4 +705,4 @@ let signal_count_zero () =
 let signals =
   group "signals" [test "a count of 0 is not a signal" signal_count_zero]
 
-let tests = [world; span; time; signals]
+let tests = [world; events; span; time; signals]

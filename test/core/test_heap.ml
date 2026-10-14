@@ -51,11 +51,58 @@ let heap_is_ordered ops =
     ops ;
   equal int (List.length !model) h.size
 
+let top_deadline h =
+  Option.map (fun e -> Int64.to_int e.S.deadline) (S.Heap.top h)
+
+(* It pushes entries at the deadlines 1 and 2, and gives a function that makes
+   the two entries stale. *)
+let two_entries h =
+  let a = dummy_sync () and b = dummy_sync () in
+  S.Heap.push h ~deadline:1L a 0 ;
+  S.Heap.push h ~deadline:2L b 0 ;
+  fun () ->
+    ignore (S.C.self_commit a.S.word 1) ;
+    ignore (S.C.self_commit b.S.word 1)
+
+(* The stale entries at the head of the heap go. *)
+let drop_stale () =
+  let h = S.Heap.create () in
+  let stale = two_entries h in
+  S.Heap.push h ~deadline:3L (dummy_sync ()) 0 ;
+  stale () ;
+  S.Heap.drop_stale h ;
+  equal int 1 h.S.size ;
+  equal (option int) (Some 3) (top_deadline h)
+
+(* An add drops the stale entries at the head (design section 2.5, Timers and
+   domains). *)
+let push_drops_stale () =
+  let h = S.Heap.create () in
+  let stale = two_entries h in
+  stale () ;
+  S.Heap.push h ~deadline:3L (dummy_sync ()) 0 ;
+  equal int 1 h.S.size ;
+  equal (option int) (Some 3) (top_deadline h)
+
+(* The alarm is the earliest live deadline: a cancelled timeout does not set
+   it. *)
+let alarm_skips_stale () =
+  let t = S.create ~slack:Weft.Span.zero ~domains:1 () in
+  let d = t.S.doms.(0) in
+  let first = dummy_sync () in
+  S.Heap.push d.S.heap ~deadline:1L first 0 ;
+  S.Heap.push d.S.heap ~deadline:2L (dummy_sync ()) 0 ;
+  ignore (S.C.self_commit first.S.word 1) ;
+  equal (option int64) (Some 2L) (S.alarm_of d d.S.heap)
+
 let heap =
   group "heap"
     [ prop "the heap gives the order of a sorted list"
         (Gen.with_pp (Format.pp_print_list pp_op) ops)
-        heap_is_ordered ]
+        heap_is_ordered
+    ; test "a drop takes the stale entries at the head" drop_stale
+    ; test "an add drops the stale entries at the head" push_drops_stale
+    ; test "the alarm skips a stale entry" alarm_skips_stale ]
 
 (* Two domains increment a counter under the lock. *)
 let spin_excludes () =
@@ -186,8 +233,23 @@ let domains_range () =
   equal int 1 (Array.length (S.create ~domains:1 ()).S.doms) ;
   equal int 62 (Array.length (S.create ~domains:62 ()).S.doms)
 
+(* The beats of a new scheduler are 0, also in memory that held other values. *)
+let beats_start_at_zero () =
+  for n = 1 to 8 do
+    let junk = Bigarray.Array1.create Bigarray.int Bigarray.c_layout n in
+    Bigarray.Array1.fill junk (-1) ;
+    ignore (Sys.opaque_identity junk) ;
+    Gc.full_major () ;
+    let t = S.create ~domains:n () in
+    for i = 0 to n - 1 do
+      equal int 0 t.S.beats.{i}
+    done
+  done
+
 let tests =
   [ heap
   ; spin
   ; ring
-  ; group "domains" [test "the number of domains is 1 to 62" domains_range] ]
+  ; group "domains"
+      [ test "the number of domains is 1 to 62" domains_range
+      ; test "the beats start at 0" beats_start_at_zero ] ]
