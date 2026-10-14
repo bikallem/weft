@@ -6,8 +6,6 @@ open Weft
 module Sim = Weft_sim
 module C = Private.Chan
 
-let run f = Sim.run (fun _ -> f ())
-
 let not_in_fiber = function Fiber.Not_in_fiber _ -> true | _ -> false
 
 (* All the offers of a side, also the stale offers. [C.offers] moves [back] to
@@ -21,7 +19,7 @@ let all_offers side =
    in the queue, and a later partner meets it. The seed selects the order of the
    two branches, so the test has a partner of each type. *)
 let skipped_own_offer partner_sends () =
-  run (fun () ->
+  Helpers.run (fun () ->
       let c = Chan.create () in
       Fiber.scope (fun s ->
           let p =
@@ -42,7 +40,7 @@ let skipped_own_offer partner_sends () =
 (* A send that meets the oldest offer in [front] does not scan [back]. The stale
    offer in [back] stays there, and the send adds no offer of its own. *)
 let send_stops_in_front () =
-  run (fun () ->
+  Helpers.run (fun () ->
       let c = Chan.create () in
       let got = ref [] in
       Fiber.scope (fun s ->
@@ -74,7 +72,7 @@ let send_stops_in_front () =
    of the stale offers calls it, so a copy adds a second pass over the
    offers. *)
 let offers_no_copy () =
-  run (fun () ->
+  Helpers.run (fun () ->
       let c = Chan.create () in
       Fiber.scope (fun s ->
           for _ = 1 to 3 do
@@ -93,7 +91,7 @@ let offers_no_copy () =
 
 (* [use_ro] unlocks the mutex when [f] gives a value. *)
 let use_ro_unlocks () =
-  run (fun () ->
+  Helpers.run (fun () ->
       let m = Fiber.Mutex.create () in
       equal int 1 (Fiber.Mutex.use_ro m (fun () -> 1)) ;
       equal int 2 (Fiber.Mutex.use_ro m (fun () -> 2)) )
@@ -101,7 +99,7 @@ let use_ro_unlocks () =
 (* After [Condition.wait], the shield of [use_rw ~protect:true] is closed again.
    Thus a cancel does not stop the sleep after the wait. *)
 let shield_closes_after_wait () =
-  run (fun () ->
+  Helpers.run (fun () ->
       let m = Fiber.Mutex.create () and c = Fiber.Condition.create () in
       let slept = ref false in
       Fiber.scope (fun outer ->
@@ -140,7 +138,7 @@ exception Boom
 (* The promise holds the cell of its finaliser. Thus a GC before the await does
    not report the failure. *)
 let gc_before_await () =
-  run (fun () ->
+  Helpers.run (fun () ->
       Fiber.scope (fun s ->
           let p = Fiber.fork_promise s (fun () -> raise Boom) in
           Time.sleep Mono (Span.ms 1) ;
@@ -151,7 +149,7 @@ let gc_before_await () =
 (* A finaliser runs outside a fiber. Its [Promise.cancel] raises [Not_in_fiber]
    and does not cancel the promise. *)
 let cancel_outside () =
-  run (fun () ->
+  Helpers.run (fun () ->
       Fiber.scope (fun s ->
           let p = Fiber.fork_promise s (fun () -> "done") in
           let r = ref None in

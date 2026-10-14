@@ -129,9 +129,7 @@ let detached_at_end seed =
 let jobs =
   group "jobs"
     [ test "F4: a detached job at the end of run releases its fd" (fun () ->
-          is_true
-            (List.exists Fun.id
-               (List.init 20 (fun s -> detached_at_end (s + 1))) ) )
+          is_true (Helpers.some_seed 20 detached_at_end) )
     ; test "a job takes a time cost from the seed" (fun () ->
           let costs = List.init 50 (fun s -> cost (s + 1)) in
           List.iter (fun c -> at_most int ~than:40 c) costs ;

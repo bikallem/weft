@@ -309,13 +309,8 @@ let next_steal seed =
               (* F2 parks first, so the send claims F2. *)
               Time.sleep Mono (Span.ms 1) ;
               sync (Chan.send c ()) ;
-              let n = ref 0 in
-              while (not (Atomic.get ran)) && !n < 10_000 do
-                incr n ;
-                ignore (Time.now Mono)
-              done ;
               (* F2 ran before the end of the loop of F1. *)
-              Atomic.set early (Atomic.get ran) ) ) ;
+              Atomic.set early (Helpers.spin_until ran) ) ) ;
       Atomic.get early )
 
 (* A pinned fiber that a fiber of another domain wakes while domain 0 sleeps. *)
@@ -354,8 +349,7 @@ let tests =
             greater int ~than:0 !other )
       ; test "B: a pinned fiber that yields does not starve" pinned_yield
       ; test "a thief takes a next slot, with 50 seeds" (fun () ->
-            is_true
-              (List.exists Fun.id (List.init 50 (fun s -> next_steal (s + 1)))) )
+            is_true (Helpers.some_seed 50 next_steal) )
       ; test "a pinned fiber wakes while domain 0 sleeps, with 50 seeds"
           (fun () ->
             for seed = 1 to 50 do

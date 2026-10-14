@@ -8,12 +8,7 @@ module Sched = Private.Sched
 
 exception Boom
 
-let error_of f =
-  match f () with
-  | _ ->
-      "no error"
-  | exception Net.Error (e, _) ->
-      Format.asprintf "%a" Private.Op.pp_error e
+let error_of = Portable.error_of
 
 (* Each function checks its range before the world, and the error has its name.
    Without the check, the world reads 0 bytes, or [Bytes] raises with its own

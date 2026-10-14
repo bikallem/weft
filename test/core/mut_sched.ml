@@ -104,12 +104,10 @@ let beats_start_at_zero () =
     done
   done
 
-let us n = Int64.mul (Int64.of_int n) 1_000L
-
 (* K1 with a pinned fiber: its deadline passes between the poll and the sleep.
    The expire puts it in the pinned queue, and domain 0 must not sleep. *)
 let pinned_expire_before_sleep () =
-  let w = Manual.make ~tick:(us 400) () in
+  let w = Manual.make ~tick:(Test_world.us 400) () in
   Test_world.run ~slack:Span.zero w (fun () ->
       Fiber.scope (fun s ->
           Fiber.fork ~pinned:true s (fun () -> Time.sleep Mono (Span.us 1300)) ) )

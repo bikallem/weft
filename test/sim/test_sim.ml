@@ -5,18 +5,14 @@ open Windtrap
 open Weft
 module Sim = Weft_sim
 
-let run ?seed f = Sim.run ?seed (fun _ -> f ())
+let run = Helpers.run
 
 (* The time since [t0], in milliseconds. *)
 let ms_since t0 =
   Int64.to_int
     (Int64.div (Span.to_ns (Time.diff Mono (Time.now Mono) t0)) 1_000_000L)
 
-let log () =
-  let l = ref [] in
-  let add fmt = Printf.ksprintf (fun s -> l := s :: !l) fmt in
-  let get () = List.rev !l in
-  (add, get)
+let log = Helpers.log
 
 exception Boom of string
 

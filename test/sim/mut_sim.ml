@@ -118,8 +118,7 @@ let jobs =
                  ignore (submit (Op.Finish (id, j))) ) ) ) ]
 
 (* The edges of all domains. *)
-let edges sim =
-  Array.fold_left (fun n d -> n + d.S.stats.S.edges) 0 (Sim.sched sim).S.doms
+let edges sim = Helpers.sum_stats sim (fun s -> s.S.edges)
 
 let net =
   group "edges and names"
@@ -149,11 +148,7 @@ let net =
                       Time.sleep Mono (Span.ms 1)
                     done ;
                     Pipe.write w "x" ) ;
-                idle :=
-                  !idle
-                  + Array.fold_left
-                      (fun n d -> n + d.S.stats.S.idle_edges)
-                      0 (Sim.sched sim).S.doms ;
+                idle := !idle + Helpers.sum_stats sim (fun s -> s.S.idle_edges) ;
                 Pipe.close r ;
                 Pipe.close w )
           done ;
@@ -211,10 +206,7 @@ let posix_step seed =
 let clock =
   group "wall clock"
     [ test "a step of the wall clock wakes a sleeping domain, with 20 seeds"
-        (fun () ->
-          is_true
-            (List.exists Fun.id (List.init 20 (fun s -> posix_step (s + 1)))) )
-    ]
+        (fun () -> is_true (Helpers.some_seed 20 posix_step) ) ]
 
 let run_end =
   group "the end of a run"

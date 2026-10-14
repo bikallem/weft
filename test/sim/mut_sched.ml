@@ -12,31 +12,12 @@ let spin n =
     ignore (Time.now Mono)
   done
 
-(* [spin_until flag] spins until [flag] is set, or for 10,000 switch points. It
-   gives [true] if the flag came. Only another domain can set the flag. *)
-let spin_until flag =
-  let n = ref 0 in
-  while (not (Atomic.get flag)) && !n < 10_000 do
-    incr n ;
-    ignore (Time.now Mono)
-  done ;
-  Atomic.get flag
-
-let seeds n f =
-  for seed = 1 to n do
-    f seed
-  done
-
-let log () =
-  let l = ref [] in
-  ((fun s -> l := s :: !l), fun () -> List.rev !l)
-
 (* Where a woken fiber goes (design section 2.5). *)
 
 (* One fiber that a fiber wakes goes to the next slot: it runs before the fiber
    that is at the head of the local queue. *)
 let woken_goes_next () =
-  let add, get = log () in
+  let add, get = Helpers.log () in
   Sim.run (fun _ ->
       let iv = Ivar.create () in
       Fiber.scope (fun s ->
@@ -53,7 +34,7 @@ let woken_goes_next () =
    that send to each other fill the next slot, and the third fiber runs after 3
    runs from the next slot. *)
 let next_limit () =
-  let add, get = log () in
+  let add, get = Helpers.log () in
   Sim.run (fun _ ->
       let c = Chan.create () in
       Fiber.scope (fun s ->
@@ -63,15 +44,15 @@ let next_limit () =
               done ) ;
           Fiber.fork s (fun () ->
               for _ = 1 to 6 do
-                add (string_of_int (sync (Chan.recv c)))
+                add "%s" (string_of_int (sync (Chan.recv c)))
               done ) ;
-          Fiber.fork s (fun () -> add "other") ) ) ;
+          Fiber.fork s (fun () -> add "%s" "other") ) ) ;
   equal (list string) ["1"; "2"; "3"; "other"; "4"; "5"; "6"] (get ())
 
 (* Domain 0 takes a pinned fiber that yields at most 3 times in sequence. Then
    it takes the local queue. *)
 let pinned_limit () =
-  let add, get = log () in
+  let add, get = Helpers.log () in
   Sim.run (fun _ ->
       Fiber.scope (fun s ->
           Fiber.fork ~pinned:true s (fun () ->
@@ -271,7 +252,9 @@ let wakes_other ~seed ?signals push =
           Time.sleep Mono (Span.ms 1) ;
           spin 1000 ;
           go () ;
-          equal ~msg:(Printf.sprintf "seed %d" seed) bool true (spin_until ran) ) )
+          equal
+            ~msg:(Printf.sprintf "seed %d" seed)
+            bool true (Helpers.spin_until ran) ) )
 
 (* A fork. *)
 let fork_wakes seed =
@@ -331,7 +314,7 @@ let forks_in_sequence seed =
             Fiber.fork s (fun () -> Atomic.set ran true) ;
             equal
               ~msg:(Printf.sprintf "seed %d, fork %d" seed i)
-              bool true (spin_until ran)
+              bool true (Helpers.spin_until ran)
           done ) )
 
 (* The end of the run. Fibers on the two domains register the fds. Then each
@@ -444,7 +427,7 @@ let tests =
       ; test "the beat is odd while a fiber runs" beats
       ; test "a completion leaves no record" no_external_left
       ; test "a detach before the wait leaves no record, with 100 seeds"
-          (fun () -> seeds 100 detach_before_wait )
+          (fun () -> Helpers.seeds 100 detach_before_wait )
       ; test "a close wakes a writer" close_wakes_writer
       ; test "a fiber that ended leaves its scope" ended_fibers_leave
       ; test "the body of a scope that ended leaves it" body_leaves
@@ -459,28 +442,29 @@ let tests =
       ; test "a cancel of the root scope reaches main" main_in_root
       ; test "an idle domain takes a fill from outside at once" inject_at_once
       ; test "a fork wakes an idle domain, with 50 seeds" (fun () ->
-            seeds 50 fork_wakes )
+            Helpers.seeds 50 fork_wakes )
       ; test "a send wakes an idle domain, with 50 seeds" (fun () ->
-            seeds 50 send_wakes )
+            Helpers.seeds 50 send_wakes )
       ; test "a fill wakes an idle domain, with 50 seeds" (fun () ->
-            seeds 50 fill_wakes )
+            Helpers.seeds 50 fill_wakes )
       ; test "an unwatch wakes an idle domain, with 50 seeds" (fun () ->
-            seeds 50 unwatch_wakes )
+            Helpers.seeds 50 unwatch_wakes )
       ; test "a close wakes an idle domain, with 50 seeds" (fun () ->
-            seeds 50 close_wakes )
+            Helpers.seeds 50 close_wakes )
       ; test "a domain that looks for work finds a fork, with 20 seeds"
-          (fun () -> seeds 20 forks_in_sequence )
+          (fun () -> Helpers.seeds 20 forks_in_sequence )
       ; test "the last close notices close the fds, with 200 seeds" (fun () ->
-            seeds 200 last_notices )
+            Helpers.seeds 200 last_notices )
       ; test "a close notice goes before the fiber of the same Wait, 200 seeds"
           (fun () ->
             let late = ref 0 in
-            seeds 200 (fun seed -> late := !late + notice_before_resume seed) ;
+            Helpers.seeds 200 (fun seed ->
+                late := !late + notice_before_resume seed ) ;
             equal int 0 !late )
       ; test "an edge after a close notice does not count, with 200 seeds"
           (fun () ->
             let hits = ref 0 and counted = ref 0 in
-            seeds 200 (fun seed ->
+            Helpers.seeds 200 (fun seed ->
                 let on1, d = stale_edge seed in
                 if on1 then (
                   incr hits ;
