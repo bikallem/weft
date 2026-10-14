@@ -278,7 +278,8 @@ module Fiber : sig
 
         @raise Invalid_argument
           if [n < 0], [max < n] or [max = 0]. Thus [create 0] raises: a
-          semaphore that can never have a permit is a bug. Give a [~max]. *)
+          semaphore that can never have a permit is a bug. Give a [~max] of 1 or
+          more. *)
 
     val acquire : t -> unit event
     (** An event that takes one permit. The sync gets the permit only if it

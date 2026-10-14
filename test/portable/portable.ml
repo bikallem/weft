@@ -1861,7 +1861,8 @@ let semaphores w =
               (* A semaphore with no permit and no maximum is a bug. *)
               let zero =
                 Invalid_argument
-                  "Fiber.Semaphore.create: the maximum is 0 (give a ~max)"
+                  "Fiber.Semaphore.create: the maximum is 0 (give a ~max of 1 \
+                   or more)"
               in
               raises zero (fun () -> Sem.create 0) ;
               raises zero (fun () -> Sem.create ~max:0 0) ;
