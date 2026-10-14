@@ -47,22 +47,34 @@ LINUX_EXCLUDE := -e "linux on 4 domains" -e "a waiter at Signal.unwatch raises"
 report = $(DUNE) exec $(MUTATE) windtrap -- mutants \
   $(if $(1),--since $(1)) $(if $(MIN_SCORE),--min-score $(MIN_SCORE))
 
-.PHONY: help mutate mutate-all mutate-linux mutate-report mutate-arm
+.PHONY: help check-windtrap mutate mutate-all mutate-linux mutate-report mutate-arm
 
 help:
 	@sed -n '1,/^$$/p' Makefile | sed 's/^# \{0,1\}//'
 
-# The build comes first, so that a compile error stops the target. A suite
-# with a survivor gives exit status 1, so the run ignores the status, and the
-# report gives the result.
-mutate:
+# A dev shell that started before a change of flake.nix keeps its old
+# windtrap. windtrap 0.2.0 tests one mutant at a time, has fewer types of
+# mutants, and writes verdict files that the fork cannot read. Its `mutants`
+# command has no --since.
+check-windtrap:
+	@$(DUNE) exec $(MUTATE) windtrap -- mutants --help 2>/dev/null | grep -q -- --since || { \
+	  echo "The windtrap of this shell is not the fork of flake.nix."; \
+	  echo "Start nix develop again, or run direnv reload."; exit 2; }
+
+# The build comes first, so that a compile error stops the target. The run
+# removes the old verdict files: it runs each suite again, and a file of an
+# older windtrap stops the merge. A suite with a survivor gives exit status 1,
+# so the run ignores the status, and the report gives the result.
+mutate: check-windtrap
 	$(DUNE) build $(MUTATE) $(SUITES:%=@%/all)
+	rm -rf _build/_mutants
 	-WINDTRAP_MUTATE=1 WINDTRAP_MUTATE_SINCE=$(BASE) WINDTRAP_MUTATE_JOBS=$(JOBS) \
 	  $(DUNE) runtest --force $(MUTATE) $(SUITES)
 	$(call report,$(BASE))
 
-mutate-all:
+mutate-all: check-windtrap
 	$(DUNE) build $(MUTATE) $(SUITES:%=@%/all)
+	rm -rf _build/_mutants
 	-WINDTRAP_MUTATE=1 WINDTRAP_MUTATE_JOBS=$(JOBS) \
 	  $(DUNE) runtest --force $(MUTATE) $(SUITES)
 	$(call report,)
@@ -72,11 +84,11 @@ mutate-all:
 # exit status 0 for a survivor in such a run. Each mutant that only
 # test/linux/few_fds.exe tests survives here: few_fds is a program that a dune
 # rule runs, not a suite, so it reaches no mutant.
-mutate-linux:
+mutate-linux: check-windtrap
 	$(DUNE) exec $(MUTATE) test/linux/test_linux.exe -- \
 	  --mutate --mutate-since=$(BASE) --mutate-jobs $(JOBS) $(LINUX_EXCLUDE)
 
-mutate-report:
+mutate-report: check-windtrap
 	$(call report,$(BASE))
 
 mutate-arm:
