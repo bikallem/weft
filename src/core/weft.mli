@@ -391,7 +391,11 @@ end
 
 (** {1 Worlds}
 
-    Design section 2.3. *)
+    A world is everything outside the program: the clock, the I/O, the waits,
+    the randomness and the order in which the domains run. In production, the
+    world is the OS ([Weft_linux], [Weft_kqueue]). In tests, the world is the
+    simulator ([Weft_sim]). The simulator models the OS, and it also controls
+    the order of the domains and the randomness. Design section 2.3. *)
 
 module type WORLD = World.WORLD
 

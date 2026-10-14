@@ -96,7 +96,7 @@ The main idea: the effects are in two layers. The seam for the outside world is 
   scheduler       (each domain: queues, poller registrations, a heap; shared: scopes, sync words)
      |  world effects from the scheduler: Now, Submit, Wait, Wake, Random, Switch
      v
-  world handler   one of: Linux (epoll), Bsd (kqueue), Poll, Sim
+  world handler   one of: Weft_linux (epoll), Weft_kqueue (kqueue), Weft_sim
 ```
 
 - **Program effects** go from a fiber to the scheduler. The scheduler handles them. They are the same in production and in tests.
@@ -115,7 +115,9 @@ This order solves lesson 6. The scheduler runs inside the world handler. Thus a 
 
 ## 2.3 The world interface
 
-A world is a module type. A function makes a handler from it. You get a typed contract from the module type, and you get a plug that needs no argument in the program code from the effect.
+A world is everything outside the program: the clock, the I/O, the waits, the randomness and the order in which the domains run. In production, the world is the OS (`Weft_linux`, `Weft_kqueue`). In tests, the world is the simulator (`Weft_sim`). The simulator models the OS, and it also controls the order of the domains and the randomness.
+
+In the code, the interface of a world is a module type, `WORLD`. A function makes a handler from it. You get a typed contract from the module type, and you get a plug that needs no argument in the program code from the effect.
 
 ```ocaml
 module type WORLD = sig
