@@ -1672,6 +1672,7 @@ The tests use windtrap from the fork `bikallem/windtrap` (decision 9). The fork 
 - `dune runtest`: all suites.
 - `dune runtest --force --instrument-with ppx_windtrap.coverage`, then `dune exec windtrap -- coverage`.
 - `WINDTRAP_MUTATE=1 dune runtest --force --instrument-with ppx_windtrap.mutate`, then `dune exec windtrap -- mutants`.
+- The Makefile has the recipes. `make mutate` tests the mutants on the lines that changed since the merge base with `origin/main` (`--mutate-since`), with one child for each CPU (`--mutate-jobs auto`). Then it merges the verdicts of `test/core` and `test/sim`. `make mutate-linux` tests the Linux suite with the tests that start a domain excluded. `make help` gives all the targets and variables.
 
 **Two facts for M1.** I read them in the source of windtrap 0.2.0, but I did not do a test of them with domains:
 
