@@ -1679,7 +1679,7 @@ The tests use windtrap from the fork `bikallem/windtrap` (decision 9). The fork 
 - If a suite that runs on one real domain (`test/core` or `test/sim`) can see the mutant, kill it with a test of a behavior. When the effect is internal, use the debug interfaces: `Sched_debug`, the counters of `Sim` and the counters of the measurements.
 - Dismiss only an equivalent mutant, with `[@mutate off "reason"]`. The reason tells in one sentence why no result, resource, effect or debug value changes.
 - Do not dismiss a mutant that only more than one real domain or another world can see. Name the test that covers its behavior, for example a `dscheck` test or `test/linux_md`, or tell that no test covers it.
-- If only a test with one fixed seed or schedule can see the mutant, do not dismiss it, and do not add that test. A change of the schedule can make such a test fail on correct code. Keep the mutant as a known survivor.
+- If only a test with one fixed seed or schedule can see the mutant, do not dismiss it. Do not add that test. A change of the schedule can make such a test fail on correct code. Keep the mutant as a known survivor.
 - Record each known survivor in the list that follows, with its reason.
 - Put a test for a mutant in the group of its behavior, not in a group of mutants.
 - `make mutate-arm MUTANT=<id>` runs a suite with one mutant armed. It shows that a new test kills the mutant, and it refuses a dismissed mutant.
@@ -1688,7 +1688,7 @@ The known survivors of `make mutate-all`:
 
 | Site | Why it survives | The test that covers it |
 |---|---|---|
-| `sched.ml`, the `flush_wake` at the start of `wait` | Only real time on more than one real domain resumes a pinned fiber in that expire. | None at this time. |
+| `sched.ml`, the `flush_wake` at the start of `wait` | In the simulator, the time does not move between two expires, so this expire marks no wake of domain 0. Only a real clock on more than one real domain can make a pinned deadline pass here. | None at this time. |
 | `weft.ml`, `run`: the set of `finished` and the wake of the domains after an error of the world | Only more than one real domain sees the stop of the other domains. | "Weft.run › an error of the world on domain 0 stops domain 1". A mutation run skips it, because it starts a domain. |
 | `net.ml`, `reset`: the check that the caller is in a fiber | Only a close on another thread at the same time changes the state. | None. A test of this race is not deterministic. |
 | `pipe.ml`, `read` and `write`: the check of the direction of the end | Linux and the simulator give `EBADF` for the wrong end. Only the pipes of FreeBSD and macOS have two directions. | "pipes › each end has one direction" of the portable suite, in `test/kqueue`. |
