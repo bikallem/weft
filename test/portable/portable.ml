@@ -742,6 +742,74 @@ let unwatch_busy w () =
           Pipe.close out ;
           is_true (st = Process.Signaled SIGINT) ) )
 
+(* The writes of 0 bytes, as on Linux 7.1. The simulator and the Linux world run
+   them. I am not sure that FreeBSD and macOS give the same results. *)
+let zero_writes w =
+  let pause () = Time.sleep Mono (Span.ms 10) in
+  let b = Bytes.create 65536 in
+  (* The result of a write of 0 bytes, or the text of its error. *)
+  let zero c =
+    match Net.write_sub c b 0 0 with
+    | k ->
+        string_of_int k
+    | exception Net.Error (e, _) ->
+        Format.asprintf "%a" Private.Op.pp_error e
+  in
+  let conn (l, a) =
+    let c = Net.connect a in
+    let s, _ = Net.accept l in
+    Net.close l ; (c, s)
+  in
+  let tcp () = conn (w.listen ()) in
+  group
+    (w.name ^ ": a write of 0 bytes, as on Linux")
+    [ test "a full socket gives 0" (fun () ->
+          w.run (fun () ->
+              let c, s = tcp () in
+              while Net.write_now c b 0 65536 <> None do
+                ()
+              done ;
+              equal (option int) (Some 0) (Net.write_now c b 0 0) ;
+              equal string "0" (zero c) ;
+              List.iter Net.close [c; s] ) )
+    ; test "a pipe with no reader gives 0" (fun () ->
+          w.run (fun () ->
+              let r, wr = Pipe.create () in
+              Pipe.close r ;
+              equal int 0 (Pipe.write_sub wr b 0 0) ;
+              equal string "EPIPE" (error_of (fun () -> Pipe.write_sub wr b 0 1)) ;
+              Pipe.close wr ) )
+    ; test "TCP after a close of the peer gives 0" (fun () ->
+          w.run (fun () ->
+              let c, s = tcp () in
+              Net.close s ;
+              pause () ;
+              equal string "0" (zero c) ;
+              equal string "0" (zero c) ;
+              Net.close c ) )
+    ; test "TCP after a reset gives ECONNRESET, then EPIPE" (fun () ->
+          w.run (fun () ->
+              let c, s = tcp () in
+              Net.reset s ;
+              pause () ;
+              equal string "ECONNRESET" (zero c) ;
+              equal string "EPIPE" (zero c) ;
+              Net.close c ) )
+    ; test "after a shutdown, TCP gives EPIPE" (fun () ->
+          w.run (fun () ->
+              let c, s = tcp () in
+              Net.shutdown c ;
+              equal string "EPIPE" (zero c) ;
+              List.iter Net.close [c; s] ) )
+    ; test "Unix after a close of the peer gives EPIPE" (fun () ->
+          w.run (fun () ->
+              let a = Net.Unix (Filename.concat (w.tmp ()) "z") in
+              let c, s = conn (Net.listen a, a) in
+              Net.close s ;
+              pause () ;
+              equal string "EPIPE" (zero c) ;
+              Net.close c ) ) ]
+
 (* The details of a reset that follow Linux. The simulator and the Linux world
    run them. *)
 let reset_details w =

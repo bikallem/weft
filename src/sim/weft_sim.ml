@@ -76,6 +76,9 @@ type conn =
             before it. *)
   ; mutable peer: conn option  (** [None] after the peer closed. *)
   ; mutable eof: bool  (** The peer ended its send side. *)
+  ; mutable fin: bool
+        (** The peer closed with no reset, while this side had a peer: on TCP,
+            CLOSE_WAIT on Linux. A write of 0 bytes then gives 0. *)
   ; mutable shut: bool  (** This side ended its send side. *)
   ; mutable abort: bool  (** [Reset_on_close]: the close sends a reset. *)
   ; mutable err: Op.error option
@@ -614,6 +617,7 @@ let close_conn t c =
   | Some p ->
       c.peer <- None ;
       deliver t c p (fun () ->
+          if Option.is_some p.peer then p.fin <- true ;
           p.eof <- true ;
           p.peer <- None ;
           edge t.net p.cfd ~read:true ~write:true )
@@ -654,9 +658,13 @@ let reset_conn t c =
    at once, and the data of a socket after the latency. Data that arrives after
    the close or the reset of the peer, or after a lost link, is lost. With
    [resets], one write of a TCP socket in 64 resets the connection: this side
-   gets ECONNRESET at once, and the peer gets the reset after the delay. A write
-   of 0 bytes to a peer gives 0 at once, also on a full socket, as on Linux. It
-   sends nothing, so it does not reset the connection. *)
+   gets ECONNRESET at once, and the peer gets the reset after the delay.
+
+   A write of 0 bytes to a peer gives 0 at once, also on a full socket, as on
+   Linux. It sends nothing, so it does not reset the connection. With no peer, a
+   write of 0 bytes to a pipe gives 0, as [pipe_write] on Linux. A TCP socket
+   after a close of the peer with no reset ([fin]) also gives 0. The other cases
+   give EPIPE, as on Linux. *)
 let write_conn t c buf off len =
   let n = t.net in
   (* On a Unix socket, a write gives EPIPE and keeps a reset for the next
@@ -668,6 +676,8 @@ let write_conn t c buf off len =
   else if c.shut then Error Op.Broken_pipe
   else
     match c.peer with
+    | None when len = 0 && (c.role = Wr_end || (c.tcp && c.fin)) ->
+        Ok 0
     | None ->
         Error Op.Broken_pipe
     | Some _ when len = 0 ->
@@ -850,6 +860,7 @@ let new_pipe n =
     ; last_at= 0L
     ; peer= None
     ; eof= false
+    ; fin= false
     ; shut= false
     ; abort= false
     ; err= None
@@ -875,6 +886,7 @@ let new_sock ~tcp ~local remote =
   ; last_at= 0L
   ; peer= None
   ; eof= false
+  ; fin= false
   ; shut= false
   ; abort= false
   ; err= None
@@ -1916,6 +1928,7 @@ let fault t (fd : Net.t) e =
           (* The socket has one slot for its error, as on Linux: the fault
              replaces an error that the socket did not give. *)
           c.err <- Some e ;
+          c.fin <- false ;
           if e <> Op.Reset then c.lost <- true ;
           ( match c.peer with
           | Some p ->

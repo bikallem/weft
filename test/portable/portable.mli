@@ -28,6 +28,11 @@ val fiber_ids : world -> Windtrap.test
 val files : world -> Windtrap.test
 (** The tests of [File] and [Dir] (milestone M2), also in [tests]. *)
 
+val zero_writes : world -> Windtrap.test
+(** The writes of 0 bytes, as on Linux: on a full socket, on a pipe with no
+    reader, and on TCP and Unix sockets after a close or a reset of the peer.
+    The simulator and the Linux world run them. They are not in [tests]. *)
+
 val reset_details : world -> Windtrap.test
 (** The details of [Net.reset] that follow Linux. The simulator and the Linux
     world run them. They are not in [tests]. *)

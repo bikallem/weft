@@ -854,21 +854,6 @@ let unix_path_limit () =
       let c = Net.connect (Net.Unix (path 107)) in
       List.iter Net.close [c; l] )
 
-(* A send of 0 bytes on a full TCP socket gives 0 at once. The simulator gives
-   the same result. *)
-let zero_write () =
-  Weft_linux.run ~domains:1 (fun () ->
-      let l = Net.listen (Net.Tcp ("127.0.0.1", 0)) in
-      let c = Net.connect (Net.local_addr l) in
-      let s, _ = Net.accept l in
-      let chunk = Bytes.create 65536 in
-      while Net.write_now c chunk 0 65536 <> None do
-        ()
-      done ;
-      equal (option int) (Some 0) (Net.write_now c chunk 0 0) ;
-      equal int 0 (Net.write_sub c chunk 0 0) ;
-      List.iter Net.close [c; s; l] )
-
 (* Only one world at a time can watch signals, as on kqueue. For a world with no
    signals, the claim is not necessary. A refused create does not release the
    claim of the open world, so a second try also raises. *)
@@ -910,7 +895,6 @@ let linux =
         register_failure
     ; test "L2: the peer of a Unix socket has a Unix address" unix_peer_addr
     ; test "L3: a port out of range gives an error" port_range
-    ; test "a write of 0 bytes on a full socket gives 0" zero_write
     ; test "a Unix path of 108 bytes gives ENAMETOOLONG" unix_path_limit
     ; test "Time.now Posix is the time of the system" posix_time
     ; test "an address that is not an IP address gives an error" invalid_address
@@ -962,6 +946,7 @@ let () =
     (Windtrap.run "linux"
        ( Portable.tests world
        @ [ Portable.reset_details world
+         ; Portable.zero_writes world
          ; group "linux on 4 domains"
              [ Portable.fiber_ids
                  { world with
