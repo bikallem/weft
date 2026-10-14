@@ -186,9 +186,7 @@ let make ~domains ~nums ~undo signals =
    error, [create] closes what it made, restores the mask and releases the
    claim, as the kqueue world does. *)
 let create ?(domains = 1) ?(signals = []) () =
-  if domains < 1 || domains > 62 then
-    invalid_arg
-      "Weft_linux.create: the number of domains is not in the range 1 to 62" ;
+  Sched.check_domains "Weft_linux.create" domains ;
   Sys.set_signal Sys.sigpipe Sys.Signal_ignore ;
   let nums = Array.of_list (List.map number_of signals) in
   if signals <> [] && not (Atomic.compare_and_set signal_world false true) then

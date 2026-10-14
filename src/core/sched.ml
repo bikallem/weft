@@ -1820,10 +1820,21 @@ let reason () =
 
 let next_run = Atomic.make 0
 
+(* The maximum number of domains of a run. The domain bits of an fd record are
+   in one [int]. *)
+let max_domains = 62
+
+(* [name] raises [Invalid_argument] if [domains] is not in the range 1 to
+   [max_domains]. The scheduler and the worlds use the same check. *)
+let check_domains name domains =
+  if domains < 1 || domains > max_domains then
+    invalid_arg
+      (Printf.sprintf "%s: the number of domains is not in the range 1 to %d"
+         name max_domains )
+
 (* The scheduler of [domains] domains. *)
 let create ?(slack = Span.us 100) ?(simulated = false) ~domains () =
-  if domains < 1 || domains > 62 then
-    invalid_arg "run: the number of domains is not in the range 1 to 62" ;
+  check_domains "run" domains ;
   let t =
     { run_id= Atomic.fetch_and_add next_run 1
     ; beats=

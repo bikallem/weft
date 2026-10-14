@@ -97,9 +97,7 @@ let make_dom () =
    After an error, [create] closes what it made and restores the actions that it
    changed. *)
 let create ?(domains = 1) ?(signals = []) () =
-  if domains < 1 || domains > 62 then
-    invalid_arg
-      "Weft_kqueue.create: the number of domains is not in the range 1 to 62" ;
+  Sched.check_domains "Weft_kqueue.create" domains ;
   Sys.set_signal Sys.sigpipe Sys.Signal_ignore ;
   let nums = List.sort_uniq compare (List.map number_of signals) in
   let doms = ref [] and old_actions = ref [] and claimed = ref false in
