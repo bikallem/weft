@@ -143,11 +143,41 @@ let ring_clears () =
     equal ~msg:"the ring of the thief" int 0 (held into)
   done
 
+(* Random pushes, pops and steals between two rings. At each pop on an empty
+   ring with head h, the slots of h and h + 1 hold no item. *)
+let ring_empty_slots () =
+  let st = Random.State.make [|7|] in
+  let held = ref 0 and empties = ref 0 in
+  for trial = 1 to 200 do
+    let a = Ring.create () and b = Ring.create () in
+    let pushes = 1 + (trial mod 5) in
+    for _ = 1 to 5000 do
+      let r, o = if Random.State.bool st then (a, b) else (b, a) in
+      match Random.State.int st 8 with
+      | k when k < pushes ->
+          ignore (Ring.push r 1)
+      | k when k < 7 ->
+          let h = Atomic.get r.Ring.head in
+          if Atomic.get r.Ring.tail = h then (
+            incr empties ;
+            let slot i = Atomic.get r.Ring.buf.(i land Ring.mask) in
+            if Option.is_some (slot h) || Option.is_some (slot (h + 1)) then
+              incr held ) ;
+          ignore (Ring.pop r)
+      | _ ->
+          if Ring.is_empty o then ignore (Ring.steal ~from:r ~into:o)
+    done
+  done ;
+  greater int ~than:0 !empties ;
+  equal int 0 !held
+
 let ring =
   group "ring"
     [ test "a full ring refuses a push and keeps the FIFO order" ring_full
     ; test "a steal takes half of a full ring" ring_steal_full
-    ; test "an empty ring holds no item" ring_clears ]
+    ; test "an empty ring holds no item" ring_clears
+    ; test "the slots at the head of an empty ring hold no item"
+        ring_empty_slots ]
 
 let domains_range () =
   let invalid = function Invalid_argument _ -> true | _ -> false in
