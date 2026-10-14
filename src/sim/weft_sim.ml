@@ -1089,46 +1089,50 @@ let submit : type a. t -> a Op.t -> (a, Op.error) result =
       | None ->
           refused ()
       | Some lfd -> (
-          (* The client has the host "client" and a port from [client_port]. As
-             on Linux, the port comes before the check of the backlog. A Unix
-             client has no path. *)
-          let* client =
-            match Hashtbl.find_opt n.fds lfd with
-            | Some (Lsn {ltcp= true; _}) ->
-                Result.map (fun p -> Op.Tcp ("client", p)) (client_port n)
-            | _ ->
-                Ok (Op.Unix "")
-          in
+        (* The client has the host "client" and a port from [client_port]. As on
+           Linux, the port comes before the check of the backlog. A Unix client
+           has no path. *)
+        match
           match Hashtbl.find_opt n.fds lfd with
-          | Some (Lsn l) when Queue.length l.backlog + l.pending < l.limit ->
-              l.pending <- l.pending + 1 ;
-              let c = new_sock ~tcp:l.ltcp ~local:client addr
-              and s = new_sock ~tcp:l.ltcp ~local:l.laddr client in
-              c.peer <- Some s ;
-              s.peer <- Some c ;
-              s.established <- true ;
-              c.cfd <- new_fd n ;
-              Hashtbl.replace n.fds c.cfd (Conn c) ;
-              ( match client with
-              | Op.Tcp (_, p) ->
-                  Hashtbl.replace n.client_ports p c.cfd
-              | Op.Unix _ ->
-                  () ) ;
-              later t (fun () ->
-                  l.pending <- l.pending - 1 ;
-                  match Hashtbl.find_opt n.fds lfd with
-                  | Some (Lsn l') when l' == l ->
-                      Queue.push s l.backlog ;
-                      c.established <- true ;
-                      edge n lfd ~read:true ~write:false ;
-                      edge n c.cfd ~read:false ~write:true
-                  | _ ->
-                      c.refused <- true ;
-                      c.peer <- None ;
-                      edge n c.cfd ~read:true ~write:true ) ;
-              Ok c.cfd
+          | Some (Lsn l) when l.ltcp ->
+              ( Some l
+              , Result.map (fun p -> Op.Tcp ("client", p)) (client_port n) )
+          | Some (Lsn l) ->
+              (Some l, Ok (Op.Unix ""))
           | _ ->
-              refused () ) )
+              (None, Ok (Op.Unix ""))
+        with
+        | _, Error e ->
+            Error e
+        | Some l, Ok client when Queue.length l.backlog + l.pending < l.limit ->
+            l.pending <- l.pending + 1 ;
+            let c = new_sock ~tcp:l.ltcp ~local:client addr
+            and s = new_sock ~tcp:l.ltcp ~local:l.laddr client in
+            c.peer <- Some s ;
+            s.peer <- Some c ;
+            s.established <- true ;
+            c.cfd <- new_fd n ;
+            Hashtbl.replace n.fds c.cfd (Conn c) ;
+            ( match client with
+            | Op.Tcp (_, p) ->
+                Hashtbl.replace n.client_ports p c.cfd
+            | Op.Unix _ ->
+                () ) ;
+            later t (fun () ->
+                l.pending <- l.pending - 1 ;
+                match Hashtbl.find_opt n.fds lfd with
+                | Some (Lsn l') when l' == l ->
+                    Queue.push s l.backlog ;
+                    c.established <- true ;
+                    edge n lfd ~read:true ~write:false ;
+                    edge n c.cfd ~read:false ~write:true
+                | _ ->
+                    c.refused <- true ;
+                    c.peer <- None ;
+                    edge n c.cfd ~read:true ~write:true ) ;
+            Ok c.cfd
+        | _ ->
+            refused () ) )
   | Op.Connect_result fd ->
       conn fd (fun c ->
           if c.refused then Error Op.Refused

@@ -548,6 +548,33 @@ let unix_path_limit () =
       Sim.set_fd_limit sim None ;
       List.iter Net.close [c; l] )
 
+(* A TCP connect takes its port before the check of the backlog, as Linux takes
+   a port before the SYN. A refused connect thus uses a port of the counter.
+   With no free port, a connect to a full backlog gives EADDRNOTAVAIL, not
+   ECONNREFUSED. *)
+let port_before_backlog () =
+  Sim.run (fun _ ->
+      let full = Net.Tcp ("server", 2) in
+      let lf = Net.listen ~backlog:1 full in
+      let c1 = Net.connect full in
+      is_true (Net.local_addr c1 = Net.Tcp ("client", 40000)) ;
+      equal string "ECONNREFUSED" (error_of (fun () -> Net.connect full)) ;
+      (* The refused connect used the port 40001. *)
+      let a = Net.Tcp ("server", 1) in
+      let l = Net.listen ~backlog:30_000 a in
+      is_true (Net.local_addr (Net.connect a) = Net.Tcp ("client", 40002)) ;
+      (* Each other port of the counter gets an open client. *)
+      let rec fill () =
+        match Net.connect a with
+        | _ ->
+            fill ()
+        | exception Net.Error (Other "EADDRNOTAVAIL", _) ->
+            ()
+      in
+      fill () ;
+      equal string "EADDRNOTAVAIL" (error_of (fun () -> Net.connect full)) ;
+      ignore (lf, l) )
+
 (* The bytes that the latency holds count against the buffer of the peer. *)
 let inflight_backpressure () =
   Sim.run (fun sim ->
@@ -1445,6 +1472,8 @@ let tests =
       ; test "a listen on port 0 skips the ports in use" listen_port_0
       ; test "a client skips the port of an open client" client_port_wraps
       ; test "a connect with no free port gives EADDRNOTAVAIL" no_free_port
+      ; test "a connect takes its port before the check of the backlog"
+          port_before_backlog
       ; test "a Unix path of 108 bytes gives ENAMETOOLONG" unix_path_limit
       ; test "the bytes in flight count against the buffer"
           inflight_backpressure
