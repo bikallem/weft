@@ -19,9 +19,9 @@ val create : ?domains:int -> ?signals:Weft.Signal.t list -> unit -> t
     world examines the clock again at least each second.
 
     @raise Invalid_argument
-      if [~domains] is not in the range 1 to 62. It also raises it if [~signals]
-      is not empty and another world of the process holds signals: only one
-      world at a time can watch signals. *)
+      if [~domains] is not in the range 1 to 62. [create] with [~signals] also
+      raises [Invalid_argument] if another world of the process holds signals.
+      Only one world at a time can watch signals. *)
 
 val close : t -> unit
 (** [close t] stops the thread pools, closes the fds of the world, also the exit
