@@ -142,11 +142,10 @@ let of_utc u =
   if
     ( u.year < -10000 )
     [@mutate
-      off "the year -10000 is far outside Clock.posix, so the limit gives None"]
+      off "at the year -10000, the range check of the seconds gives None"]
     || ( u.year > 10000 )
        [@mutate
-         off
-           "the year 10000 is far outside Clock.posix, so the limit gives None"]
+         off "at the year 10000, the range check of the seconds gives None"]
     || u.month < 1 || u.month > 12 || u.day < 1
     || u.day > days_in_month u.year u.month
     || u.hour < 0 || u.hour > 23 || u.minute < 0 || u.minute > 59

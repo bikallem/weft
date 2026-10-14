@@ -439,7 +439,8 @@ let tests =
       ; test "a run that raises restores the report of promises" restore_report
       ; test "a failed promise that nobody awaits gives Unawaited" unawaited
       ; test "a step of the wall clock moves a Posix timer only" posix_timers
-      ; test "a step of the wall clock wakes a sleeping domain, with 20 seeds"
+      ; test
+          "a step of the wall clock wakes a domain that sleeps, with 20 seeds"
           (fun () -> is_true (Helpers.some_seed 20 posix_step) )
       ; test "a finaliser fills an Ivar" finaliser
       ; test "a fill from outside needs ~outside_fills" refused

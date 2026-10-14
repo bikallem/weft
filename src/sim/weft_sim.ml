@@ -1611,8 +1611,8 @@ let quiescent t st =
   progress t
   [@mutate
     off
-      "the next step wakes a sleeping domain, and that step also sets the \
-       count to 0"] ;
+      "the next step wakes a domain that sleeps, and that step also sets the \
+       count of no progress to 0"] ;
   let s = sched t in
   ( match
       Sched_debug.lost s
