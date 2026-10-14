@@ -1373,7 +1373,7 @@ Decisions 1 to 6 were made on 2026-10-09, decisions 7 to 9 on 2026-10-10, decisi
 | 6 | Unix in fiber code | Wrap the full Unix I/O API |
 | 7 | Stealing | Full stealing, as in affect. A fiber that ran can move, but its registrations stay on the domain where it blocked. |
 | 8 | Fd registration | Edge-triggered, with one registration in each domain where a fiber blocks on the fd |
-| 9 | Tests | windtrap 0.2.0: property, stateful and expect tests, coverage and mutation testing (section 2.17) |
+| 9 | Tests | windtrap (the fork bikallem/windtrap, after 0.2.0): property, stateful and expect tests, coverage and mutation testing (section 2.17) |
 | 10 | A read with no wait | `Net.read_now` and `Net.write_now`, which clear the flag of the domain after `EAGAIN` (section 2.7). A fiber for each read costs a fiber and a scope for each wait. A cancel for the stop cannot stop only the idle connections. |
 | 11 | A close with a reset | `Net.reset`, not a `Linger` socket option. A linger time of more than 0 makes `close(2)` block, and the simulator models one reset more easily than all linger times. The simulator gives the reset to the peer, and the fault `resets` of `Sim.net_faults` resets a connection at random (section 2.8). |
 | 12 | The local address | `Net.local_addr` in the core, not a function of each world, so that code for all worlds and the simulator can use it (sections 2.7 and 2.8). We removed `Weft_linux.local_port` and `Weft_kqueue.local_port`, because `local_addr` gives the same port. A UDP socket gives `Tcp (host, port)`. A `Udp` constructor in `addr` adds a case that `listen` and `connect` must refuse, and a separate function for UDP adds a second API for one task. |
@@ -1637,7 +1637,7 @@ Run all of the models with `nix develop -c spec/tla/check.sh`. `MODELS="Ivar Fd"
 
 ## 2.17 Tests with windtrap
 
-The tests use windtrap 0.2.0 (decision 9). The flake builds windtrap and `ppx_windtrap` from the `v0.2.0` tag, because nixpkgs has only 0.1.0. Windtrap gives unit tests, property tests, stateful tests, expect tests, coverage and mutation testing from one library.
+The tests use windtrap from the fork `bikallem/windtrap` (decision 9). The fork has changes after the release 0.2.0, and it has no release. Thus the flake builds windtrap and `ppx_windtrap` from one commit of its main branch, and the FreeBSD job of CI pins the same commit with opam. Windtrap gives unit tests, property tests, stateful tests, expect tests, coverage and mutation testing from one library.
 
 **Which test for which part:**
 
