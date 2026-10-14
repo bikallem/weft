@@ -4,6 +4,7 @@
 open Windtrap
 open Weft
 module Sim = Weft_sim
+module C = Private.Chan
 module S = Private.Sched
 
 let run = Helpers.run
@@ -961,6 +962,83 @@ let values_conserved (seed, n) =
   in
   equal (list int) (List.init n (fun i -> i + 1)) (List.sort compare got)
 
+(* All the offers of a side, also the stale offers. [C.offers] moves [back] to
+   [front], so the count does not use it. *)
+let all_offers side =
+  List.length (Atomic.get side.C.front) + List.length (Atomic.get side.C.back)
+
+(* One branch of the choose skips the offer of the other branch. The offer stays
+   in the queue, and a later partner meets it. The seed selects the order of the
+   two branches, so the test has a partner of each type. *)
+let skipped_own_offer partner_sends () =
+  Helpers.run (fun () ->
+      let c = Chan.create () in
+      Fiber.scope (fun s ->
+          let p =
+            Fiber.fork_promise s (fun () ->
+                sync
+                  (choose
+                     [ wrap (Chan.send c 1) (fun () -> "sent")
+                     ; wrap (Chan.recv c) (fun v -> "got " ^ string_of_int v) ] ) )
+          in
+          Time.sleep Mono (Span.ms 1) ;
+          if partner_sends then (
+            sync (Chan.send c 2) ;
+            equal string "got 2" (Promise.await p) )
+          else (
+            equal int 1 (sync (Chan.recv c)) ;
+            equal string "sent" (Promise.await p) ) ) )
+
+(* A send that meets the oldest offer in [front] does not scan [back]. The stale
+   offer in [back] stays there, and the send adds no offer of its own. *)
+let send_stops_in_front () =
+  Helpers.run (fun () ->
+      let c = Chan.create () in
+      let got = ref [] in
+      Fiber.scope (fun s ->
+          for _ = 1 to 3 do
+            Fiber.fork s (fun () ->
+                (* Read [!got] after the sync, not before it. *)
+                let v = sync (Chan.recv c) in
+                got := v :: !got )
+          done ;
+          Time.sleep Mono (Span.ms 1) ;
+          (* The scan of [back] meets the first receiver. The two other offers
+             go to [front]. *)
+          sync (Chan.send c 1) ;
+          equal int 2 (all_offers c.C.receivers) ;
+          (* A stale offer in [back]. *)
+          equal (option int) None
+            (sync
+               (choose
+                  [ wrap (Chan.recv c) Option.some
+                  ; wrap (Time.after Mono (Span.ms 1)) (fun () -> None) ] ) ) ;
+          equal int 3 (all_offers c.C.receivers) ;
+          sync (Chan.send c 2) ;
+          equal int 2 (all_offers c.C.receivers) ;
+          equal int 0 (all_offers c.C.senders) ;
+          sync (Chan.send c 3) ) ;
+      equal (list int) [1; 2; 3] (List.sort compare !got) )
+
+(* With an empty [back], [C.offers] gives [front] itself, with no copy. The drop
+   of the stale offers calls it, so a copy adds a second pass over the
+   offers. *)
+let offers_no_copy () =
+  Helpers.run (fun () ->
+      let c = Chan.create () in
+      Fiber.scope (fun s ->
+          for _ = 1 to 3 do
+            Fiber.fork s (fun () -> ignore (sync (Chan.recv c)))
+          done ;
+          Time.sleep Mono (Span.ms 1) ;
+          sync (Chan.send c 1) ;
+          let side = c.C.receivers in
+          equal int 0 (List.length (Atomic.get side.C.back)) ;
+          let front = Atomic.get side.C.front in
+          is_true (C.offers side == front) ;
+          sync (Chan.send c 2) ;
+          sync (Chan.send c 3) ) )
+
 let chans =
   group "channels"
     [ test "a send and a recv that start at the same time meet" send_recv_meet
@@ -973,7 +1051,14 @@ let chans =
         timeout_loop_bounded
     ; prop "each sent value arrives exactly one time"
         (Gen.pair Gen.int (Gen.int_range 0 12))
-        values_conserved ]
+        values_conserved
+    ; test "a recv meets an offer that its own sync skipped"
+        (skipped_own_offer false)
+    ; test "a send meets an offer that its own sync skipped"
+        (skipped_own_offer true)
+    ; test "a send that meets an offer in front does not scan back"
+        send_stops_in_front
+    ; test "with an empty back, offers does not copy front" offers_no_copy ]
 
 (* Properties *)
 
@@ -1076,7 +1161,7 @@ let () =
     (Windtrap.run "sim"
        ( [time; timers; events; chans; scopes; reviews; checks; properties]
        @ Test_net.tests @ Test_m1.tests @ Test_m2.tests @ Test_m3.tests
-       @ Test_wakes.tests @ Test_io.tests @ Mut_sync.tests
+       @ Test_wakes.tests @ Test_io.tests @ Test_sync.tests
        @ Portable.tests portable_world
        @ Portable.tests portable_world_4
        @ [ Portable.reset_details portable_world
