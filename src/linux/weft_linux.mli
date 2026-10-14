@@ -21,14 +21,17 @@ val create : ?domains:int -> ?signals:Weft.Signal.t list -> unit -> t
     unblocks it at its next wait. SIGPIPE is ignored, so a write with no reader
     gives EPIPE.
 
+    After an error, [create] closes the fds that it made and restores the signal
+    mask.
+
     @raise Invalid_argument
-      if [~signals] is not empty and another world of the process watches
-      signals: only one world at a time can watch signals. [close] releases the
-      claim. *)
+      if [~domains] is not in the range 1 to 62, or if [~signals] is not empty
+      and another world of the process watches signals: only one world at a time
+      can watch signals. [close] releases the claim. *)
 
 val close : t -> unit
 (** [close t] stops the thread pools, closes the fds of the world and restores
-    the signal mask of [create]. *)
+    the signal mask of [create]. A second close does nothing. *)
 
 val run :
      ?slack:Weft.Span.t

@@ -869,16 +869,39 @@ let zero_write () =
       equal int 0 (Net.write_sub c chunk 0 0) ;
       List.iter Net.close [c; s; l] )
 
-(* Only one world at a time can watch signals, as on kqueue. A world with no
-   signals does not need the claim. *)
+(* Only one world at a time can watch signals, as on kqueue. For a world with no
+   signals, the claim is not necessary. A refused create does not release the
+   claim of the open world, so a second try also raises. *)
 let one_signal_world () =
+  let another =
+    Invalid_argument "Weft_linux.create: another world watches signals"
+  in
   Weft_linux.run ~domains:1 ~signals:[SIGUSR1] (fun () ->
-      raises
-        (Invalid_argument "Weft_linux.create: another world watches signals")
-        (fun () -> ignore (Weft_linux.create ~signals:[SIGUSR2] ()) ) ;
+      raises another (fun () ->
+          ignore (Weft_linux.create ~signals:[SIGUSR2] ()) ) ;
+      raises another (fun () ->
+          ignore (Weft_linux.create ~signals:[SIGUSR2] ()) ) ;
       Weft_linux.close (Weft_linux.create ()) ) ;
   (* After the close, a new world can watch signals. *)
-  Weft_linux.close (Weft_linux.create ~signals:[SIGUSR2] ())
+  Weft_linux.close (Weft_linux.create ~signals:[SIGUSR2] ()) ;
+  (* A second close of a world does nothing: it does not release the claim of a
+     later world. *)
+  let a = Weft_linux.create ~signals:[SIGUSR1] () in
+  Weft_linux.close a ;
+  let b = Weft_linux.create ~signals:[SIGUSR2] () in
+  Weft_linux.close a ;
+  raises another (fun () -> ignore (Weft_linux.create ~signals:[SIGUSR1] ())) ;
+  Weft_linux.close b ;
+  (* A number of domains out of the range raises before the claim. *)
+  List.iter
+    (fun domains ->
+      raises
+        (Invalid_argument
+           "Weft_linux.create: the number of domains is not in the range 1 to \
+            62" ) (fun () ->
+          ignore (Weft_linux.create ~domains ~signals:[SIGUSR1] ()) ) )
+    [0; 63] ;
+  Weft_linux.close (Weft_linux.create ~signals:[SIGUSR1] ())
 
 let linux =
   group "linux"

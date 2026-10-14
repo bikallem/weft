@@ -240,16 +240,40 @@ let signal_storm () =
   in
   at_least int ~than:100 got
 
-(* Only one world at a time can watch signals: the handler is for the process. A
-   world with no signals does not need it. *)
+(* Only one world at a time can watch signals: the handler is for the process.
+   For a world with no signals, the handler is not necessary. A refused create
+   does not release the handler of the open world, so a second try also
+   raises. *)
 let one_signal_world () =
+  let another =
+    Invalid_argument "Weft_kqueue.create: another world watches signals"
+  in
   Weft_kqueue.run ~domains:1 ~signals:[SIGUSR1] (fun () ->
-      raises
-        (Invalid_argument "Weft_kqueue.create: another world watches signals")
-        (fun () -> ignore (Weft_kqueue.create ~signals:[SIGUSR2] ()) ) ;
+      raises another (fun () ->
+          ignore (Weft_kqueue.create ~signals:[SIGUSR2] ()) ) ;
+      raises another (fun () ->
+          ignore (Weft_kqueue.create ~signals:[SIGUSR2] ()) ) ;
       Weft_kqueue.close (Weft_kqueue.create ()) ) ;
   (* After the close, a new world can watch signals. *)
-  Weft_kqueue.close (Weft_kqueue.create ~signals:[SIGUSR2] ())
+  Weft_kqueue.close (Weft_kqueue.create ~signals:[SIGUSR2] ()) ;
+  (* A second close of a world does nothing: it does not release the handler of
+     a later world. *)
+  let a = Weft_kqueue.create ~signals:[SIGUSR1] () in
+  Weft_kqueue.close a ;
+  let b = Weft_kqueue.create ~signals:[SIGUSR2] () in
+  Weft_kqueue.close a ;
+  raises another (fun () -> ignore (Weft_kqueue.create ~signals:[SIGUSR1] ())) ;
+  Weft_kqueue.close b ;
+  (* A number of domains out of the range raises before the claim. *)
+  List.iter
+    (fun domains ->
+      raises
+        (Invalid_argument
+           "Weft_kqueue.create: the number of domains is not in the range 1 to \
+            62" ) (fun () ->
+          ignore (Weft_kqueue.create ~domains ~signals:[SIGUSR1] ()) ) )
+    [0; 63] ;
+  Weft_kqueue.close (Weft_kqueue.create ~signals:[SIGUSR1] ())
 
 let () =
   exit

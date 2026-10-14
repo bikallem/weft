@@ -71,7 +71,8 @@ type t =
             before [create]. *)
   ; lock: Mutex.t
   ; procs: (int, proc) Hashtbl.t  (** By the read end of the exit pipe. *)
-  ; pids: (int, proc) Hashtbl.t  (** By pid. *) }
+  ; pids: (int, proc) Hashtbl.t  (** By pid. *)
+  ; closed: bool Atomic.t  (** [close] sets it, one time. *) }
 
 let make_dom () =
   let kq = check "kqueue" (kq_create ()) in
@@ -90,6 +91,9 @@ let close_dom d =
    After an error, [create] closes what it made and restores the actions that it
    changed. *)
 let create ?(domains = 1) ?(signals = []) () =
+  if domains < 1 || domains > 62 then
+    invalid_arg
+      "Weft_kqueue.create: the number of domains is not in the range 1 to 62" ;
   Sys.set_signal Sys.sigpipe Sys.Signal_ignore ;
   let nums = List.sort_uniq compare (List.map number_of signals) in
   let doms = ref [] and old_actions = ref [] and claimed = ref false in
@@ -123,11 +127,12 @@ let create ?(domains = 1) ?(signals = []) () =
       ; old_actions= !old_actions
       ; lock= Mutex.create ()
       ; procs= Hashtbl.create ~random:false 8
-      ; pids= Hashtbl.create ~random:false 8 }
+      ; pids= Hashtbl.create ~random:false 8
+      ; closed= Atomic.make false }
 
 (* The actions come back first. Then the release waits until no handler can
    write the wake pipe, and the pipe can close. *)
-let close t =
+let close_once t =
   let watched = List.map number_of (Atomic.get t.watched) in
   List.iter
     (fun (n, a) -> if List.mem n watched then sig_restore n a)
@@ -140,6 +145,10 @@ let close t =
       ignore (close_fd p.exit_w) )
     t.procs ;
   Array.iter close_dom t.doms
+
+(* A second close does nothing. Thus it cannot release the handler of a later
+   world. *)
+let close t = if Atomic.compare_and_set t.closed false true then close_once t
 
 let esrch = Error (Op.Other "ESRCH")
 
