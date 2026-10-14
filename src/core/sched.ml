@@ -1824,8 +1824,9 @@ let next_run = Atomic.make 0
    in one [int]. *)
 let max_domains = 62
 
-(* [name] raises [Invalid_argument] if [domains] is not in the range 1 to
-   [max_domains]. The scheduler and the worlds use the same check. *)
+(* [check_domains name domains] raises [Invalid_argument] if [domains] is not
+   in the range 1 to [max_domains]. The error text starts with [name]. The
+   scheduler and the worlds use the same check. *)
 let check_domains name domains =
   if domains < 1 || domains > max_domains then
     invalid_arg

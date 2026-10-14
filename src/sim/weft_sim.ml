@@ -624,8 +624,8 @@ let read_conn t c buf off len =
 
 (* The close of a socket or of an end of a pipe: the peer reads the end of the
    stream, and a write of the peer gives EPIPE. With [~fin:false], the peer does
-   not get [fin]: on Linux, a TCP close after [Shutdown] sends a reset, and the
-   peer is then closed. *)
+   not get [fin]. This is a reset after [Shutdown], and on Linux the peer then
+   gives EPIPE. *)
 let close_conn ?(fin = true) t c =
   match c.peer with
   | Some p ->
