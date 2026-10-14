@@ -95,6 +95,30 @@ let alarm_skips_stale () =
   ignore (S.C.self_commit first.S.word 1) ;
   equal (option int64) (Some 2L) (S.alarm_of d d.S.heap)
 
+(* A push at the limit rebuilds the heap: it removes the stale entries, and the
+   live entries keep their order. *)
+let rebuild_keeps_live () =
+  let h = S.Heap.create () in
+  let syncs = List.init 64 (fun _ -> dummy_sync ()) in
+  List.iteri
+    (fun i s -> S.Heap.push h ~deadline:(Int64.of_int (i + 1)) s 0)
+    syncs ;
+  (* The entries at the even deadlines become stale. *)
+  List.iteri
+    (fun i s -> if i mod 2 = 1 then ignore (S.C.self_commit s.S.word 1))
+    syncs ;
+  S.Heap.push h ~deadline:100L (dummy_sync ()) 0 ;
+  equal int 33 h.S.size ;
+  let rec all acc =
+    match S.Heap.top h with
+    | Some e ->
+        S.Heap.pop h ;
+        all (Int64.to_int e.S.deadline :: acc)
+    | None ->
+        List.rev acc
+  in
+  equal (list int) (List.init 32 (fun i -> (2 * i) + 1) @ [100]) (all [])
+
 let heap =
   group "heap"
     [ prop "the heap gives the order of a sorted list"
@@ -102,7 +126,8 @@ let heap =
         heap_is_ordered
     ; test "a drop takes the stale entries at the head" drop_stale
     ; test "an add drops the stale entries at the head" push_drops_stale
-    ; test "the alarm skips a stale entry" alarm_skips_stale ]
+    ; test "the alarm skips a stale entry" alarm_skips_stale
+    ; test "a rebuild keeps only the live entries" rebuild_keeps_live ]
 
 (* Two domains increment a counter under the lock. *)
 let spin_excludes () =
