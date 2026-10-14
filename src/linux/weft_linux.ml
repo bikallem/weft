@@ -321,7 +321,11 @@ module World = struct
           let counts = signalfd_read t.sigfd in
           let acc = ref acc in
           for n = Array.length counts - 1 downto 0 do
-            if (counts.(n) > 0) [@mutate off "a count of 0 commits no waiter"]
+            if
+              ( counts.(n) > 0 )
+              [@mutate
+                off
+                  "the core ignores a count of 0, so this check only saves work"]
             then acc := World.Ready.Signal (signal_of n, counts.(n)) :: !acc
           done ;
           !acc )

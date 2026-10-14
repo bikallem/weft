@@ -552,4 +552,65 @@ let time =
     ; test "to_utc and of_utc agree with a walk of each day" utc_each_day
     ; test "Time.now outside run raises Not_in_fiber" time_outside_fiber ]
 
-let tests = [world; span; time]
+(* A world that watches each signal and gives the signals of [batches], one
+   batch at each wait. It records each signal that the core sends again. *)
+module Signals = struct
+  type t =
+    { mutable batches: Private.World.Ready.t list list
+    ; mutable resent: Signal.t list }
+
+  let now (type time) _ (line : time Clock.line) : time = Clock.of_ns line 0L
+
+  let submit : type a. t -> a Private.Op.t -> (a, Private.Op.error) result =
+   fun t op ->
+    match op with
+    | Private.Op.Watch s ->
+        Ok s
+    | Private.Op.Unwatch s ->
+        Ok s
+    | Private.Op.Resend s ->
+        t.resent <- s :: t.resent ;
+        Ok ()
+    | _ ->
+        Error (Private.Op.Other "no network")
+
+  let wait t ~domain:_ (_ : Private.World.Wait.t) =
+    match t.batches with
+    | b :: rest ->
+        t.batches <- rest ;
+        b
+    | [] ->
+        failwith "the program sleeps forever"
+
+  let wake _ ~domain:_ = ()
+
+  let random _ n = n - 1
+
+  let random_bytes _ b = Bytes.fill b 0 (Bytes.length b) 'x'
+end
+
+(* A count of 0 is a signal that did not come. A waiter of a watched signal does
+   not get it, and the core does not send an unwatched signal again. *)
+let signal_count_zero () =
+  let w =
+    { Signals.batches=
+        [ [ Private.World.Ready.Signal (SIGUSR1, 0)
+          ; Private.World.Ready.Signal (SIGUSR2, 0) ]
+        ; [Private.World.Ready.Signal (SIGUSR1, 2)] ]
+    ; resent= [] }
+  in
+  let n =
+    Weft.run
+      (module Signals)
+      w
+      (fun () ->
+        Signal.unwatch SIGUSR2 ;
+        sync (Signal.received SIGUSR1) )
+  in
+  equal int 2 n ;
+  equal int 0 (List.length w.resent)
+
+let signals =
+  group "signals" [test "a count of 0 is not a signal" signal_count_zero]
+
+let tests = [world; span; time; signals]

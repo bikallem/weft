@@ -928,40 +928,43 @@ let signal_leaf sg cell : leaf =
 
 (* [n] more of [sg]: the oldest waiter that can commit takes the count. After an
    unwatch, the world sends the signal again, and it gets its action (design
-   section 2.7, The end of a watch). *)
+   section 2.7, The end of a watch). A count of 0 or less did not come: it
+   counts nothing, and it sends no signal again. *)
 let deliver dom sg n =
   let t = dom.sched in
   let unwatched, resumed =
-    Spin.with_lock t.signals_lock (fun () ->
-        let st = sigstate t sg in
-        if st.unwatched then (true, [])
-        else (
-          st.count <- st.count + n ;
-          let rec give resumed = function
-            | [] ->
-                (resumed, [])
-            | (ws
-               [@mutate
-                 off
-                   "each world gives a count of 1 or more, and the give stops \
-                    at the first commit, so the count is not 0 here"] )
-              when st.count = 0 ->
-                (resumed, ws)
-            | (s, i, cell) :: rest -> (
-                cell := st.count ;
-                match C.notify s.word i with
-                | C.Resume ->
-                    st.count <- 0 ;
-                    (s :: resumed, rest)
-                | C.In_scan ->
-                    st.count <- 0 ;
-                    (resumed, rest)
-                | C.Lost _ ->
-                    give resumed rest )
-          in
-          let resumed, rest = give [] (List.rev st.swait) in
-          st.swait <- List.rev rest ;
-          (false, resumed) ) )
+    if n <= 0 then (false, [])
+    else
+      Spin.with_lock t.signals_lock (fun () ->
+          let st = sigstate t sg in
+          if st.unwatched then (true, [])
+          else (
+            st.count <- st.count + n ;
+            let rec give resumed = function
+              | [] ->
+                  (resumed, [])
+              | (ws
+                 [@mutate
+                   off
+                     "the count is 1 or more after the add, and the give stops \
+                      at the first commit, so the count is not 0 here"] )
+                when st.count = 0 ->
+                  (resumed, ws)
+              | (s, i, cell) :: rest -> (
+                  cell := st.count ;
+                  match C.notify s.word i with
+                  | C.Resume ->
+                      st.count <- 0 ;
+                      (s :: resumed, rest)
+                  | C.In_scan ->
+                      st.count <- 0 ;
+                      (resumed, rest)
+                  | C.Lost _ ->
+                      give resumed rest )
+            in
+            let resumed, rest = give [] (List.rev st.swait) in
+            st.swait <- List.rev rest ;
+            (false, resumed) ) )
   in
   if unwatched then ignore (World.perform "sched" (World.Submit (Op.Resend sg)))
   else List.iter (resume dom) resumed
