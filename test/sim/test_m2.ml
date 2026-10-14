@@ -4,6 +4,7 @@
 open Windtrap
 open Weft
 module Sim = Weft_sim
+module S = Private.Sched
 
 (* Each test of the fiber layer runs with 200 seeds on 4 virtual domains. *)
 let seeds_200 =
@@ -126,6 +127,39 @@ let detached_at_end seed =
   equal int 0 (Sim.open_fds (Option.get !saved)) ;
   timed_out
 
+(* A completion that a fiber waited for leaves no record. *)
+let no_external_left () =
+  Sim.run (fun sim ->
+      for _ = 1 to 10 do
+        ignore (File.stat "/")
+      done ;
+      equal int 0 (Hashtbl.length (Sim.sched sim).S.externals) )
+
+(* A cancel from another domain can come between the start of a job and the
+   start of its wait. Then the fiber never waits, and it detaches. Its
+   completion leaves no record. *)
+let detach_before_wait seed =
+  Sim.run ~seed ~domains:4 (fun sim ->
+      let inner = ref None in
+      Fiber.scope (fun outer ->
+          Fiber.fork outer (fun () ->
+              Fiber.scope (fun s ->
+                  inner := Some s ;
+                  Fiber.fork s (fun () ->
+                      while true do
+                        ignore (File.stat "/")
+                      done ) ) ) ;
+          while Option.is_none !inner do
+            Fiber.yield ()
+          done ;
+          Helpers.spin (seed mod 40) ;
+          Fiber.cancel (Option.get !inner) Exit ) ;
+      Time.sleep Mono (Span.ms 1) ;
+      equal
+        ~msg:(Printf.sprintf "seed %d" seed)
+        int 0
+        (Hashtbl.length (Sim.sched sim).S.externals) )
+
 let jobs =
   group "jobs"
     [ test "F4: a detached job at the end of run releases its fd" (fun () ->
@@ -154,7 +188,10 @@ let jobs =
           less int ~than:2000 !total )
     ; test "with_timeout around a DNS that never answers ends at the deadline"
         dns_timeout
-    ; test "the name table of Dns" dns ]
+    ; test "the name table of Dns" dns
+    ; test "a completion leaves no record" no_external_left
+    ; test "a detach before the wait leaves no record, with 100 seeds"
+        (fun () -> Helpers.seeds 100 detach_before_wait ) ]
 
 (* Processes and signals (milestone M2). *)
 

@@ -336,6 +336,57 @@ let lost_next () =
     (List.mem "the queue of domain 0 is not empty"
        (Private.Sched_debug.lost t ~now:(Clock.of_ns Mono 0L)) )
 
+(* One fiber that a fiber wakes goes to the next slot: it runs before the fiber
+   that is at the head of the local queue. *)
+let woken_goes_next () =
+  let add, get = Helpers.log () in
+  Sim.run (fun _ ->
+      let iv = Ivar.create () in
+      Fiber.scope (fun s ->
+          Fiber.fork s (fun () ->
+              sync (Ivar.read iv) ;
+              add "woken" ) ;
+          Fiber.yield () ;
+          Fiber.fork s (fun () -> add "queued") ;
+          Ivar.fill iv () ;
+          Fiber.yield () ) ) ;
+  equal (list string) ["woken"; "queued"] (get ())
+
+(* The next slot runs at most 3 times in sequence (open question 5). Two fibers
+   that send to each other fill the next slot, and the third fiber runs after 3
+   runs from the next slot. *)
+let next_limit () =
+  let add, get = Helpers.log () in
+  Sim.run (fun _ ->
+      let c = Chan.create () in
+      Fiber.scope (fun s ->
+          Fiber.fork s (fun () ->
+              for i = 1 to 6 do
+                sync (Chan.send c i)
+              done ) ;
+          Fiber.fork s (fun () ->
+              for _ = 1 to 6 do
+                add "%s" (string_of_int (sync (Chan.recv c)))
+              done ) ;
+          Fiber.fork s (fun () -> add "%s" "other") ) ) ;
+  equal (list string) ["1"; "2"; "3"; "other"; "4"; "5"; "6"] (get ())
+
+(* Domain 0 takes a pinned fiber that yields at most 3 times in sequence. Then
+   it takes the local queue. *)
+let pinned_limit () =
+  let add, get = Helpers.log () in
+  Sim.run (fun _ ->
+      Fiber.scope (fun s ->
+          Fiber.fork ~pinned:true s (fun () ->
+              for _ = 1 to 6 do
+                add "p" ; Fiber.yield ()
+              done ) ;
+          Fiber.fork s (fun () ->
+              for _ = 1 to 2 do
+                add "n" ; Fiber.yield ()
+              done ) ) ) ;
+  equal string "pppnpppn" (String.concat "" (get ()))
+
 let tests =
   [ group "m3"
       [ test "pinned fibers run only on domain 0, with 200 seeds" (fun () ->
@@ -348,6 +399,9 @@ let tests =
             done ;
             greater int ~than:0 !other )
       ; test "B: a pinned fiber that yields does not starve" pinned_yield
+      ; test "a woken fiber goes to the next slot" woken_goes_next
+      ; test "the next slot runs at most 3 times in sequence" next_limit
+      ; test "a pinned fiber runs at most 3 times in sequence" pinned_limit
       ; test "a thief takes a next slot, with 50 seeds" (fun () ->
             is_true (Helpers.some_seed 50 next_steal) )
       ; test "a pinned fiber wakes while domain 0 sleeps, with 50 seeds"

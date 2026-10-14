@@ -1451,6 +1451,23 @@ let fault_then_listener_close () =
       equal string "no error" (read ()) ;
       Net.close c )
 
+(* A close wakes a fiber that waits to write. *)
+let close_wakes_writer () =
+  Sim.run (fun sim ->
+      let a, b = Sim.socket_pair sim in
+      let got = ref None in
+      Fiber.scope (fun s ->
+          Fiber.fork s (fun () ->
+              match Net.write a (String.make (1 lsl 24) 'x') with
+              | () ->
+                  ()
+              | exception Net.Error (e, _) ->
+                  got := Some e ) ;
+          Time.sleep Mono (Span.ms 1) ;
+          Net.close a ) ;
+      Net.close b ;
+      is_true (!got = Some Net.Bad_fd) )
+
 let tests =
   [ group "net"
       [ slow "echo: the client gets hello back, with 1000 seeds" echo_1000_seeds
@@ -1464,6 +1481,7 @@ let tests =
       ; test "shutdown gives the end of the stream to the peer"
           shutdown_gives_eof
       ; test "close gives EBADF to a fiber that waits" close_wakes_waiter
+      ; test "a close wakes a writer" close_wakes_writer
       ; test "a late write after close gives EBADF" late_write_after_close
       ; test "1 MiB goes through the 64 KiB buffers" big_transfer
       ; test "the latency delays the connect and the data" latency_round_trip

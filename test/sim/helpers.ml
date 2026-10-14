@@ -25,6 +25,12 @@ let seeds n f =
    one of the runs gives [true]. *)
 let some_seed n f = List.exists Fun.id (List.init n (fun s -> f (s + 1)))
 
+(* Switch points with no switch of fiber, as a fiber that computes. *)
+let spin n =
+  for _ = 1 to n do
+    ignore (Time.now Mono)
+  done
+
 (* [spin_until flag] spins until [flag] is set, or for 10,000 switch points. It
    gives [true] if the flag came. Only another domain can set the flag. *)
 let spin_until flag =

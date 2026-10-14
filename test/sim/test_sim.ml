@@ -4,6 +4,7 @@
 open Windtrap
 open Weft
 module Sim = Weft_sim
+module S = Private.Sched
 
 let run = Helpers.run
 
@@ -584,6 +585,86 @@ let reviews =
         fill_outside_fiber
     ; test "K4: the waiters of an Ivar stay bounded" ivar_waiters_bounded ]
 
+(* A fiber that ended is not a member of its scope any more. *)
+let ended_fibers_leave () =
+  Sim.run (fun _ ->
+      Fiber.scope (fun s ->
+          for _ = 1 to 10 do
+            Fiber.fork s ignore
+          done ;
+          Fiber.yield () ;
+          (* Only the fiber of the body stays. *)
+          equal int 1 (Hashtbl.length (Private.scope_ctx s).S.members) ) )
+
+(* The body of a scope that ended is not a member of the scope any more. *)
+let body_leaves () =
+  Sim.run (fun _ ->
+      let sc = ref None in
+      Fiber.scope (fun s -> sc := Some s) ;
+      equal int 0
+        (Hashtbl.length (Private.scope_ctx (Option.get !sc)).S.members) )
+
+(* A cancel of a scope reaches its daemons with the reason of the cancel, not
+   with the end of the other members. *)
+let daemon_gets_reason () =
+  Sim.run (fun _ ->
+      let got = ref None in
+      Fiber.scope (fun s ->
+          Fiber.fork_daemon s (fun () ->
+              match sync (Ivar.read (Ivar.create ())) with
+              | () ->
+                  ()
+              | exception Fiber.Cancelled r ->
+                  got := Some r ) ;
+          Fiber.yield () ;
+          Fiber.cancel s Exit ;
+          (* The daemon runs before the body ends. *)
+          try Fiber.yield () with Fiber.Cancelled _ -> () ) ;
+      is_true (match !got with Some Exit -> true | _ -> false) )
+
+(* After [f], a cancel of the scope reaches the next wait of the fiber. *)
+let cancel_after f =
+  Sim.run (fun _ ->
+      let got = ref false in
+      Fiber.scope (fun s ->
+          Fiber.fork s (fun () ->
+              f () ;
+              match sync (Ivar.read (Ivar.create ())) with
+              | () ->
+                  ()
+              | exception Fiber.Cancelled _ ->
+                  got := true ) ;
+          Fiber.yield () ;
+          Fiber.cancel s Exit ) ;
+      is_true !got )
+
+(* The root scope (design section 2.5). The tests fork into it with the inside
+   API: a program cannot. *)
+
+(* When main returns, the root scope cancels the other fibers. *)
+let root_cancels_others () =
+  let reason = ref None in
+  Sim.run (fun _ ->
+      let root = List.hd (S.self ()).S.ctxs in
+      S.fork root (fun () ->
+          match sync (Ivar.read (Ivar.create ())) with
+          | () ->
+              ()
+          | exception Fiber.Cancelled r ->
+              reason := Some r ) ) ;
+  is_true (match !reason with Some S.Main_returned -> true | _ -> false)
+
+(* Main is a member of the root scope: a cancel of the root reaches it. *)
+let main_in_root () =
+  Sim.run (fun _ ->
+      let root = List.hd (S.self ()).S.ctxs in
+      S.fork root (fun () -> S.cancel root Exit) ;
+      match sync (Ivar.read (Ivar.create ())) with
+      | () ->
+          failwith "the wait ended"
+      | exception Fiber.Cancelled Exit ->
+          () )
+
 let scopes =
   group "scopes"
     [ test "an error in a child cancels the body" child_error_cancels_body
@@ -620,7 +701,18 @@ let scopes =
         backtrace_of_child
     ; test "run gives the value of main" main_gives_value
     ; test "a cancelled scope leaves no fibers and no live timers"
-        no_fibers_after_cancel ]
+        no_fibers_after_cancel
+    ; test "a fiber that ended leaves its scope" ended_fibers_leave
+    ; test "the body of a scope that ended leaves it" body_leaves
+    ; test "a daemon gets the reason of the cancel" daemon_gets_reason
+    ; test "a cancel reaches a fiber after a shield" (fun () ->
+          cancel_after (fun () -> Fiber.shield ignore) )
+    ; test "a cancel reaches a fiber after a shield that raised" (fun () ->
+          cancel_after (fun () ->
+              try Fiber.shield (fun () -> raise Exit) with Exit -> () ) )
+    ; test "the root scope cancels the others when main returns"
+        root_cancels_others
+    ; test "a cancel of the root scope reaches main" main_in_root ]
 
 (* The checks of the simulator *)
 
@@ -984,7 +1076,7 @@ let () =
     (Windtrap.run "sim"
        ( [time; timers; events; chans; scopes; reviews; checks; properties]
        @ Test_net.tests @ Test_m1.tests @ Test_m2.tests @ Test_m3.tests
-       @ Mut_sched.tests @ Mut_sim.tests @ Mut_io.tests @ Mut_sync.tests
+       @ Test_wakes.tests @ Mut_sim.tests @ Mut_io.tests @ Mut_sync.tests
        @ Portable.tests portable_world
        @ Portable.tests portable_world_4
        @ [ Portable.reset_details portable_world
