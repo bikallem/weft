@@ -70,6 +70,25 @@ let send_stops_in_front () =
           sync (Chan.send c 3) ) ;
       equal (list int) [1; 2; 3] (List.sort compare !got) )
 
+(* With an empty [back], [C.offers] gives [front] itself, with no copy. The drop
+   of the stale offers calls it, so a copy adds a second pass over the
+   offers. *)
+let offers_no_copy () =
+  run (fun () ->
+      let c = Chan.create () in
+      Fiber.scope (fun s ->
+          for _ = 1 to 3 do
+            Fiber.fork s (fun () -> ignore (sync (Chan.recv c)))
+          done ;
+          Time.sleep Mono (Span.ms 1) ;
+          sync (Chan.send c 1) ;
+          let side = c.C.receivers in
+          equal int 0 (List.length (Atomic.get side.C.back)) ;
+          let front = Atomic.get side.C.front in
+          is_true (C.offers side == front) ;
+          sync (Chan.send c 2) ;
+          sync (Chan.send c 3) ) )
+
 (* Locks *)
 
 (* [use_ro] unlocks the mutex when [f] gives a value. *)
@@ -167,6 +186,7 @@ let tests =
           (skipped_own_offer true)
       ; test "a send that meets an offer in front does not scan back"
           send_stops_in_front
+      ; test "with an empty back, offers does not copy front" offers_no_copy
       ; test "use_ro unlocks the mutex when f gives a value" use_ro_unlocks
       ; test "the shield of use_rw closes again after Condition.wait"
           shield_closes_after_wait

@@ -45,7 +45,11 @@ let rec start p inner =
       if not (Atomic.compare_and_set p.state Not_started (Running inner)) then
         start p inner
   | Requested ->
-      Atomic.set p.state (Running inner) ;
+      Atomic.set p.state (Running inner)
+      [@mutate
+        off
+          "a sync in a cancelled scope commits at once, so a second cancel \
+           does nothing"] ;
       Fiber.cancel inner Cancel_request
   | Running _ ->
       assert false (* Only the fiber of the promise starts it. *)

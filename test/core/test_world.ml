@@ -221,6 +221,30 @@ let world_error_of_domain_0 () =
     (function Failure m -> m = "the program sleeps forever" | _ -> false)
     (fun () -> run w (fun () -> sync (Ivar.read (Ivar.create ()))))
 
+(* The minor words of one sync of [ev], on average. *)
+let words_of_sync ev =
+  let w = Manual.make () in
+  run w (fun () ->
+      for _ = 1 to 100 do
+        ignore (sync ev)
+      done ;
+      let w0 = Gc.minor_words () in
+      for _ = 1 to 1000 do
+        ignore (sync ev)
+      done ;
+      (Gc.minor_words () -. w0) /. 1000. )
+
+(* A sync of a base event does not flatten the event (M3). Thus it allocates
+   much less than a sync of a choose of the same event: 60 words and 118 words
+   in OCaml 5.5. *)
+let base_needs_no_flatten () =
+  let base = words_of_sync (always 1)
+  and choice = words_of_sync (choose [always 1]) in
+  if not (base +. 25. < choice) then
+    fail
+      (Printf.sprintf "a base sync allocates %.1f words, a choose %.1f" base
+         choice )
+
 let world =
   group "Weft.run"
     [ test "run gives the value of main" run_gives_value
@@ -243,6 +267,7 @@ let world =
     ; test ~timeout:5. "C4: the alarm near the largest time saturates"
         alarm_saturates
     ; test "on_create gets the scheduler before main" on_create_runs_first
+    ; test "a sync of a base event does not flatten it" base_needs_no_flatten
     ; test "a fill from outside a fiber reaches the run"
         fill_from_outside_in_run
     ; test "after the end of run, a fill from outside gives false"
