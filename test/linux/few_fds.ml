@@ -4,10 +4,10 @@
    connection with no free fd gives EMFILE, and the connection stays in the
    backlog.
 
-   Then a create with signals fails, first at the signalfd and then at the epoll
-   set of domain 0. After each failure, the world closed the fds that it made
-   and restored the signal mask. A later world with signals works. The program
-   prints "ok" at the end. *)
+   Then a create with signals fails at each fd that it opens: the signalfd, and
+   the epoll set, the eventfd and the two timerfds of domain 0. After each
+   failure, the world closed the fds that it made and restored the signal mask.
+   A later world with signals works. The program prints "ok" at the end. *)
 
 open Weft
 
@@ -18,8 +18,8 @@ let emfile name f =
   | exception Net.Error (Net.No_resources "EMFILE", _) ->
       ()
 
-(* [true] if the calling thread blocks SIGUSR1 (10 on Linux). It needs one free
-   fd. *)
+(* [true] if the calling thread blocks SIGUSR1 (10 on Linux). One free fd is
+   necessary. *)
 let blocks_usr1 () =
   let lines =
     In_channel.with_open_text "/proc/thread-self/status" In_channel.input_lines
@@ -49,21 +49,53 @@ let fill () =
   in
   go []
 
+(* With [k] free fds, a create with signals fails in the call [name]. After the
+   failure, the [k] fds are free again, and SIGUSR1 is not blocked. *)
+let fails_with_free spare k name =
+  let rec free k l =
+    if k = 0 then l
+    else
+      match l with
+      | u :: l ->
+          Net.close u ;
+          free (k - 1) l
+      | [] ->
+          failwith "no fd"
+  in
+  let spare = free k spare in
+  create_fails name ;
+  let again = fill () in
+  if List.length again <> k then
+    failwith
+      (Printf.sprintf "%s: %d fds stay open" name (k - List.length again)) ;
+  (* Free one fd to read the mask. *)
+  let spare =
+    match again @ spare with
+    | u :: l ->
+        Net.close u ; l
+    | [] ->
+        failwith "no fd"
+  in
+  if blocks_usr1 () then failwith (name ^ ": SIGUSR1 stays blocked") ;
+  fill () @ spare
+
 let failed_create () =
   Weft_linux.run ~domains:1 ~watchdog:None (fun () ->
-      match fill () with
-      | u :: rest ->
-          create_fails "signalfd" ;
-          (* One free fd: the signalfd works, and epoll_create1 fails. *)
-          Net.close u ;
-          create_fails "epoll_create1" ;
-          (* The world closed its signalfd, so one fd is free again. *)
-          if blocks_usr1 () then failwith "SIGUSR1 stays blocked" ;
-          List.iter Net.close rest ;
-          Weft_linux.close (Weft_linux.create ~signals:[SIGUSR1] ()) ;
-          if blocks_usr1 () then failwith "SIGUSR1 is blocked after the close"
-      | [] ->
-          failwith "no free fd" )
+      (* The fds that [create] opens, in order: the signalfd, then for domain 0
+         epoll, eventfd and two timerfds. *)
+      let spare =
+        List.fold_left
+          (fun spare (k, name) -> fails_with_free spare k name)
+          (fill ())
+          [ (0, "signalfd")
+          ; (1, "epoll_create1")
+          ; (2, "eventfd")
+          ; (3, "timerfd_create")
+          ; (4, "timerfd_create") ]
+      in
+      List.iter Net.close spare ;
+      Weft_linux.close (Weft_linux.create ~signals:[SIGUSR1] ()) ;
+      if blocks_usr1 () then failwith "SIGUSR1 is blocked after the close" )
 
 let () =
   Weft_linux.run ~domains:1 ~watchdog:None (fun () ->

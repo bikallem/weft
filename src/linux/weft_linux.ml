@@ -78,11 +78,18 @@ type t =
   ; old_mask: bytes option  (** The signal mask before [create]. *)
   ; closed: bool Atomic.t  (** [close] sets it, one time. *) }
 
-let make_dom () =
-  let epfd = check "epoll_create1" (epoll_create ()) in
-  let evfd = check "eventfd" (eventfd ()) in
-  let tfd = check "timerfd_create" (timerfd false) in
-  let ptfd = check "timerfd_create" (timerfd true) in
+(* The poller of a domain. [undo] gets the close of each fd when [make_dom]
+   opens it. Thus an error in the middle leaves no fd open. *)
+let make_dom ~undo () =
+  let fd name r =
+    let fd = check name r in
+    undo := (fun () -> ignore (close_fd fd)) :: !undo ;
+    fd
+  in
+  let epfd = fd "epoll_create1" (epoll_create ()) in
+  let evfd = fd "eventfd" (eventfd ()) in
+  let tfd = fd "timerfd_create" (timerfd false) in
+  let ptfd = fd "timerfd_create" (timerfd true) in
   ignore (check "epoll_ctl" (epoll_add_in epfd evfd wake_token)) ;
   ignore (check "epoll_ctl" (epoll_add_in epfd tfd timer_token)) ;
   ignore (check "epoll_ctl" (epoll_add_in epfd ptfd posix_token)) ;
@@ -159,12 +166,7 @@ let make ~domains ~nums ~undo signals =
         (unblocked_numbers (Array.to_list nums)) ;
       (Some old, fd)
   in
-  let doms =
-    Array.init domains (fun _ ->
-        let d = make_dom () in
-        undo := (fun () -> close_dom d) :: !undo ;
-        d )
-  in
+  let doms = Array.init domains (fun _ -> make_dom ~undo ()) in
   if sigfd >= 0 then
     ignore (check "epoll_ctl" (epoll_add_in doms.(0).epfd sigfd signal_token)) ;
   { doms

@@ -74,17 +74,23 @@ type t =
   ; pids: (int, proc) Hashtbl.t  (** By pid. *)
   ; closed: bool Atomic.t  (** [close] sets it, one time. *) }
 
-let make_dom () =
-  let kq = check "kqueue" (kq_create ()) in
-  let r, w = pipe () in
-  let wake_r = check "pipe" r in
-  ignore (check "kevent" (kq_add_in kq wake_r wake_token)) ;
-  {kq; wake_r; wake_w= w}
-
 let close_dom d =
   ignore (close_fd d.wake_r) ;
   ignore (close_fd d.wake_w) ;
   ignore (close_fd d.kq)
+
+(* The poller of a domain. Before an error, [make_dom] closes the fds that it
+   opened. Thus an error in the middle leaves no fd open. *)
+let make_dom () =
+  let kq = check "kqueue" (kq_create ()) in
+  let r, w = pipe () in
+  if r < 0 then ignore (close_fd kq) ;
+  let wake_r = check "pipe" r in
+  let d = {kq; wake_r; wake_w= w} in
+  let added = kq_add_in kq wake_r wake_token in
+  if added < 0 then close_dom d ;
+  ignore (check "kevent" added) ;
+  d
 
 (* A watched signal gets the handler of the world (weft_kqueue_stubs.c), which
    counts it and wakes domain 0. Only one world at a time can hold the handler.
