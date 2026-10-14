@@ -50,14 +50,9 @@ let rec exited_ev ~clear t =
           Event.always s
       | None ->
           Event.choose
-            ([ Ivar.read t.status
-             ; Event.wrap (Net.fd_event ~write:false ~clear t.pidfd) (fun () ->
-                   reap t ) ]
-            [@mutate
-              off
-                "with one domain the Ivar branch never commits, and with more \
-                 domains the close of the pidfd after the fill wakes each \
-                 other waiter"] ) )
+            [ Ivar.read t.status
+            ; Event.wrap (Net.fd_event ~write:false ~clear t.pidfd) (fun () ->
+                  reap t ) ] )
 
 (* The first fiber reaps the child, fills the status, and then closes the pidfd.
    The others also watch the pidfd, because the reaper can leave with no status

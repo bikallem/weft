@@ -107,8 +107,11 @@ let rebuild_keeps_live () =
   List.iteri
     (fun i s -> if i mod 2 = 1 then ignore (S.C.self_commit s.S.word 1))
     syncs ;
+  (* Two pushes, so that the test does not depend on the exact size that starts
+     the rebuild. *)
   S.Heap.push h ~deadline:100L (dummy_sync ()) 0 ;
-  equal int 33 h.S.size ;
+  S.Heap.push h ~deadline:101L (dummy_sync ()) 0 ;
+  equal int 34 h.S.size ;
   let rec all acc =
     match S.Heap.top h with
     | Some e ->
@@ -117,7 +120,7 @@ let rebuild_keeps_live () =
     | None ->
         List.rev acc
   in
-  equal (list int) (List.init 32 (fun i -> (2 * i) + 1) @ [100]) (all [])
+  equal (list int) (List.init 32 (fun i -> (2 * i) + 1) @ [100; 101]) (all [])
 
 let heap =
   group "heap"

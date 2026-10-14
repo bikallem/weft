@@ -300,9 +300,10 @@ let cancel_outside () =
     (function Fiber.Not_in_fiber _ -> true | _ -> false)
     (fun () -> Fiber.cancel (Option.get !sc) Exit)
 
-(* A world for two domains. Domain 1 sleeps in a spin of at most 2 s of CPU
-   time, and a wake of domain 1 ends the spin early. When domain 1 sleeps, the
-   wait of domain 0 raises "boom". [stuck] tells that domain 1 got no wake. *)
+(* A world for two domains. Domain 1 sleeps in a spin of at most 2 s of the CPU
+   time of the process, and a wake of domain 1 ends the spin early. When domain
+   1 sleeps, the wait of domain 0 raises "boom". [stuck] tells that domain 1 got
+   no wake. *)
 module Stop = struct
   type t = {woken: bool Atomic.t; sleeps: bool Atomic.t; stuck: bool Atomic.t}
 

@@ -81,7 +81,8 @@ Weft_sim.run ~seed ~domains:2 (fun sim ->
 
 ## Requirements
 
-- OCaml 5.5 or later. The CI tests OCaml 5.5.
+- OCaml 5.5 or later. The CI and the tests use only OCaml 5.5, so the package
+  does not claim an older version.
 - For the Linux world: Linux 5.4 or later (pidfd), and glibc 2.39 or later
   (`pidfd_spawnp`).
 - The core and the simulator need no OS calls. They build on each system that
