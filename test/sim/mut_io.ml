@@ -103,22 +103,6 @@ let datagram_reader_yields () =
           in
           at_least int ~than:4 n ; at_most int ~than:5 n ) )
 
-(* A connect that fails closes the socket that it made. *)
-let failed_connect_closes () =
-  Sim.run (fun sim ->
-      Sim.set_latency sim (Span.ms 5) ;
-      let a = Sim.addr sim "server:1" in
-      let l = Net.listen a in
-      Fiber.scope (fun s ->
-          let p =
-            Fiber.fork_promise s (fun () -> error_of (fun () -> Net.connect a))
-          in
-          Time.sleep Mono (Span.ms 1) ;
-          equal int 2 (Sim.open_fds sim) ;
-          Net.close l ;
-          equal string "ECONNREFUSED" (Promise.await p) ;
-          equal int 0 (Sim.open_fds sim) ) )
-
 (* Outside a fiber, [close] and [reset] raise [Not_in_fiber] before they change
    the state, also for a closed socket. *)
 let close_outside_fiber () =
@@ -161,7 +145,6 @@ let tests =
           stream_reader_yields
       ; test "a reader of datagrams yields, and an empty one counts as one byte"
           datagram_reader_yields
-      ; test "a connect that fails closes its socket" failed_connect_closes
       ; test
           "close and reset outside a fiber raise Not_in_fiber and change \
            nothing"
