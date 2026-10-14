@@ -4,6 +4,7 @@
 open Windtrap
 open Weft
 module Sim = Weft_sim
+module Sched = Private.Sched
 module Op = Private.Op
 
 let ms_since t0 =
@@ -1469,6 +1470,57 @@ let close_wakes_writer () =
       Net.close b ;
       is_true (!got = Some Net.Bad_fd) )
 
+(* Each function checks its range before the world, and the error has its name.
+   Without the check, the world reads 0 bytes, or [Bytes] raises with its own
+   name. *)
+let other_ranges () =
+  Sim.run (fun sim ->
+      let b = Bytes.create 4 in
+      let c, _ = Sim.socket_pair sim in
+      raises (Invalid_argument "Net.read_now") (fun () ->
+          ignore (Net.read_now c b 0 0) ) ;
+      raises (Invalid_argument "Net.write_now") (fun () ->
+          ignore (Net.write_now c b 5 0) ) ;
+      let u = Net.udp ("mut_io", 1) in
+      raises (Invalid_argument "Net.sendto") (fun () ->
+          Net.sendto u b 5 0 ("mut_io", 1) ) ;
+      raises (Invalid_argument "Net.recvfrom") (fun () ->
+          ignore (Net.recvfrom u b 0 0) ) ;
+      let r, w = Pipe.create () in
+      Pipe.write w "data" ;
+      raises (Invalid_argument "Pipe.read") (fun () ->
+          ignore (Pipe.read r b 0 0) ) ;
+      raises (Invalid_argument "Pipe.write_sub") (fun () ->
+          ignore (Pipe.write_sub w b 5 0) ) ;
+      let f = File.openfile [Read; Write; Create] "/ranges" in
+      File.write f "data" ;
+      raises (Invalid_argument "File.read") (fun () ->
+          ignore (File.read f b 0 0) ) ;
+      raises (Invalid_argument "File.pread") (fun () ->
+          ignore (File.pread f ~file_offset:0 b 0 0) ) ;
+      raises (Invalid_argument "File.write") (fun () ->
+          ignore (File.write_sub f b 5 0) ) ;
+      raises (Invalid_argument "File.pwrite") (fun () ->
+          ignore (File.pwrite f ~file_offset:0 b 5 0) ) ;
+      File.close f )
+
+(* Outside a fiber, [close] and [reset] raise [Not_in_fiber] before they change
+   the state, also for a closed socket. *)
+let close_outside_fiber () =
+  let a, b =
+    Sim.run (fun sim ->
+        let a, b = Sim.socket_pair sim in
+        Net.close b ; (a, b) )
+  in
+  let outside f =
+    raises_match (function Fiber.Not_in_fiber _ -> true | _ -> false) f
+  in
+  outside (fun () -> Net.close a) ;
+  outside (fun () -> Net.close b) ;
+  outside (fun () -> Net.reset a) ;
+  outside (fun () -> Net.reset b) ;
+  is_true (Atomic.get a.Sched.rc = Sched.Open 0)
+
 let tests =
   [ group "net"
       [ slow "echo: the client gets hello back, with 1000 seeds" echo_1000_seeds
@@ -1482,12 +1534,20 @@ let tests =
       ; test "shutdown gives the end of the stream to the peer"
           shutdown_gives_eof
       ; test "close gives EBADF to a fiber that waits" close_wakes_waiter
+      ; test
+          "close and reset outside a fiber raise Not_in_fiber and change \
+           nothing"
+          close_outside_fiber
       ; test "a close wakes a writer" close_wakes_writer
       ; test "a late write after close gives EBADF" late_write_after_close
       ; test "1 MiB goes through the 64 KiB buffers" big_transfer
       ; test "the latency delays the connect and the data" latency_round_trip
       ; test "Sim.addr" addr_parse
       ; test "read and write_sub check the range" bad_ranges
+      ; test
+          "read_now, write_now, sendto, recvfrom, Pipe and File check the \
+           range with their own name"
+          other_ranges
       ; test "a partial read keeps the rest" partial_read
       ; test "a full backlog gives ECONNREFUSED" backlog_limit
       ; test "two clients get different ports" client_ports_differ

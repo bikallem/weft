@@ -1,5 +1,5 @@
-(* The tests of the I/O of the simulator: the files, and the edges and the names
-   of the network (design sections 2.6 and 2.7). *)
+(* The tests of the I/O of the simulator: the files, the edges and the names of
+   the network, and the fair reads (design sections 2.6 and 2.7). *)
 
 open Windtrap
 open Weft
@@ -91,4 +91,65 @@ let net =
               Net.close (Net.listen a) ;
               Net.close (Net.listen a) ) ) ]
 
-let tests = [files; net]
+let with_yield_bytes n f =
+  let old = !Private.Net.yield_bytes in
+  Private.Net.yield_bytes := n ;
+  Fun.protect ~finally:(fun () -> Private.Net.yield_bytes := old) f
+
+(* The switches of a ticker fiber while [reads] runs. The ticker runs only when
+   the reader yields. *)
+let ticks_during reads =
+  let ticks = ref 0 in
+  Fiber.scope (fun s ->
+      Fiber.fork_daemon s (fun () ->
+          while true do
+            incr ticks ; Fiber.yield ()
+          done ) ;
+      Fiber.yield () ;
+      let before = !ticks in
+      reads () ; !ticks - before )
+
+(* With a limit of 100 bytes, 100 reads of 10 bytes that always find data yield
+   10 times, or 9 times if the reader yields one byte later. *)
+let stream_reader_yields () =
+  with_yield_bytes 100 (fun () ->
+      Sim.run (fun sim ->
+          let a, b = Sim.socket_pair sim in
+          Net.write a (String.make 1000 'x') ;
+          Time.sleep Mono (Span.ms 1) ;
+          let buf = Bytes.create 10 in
+          let n =
+            ticks_during (fun () ->
+                for _ = 1 to 100 do
+                  equal int 10 (Net.read b buf 0 10)
+                done )
+          in
+          at_least int ~than:9 n ; at_most int ~than:10 n ) )
+
+(* An empty datagram counts as one byte: 50 empty datagrams with a limit of 10
+   bytes yield 5 times, or 4 times if the reader yields one byte later. *)
+let datagram_reader_yields () =
+  with_yield_bytes 10 (fun () ->
+      Sim.run (fun _ ->
+          let u1 = Net.udp ("mut_io", 2) and u2 = Net.udp ("mut_io", 3) in
+          let buf = Bytes.create 1 in
+          for _ = 1 to 50 do
+            Net.sendto u1 buf 0 0 ("mut_io", 3)
+          done ;
+          Time.sleep Mono (Span.ms 1) ;
+          let n =
+            ticks_during (fun () ->
+                for _ = 1 to 50 do
+                  equal int 0 (fst (Net.recvfrom u2 buf 0 1))
+                done )
+          in
+          at_least int ~than:4 n ; at_most int ~than:5 n ) )
+
+let fair =
+  group "fair reads"
+    [ test "a reader of a stream that always finds data yields"
+        stream_reader_yields
+    ; test "a reader of datagrams yields, and an empty one counts as one byte"
+        datagram_reader_yields ]
+
+let tests = [files; net; fair]

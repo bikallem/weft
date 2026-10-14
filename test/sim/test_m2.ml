@@ -161,6 +161,26 @@ let detach_before_wait seed =
         int 0
         (Hashtbl.length (Sim.sched sim).S.externals) )
 
+exception Boom
+
+(* A fiber in a cancelled context does not start a job: the directory does not
+   come. *)
+let cancelled_job () =
+  Sim.run (fun _ ->
+      let r =
+        Fiber.scope (fun s ->
+            Fiber.cancel s Boom ;
+            match Dir.mkdir "/cancelled" with
+            | () ->
+                "no cancel"
+            | exception Fiber.Cancelled Boom ->
+                "cancelled" )
+      in
+      equal string "cancelled" r ;
+      Time.sleep Mono (Span.ms 1) ;
+      equal string "ENOENT"
+        (Portable.error_of (fun () -> File.stat "/cancelled")) )
+
 let jobs =
   group "jobs"
     [ test "F4: a detached job at the end of run releases its fd" (fun () ->
@@ -216,7 +236,9 @@ let jobs =
                  let j = Op.Stat "/" in
                  let id = Helpers.ok (Helpers.submit (Op.Start (0, j))) in
                  ignore (Helpers.ok (Helpers.submit (Op.Finish (id, j)))) ;
-                 ignore (Helpers.submit (Op.Finish (id, j))) ) ) ) ]
+                 ignore (Helpers.submit (Op.Finish (id, j))) ) ) )
+    ; test "a fiber in a cancelled context does not start a job" cancelled_job
+    ]
 
 (* Processes and signals (milestone M2). *)
 
