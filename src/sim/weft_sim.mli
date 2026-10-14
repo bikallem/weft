@@ -154,9 +154,10 @@ val fault : t -> Weft.Net.t -> Weft.Net.error -> unit
     middlebox. The peer gets the reset after the delay, after the data that [s]
     sent before, as from [Net.reset]. On a Unix socket, the writes of [s] give
     [Broken_pipe] and its next read gives [Reset], as after a reset of a Unix
-    socket. With another error, the link is lost. The peer gets nothing, and its
-    data stays in flight, so its writes fill the window and then wait. The peer
-    can thus wait until its own timeout.
+    socket. With another error, the link is lost. The peer gets nothing, also
+    not the data of [s] that is in flight at the fault. The data of the peer
+    stays in flight, so its writes fill the window and then wait. The peer can
+    thus wait until its own timeout.
 
     The fault occurs at the call, and the delay of a reset comes from the seed,
     as each delay. Thus a seed gives the same run.

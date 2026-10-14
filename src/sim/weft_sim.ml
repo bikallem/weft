@@ -640,9 +640,9 @@ let reset_conn t c =
 
 (* A write of a socket or of the write end of a pipe. The data of a pipe arrives
    at once, and the data of a socket after the latency. Data that arrives after
-   the close or the reset of the peer is lost. With [resets], one write of a TCP
-   socket in 64 resets the connection: this side gets ECONNRESET at once, and
-   the peer gets the reset after the delay. *)
+   the close or the reset of the peer, or after a lost link, is lost. With
+   [resets], one write of a TCP socket in 64 resets the connection: this side
+   gets ECONNRESET at once, and the peer gets the reset after the delay. *)
 let write_conn t c buf off len =
   let n = t.net in
   if Option.is_some c.err then (
@@ -677,11 +677,13 @@ let write_conn t c buf off len =
           let k = if atomic then len else part t (Int.min len space) in
           let data = Bytes.sub_string buf off k in
           p.inflight <- p.inflight + k ;
-          (* After a lost link, the data never comes, and the peer gets no space
-             again, as when no acknowledgment comes. *)
+          (* After a lost link, the data never comes. If the link of the peer is
+             lost, the peer gets no space again, as when no acknowledgment
+             comes. If the link of this side is lost, the data in flight is lost
+             too, but this side can write no more. *)
           deliver t c p (fun () ->
               if not p.lost then p.inflight <- p.inflight - k ;
-              if Option.is_some p.peer then (
+              if Option.is_some p.peer && not c.lost then (
                 Buffer.add_string p.inbox data ;
                 edge n p.cfd ~read:true ~write:false ) ) ;
           Ok k

@@ -1082,6 +1082,22 @@ let fault_error () =
       equal int 0 (Net.read a (Bytes.create 1) 0 1) ;
       Net.close a )
 
+(* After a lost link, the peer does not get the data that was in flight. *)
+let fault_lost_in_flight () =
+  Sim.run (fun sim ->
+      Sim.set_latency sim (Span.ms 10) ;
+      let a, b = Sim.socket_pair sim in
+      Net.write a "abc" ;
+      Sim.fault sim a (Net.Other "ETIMEDOUT") ;
+      Sim.settle sim ;
+      Time.sleep Mono (Span.ms 20) ;
+      is_true (Net.read_now b (Bytes.create 3) 0 3 = None) ;
+      (* The peer can fill its window, as after a fault with no data in
+         flight. *)
+      equal (option int) (Some 3) (Net.write_now b (Bytes.of_string "xyz") 0 3) ;
+      Net.close a ;
+      Net.close b )
+
 (* A read gets the error after the data that the side already has. *)
 let fault_read_after_data () =
   Sim.run (fun sim ->
@@ -1371,6 +1387,8 @@ let tests =
       ; test "the pair has the faults of the network" pair_faults ]
   ; group "fault of one connection"
       [ test "the next write gets the error, then EPIPE" fault_error
+      ; test "after a lost link, the data in flight does not come"
+          fault_lost_in_flight
       ; test "a read gets the error after the data" fault_read_after_data
       ; test "a fiber that waits on the socket gets the error"
           fault_wakes_reader
