@@ -139,7 +139,9 @@ let cancelled_job () =
 
 let tests =
   [ group "io checks"
-      [ test "a bad range raises Invalid_argument with the name of the function"
+      [ test
+          "read_now, write_now, sendto, recvfrom, Pipe and File check the \
+           range with their own name"
           bad_ranges
       ; test "a reader of a stream that always finds data yields"
           stream_reader_yields

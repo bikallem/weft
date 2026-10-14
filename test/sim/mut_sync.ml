@@ -118,22 +118,18 @@ let shield_closes_after_wait () =
                   Fiber.cancel s (Failure "stop") ) ) ) ;
       is_true !slept )
 
-(* Outside a fiber, a call raises [Not_in_fiber] before it changes the lock. *)
-let unlock_outside () =
-  raises_match not_in_fiber (fun () ->
-      Fiber.Mutex.unlock (Fiber.Mutex.create ()) )
-
-let signal_outside () =
-  raises_match not_in_fiber (fun () ->
-      Fiber.Condition.signal (Fiber.Condition.create ()) )
-
-let broadcast_outside () =
-  raises_match not_in_fiber (fun () ->
-      Fiber.Condition.broadcast (Fiber.Condition.create ()) )
-
-let release_outside () =
+(* Outside a fiber, each call raises [Not_in_fiber] before it changes the lock.
+   The release of the semaphore does not change its count. *)
+let lock_calls_outside () =
   let t = Fiber.Semaphore.create ~max:2 1 in
-  raises_match not_in_fiber (fun () -> Fiber.Semaphore.release t) ;
+  List.iter
+    (fun (name, f) -> raises_match ~msg:name not_in_fiber f)
+    [ ("Mutex.unlock", fun () -> Fiber.Mutex.unlock (Fiber.Mutex.create ()))
+    ; ( "Condition.signal"
+      , fun () -> Fiber.Condition.signal (Fiber.Condition.create ()) )
+    ; ( "Condition.broadcast"
+      , fun () -> Fiber.Condition.broadcast (Fiber.Condition.create ()) )
+    ; ("Semaphore.release", fun () -> Fiber.Semaphore.release t) ] ;
   is_true (Fiber.Semaphore.try_acquire t) ;
   is_false (Fiber.Semaphore.try_acquire t)
 
@@ -190,13 +186,8 @@ let tests =
       ; test "use_ro unlocks the mutex when f gives a value" use_ro_unlocks
       ; test "the shield of use_rw closes again after Condition.wait"
           shield_closes_after_wait
-      ; test "Mutex.unlock outside a fiber raises Not_in_fiber" unlock_outside
-      ; test "Condition.signal outside a fiber raises Not_in_fiber"
-          signal_outside
-      ; test "Condition.broadcast outside a fiber raises Not_in_fiber"
-          broadcast_outside
-      ; test "Semaphore.release outside a fiber raises Not_in_fiber"
-          release_outside
+      ; test "each lock call outside a fiber raises Not_in_fiber"
+          lock_calls_outside
       ; test "a GC before the await of a failed promise gives no report"
           gc_before_await
       ; test "Promise.cancel outside a fiber raises Not_in_fiber" cancel_outside
