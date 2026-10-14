@@ -74,21 +74,24 @@
         let
           ocamlPackages = pkgs.ocaml-ng.ocamlPackages_5_5;
           # The test library and its ppx (expect tests, coverage, mutation).
-          # nixpkgs has 0.1.0, and we use 0.2.0.
+          # We use the fork bikallem/windtrap at a commit of its main branch.
+          # The fork has changes after the release 0.2.0 of invariant-hq, and
+          # it has no release. CI on FreeBSD pins the same commit (ci.yml).
+          windtrapVersion = "0.2.0-unstable-2026-10-14";
           windtrapSrc = pkgs.fetchFromGitHub {
-            owner = "invariant-hq";
+            owner = "bikallem";
             repo = "windtrap";
-            rev = "v0.2.0";
-            hash = "sha256-ZNgC26Oko47M8FyzibvnRNozt4vVGf6MvBlGztzTg+c=";
+            rev = "b80c58524f8ce268dcc6dbfb598b249b7174f351";
+            hash = "sha256-VPMbLWQS2MuwcIXqUvGHhh4klndNOyPTNijXLpDOvt0=";
           };
           windtrap = ocamlPackages.buildDunePackage {
             pname = "windtrap";
-            version = "0.2.0";
+            version = windtrapVersion;
             src = windtrapSrc;
           };
           ppx_windtrap = ocamlPackages.buildDunePackage {
             pname = "ppx_windtrap";
-            version = "0.2.0";
+            version = windtrapVersion;
             src = windtrapSrc;
             propagatedBuildInputs = [
               windtrap
