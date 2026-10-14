@@ -181,11 +181,10 @@ let stale_edge seed =
               Fiber.fork s (fun () ->
                   Time.sleep Mono (Span.ms 1) ;
                   Pipe.write xw "a" ;
-                  let dom () = S.prog "test" S.Dom_index in
-                  while (not (Atomic.get registered)) && dom () = 1 do
+                  while (not (Atomic.get registered)) && Helpers.dom () = 1 do
                     Fiber.yield ()
                   done ;
-                  on1 := Atomic.get registered && dom () = 1 ;
+                  on1 := Atomic.get registered && Helpers.dom () = 1 ;
                   before := d0 () ;
                   Pipe.write xw "b" ;
                   Pipe.close xr ;

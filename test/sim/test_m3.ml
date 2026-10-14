@@ -396,7 +396,7 @@ let posix_step seed =
       let at = Option.get (Time.add Posix (Time.now Posix) (Span.s 10)) in
       Fiber.scope (fun s ->
           Fiber.fork s (fun () ->
-              on := S.prog "test" S.Dom_index ;
+              on := dom () ;
               sync (Time.at Posix at) ;
               Atomic.set fired true ) ;
           Fiber.fork ~pinned:true s (fun () ->

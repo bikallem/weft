@@ -16,6 +16,9 @@ let log () =
   let get () = List.rev !l in
   (add, get)
 
+(* The domain that runs the fiber. *)
+let dom () = S.prog "test" S.Dom_index
+
 (* [seeds n f] runs [f seed] for each seed from 1 to [n]. *)
 let seeds n f =
   for seed = 1 to n do
