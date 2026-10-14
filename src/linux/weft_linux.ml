@@ -272,7 +272,10 @@ module World = struct
 
   let wait t ~domain (w : World.Wait.t) =
     let d = t.doms.(domain) in
-    ( if domain = 0 then
+    (* A get first: an unwatch is rare, and a get costs less than an exchange on
+       each wait. An unwatch adds to [unblock0] before it wakes domain 0, so the
+       next wait sees it. *)
+    ( if domain = 0 && Atomic.get t.unblock0 <> [] then
         match Atomic.exchange t.unblock0 [] with
         | [] ->
             ()
