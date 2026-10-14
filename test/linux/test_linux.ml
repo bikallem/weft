@@ -878,6 +878,21 @@ let utc_against_gmtime () =
     check ((d * 86400) - 1)
   done
 
+(* A Unix path of 107 bytes fits in sun_path with its NUL byte, and a path of
+   108 bytes gives ENAMETOOLONG. The simulator has the same limit. *)
+let unix_path_limit () =
+  let dir = tmp () in
+  let path n =
+    Filename.concat dir (String.make (n - String.length dir - 1) 'p')
+  in
+  Weft_linux.run ~domains:1 (fun () ->
+      let too_long f = equal string "ENAMETOOLONG" (Portable.error_of f) in
+      too_long (fun () -> Net.listen (Net.Unix (path 108))) ;
+      too_long (fun () -> Net.connect (Net.Unix (path 108))) ;
+      let l = Net.listen (Net.Unix (path 107)) in
+      let c = Net.connect (Net.Unix (path 107)) in
+      List.iter Net.close [c; l] )
+
 (* A send of 0 bytes on a full TCP socket gives 0 at once. The simulator gives
    the same result. *)
 let zero_write () =
@@ -901,6 +916,7 @@ let linux =
     ; test "L2: the peer of a Unix socket has a Unix address" unix_peer_addr
     ; test "L3: a port out of range gives an error" port_range
     ; test "a write of 0 bytes on a full socket gives 0" zero_write
+    ; test "a Unix path of 108 bytes gives ENAMETOOLONG" unix_path_limit
     ; test "Time.now Posix is the time of the system" posix_time
     ; test "an address that is not an IP address gives an error" invalid_address
     ; test "a 10 ms sleep ends between 10 ms and 12 ms" sleep_10ms

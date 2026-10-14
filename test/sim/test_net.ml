@@ -532,6 +532,22 @@ let pair_client_ports () =
       ignore clients ;
       Net.close l )
 
+(* A Unix path of 108 bytes or more gives ENAMETOOLONG, as on Linux. The check
+   comes before the check of the fd limit, as in the POSIX worlds. *)
+let unix_path_limit () =
+  Sim.run (fun sim ->
+      let path n = "/" ^ String.make (n - 1) 'p' in
+      let too_long f = equal string "ENAMETOOLONG" (error_of f) in
+      too_long (fun () -> Net.listen (Net.Unix (path 108))) ;
+      too_long (fun () -> Net.connect (Net.Unix (path 108))) ;
+      let l = Net.listen (Net.Unix (path 107)) in
+      let c = Net.connect (Net.Unix (path 107)) in
+      Sim.set_fd_limit sim (Some (Sim.open_fds sim)) ;
+      too_long (fun () -> Net.listen (Net.Unix (path 108))) ;
+      too_long (fun () -> Net.connect (Net.Unix (path 108))) ;
+      Sim.set_fd_limit sim None ;
+      List.iter Net.close [c; l] )
+
 (* The bytes that the latency holds count against the buffer of the peer. *)
 let inflight_backpressure () =
   Sim.run (fun sim ->
@@ -1429,6 +1445,7 @@ let tests =
       ; test "a listen on port 0 skips the ports in use" listen_port_0
       ; test "a client skips the port of an open client" client_port_wraps
       ; test "a connect with no free port gives EADDRNOTAVAIL" no_free_port
+      ; test "a Unix path of 108 bytes gives ENAMETOOLONG" unix_path_limit
       ; test "the bytes in flight count against the buffer"
           inflight_backpressure
       ; test "a Register of a ready fd gives an edge at once" register_ready_fd

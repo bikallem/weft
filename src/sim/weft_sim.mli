@@ -69,7 +69,10 @@ val advance_until : t -> Weft.Clock.mono -> unit
 
 val addr : t -> string -> Weft.Net.addr
 (** [addr t "server:80"] is the address of a name and a port in the in-memory
-    network. [addr t "unix:/run/s"] is a Unix socket. *)
+    network. [addr t "unix:/run/s"] is a Unix socket. As on Linux, a listen or a
+    connect with a Unix path of 108 bytes or more gives
+    [Weft.Net.Error (Other "ENAMETOOLONG", _)]. The limit is 104 bytes on macOS
+    and FreeBSD. *)
 
 val set_latency : t -> Weft.Span.t -> unit
 (** The latency of each packet. It is 0 by default. *)

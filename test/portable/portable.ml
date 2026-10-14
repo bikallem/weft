@@ -944,6 +944,16 @@ let local_addr w =
               equal string "EBADF"
                 (error_of (fun () -> Net.sendto u b 0 1 (host, up))) ;
               Net.close l ) )
+    ; test "a Unix path that is too long gives ENAMETOOLONG" (fun () ->
+          w.run (fun () ->
+              (* The limit is 108 bytes on Linux and 104 on macOS and
+                 FreeBSD. *)
+              let a =
+                Net.Unix (Filename.concat (w.tmp ()) (String.make 200 'a'))
+              in
+              let too_long f = equal string "ENAMETOOLONG" (error_of f) in
+              too_long (fun () -> Net.listen a) ;
+              too_long (fun () -> Net.connect a) ) )
     ; test "a closed socket gives EBADF" (fun () ->
           w.run (fun () ->
               let l, _ = w.listen () and u, _ = w.udp () in

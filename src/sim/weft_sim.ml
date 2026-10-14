@@ -367,6 +367,16 @@ let fresh_port n used =
   (go (65535 - 40000)
    [@mutate off "the count of tries matters only when all ports are in use"] )
 
+(* A Unix path must fit in [sun_path] with its NUL byte: 108 bytes on Linux. The
+   POSIX worlds check the path before they make the socket, thus before EMFILE.
+   macOS and FreeBSD have a limit of 104 bytes, and the simulator follows
+   Linux. *)
+let path_fits = function
+  | Op.Unix path when String.length path >= 108 ->
+      Error (Op.Other "ENAMETOOLONG")
+  | Op.Unix _ | Op.Tcp _ ->
+      Ok ()
+
 (* The limit of open fds, as RLIMIT_NOFILE. An operation that makes [k] fds
    gives EMFILE if the open fds and [k] are more than the limit. As on Linux,
    the check comes before the other checks of the operation. *)
@@ -982,6 +992,7 @@ let submit : type a. t -> a Op.t -> (a, Op.error) result =
   let ( let* ) = Result.bind in
   match op with
   | Op.Listen (addr, backlog) ->
+      let* () = path_fits addr in
       let* () = room n 1 in
       (* A listen on port 0 gets a free port, as on Linux. *)
       let addr =
@@ -1008,6 +1019,7 @@ let submit : type a. t -> a Op.t -> (a, Op.error) result =
         Hashtbl.replace n.names k fd ;
         Ok fd
   | Op.Connect addr -> (
+      let* () = path_fits addr in
       let* () = room n 1 in
       let refused () = Error Op.Refused in
       match Hashtbl.find_opt n.names (key addr) with
