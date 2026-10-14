@@ -1328,7 +1328,11 @@ let submit : type a. t -> a Op.t -> (a, Op.error) result =
           Error Op.Bad_fd
       | Some sfd ->
           Hashtbl.remove n.fds fd ;
-          Hashtbl.remove n.opts fd ;
+          Hashtbl.remove n.opts fd
+          [@mutate
+            off
+              "the simulator does not use an fd number again, thus no \
+               operation reads the options of a closed fd"] ;
           ( match sfd with
           | Conn c ->
               ( match c.local with
@@ -1604,7 +1608,11 @@ let step t st d =
 (* The program is quiescent: each domain sleeps, or ended, and nothing is ready
    (design section 2.8, The wait steps). *)
 let quiescent t st =
-  progress t ;
+  progress t
+  [@mutate
+    off
+      "the next step wakes a domain that sleeps, and that step also sets the \
+       count of no progress to 0"] ;
   let s = sched t in
   ( match
       Sched_debug.lost s

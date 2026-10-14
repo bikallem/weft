@@ -1448,7 +1448,7 @@ The sections of this document mark each part that does not come in M0 with its m
 - A test with a fiber that waits forever gets `Deadlock`, with the name of that fiber. A planted lost wakeup gives `Lost_wakeup`, not an incorrect timeout.
 - 10,000 connections open and close on Linux with no fd leak, and a late `write` after `close` gives `EBADF` and closes nothing.
 - The guard `test/nounix` with `(forbidden_libraries unix)` builds, and it links `weft` and `weft.sim`.
-- Each module of the core has its windtrap tests: property tests for each law, expect tests for long text, and a mutation run with no survivor that is not dismissed with a reason (section 2.17).
+- Each module of the core has its windtrap tests: property tests for each law, expect tests for long text, and a mutation run with no survivor that section 2.17 does not explain.
 - The TLA+ models of section 2.16 pass (`spec/tla/check.sh`).
 
 **The state of M0 (2026-10-10).** The code is in `src/core`, `src/sim` and `src/linux`, and each item of the "done" list has a test. The code settled these points of the design:
@@ -1651,7 +1651,7 @@ The tests use windtrap from the fork `bikallem/windtrap` (decision 9). The fork 
 
 **The layout:**
 
-- `test/sim` and `test/linux` are windtrap suites. Each suite runs with `--corrected`, so `dune promote` accepts a new baseline. The tests that use only the public API run on each world.
+- `test/core`, `test/sim` and `test/linux` are windtrap suites. Each suite runs with `--corrected`, so `dune promote` accepts a new baseline. The tests that use only the public API run on each world.
 - `test/nounix` is the guard of section 2.3. It has no test library.
 - The libraries have the backends `ppx_windtrap.coverage` and `ppx_windtrap.mutate`. A backend does nothing until a build asks for it. Its runtime library, `windtrap.runtime`, uses only the stdlib, so the guard stays correct also with the instrumented libraries.
 - The libraries do not use `ppx_windtrap` itself. Its runtime libraries include `windtrap`, which links `unix`. Thus there are no inline tests in `weft` or `weft.sim`, and a test of an inside part goes through a module that the library exports for tests, as `Sched_debug` (section 2.2).
@@ -1673,6 +1673,27 @@ The tests use windtrap from the fork `bikallem/windtrap` (decision 9). The fork 
 - `dune runtest --force --instrument-with ppx_windtrap.coverage`, then `dune exec windtrap -- coverage`.
 - `WINDTRAP_MUTATE=1 dune runtest --force --instrument-with ppx_windtrap.mutate`, then `dune exec windtrap -- mutants`.
 - The Makefile has the recipes. `make mutate` tests the mutants on the lines that changed since the merge base with `origin/main` (`--mutate-since`), with one child for each CPU (`--mutate-jobs auto`). Then it merges the verdicts of `test/core` and `test/sim`. `make mutate-linux` tests the Linux suite with the tests that start a domain excluded. `make help` gives all the targets and variables.
+
+**Survivors of a mutation run.** A survivor is a mutant that no test kills. These rules apply to each survivor:
+
+- If a suite that runs on one real domain (`test/core` or `test/sim`) can see the mutant, kill it with a test of a behavior. When the effect is internal, use the debug interfaces: `Sched_debug`, the counters of `Sim` and the counters of the measurements.
+- Dismiss only an equivalent mutant, with `[@mutate off "reason"]`. The reason tells in one sentence why no result, resource, effect or debug value changes.
+- Do not dismiss a mutant that only more than one real domain or another world can see. Name the test that covers its behavior, for example a `dscheck` test or `test/linux_md`, or tell that no test covers it.
+- If only a test with one fixed seed or schedule can see the mutant, do not dismiss it. Do not add that test. A change of the schedule can make such a test fail on correct code. Keep the mutant as a known survivor.
+- Record each known survivor in the list that follows, with its reason.
+- Put a test for a mutant in the group of its behavior, not in a group of mutants.
+- `make mutate-arm MUTANT=<id>` runs a suite with one mutant armed. It shows that a new test kills the mutant, and it refuses a dismissed mutant.
+
+The known survivors of `make mutate-all`:
+
+| Site | Why it survives | The test that covers it |
+|---|---|---|
+| `sched.ml`, the `flush_wake` at the start of `wait` | In the simulator, the `Mono` time moves only in a wait. `Sim.set_posix` can move the `Posix` line between two expires, but it also gives each domain an edge. Thus the next wait ends at once, and its flush wakes domain 0. I think that the simulator cannot see the mutant, but no test confirms this for `Posix`. A real clock on more than one real domain can make a pinned deadline pass here. | None at this time. |
+| `weft.ml`, `run`: the set of `finished` and the wake of the domains after an error of the world | Only more than one real domain sees the stop of the other domains. | "Weft.run › an error of the world on domain 0 stops domain 1". A mutation run skips it, because it starts a domain. |
+| `net.ml`, `reset`: the check that the caller is in a fiber | Only a close on another thread at the same time changes the state. | None. A test of this race is not deterministic. |
+| `pipe.ml`, `read` and `write`: the check of the direction of the end | Linux and the simulator give `EBADF` for the wrong end. Only the pipes of FreeBSD and macOS have two directions. | "pipes › each end has one direction" of the portable suite, in `test/kqueue`. |
+| `process.ml`, `wait`: the `Ivar.read` branch | The mutant does more effects only in some seeds with more than one virtual domain. | None. Only a test with one fixed seed can see it. |
+| `weft_sim.ml`, the end of a run: the second `Gc.full_major` | Only a chain of finalisers needs it, and the number of GC cycles that a test needs depends on the runtime. | None. A test that counts GC cycles breaks with a change of the runtime. |
 
 **Two facts for M1.** I read them in the source of windtrap 0.2.0, but I did not do a test of them with domains:
 

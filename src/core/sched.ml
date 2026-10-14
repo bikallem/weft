@@ -724,7 +724,11 @@ let resume ?(next = false) dom s =
   s.k <- None ;
   dom.stats.resumes <- dom.stats.resumes + 1 ;
   (if next then push_next else push) dom s.owner (fun () ->
-      Atomic.set s.owner.current None ;
+      Atomic.set s.owner.current None
+      [@mutate
+        off
+          "the next sync of the fiber replaces a Done sync, and each reader of \
+           current ignores a Done sync"] ;
       Effect.Deep.continue k i )
 
 (* Commit each waiter, the oldest first. *)
@@ -843,7 +847,12 @@ let external_leaf id : leaf =
   let t = dom.sched in
   Spin.with_lock t.externals_lock (fun () ->
       match Hashtbl.find_opt t.externals id with
-      | Some e when e.arrived ->
+      | ((Some e)
+         [@mutate
+           off
+             "only the domain of the job takes its completion, and it does not \
+              poll between the start of the job and the wait or the detach"] )
+        when e.arrived ->
           Hashtbl.remove t.externals id ;
           ignore (C.self_commit s.word i)
       | Some e ->
@@ -856,7 +865,12 @@ let external_leaf id : leaf =
 let drop_external t id =
   Spin.with_lock t.externals_lock (fun () ->
       match Hashtbl.find_opt t.externals id with
-      | Some e when e.arrived ->
+      | ((Some e)
+         [@mutate
+           off
+             "only the domain of the job takes its completion, and it does not \
+              poll between the start of the job and the wait or the detach"] )
+        when e.arrived ->
           Hashtbl.remove t.externals id
       | Some e ->
           e.dropped <- true
@@ -914,35 +928,43 @@ let signal_leaf sg cell : leaf =
 
 (* [n] more of [sg]: the oldest waiter that can commit takes the count. After an
    unwatch, the world sends the signal again, and it gets its action (design
-   section 2.7, The end of a watch). *)
+   section 2.7, The end of a watch). A count of 0 or less did not come: it
+   counts nothing, and it sends no signal again. *)
 let deliver dom sg n =
   let t = dom.sched in
   let unwatched, resumed =
-    Spin.with_lock t.signals_lock (fun () ->
-        let st = sigstate t sg in
-        if st.unwatched then (true, [])
-        else (
-          st.count <- st.count + n ;
-          let rec give resumed = function
-            | [] ->
-                (resumed, [])
-            | ws when st.count = 0 ->
-                (resumed, ws)
-            | (s, i, cell) :: rest -> (
-                cell := st.count ;
-                match C.notify s.word i with
-                | C.Resume ->
-                    st.count <- 0 ;
-                    (s :: resumed, rest)
-                | C.In_scan ->
-                    st.count <- 0 ;
-                    (resumed, rest)
-                | C.Lost _ ->
-                    give resumed rest )
-          in
-          let resumed, rest = give [] (List.rev st.swait) in
-          st.swait <- List.rev rest ;
-          (false, resumed) ) )
+    if n <= 0 then (false, [])
+    else
+      Spin.with_lock t.signals_lock (fun () ->
+          let st = sigstate t sg in
+          if st.unwatched then (true, [])
+          else (
+            st.count <- st.count + n ;
+            let rec give resumed = function
+              | [] ->
+                  (resumed, [])
+              | (ws
+                 [@mutate
+                   off
+                     "the count is 1 or more after the add, and [give] stops \
+                      at the first commit, so the count is not 0 here"] )
+                when st.count = 0 ->
+                  (resumed, ws)
+              | (s, i, cell) :: rest -> (
+                  cell := st.count ;
+                  match C.notify s.word i with
+                  | C.Resume ->
+                      st.count <- 0 ;
+                      (s :: resumed, rest)
+                  | C.In_scan ->
+                      st.count <- 0 ;
+                      (resumed, rest)
+                  | C.Lost _ ->
+                      give resumed rest )
+            in
+            let resumed, rest = give [] (List.rev st.swait) in
+            st.swait <- List.rev rest ;
+            (false, resumed) ) )
   in
   if unwatched then ignore (World.perform "sched" (World.Submit (Op.Resend sg)))
   else List.iter (resume dom) resumed
@@ -1256,7 +1278,11 @@ and sync dom fiber (r : sync_req) (k : (int, step) Effect.Deep.continuation) =
       ()
   | `Done i ->
       s.k <- None ;
-      Atomic.set fiber.current None ;
+      Atomic.set fiber.current None
+      [@mutate
+        off
+          "the next sync of the fiber replaces a Done sync, and each reader of \
+           current ignores a Done sync"] ;
       run_fiber dom fiber (Effect.Deep.continue k i)
 
 (* The loop of one domain (design section 2.5). *)

@@ -34,7 +34,14 @@ let push r x =
    ended. A thief with an old head can read a cleared slot, but then its CAS on
    the head fails. *)
 let clear r h =
-  for i = Int.max r.clean (h - size) to h - 1 do
+  for
+    i = Int.max r.clean (h - size)
+    to ( h - 1 )
+       [@mutate
+         off
+           "a push writes the slots of h and h + 1 before a pop or a steal \
+            reads them"]
+  do
     Atomic.set r.buf.(i land mask) None
   done ;
   r.clean <- h
@@ -45,7 +52,10 @@ let clear r h =
 let rec pop r =
   let h = Atomic.get r.head in
   if Atomic.get r.tail = h then (
-    if r.clean < h then clear r h ;
+    if
+      ( r.clean < h )
+      [@mutate off "at clean = h, clear writes no slot and keeps clean"]
+    then clear r h ;
     None )
   else
     let x = Atomic.get r.buf.(h land mask) in

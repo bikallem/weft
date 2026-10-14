@@ -224,9 +224,7 @@ let counters_of seed =
           let c = Net.connect a in
           ignore (Net.read c (Bytes.create 1) 0 1) ;
           Net.close c ) ;
-      let sum f =
-        Array.fold_left (fun n d -> n + f d.S.stats) 0 (Sim.sched sim).S.doms
-      in
+      let sum = Helpers.sum_stats sim in
       ( sum (fun s -> s.S.edges)
       , sum (fun s -> s.S.busy_polls)
       , sum (fun s -> s.S.wakes)
@@ -247,10 +245,32 @@ let counters () =
   at_most int ~than:e i ;
   at_least int ~than:0 i
 
-let seeds n f =
-  for seed = 1 to n do
-    f seed
-  done
+(* Each fiber that a commit resumes counts in [resumes]: the simulator uses it
+   to find progress (Livelock). *)
+let resumes_count () =
+  Sim.run (fun sim ->
+      let c = Chan.create () in
+      Fiber.scope (fun s ->
+          Fiber.fork s (fun () ->
+              for i = 1 to 10 do
+                sync (Chan.send c i)
+              done ) ;
+          for _ = 1 to 10 do
+            ignore (sync (Chan.recv c))
+          done ) ;
+      at_least int ~than:10 (Sim.sched sim).S.doms.(0).S.stats.S.resumes )
+
+(* The beat of a domain is one more at the start and at the end of each run of a
+   fiber. Thus it is odd while a fiber runs. *)
+let beats () =
+  Sim.run (fun sim ->
+      let beat () = (Sim.sched sim).S.beats.{0} in
+      let b1 = beat () in
+      Fiber.yield () ;
+      let b2 = beat () in
+      greater int ~than:0 b1 ;
+      equal int 1 (b1 land 1) ;
+      equal int (b1 + 2) b2 )
 
 let tests =
   [ group "many domains"
@@ -261,21 +281,23 @@ let tests =
             let moves = List.init 50 (fun s -> id_moves (s + 1)) in
             is_true (List.mem true moves) )
       ; test "the counters of the measurements count" counters
+      ; test "the resumes count" resumes_count
+      ; test "the beat is odd while a fiber runs" beats
       ; test "the server gets the nack of each client that left" (fun () ->
-            seeds 200 nack_server )
+            Helpers.seeds 200 nack_server )
       ; slow "echo with 4 domains and 10,000 seeds" (fun () ->
-            seeds 10_000 (fun seed ->
+            Helpers.seeds 10_000 (fun seed ->
                 equal
                   ~msg:(Printf.sprintf "seed %d" seed)
                   string "hello"
                   (Test_net.echo_once ~domains:4 seed) ) )
       ; slow "408 with 4 domains and 10,000 seeds" (fun () ->
-            seeds 10_000 (fun seed ->
+            Helpers.seeds 10_000 (fun seed ->
                 equal
                   ~msg:(Printf.sprintf "seed %d" seed)
                   (pair string int) ("408", 10_000)
                   (Test_net.t408 ~domains:4 seed) ) )
       ; slow "chained timers with 4 domains and 10,000 seeds" (fun () ->
-            seeds 10_000 chained_timers )
+            Helpers.seeds 10_000 chained_timers )
       ; slow "work stealing with 4 domains and 10,000 seeds" (fun () ->
-            seeds 10_000 work_stealing ) ] ]
+            Helpers.seeds 10_000 work_stealing ) ] ]

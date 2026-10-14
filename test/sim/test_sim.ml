@@ -4,19 +4,17 @@
 open Windtrap
 open Weft
 module Sim = Weft_sim
+module C = Private.Chan
+module S = Private.Sched
 
-let run ?seed f = Sim.run ?seed (fun _ -> f ())
+let run = Helpers.run
 
 (* The time since [t0], in milliseconds. *)
 let ms_since t0 =
   Int64.to_int
     (Int64.div (Span.to_ns (Time.diff Mono (Time.now Mono) t0)) 1_000_000L)
 
-let log () =
-  let l = ref [] in
-  let add fmt = Printf.ksprintf (fun s -> l := s :: !l) fmt in
-  let get () = List.rev !l in
-  (add, get)
+let log = Helpers.log
 
 exception Boom of string
 
@@ -588,6 +586,86 @@ let reviews =
         fill_outside_fiber
     ; test "K4: the waiters of an Ivar stay bounded" ivar_waiters_bounded ]
 
+(* A fiber that ended is not a member of its scope any more. *)
+let ended_fibers_leave () =
+  Sim.run (fun _ ->
+      Fiber.scope (fun s ->
+          for _ = 1 to 10 do
+            Fiber.fork s ignore
+          done ;
+          Fiber.yield () ;
+          (* Only the fiber of the body stays. *)
+          equal int 1 (Hashtbl.length (Private.scope_ctx s).S.members) ) )
+
+(* The body of a scope that ended is not a member of the scope any more. *)
+let body_leaves () =
+  Sim.run (fun _ ->
+      let sc = ref None in
+      Fiber.scope (fun s -> sc := Some s) ;
+      equal int 0
+        (Hashtbl.length (Private.scope_ctx (Option.get !sc)).S.members) )
+
+(* A cancel of a scope reaches its daemons with the reason of the cancel, not
+   with the end of the other members. *)
+let daemon_gets_reason () =
+  Sim.run (fun _ ->
+      let got = ref None in
+      Fiber.scope (fun s ->
+          Fiber.fork_daemon s (fun () ->
+              match sync (Ivar.read (Ivar.create ())) with
+              | () ->
+                  ()
+              | exception Fiber.Cancelled r ->
+                  got := Some r ) ;
+          Fiber.yield () ;
+          Fiber.cancel s Exit ;
+          (* The daemon runs before the body ends. *)
+          try Fiber.yield () with Fiber.Cancelled _ -> () ) ;
+      is_true (match !got with Some Exit -> true | _ -> false) )
+
+(* After [f], a cancel of the scope reaches the next wait of the fiber. *)
+let cancel_after f =
+  Sim.run (fun _ ->
+      let got = ref false in
+      Fiber.scope (fun s ->
+          Fiber.fork s (fun () ->
+              f () ;
+              match sync (Ivar.read (Ivar.create ())) with
+              | () ->
+                  ()
+              | exception Fiber.Cancelled _ ->
+                  got := true ) ;
+          Fiber.yield () ;
+          Fiber.cancel s Exit ) ;
+      is_true !got )
+
+(* The root scope (design section 2.5). The tests fork into it with the inside
+   API: a program cannot. *)
+
+(* When main returns, the root scope cancels the other fibers. *)
+let root_cancels_others () =
+  let reason = ref None in
+  Sim.run (fun _ ->
+      let root = List.hd (S.self ()).S.ctxs in
+      S.fork root (fun () ->
+          match sync (Ivar.read (Ivar.create ())) with
+          | () ->
+              ()
+          | exception Fiber.Cancelled r ->
+              reason := Some r ) ) ;
+  is_true (match !reason with Some S.Main_returned -> true | _ -> false)
+
+(* Main is a member of the root scope: a cancel of the root reaches it. *)
+let main_in_root () =
+  Sim.run (fun _ ->
+      let root = List.hd (S.self ()).S.ctxs in
+      S.fork root (fun () -> S.cancel root Exit) ;
+      match sync (Ivar.read (Ivar.create ())) with
+      | () ->
+          failwith "the wait ended"
+      | exception Fiber.Cancelled Exit ->
+          () )
+
 let scopes =
   group "scopes"
     [ test "an error in a child cancels the body" child_error_cancels_body
@@ -624,7 +702,18 @@ let scopes =
         backtrace_of_child
     ; test "run gives the value of main" main_gives_value
     ; test "a cancelled scope leaves no fibers and no live timers"
-        no_fibers_after_cancel ]
+        no_fibers_after_cancel
+    ; test "a fiber that ended leaves its scope" ended_fibers_leave
+    ; test "the body of a scope that ended leaves it" body_leaves
+    ; test "a daemon gets the reason of the cancel" daemon_gets_reason
+    ; test "a cancel reaches a fiber after a shield" (fun () ->
+          cancel_after (fun () -> Fiber.shield ignore) )
+    ; test "a cancel reaches a fiber after a shield that raised" (fun () ->
+          cancel_after (fun () ->
+              try Fiber.shield (fun () -> raise Exit) with Exit -> () ) )
+    ; test "the root scope cancels the others when main returns"
+        root_cancels_others
+    ; test "a cancel of the root scope reaches main" main_in_root ]
 
 (* The checks of the simulator *)
 
@@ -873,6 +962,83 @@ let values_conserved (seed, n) =
   in
   equal (list int) (List.init n (fun i -> i + 1)) (List.sort compare got)
 
+(* All the offers of a side, also the stale offers. [C.offers] moves [back] to
+   [front], so the count does not use it. *)
+let all_offers side =
+  List.length (Atomic.get side.C.front) + List.length (Atomic.get side.C.back)
+
+(* One branch of the choose skips the offer of the other branch. The offer stays
+   in the queue, and a later partner meets it. The seed selects the order of the
+   two branches, so the test has a partner of each type. *)
+let skipped_own_offer partner_sends () =
+  Helpers.run (fun () ->
+      let c = Chan.create () in
+      Fiber.scope (fun s ->
+          let p =
+            Fiber.fork_promise s (fun () ->
+                sync
+                  (choose
+                     [ wrap (Chan.send c 1) (fun () -> "sent")
+                     ; wrap (Chan.recv c) (fun v -> "got " ^ string_of_int v) ] ) )
+          in
+          Time.sleep Mono (Span.ms 1) ;
+          if partner_sends then (
+            sync (Chan.send c 2) ;
+            equal string "got 2" (Promise.await p) )
+          else (
+            equal int 1 (sync (Chan.recv c)) ;
+            equal string "sent" (Promise.await p) ) ) )
+
+(* A send that meets the oldest offer in [front] does not scan [back]. The stale
+   offer in [back] stays there, and the send adds no offer of its own. *)
+let send_stops_in_front () =
+  Helpers.run (fun () ->
+      let c = Chan.create () in
+      let got = ref [] in
+      Fiber.scope (fun s ->
+          for _ = 1 to 3 do
+            Fiber.fork s (fun () ->
+                (* Read [!got] after the sync, not before it. *)
+                let v = sync (Chan.recv c) in
+                got := v :: !got )
+          done ;
+          Time.sleep Mono (Span.ms 1) ;
+          (* The scan of [back] meets the first receiver. The two other offers
+             go to [front]. *)
+          sync (Chan.send c 1) ;
+          equal int 2 (all_offers c.C.receivers) ;
+          (* A stale offer in [back]. *)
+          equal (option int) None
+            (sync
+               (choose
+                  [ wrap (Chan.recv c) Option.some
+                  ; wrap (Time.after Mono (Span.ms 1)) (fun () -> None) ] ) ) ;
+          equal int 3 (all_offers c.C.receivers) ;
+          sync (Chan.send c 2) ;
+          equal int 2 (all_offers c.C.receivers) ;
+          equal int 0 (all_offers c.C.senders) ;
+          sync (Chan.send c 3) ) ;
+      equal (list int) [1; 2; 3] (List.sort compare !got) )
+
+(* With an empty [back], [C.offers] gives [front] itself, with no copy. The drop
+   of the stale offers calls it, so a copy adds a second pass over the
+   offers. *)
+let offers_no_copy () =
+  Helpers.run (fun () ->
+      let c = Chan.create () in
+      Fiber.scope (fun s ->
+          for _ = 1 to 3 do
+            Fiber.fork s (fun () -> ignore (sync (Chan.recv c)))
+          done ;
+          Time.sleep Mono (Span.ms 1) ;
+          sync (Chan.send c 1) ;
+          let side = c.C.receivers in
+          equal int 0 (List.length (Atomic.get side.C.back)) ;
+          let front = Atomic.get side.C.front in
+          is_true (C.offers side == front) ;
+          sync (Chan.send c 2) ;
+          sync (Chan.send c 3) ) )
+
 let chans =
   group "channels"
     [ test "a send and a recv that start at the same time meet" send_recv_meet
@@ -885,7 +1051,14 @@ let chans =
         timeout_loop_bounded
     ; prop "each sent value arrives exactly one time"
         (Gen.pair Gen.int (Gen.int_range 0 12))
-        values_conserved ]
+        values_conserved
+    ; test "a recv meets an offer that its own sync skipped"
+        (skipped_own_offer false)
+    ; test "a send meets an offer that its own sync skipped"
+        (skipped_own_offer true)
+    ; test "a send that meets an offer in front does not scan back"
+        send_stops_in_front
+    ; test "with an empty back, offers does not copy front" offers_no_copy ]
 
 (* Properties *)
 
@@ -988,6 +1161,7 @@ let () =
     (Windtrap.run "sim"
        ( [time; timers; events; chans; scopes; reviews; checks; properties]
        @ Test_net.tests @ Test_m1.tests @ Test_m2.tests @ Test_m3.tests
+       @ Test_wakes.tests @ Test_io.tests @ Test_sync.tests
        @ Portable.tests portable_world
        @ Portable.tests portable_world_4
        @ [ Portable.reset_details portable_world

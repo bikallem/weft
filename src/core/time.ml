@@ -74,7 +74,12 @@ type utc =
 
 let days_from_civil y m d =
   let y = if m <= 2 then y - 1 else y in
-  let era = (if y >= 0 then y else y - 399) / 400 in
+  let era =
+    ( if (y >= 0) [@mutate off "at y = 0, (y - 399) / 400 also gives the era 0"]
+      then y
+      else y - 399 )
+    / 400
+  in
   let yoe = y - (era * 400) in
   let doy = (((153 * if m > 2 then m - 3 else m + 9) + 2) / 5) + d - 1 in
   let doe = (yoe * 365) + (yoe / 4) - (yoe / 100) + doy in
@@ -82,7 +87,14 @@ let days_from_civil y m d =
 
 let civil_from_days z =
   let z = z + 719468 in
-  let era = (if z >= 0 then z else z - 146096) / 146097 in
+  let era =
+    ( if
+        ( z >= 0 )
+        [@mutate off "at z = 0, (z - 146096) / 146097 also gives the era 0"]
+      then z
+      else z - 146096 )
+    / 146097
+  in
   let doe = z - (era * 146097) in
   let yoe = (doe - (doe / 1460) + (doe / 36524) - (doe / 146096)) / 365 in
   let doy = doe - ((365 * yoe) + (yoe / 4) - (yoe / 100)) in
@@ -128,8 +140,13 @@ let of_utc u =
   (* The years of the two ends of [Clock.posix] are 1677 to 2262. A bound on the
      year keeps the integer arithmetic far from overflow. *)
   if
-    u.year < -10000 || u.year > 10000 || u.month < 1 || u.month > 12
-    || u.day < 1
+    ( u.year < -10000 )
+    [@mutate
+      off "at the year -10000, the range check of the seconds gives None"]
+    || ( u.year > 10000 )
+       [@mutate
+         off "at the year 10000, the range check of the seconds gives None"]
+    || u.month < 1 || u.month > 12 || u.day < 1
     || u.day > days_in_month u.year u.month
     || u.hour < 0 || u.hour > 23 || u.minute < 0 || u.minute > 59
     || u.second < 0 || u.second > 59

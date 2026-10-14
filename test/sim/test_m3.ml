@@ -309,13 +309,8 @@ let next_steal seed =
               (* F2 parks first, so the send claims F2. *)
               Time.sleep Mono (Span.ms 1) ;
               sync (Chan.send c ()) ;
-              let n = ref 0 in
-              while (not (Atomic.get ran)) && !n < 10_000 do
-                incr n ;
-                ignore (Time.now Mono)
-              done ;
               (* F2 ran before the end of the loop of F1. *)
-              Atomic.set early (Atomic.get ran) ) ) ;
+              Atomic.set early (Helpers.spin_until ran) ) ) ;
       Atomic.get early )
 
 (* A pinned fiber that a fiber of another domain wakes while domain 0 sleeps. *)
@@ -341,6 +336,77 @@ let lost_next () =
     (List.mem "the queue of domain 0 is not empty"
        (Private.Sched_debug.lost t ~now:(Clock.of_ns Mono 0L)) )
 
+(* One fiber that a fiber wakes goes to the next slot: it runs before the fiber
+   that is at the head of the local queue. *)
+let woken_goes_next () =
+  let add, get = Helpers.log () in
+  Sim.run (fun _ ->
+      let iv = Ivar.create () in
+      Fiber.scope (fun s ->
+          Fiber.fork s (fun () ->
+              sync (Ivar.read iv) ;
+              add "woken" ) ;
+          Fiber.yield () ;
+          Fiber.fork s (fun () -> add "queued") ;
+          Ivar.fill iv () ;
+          Fiber.yield () ) ) ;
+  equal (list string) ["woken"; "queued"] (get ())
+
+(* The next slot runs at most 3 times in sequence (open question 5). Two fibers
+   that send to each other fill the next slot, and the third fiber runs after 3
+   runs from the next slot. *)
+let next_limit () =
+  let add, get = Helpers.log () in
+  Sim.run (fun _ ->
+      let c = Chan.create () in
+      Fiber.scope (fun s ->
+          Fiber.fork s (fun () ->
+              for i = 1 to 6 do
+                sync (Chan.send c i)
+              done ) ;
+          Fiber.fork s (fun () ->
+              for _ = 1 to 6 do
+                add "%s" (string_of_int (sync (Chan.recv c)))
+              done ) ;
+          Fiber.fork s (fun () -> add "%s" "other") ) ) ;
+  equal (list string) ["1"; "2"; "3"; "other"; "4"; "5"; "6"] (get ())
+
+(* Domain 0 takes a pinned fiber that yields at most 3 times in sequence. Then
+   it takes the local queue. *)
+let pinned_limit () =
+  let add, get = Helpers.log () in
+  Sim.run (fun _ ->
+      Fiber.scope (fun s ->
+          Fiber.fork ~pinned:true s (fun () ->
+              for _ = 1 to 6 do
+                add "p" ; Fiber.yield ()
+              done ) ;
+          Fiber.fork s (fun () ->
+              for _ = 1 to 2 do
+                add "n" ; Fiber.yield ()
+              done ) ) ) ;
+  equal string "pppnpppn" (String.concat "" (get ()))
+
+(* A step of the wall clock wakes a domain that sleeps until a Posix deadline.
+   The other domain does not let the program become quiescent. It gives true if
+   the waiter slept on domain 1. *)
+let posix_step seed =
+  Sim.run ~seed ~domains:2 ~livelock:100_000 (fun sim ->
+      let fired = Atomic.make false and on = ref (-1) in
+      let at = Option.get (Time.add Posix (Time.now Posix) (Span.s 10)) in
+      Fiber.scope (fun s ->
+          Fiber.fork s (fun () ->
+              on := dom () ;
+              sync (Time.at Posix at) ;
+              Atomic.set fired true ) ;
+          Fiber.fork ~pinned:true s (fun () ->
+              Time.sleep Mono (Span.ms 1) ;
+              Sim.set_posix sim (Option.get (Time.add Posix at (Span.s 1))) ;
+              while not (Atomic.get fired) do
+                Fiber.yield ()
+              done ) ) ;
+      !on = 1 )
+
 let tests =
   [ group "m3"
       [ test "pinned fibers run only on domain 0, with 200 seeds" (fun () ->
@@ -353,9 +419,11 @@ let tests =
             done ;
             greater int ~than:0 !other )
       ; test "B: a pinned fiber that yields does not starve" pinned_yield
+      ; test "a woken fiber goes to the next slot" woken_goes_next
+      ; test "the next slot runs at most 3 times in sequence" next_limit
+      ; test "a pinned fiber runs at most 3 times in sequence" pinned_limit
       ; test "a thief takes a next slot, with 50 seeds" (fun () ->
-            is_true
-              (List.exists Fun.id (List.init 50 (fun s -> next_steal (s + 1)))) )
+            is_true (Helpers.some_seed 50 next_steal) )
       ; test "a pinned fiber wakes while domain 0 sleeps, with 50 seeds"
           (fun () ->
             for seed = 1 to 50 do
@@ -371,6 +439,9 @@ let tests =
       ; test "a run that raises restores the report of promises" restore_report
       ; test "a failed promise that nobody awaits gives Unawaited" unawaited
       ; test "a step of the wall clock moves a Posix timer only" posix_timers
+      ; test
+          "a step of the wall clock wakes a domain that sleeps, with 20 seeds"
+          (fun () -> is_true (Helpers.some_seed 20 posix_step) )
       ; test "a finaliser fills an Ivar" finaliser
       ; test "a fill from outside needs ~outside_fills" refused
       ; test "a fill of an Ivar of a run that ended gives false" earlier_run
@@ -382,4 +453,7 @@ let tests =
       ; test "a register of a later run drops the waiters of a run that ended"
           dead_and_live
       ; test "no run: fill_from_outside gives false" (fun () ->
+            is_false (Ivar.fill_from_outside (Ivar.create ()) ()) )
+      ; test "after a run, no run takes a fill from outside" (fun () ->
+            Sim.run ~outside_fills:true (fun _ -> ()) ;
             is_false (Ivar.fill_from_outside (Ivar.create ()) ()) ) ] ]

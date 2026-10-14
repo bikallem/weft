@@ -4,6 +4,8 @@
 open Windtrap
 open Weft
 module Sim = Weft_sim
+module Op = Private.Op
+module S = Private.Sched
 
 (* Each test of the fiber layer runs with 200 seeds on 4 virtual domains. *)
 let seeds_200 =
@@ -126,12 +128,63 @@ let detached_at_end seed =
   equal int 0 (Sim.open_fds (Option.get !saved)) ;
   timed_out
 
+(* A completion that a fiber waited for leaves no record. *)
+let no_external_left () =
+  Sim.run (fun sim ->
+      for _ = 1 to 10 do
+        ignore (File.stat "/")
+      done ;
+      equal int 0 (Hashtbl.length (Sim.sched sim).S.externals) )
+
+(* A cancel from another domain can come between the start of a job and the
+   start of its wait. Then the fiber never waits, and it detaches. Its
+   completion leaves no record. *)
+let detach_before_wait seed =
+  Sim.run ~seed ~domains:4 (fun sim ->
+      let inner = ref None in
+      Fiber.scope (fun outer ->
+          Fiber.fork outer (fun () ->
+              Fiber.scope (fun s ->
+                  inner := Some s ;
+                  Fiber.fork s (fun () ->
+                      while true do
+                        ignore (File.stat "/")
+                      done ) ) ) ;
+          while Option.is_none !inner do
+            Fiber.yield ()
+          done ;
+          Helpers.spin (seed mod 40) ;
+          Fiber.cancel (Option.get !inner) Exit ) ;
+      Time.sleep Mono (Span.ms 1) ;
+      equal
+        ~msg:(Printf.sprintf "seed %d" seed)
+        int 0
+        (Hashtbl.length (Sim.sched sim).S.externals) )
+
+exception Boom
+
+(* A fiber in a cancelled context does not start a job: the directory does not
+   come. *)
+let cancelled_job () =
+  Sim.run (fun _ ->
+      let r =
+        Fiber.scope (fun s ->
+            Fiber.cancel s Boom ;
+            match Dir.mkdir "/cancelled" with
+            | () ->
+                "no cancel"
+            | exception Fiber.Cancelled Boom ->
+                "cancelled" )
+      in
+      equal string "cancelled" r ;
+      Time.sleep Mono (Span.ms 1) ;
+      equal string "ENOENT"
+        (Portable.error_of (fun () -> File.stat "/cancelled")) )
+
 let jobs =
   group "jobs"
     [ test "F4: a detached job at the end of run releases its fd" (fun () ->
-          is_true
-            (List.exists Fun.id
-               (List.init 20 (fun s -> detached_at_end (s + 1))) ) )
+          is_true (Helpers.some_seed 20 detached_at_end) )
     ; test "a job takes a time cost from the seed" (fun () ->
           let costs = List.init 50 (fun s -> cost (s + 1)) in
           List.iter (fun c -> at_most int ~than:40 c) costs ;
@@ -156,7 +209,36 @@ let jobs =
           less int ~than:2000 !total )
     ; test "with_timeout around a DNS that never answers ends at the deadline"
         dns_timeout
-    ; test "the name table of Dns" dns ]
+    ; test "the name table of Dns" dns
+    ; test "a completion leaves no record" no_external_left
+    ; test "a detach before the wait leaves no record, with 100 seeds"
+        (fun () -> Helpers.seeds 100 detach_before_wait )
+    ; test "a detach after the completion of an open closes its fd" (fun () ->
+          Sim.run (fun sim ->
+              let n0 = Sim.open_fds sim in
+              let id =
+                Helpers.ok
+                  (Helpers.submit
+                     (Op.Start (0, Op.Open ("/f", [O_read; O_create], 0))) )
+              in
+              Helpers.ok (Helpers.submit (Op.Detach id)) ;
+              equal int n0 (Sim.open_fds sim) ) )
+    ; test "a Finish after a detach gives Model_error" (fun () ->
+          contains ~sub:"Finish of job"
+            (Helpers.model_error (fun _ ->
+                 let j = Op.Stat "/" in
+                 let id = Helpers.ok (Helpers.submit (Op.Start (0, j))) in
+                 Helpers.ok (Helpers.submit (Op.Detach id)) ;
+                 ignore (Helpers.submit (Op.Finish (id, j))) ) ) )
+    ; test "a second Finish of a job gives Model_error" (fun () ->
+          contains ~sub:"Finish of job"
+            (Helpers.model_error (fun _ ->
+                 let j = Op.Stat "/" in
+                 let id = Helpers.ok (Helpers.submit (Op.Start (0, j))) in
+                 ignore (Helpers.ok (Helpers.submit (Op.Finish (id, j)))) ;
+                 ignore (Helpers.submit (Op.Finish (id, j))) ) ) )
+    ; test "a fiber in a cancelled context does not start a job" cancelled_job
+    ]
 
 (* Processes and signals (milestone M2). *)
 
@@ -374,7 +456,30 @@ let processes =
               raises
                 (Invalid_argument
                    "Signal.received: this signal cannot be an event" )
-                (fun () -> sync (Signal.received SIGKILL) ) ) ) ]
+                (fun () -> sync (Signal.received SIGKILL) ) ) )
+    ; test "a wait of a child that the parent reaped gives ECHILD" (fun () ->
+          Sim.run (fun sim ->
+              Sim.add_program sim "p" (fun _ ->
+                  Sim.program ~runs:(Span.ms 1) () ) ;
+              let r =
+                Helpers.ok
+                  (Helpers.submit
+                     (Op.Spawn
+                        { prog= "p"
+                        ; argv= ["p"]
+                        ; env= None
+                        ; cwd= None
+                        ; stdin= Inherit
+                        ; stdout= Inherit
+                        ; stderr= Inherit } ) )
+              in
+              Time.sleep Mono (Span.ms 2) ;
+              is_true
+                ( Helpers.ok (Helpers.submit (Op.Wait_child r.pidfd))
+                = Some (Exited 0) ) ;
+              equal string "ECHILD"
+                (Helpers.op_error (Helpers.submit (Op.Wait_child r.pidfd))) ;
+              Helpers.ok (Helpers.submit (Op.Close r.pidfd)) ) ) ]
 
 (* A graceful shutdown: at SIGTERM, the server stops to accept, and each
    connection ends its request. *)

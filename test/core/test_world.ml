@@ -3,6 +3,7 @@
 
 open Windtrap
 open Weft
+module S = Private.Sched
 
 (* A world with a manual clock. A sleep moves the clock to the alarm. Each read
    of [Mono] can also move the clock by [tick] nanoseconds, as the time moves
@@ -172,10 +173,14 @@ let one_seed_for_each_domain () =
   equal int 1 w.randoms
 
 (* K1: a deadline that passes between the poll and the sleep. The domain must
-   not sleep with the fiber in its queue. *)
-let expire_before_sleep () =
+   not sleep with the fiber in its queue. With [~pinned:true], the expire puts
+   the fiber in the pinned queue, and domain 0 must not sleep. *)
+let expire_before_sleep ~pinned () =
   let w = Manual.make ~tick:(us 400) () in
-  run ~slack:Span.zero w (fun () -> Time.sleep Mono (Span.us 1300))
+  let sleep () = Time.sleep Mono (Span.us 1300) in
+  run ~slack:Span.zero w (fun () ->
+      if pinned then Fiber.scope (fun s -> Fiber.fork ~pinned s sleep)
+      else sleep () )
 
 (* C4: the slack rounding of a deadline near the largest time saturates. *)
 let alarm_saturates () =
@@ -183,6 +188,176 @@ let alarm_saturates () =
   run ~slack:(Span.ms 1) w (fun () ->
       sync (Time.at Mono (Clock.of_ns Mono (Int64.sub Int64.max_int 10L))) ) ;
   equal (list int64) [Int64.max_int] w.alarms
+
+(* [on_create] gets the scheduler before [main] starts. *)
+let on_create_runs_first () =
+  let w = Manual.make () and created = ref false in
+  is_true
+    (Private.run_world
+       ~on_create:(fun _ -> created := true)
+       (module Manual)
+       w
+       (fun () -> !created) )
+
+(* A finaliser runs outside a fiber. Its fill from outside reaches the run. *)
+let fill_from_outside_in_run () =
+  let w = Manual.make () in
+  equal string "gc"
+    (run w (fun () ->
+         let iv = Ivar.create () and filled = ref false in
+         let () =
+           let x = ref 1 in
+           Gc.finalise (fun _ -> filled := Ivar.fill_from_outside iv "gc") x
+         in
+         Gc.full_major () ;
+         is_true !filled ;
+         sync (Ivar.read iv) ) )
+
+(* After the end of [run], no run takes a fill from outside. *)
+let no_fill_after_run () =
+  let w = Manual.make () in
+  run w (fun () -> ()) ;
+  is_false (Ivar.fill_from_outside (Ivar.create ()) 1)
+
+(* An exception of the world in the loop of domain 0 goes to the caller. *)
+let world_error_of_domain_0 () =
+  let w = Manual.make () in
+  raises_match
+    (function Failure m -> m = "the program sleeps forever" | _ -> false)
+    (fun () -> run w (fun () -> sync (Ivar.read (Ivar.create ()))))
+
+(* After a run that ended with an error of the world, no run takes a fill from
+   outside. *)
+let no_fill_after_error () =
+  let w = Manual.make () in
+  raises_match
+    (function Failure _ -> true | _ -> false)
+    (fun () -> run w (fun () -> sync (Ivar.read (Ivar.create ())))) ;
+  is_false (Ivar.fill_from_outside (Ivar.create ()) 1)
+
+(* The minor words of one sync of [ev], on average. *)
+let words_of_sync ev =
+  let w = Manual.make () in
+  run w (fun () ->
+      for _ = 1 to 100 do
+        ignore (sync ev)
+      done ;
+      let w0 = Gc.minor_words () in
+      for _ = 1 to 1000 do
+        ignore (sync ev)
+      done ;
+      (Gc.minor_words () -. w0) /. 1000. )
+
+(* A sync of a base event does not flatten the event (M3). Thus it allocates
+   much less than a sync of a choose of the same event: 60 words and 118 words
+   in OCaml 5.5. *)
+let base_needs_no_flatten () =
+  let base = words_of_sync (always 1)
+  and choice = words_of_sync (choose [always 1]) in
+  if not (base +. 25. < choice) then
+    fail
+      (Printf.sprintf "a base sync allocates %.1f words, a choose %.1f" base
+         choice )
+
+(* A Register that the world refuses gives its error to the waiter. The waiter
+   holds no user of the fd after the error, and its domain is not in the set of
+   the fd. *)
+let register_error () =
+  let w = Manual.make () in
+  run w (fun () ->
+      let fd = S.Fdtab.alloc 7 in
+      raises
+        (Net.Error (Other "no network", "Net"))
+        (fun () -> Private.Event.sync (Private.Net.readable fd)) ;
+      is_true (Atomic.get fd.S.rc = S.Open 0) ;
+      equal int 0 (Atomic.get fd.S.doms) ;
+      S.Fdtab.release fd )
+
+(* A fill from outside reaches its waiter while another fiber yields: the domain
+   takes the injection queue at each 61st take. *)
+let inject_while_busy () =
+  let w = Manual.make () in
+  let yields = ref 0 in
+  run w (fun () ->
+      Fiber.scope (fun s ->
+          let iv = Ivar.create () and filled = ref false in
+          Fiber.fork s (fun () ->
+              sync (Ivar.read iv) ;
+              filled := true ) ;
+          Fiber.fork s (fun () ->
+              while (not !filled) && !yields < 1000 do
+                incr yields ; Fiber.yield ()
+              done ) ;
+          Fiber.yield () ;
+          is_true (Ivar.fill_from_outside iv ()) ) ) ;
+  less int ~than:100 !yields
+
+(* Outside a fiber, a cancel raises [Not_in_fiber]. *)
+let cancel_outside () =
+  let sc = ref None in
+  run (Manual.make ()) (fun () -> Fiber.scope (fun s -> sc := Some s)) ;
+  raises_match
+    (function Fiber.Not_in_fiber _ -> true | _ -> false)
+    (fun () -> Fiber.cancel (Option.get !sc) Exit)
+
+(* A world for two domains. Domain 1 sleeps in a spin of at most 2 s of the CPU
+   time of the process, and a wake of domain 1 ends the spin early. When domain
+   1 sleeps, the wait of domain 0 raises "boom". [stuck] tells that domain 1 got
+   no wake. *)
+module Stop = struct
+  type t = {woken: bool Atomic.t; sleeps: bool Atomic.t; stuck: bool Atomic.t}
+
+  let now (type time) _ (line : time Clock.line) : time = Clock.of_ns line 0L
+
+  let submit _ (_ : _ Private.Op.t) = Error (Private.Op.Other "no network")
+
+  let wait t ~domain (w : Private.World.Wait.t) =
+    match w.timeout with
+    | Poll ->
+        []
+    | Sleep ->
+        let t0 = Sys.time () in
+        if domain = 0 then (
+          while (not (Atomic.get t.sleeps)) && Sys.time () -. t0 < 2. do
+            Domain.cpu_relax ()
+          done ;
+          failwith "boom" )
+        else (
+          Atomic.set t.sleeps true ;
+          while (not (Atomic.get t.woken)) && Sys.time () -. t0 < 2. do
+            Domain.cpu_relax ()
+          done ;
+          if Atomic.exchange t.woken false then [Private.World.Ready.Woken]
+          else (Atomic.set t.stuck true ; failwith "stuck") )
+
+  let wake t ~domain = if domain = 1 then Atomic.set t.woken true
+
+  let random _ n = n - 1
+
+  let random_bytes _ b = Bytes.fill b 0 (Bytes.length b) 'x'
+end
+
+(* An error of the world on domain 0 stops the run: domain 1 gets a wake and
+   sees the end, and the error goes to the caller. *)
+let error_stops_others () =
+  (* Mutation testing forks a child for each mutant, and OCaml refuses a fork
+     after a domain started. *)
+  if Option.is_some (Sys.getenv_opt "WINDTRAP_MUTATE") then
+    skip ~reason:"a mutation run cannot start a domain" () ;
+  let w =
+    { Stop.woken= Atomic.make false
+    ; sleeps= Atomic.make false
+    ; stuck= Atomic.make false }
+  in
+  raises_match
+    (function Failure m -> m = "boom" | _ -> false)
+    (fun () ->
+      Weft.run ~domains:2
+        (module Stop)
+        w
+        (fun () -> sync (Ivar.read (Ivar.create ()))) ) ;
+  is_true (Atomic.get w.sleeps) ;
+  is_false (Atomic.get w.stuck)
 
 let world =
   group "Weft.run"
@@ -202,9 +377,52 @@ let world =
         idle_poll_finds_timer
     ; test "the world gives one seed for each domain" one_seed_for_each_domain
     ; test ~timeout:5. "K1: a deadline between the poll and the sleep fires"
-        expire_before_sleep
+        (expire_before_sleep ~pinned:false)
+    ; test ~timeout:5.
+        "K1: a pinned deadline between the poll and the sleep fires"
+        (expire_before_sleep ~pinned:true)
+    ; test "a Register that fails raises in the waiter" register_error
+    ; test "a fill from outside reaches a waiter while a fiber yields"
+        inject_while_busy
+    ; test "a cancel outside a fiber raises Not_in_fiber" cancel_outside
     ; test ~timeout:5. "C4: the alarm near the largest time saturates"
-        alarm_saturates ]
+        alarm_saturates
+    ; test "on_create gets the scheduler before main" on_create_runs_first
+    ; test "a fill from outside a fiber reaches the run"
+        fill_from_outside_in_run
+    ; test "after the end of run, a fill from outside gives false"
+        no_fill_after_run
+    ; test "after an error of the world, a fill from outside gives false"
+        no_fill_after_error
+    ; test "an error of the world on domain 0 goes to the caller"
+        world_error_of_domain_0
+    ; test "an error of the world on domain 0 stops domain 1" error_stops_others
+    ]
+
+(* A handler of the user sees each effect that the fibers of its scope perform.
+   A fill with no waiter performs only [Self]: it resumes no fiber, so it
+   performs no [Enqueue]. *)
+let fill_effects () =
+  let n = ref 0 in
+  let handler =
+    { Fiber.handle=
+        (fun f ->
+          Effect.Deep.match_with f ()
+            { retc= Fun.id
+            ; exnc= raise
+            ; effc= (fun (type c) (_ : c Effect.t) -> incr n ; None) } ) }
+  in
+  run (Manual.make ()) (fun () ->
+      Fiber.scope ~handler (fun _ ->
+          let iv = Ivar.create () in
+          let before = !n in
+          Ivar.fill iv () ;
+          equal int 1 (!n - before) ) )
+
+let events =
+  group "events"
+    [ test "a sync of a base event does not flatten it" base_needs_no_flatten
+    ; test "a fill with no waiter performs one effect" fill_effects ]
 
 (* Span *)
 
@@ -407,6 +625,44 @@ let utc_months () =
   is_false (ok (1900, 2, 29, 0, 0, 0, 0)) ;
   is_true (ok (2000, 2, 29, 0, 0, 0, 0))
 
+(* Each day of the range of [Clock.posix], against a slow reference: a walk of
+   the calendar one day at a time, from 1677-09-22. The walk crosses each era,
+   each century and each leap day of the algorithm. *)
+let utc_each_day () =
+  let leap y = y mod 4 = 0 && (y mod 100 <> 0 || y mod 400 = 0) in
+  let month_days y m =
+    match m with
+    | 2 ->
+        if leap y then 29 else 28
+    | 4 | 6 | 9 | 11 ->
+        30
+    | _ ->
+        31
+  in
+  let next (y, m, d, wd) =
+    let wd = (wd + 1) mod 7 in
+    if d < month_days y m then (y, m, d + 1, wd)
+    else if m < 12 then (y, m + 1, 1, wd)
+    else (y + 1, 1, 1, wd)
+  in
+  let date = ref (1677, 9, 22, 3) in
+  for days = -106_751 to 106_751 do
+    let y, m, d, wd = !date in
+    (* Noon of the day. *)
+    let secs = (days * 86400) + 43200 in
+    let u = utc (y, m, d, 12, 0, 0, wd) in
+    if Time.to_utc (posix secs) <> u then
+      fail (Printf.sprintf "to_utc differs from the walk at day %d" days) ;
+    ( match Time.of_utc u with
+    | Some t when Clock.to_ns Posix t = Clock.to_ns Posix (posix secs) ->
+        ()
+    | _ ->
+        fail (Printf.sprintf "of_utc differs from the walk at day %d" days) ) ;
+    if days = 0 then is_true ((y, m, d, wd) = (1970, 1, 1, 4)) ;
+    date := next !date
+  done ;
+  is_true (!date = (2262, 4, 12, 6))
+
 let utc_invalid () =
   let none f = Time.of_utc (utc f) = None in
   is_true (none (2026, 0, 1, 0, 0, 0, 0)) ;
@@ -442,6 +698,68 @@ let time =
     ; test "to_utc cuts the fraction of a second" utc_fraction
     ; test "to_utc: the months of a leap year and a common year" utc_months
     ; test "of_utc: a date out of range gives None" utc_invalid
+    ; test "to_utc and of_utc agree with a walk of each day" utc_each_day
     ; test "Time.now outside run raises Not_in_fiber" time_outside_fiber ]
 
-let tests = [world; span; time]
+(* A world that watches each signal and gives the signals of [batches], one
+   batch at each wait. It records each signal that the core sends again. *)
+module Signals = struct
+  type t =
+    { mutable batches: Private.World.Ready.t list list
+    ; mutable resent: Signal.t list }
+
+  let now (type time) _ (line : time Clock.line) : time = Clock.of_ns line 0L
+
+  let submit : type a. t -> a Private.Op.t -> (a, Private.Op.error) result =
+   fun t op ->
+    match op with
+    | Private.Op.Watch s ->
+        Ok s
+    | Private.Op.Unwatch s ->
+        Ok s
+    | Private.Op.Resend s ->
+        t.resent <- s :: t.resent ;
+        Ok ()
+    | _ ->
+        Error (Private.Op.Other "no network")
+
+  let wait t ~domain:_ (_ : Private.World.Wait.t) =
+    match t.batches with
+    | b :: rest ->
+        t.batches <- rest ;
+        b
+    | [] ->
+        failwith "the program sleeps forever"
+
+  let wake _ ~domain:_ = ()
+
+  let random _ n = n - 1
+
+  let random_bytes _ b = Bytes.fill b 0 (Bytes.length b) 'x'
+end
+
+(* A count of 0 is a signal that did not come. A waiter of a watched signal does
+   not get it, and the core does not send an unwatched signal again. *)
+let signal_count_zero () =
+  let w =
+    { Signals.batches=
+        [ [ Private.World.Ready.Signal (SIGUSR1, 0)
+          ; Private.World.Ready.Signal (SIGUSR2, 0) ]
+        ; [Private.World.Ready.Signal (SIGUSR1, 2)] ]
+    ; resent= [] }
+  in
+  let n =
+    Weft.run
+      (module Signals)
+      w
+      (fun () ->
+        Signal.unwatch SIGUSR2 ;
+        sync (Signal.received SIGUSR1) )
+  in
+  equal int 2 n ;
+  equal int 0 (List.length w.resent)
+
+let signals =
+  group "signals" [test "a count of 0 is not a signal" signal_count_zero]
+
+let tests = [world; events; span; time; signals]

@@ -32,7 +32,8 @@ module Ready : sig
             [Sim.settle]. *)
     | Signal of Op.signal * int
         (** The signal came [n] times since the last [Wait]. Only domain 0 gets
-            it. *)
+            it. A world gives [n] of 1 or more. The core ignores a count of 0 or
+            less. *)
 end
 
 type _ Effect.t +=
