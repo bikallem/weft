@@ -276,7 +276,9 @@ module Fiber : sig
         with no limit, as [Semaphore.Counting.make 0] of the stdlib, is
         [create ~max:max_int 0].
 
-        @raise Invalid_argument if [n < 0] or [max < n]. *)
+        @raise Invalid_argument
+          if [n < 0], [max < n] or [max = 0]. Thus [create 0] raises: a
+          semaphore that can never have a permit is a bug. Give a [~max]. *)
 
     val acquire : t -> unit event
     (** An event that takes one permit. The sync gets the permit only if it

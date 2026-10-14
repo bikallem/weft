@@ -1731,10 +1731,16 @@ let semaphores w =
               Sem.release s ;
               raises above (fun () -> Sem.release s) ;
               all_free s 2 ;
-              (* A semaphore with no permit never gives one. *)
-              let z = Sem.create 0 in
+              (* A semaphore with no permit and no maximum is a bug. *)
+              let zero =
+                Invalid_argument
+                  "Fiber.Semaphore.create: the maximum is 0 (give a ~max)"
+              in
+              raises zero (fun () -> Sem.create 0) ;
+              raises zero (fun () -> Sem.create ~max:0 0) ;
+              (* A semaphore with no free permit at the start gives none. *)
+              let z = Sem.create ~max:1 0 in
               equal bool false (acquire_in_1ms z) ;
-              raises above (fun () -> Sem.release z) ;
               (* A count that starts at 0 and grows to its maximum. *)
               let g = Sem.create ~max:2 0 in
               equal bool false (Sem.try_acquire g) ;
