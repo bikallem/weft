@@ -305,22 +305,6 @@ let restore_report () =
   raises Exit (fun () -> Sim.run (fun _ -> raise Exit)) ;
   is_true (Atomic.get Private.promise_report == old)
 
-(* The report of a run gives a failure of another run, or of no run, to the
-   report that was there before the run. *)
-let report_of_other_run () =
-  let old = Atomic.get Private.promise_report in
-  let got = ref [] in
-  Atomic.set Private.promise_report (fun run _ ->
-      got := (if run = None then "no run" else "other run") :: !got ) ;
-  Fun.protect
-    ~finally:(fun () -> Atomic.set Private.promise_report old)
-    (fun () ->
-      Sim.run (fun sim ->
-          let report = Atomic.get Private.promise_report in
-          report None Exit ;
-          report (Some ((Sim.sched sim).S.run_id + 1)) Exit ) ) ;
-  equal (list string) ["no run"; "other run"] (List.rev !got)
-
 (* The steal of a next slot: F1 wakes F2 into its next slot, then F1 makes
    switch points with no switch of fiber. Another domain takes F2. *)
 let next_steal seed =
@@ -488,8 +472,6 @@ let tests =
       ; test "a stream of 4 MiB is not a livelock" stream
       ; test "a long exchange on a channel is not a livelock" channel_progress
       ; test "a run that raises restores the report of promises" restore_report
-      ; test "a failure of another run goes to the old report"
-          report_of_other_run
       ; test "a failed promise that nobody awaits gives Unawaited" unawaited
       ; test "a step of the wall clock moves a Posix timer only" posix_timers
       ; test

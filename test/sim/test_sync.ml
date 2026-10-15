@@ -121,13 +121,24 @@ let cancel_twice_before_start () =
           raises Promise.Cancelled (fun () -> Promise.await p) ) ;
       is_false !ran )
 
+(* The report of a run gives a failure of another run, or of no run, to the
+   report that was there before the run. *)
+let report_of_other_run () =
+  let got = ref [] in
+  Helpers.with_report (fun () ->
+      Atomic.set Private.promise_report (fun run _ ->
+          got := (if run = None then "no run" else "other run") :: !got ) ;
+      Weft_sim.run (fun sim ->
+          let report = Atomic.get Private.promise_report in
+          report None Exit ;
+          report (Some ((Weft_sim.sched sim).Private.Sched.run_id + 1)) Exit ) ) ;
+  equal (list string) ["no run"; "other run"] (List.rev !got)
+
 (* The report of a promise runs in a finaliser. If the report raises, the
    finaliser drops the exception, so the run goes on. *)
 let report_raises () =
-  let old = Atomic.get Private.promise_report and called = ref false in
-  Fun.protect
-    ~finally:(fun () -> Atomic.set Private.promise_report old)
-    (fun () ->
+  let called = ref false in
+  Helpers.with_report (fun () ->
       Helpers.run (fun () ->
           Atomic.set Private.promise_report (fun _ _ ->
               called := true ;
@@ -151,4 +162,6 @@ let tests =
       ; test "Promise.cancel outside a fiber raises Not_in_fiber" cancel_outside
       ; test "a second cancel before the start does nothing more"
           cancel_twice_before_start
-      ; test "a report that raises does not stop the run" report_raises ] ]
+      ; test "a report that raises does not stop the run" report_raises
+      ; test "a failure of another run goes to the old report"
+          report_of_other_run ] ]
