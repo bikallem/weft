@@ -876,10 +876,17 @@ module Process : sig
 
   val wait : t -> status
   (** [sync (exited t)]. A program must wait for each child: the wait ends the
-      zombie and closes the fd of the child. *)
+      zombie and closes the fd of the child.
+
+      @raise Error
+        with [Other "ECHILD"] if other code reaped the child, for example with
+        [waitid] or with [SIGCHLD] set to [SIG_IGN]. *)
 
   val kill : t -> Signal.t -> unit
-  (** Sends a signal to the child. After the exit, it does nothing. *)
+  (** Sends a signal to the child. After the exit, it does nothing.
+
+      @raise Error
+        with [Other "ESRCH"] if other code reaped the child, as on Linux. *)
 end
 
 (** {1 Names} *)
