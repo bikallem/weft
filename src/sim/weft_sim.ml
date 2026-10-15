@@ -1825,7 +1825,7 @@ let run ?(seed = 0) ?(domains = 1) ?(auto = true) ?(signals = [])
         s.doms ;
       (* The run holds no promise at this time: a full GC runs the finalisers of
          its promises. [Gc.finalise_last] needs two cycles. *)
-      if Atomic.get s.unawaited > 0 then (Gc.full_major () ; Gc.full_major ()) ;
+      if Atomic.get s.unawaited > 0 then ( Gc.full_major () ; Gc.full_major () ) ;
       restore () ;
       match Atomic.get unawaited with
       | [] ->
