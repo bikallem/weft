@@ -6,9 +6,9 @@ name: TLA+
 on:
   push:
     branches: [main]
-    paths: ["spec/tla/**"]
+    paths: ["spec/tla/**", ".github/workflows/tla.yml"]
   pull_request:
-    paths: ["spec/tla/**"]
+    paths: ["spec/tla/**", ".github/workflows/tla.yml"]
   schedule:
     - cron: "0 5 * * 1"
   workflow_dispatch:
@@ -34,10 +34,11 @@ jobs:
             models: Wake
             limit: 10800
             timeout: 240
-          # The slowest case takes about 27 min. The job takes about 45 min.
+          # The slowest case took 1420 s on CI. The job takes about 35 min. A
+          # case that hangs stops at LIMIT, also when it starts late.
           - name: Scope
             models: Scope
-            limit: 5400
+            limit: 3600
             timeout: 120
           # The slowest case takes about 2 min. The job takes about 3 min.
           - name: Commit, Ivar, Fd, Semaphore, Signal

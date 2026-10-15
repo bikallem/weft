@@ -1612,15 +1612,15 @@ The protocols that run on many domains at the same time have models in PlusCal, 
 
 Run all of the models with `nix develop -c spec/tla/check.sh`. `MODELS="Ivar Fd"` selects some of them. The script runs `JOBS` cases at the same time (default 4), each one with `-lncheck final`, so that TLC checks the liveness property one time at the end. Each case has its own `-metadir` and its own `java.io.tmpdir`. TLC copies the standard modules, for example `Integers.tla`, from its jar to `java.io.tmpdir`, and deletes them at its exit. With one directory, a case can truncate or delete the module that another case parses, and the parse fails with "Module-Table lookup failure". The 60 cases take about 17 minutes on a machine with 16 CPUs. The slowest case, `Wake.tla` with no bug and 15.3 million states, takes about 11 minutes, and it is the lower limit of the run time. The flake of the repository gives the TLA+ tools.
 
-**The models in CI.** The workflow `tla.yml` runs when a file of `spec/tla` changes, each Monday, and on request. It has three jobs that run at the same time, each on a runner with 4 CPUs: `Wake`, `Scope`, and `Commit, Ivar, Fd, Semaphore, Signal`. Each job gives `MODELS` and `LIMIT` to `check.sh`. A failure of one job does not stop the other jobs. In one job, the models took about 1 h 10 min to 1 h 35 min. Wake used about 61% of the time of TLC, Scope about 37%, and the other five models together about 2%. The times of the three jobs are estimates. A local run of each group with 4 cases at a time and 1 worker each took 1240 s, 891 s and 49 s. The Wake case with no bug took 1140 s on this machine and 3370 s on a CI runner. Thus I estimate that a CI runner is about 3 times slower:
+**The models in CI.** The workflow `tla.yml` runs when a file of `spec/tla` changes, each Monday, and on request. It has three jobs that run at the same time, each on a runner with 4 CPUs: `Wake`, `Scope`, and `Commit, Ivar, Fd, Semaphore, Signal`. Each job gives `MODELS` and `LIMIT` to `check.sh`. A failure of one job does not stop the other jobs. In one job, the models took about 1 h 10 min to 1 h 35 min. Wake used about 61% of the time of TLC, Scope about 37%, and the other five models together about 2%. The times of the three jobs are estimates. A local run of each group with 4 cases at a time and 1 worker each took 1240 s, 891 s and 49 s. The Wake case with no bug took 1140 s with 1 worker on the machine with 16 CPUs, and 3370 s on a CI runner. Thus I estimate that a CI runner is about 3 times slower:
 
 | Job | Slowest case in CI | Job in CI | `LIMIT` of a case | Timeout of the job |
 |---|---|---|---|---|
 | `Wake` | 56 min (measured) | about 1 h | 3 h | 4 h |
-| `Scope` | about 27 min | about 45 min | 1.5 h | 2 h |
+| `Scope` | 24 min (measured) | about 35 min | 1 h | 2 h |
 | `Commit, Ivar, Fd, Semaphore, Signal` | about 2 min | about 3 min | 15 min | 30 min |
 
-`LIMIT` is about three times the slowest case or more. A case that is longer stops with an error. The timeout of the job is longer than `LIMIT`, so that `check.sh` gives its list of results also when a case hangs.
+`LIMIT` is 2.5 times the slowest case or more. A case that is longer stops with an error. In each job, the last case starts early enough that its `LIMIT` ends before the timeout of the job. Thus `check.sh` gives its list of results also when a case hangs.
 
 | Model | Protocol (section) | Properties | Planted bugs that fail |
 |---|---|---|---|
@@ -1708,11 +1708,12 @@ The known survivors of `make mutate-all`:
 **The mutation gate of a pull request.** The CI job `mutation (changed lines)` runs `make mutate BASE=HEAD^1` on each pull request. The checkout is the merge commit of the pull request into its base branch, and its first parent is the base at the time of the event. Thus the diff from `HEAD^1` has only the lines of the pull request. This is also true in a stack of pull requests, and when the base branch moves later. These rules apply to the gate:
 
 - The gate is strict. It gives a failure if a mutant on a changed line survives. It has no `MIN_SCORE`.
+- The gate tests only the mutants that `test/core` and `test/sim` reach. A mutant that no test reaches gives no failure, for example in a new function with no test. The gate does not test the lines of `weft.posix`, `weft.linux` and `weft.kqueue`, because these two suites do not link them.
 - A pull request that changes no line with a mutant passes, for example a change to a comment, a test or this document.
 - A change to the line of a known survivor puts that survivor in scope again, and the gate gives a failure. The author must examine the survivor with the rules of this section.
 - A mutant is on the line where its expression starts. A change to a later line of a long expression does not put the mutant in scope. `make mutate-all` finds such a survivor.
 
-On a machine with 16 CPUs, `make mutate` took 45 s for a change to a comment, 105 s for a change with 3 mutants that the tests kill, and 572 s for a change to the line of the `Gc.full_major` survivor. The last one gave exit status 2. The job has a limit of 90 minutes.
+On a machine with 16 CPUs, `make mutate` took 45 s for a change to a comment, 105 s for a change with 3 mutants that the tests kill, and 572 s for a change to the line of the `Gc.full_major` survivor. The last one gave exit status 2. The job has a timeout of 90 minutes.
 
 **Two facts for M1.** I read them in the source of windtrap 0.2.0, but I did not do a test of them with domains:
 
