@@ -457,6 +457,7 @@ module Private : sig
   module Chan = Chan
   module Ring = Ring
   module Job = Job
+  module Process = Process
 end
 
 module Chan : sig
@@ -835,7 +836,7 @@ module Process : sig
   exception Error of Net.error * string
 
   (** A child process. *)
-  type t
+  type t = Private.Process.t
 
   (** How the child gets its fd 0, 1 or 2. *)
   type stdio =

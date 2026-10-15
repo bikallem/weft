@@ -562,15 +562,10 @@ let processes =
                   Sim.program ~runs:(Span.ms 1) () ) ;
               let p = Process.spawn "p" [] in
               Time.sleep Mono (Span.ms 2) ;
-              (* Other code reaps the child, as waitpid (-1) does. The fds of
-                 the simulator start at 3. *)
-              let reaps =
-                List.filter
-                  (fun fd ->
-                    Helpers.submit (Op.Wait_child fd) = Ok (Some (Exited 0)) )
-                  (List.init 8 Fun.id)
-              in
-              equal int 1 (List.length reaps) ;
+              (* Other code reaps the child, as waitpid (-1) does. *)
+              let pidfd = p.Private.Process.pidfd.Private.Sched.os in
+              is_true
+                (Helpers.submit (Op.Wait_child pidfd) = Ok (Some (Exited 0))) ;
               raises
                 (Process.Error (Other "ESRCH", "Process.kill"))
                 (fun () -> Process.kill p SIGTERM) ;
