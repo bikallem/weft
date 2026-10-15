@@ -597,6 +597,29 @@ let three_sigints seed =
               Time.sleep Mono (Span.ms 1) ) ) ) ;
   equal int64 3_000_000L !at
 
+(* The guard of the second branch stops the watch after the guard of [received]
+   started it, and before the scan. The waiter raises. *)
+let unwatch_in_guard () =
+  Sim.run ~signals:[SIGUSR1] (fun _ ->
+      raises (Invalid_argument not_watched) (fun () ->
+          sync
+            (choose
+               [ Signal.received SIGUSR1
+               ; guard (fun () -> Signal.unwatch SIGUSR1 ; never) ] ) ) )
+
+(* A waiter that took another branch stays in the list of waiters. The unwatch
+   does not resume it, and the watch ends. *)
+let unwatch_after_other_branch () =
+  Sim.run ~signals:[SIGUSR1] (fun _ ->
+      equal string "timeout"
+        (sync
+           (choose
+              [ wrap (Signal.received SIGUSR1) (fun _ -> "signal")
+              ; wrap (Time.after Mono (Span.ms 1)) (fun () -> "timeout") ] ) ) ;
+      Signal.unwatch SIGUSR1 ;
+      raises (Invalid_argument not_watched) (fun () ->
+          sync (Signal.received SIGUSR1) ) )
+
 let unwatch =
   group "unwatch"
     [ test "the third SIGINT ends the process, with 100 seeds" (fun () ->
@@ -706,7 +729,11 @@ let unwatch =
               raises
                 (Invalid_argument
                    "Signal.unwatch: this signal cannot be an event" ) (fun () ->
-                  Signal.unwatch SIGKILL ) ) ) ]
+                  Signal.unwatch SIGKILL ) ) )
+    ; test "an unwatch in a guard of the same sync makes the waiter raise"
+        unwatch_in_guard
+    ; test "an unwatch does not resume a waiter that took another branch"
+        unwatch_after_other_branch ]
 
 let tests =
   [ Windtrap.group "200 seeds"
