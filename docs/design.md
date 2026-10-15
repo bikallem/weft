@@ -1713,7 +1713,7 @@ The known survivors of `make mutate-all`:
 - A change to the line of a known survivor puts that survivor in scope again, and the gate gives a failure. The author must examine the survivor with the rules of this section.
 - A mutant is on the line where its expression starts. A change to a later line of a long expression does not put the mutant in scope. `make mutate-all` finds such a survivor.
 
-On a machine with 16 CPUs, `make mutate` took 45 s for a change to a comment, 105 s for a change with 3 mutants that the tests kill, and 572 s for a change to the line of the `Gc.full_major` survivor. The last one gave exit status 2. The job has a timeout of 90 minutes.
+On a machine with 16 CPUs, `make mutate` took 45 s for a change to a comment, 105 s for a change with 3 mutants that the tests kill, and 572 s for a change to the line of the `Gc.full_major` survivor. The last one gave exit status 2. On a CI runner with 4 CPUs, the job took 4 min 33 s for the same change to the line of the survivor, and it gave a failure. The job has a timeout of 90 minutes.
 
 **Two facts for M1.** I read them in the source of windtrap 0.2.0, but I did not do a test of them with domains:
 
