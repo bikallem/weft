@@ -59,9 +59,10 @@ let posix_to_unix_s t = Int64.to_float (Clock.to_ns Posix t) /. 1e9
    algorithms of Howard Hinnant, "chrono-Compatible Low-Level Date Algorithms",
    https://howardhinnant.github.io/date_algorithms.html. They use a year that
    starts on 1 March, so the leap day is the last day of the year. A day number
-   is the count of days since 1970-01-01. The OCaml [/] rounds to zero, so the
-   code makes the era of a negative number with an offset, as the source
-   does. *)
+   is the count of days since 1970-01-01. The OCaml [/] rounds to zero, so
+   [days_from_civil] makes the era of a negative year with an offset, as the
+   source does. [civil_from_days] needs no offset: its days count from
+   0000-03-01, and the first day of [Clock.posix] is day 612716. *)
 
 type utc =
   { year: int
@@ -89,14 +90,7 @@ let days_from_civil y m d =
 
 let civil_from_days z =
   let z = z + 719468 in
-  let era =
-    ( if
-        ( z >= 0 )
-        [@mutate off "at z = 0, (z - 146096) / 146097 also gives the era 0"]
-      then z
-      else z - 146096 )
-    / 146097
-  in
+  let era = z / 146097 in
   let doe = z - (era * 146097) in
   let yoe = (doe - (doe / 1460) + (doe / 36524) - (doe / 146096)) / 365 in
   let doy = doe - ((365 * yoe) + (yoe / 4) - (yoe / 100)) in
