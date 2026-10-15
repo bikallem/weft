@@ -715,7 +715,7 @@ let advance_cancelled () =
    target and cancels the advance. The advance ends at the target, with or
    without Cancelled, and a new advance can start. *)
 let advance_cancel_at_target seed =
-  Sim.run ~seed ~domains:2 ~auto:false (fun sim ->
+  Sim.run ~seed ~domains:4 ~auto:false (fun sim ->
       let t0 = Time.now Mono in
       let at n = Option.get (Time.add Mono t0 (Span.s n)) in
       Fiber.scope (fun s ->
@@ -1727,8 +1727,8 @@ let tests =
                            (Op.Start (0, Op.Pread (fd, Bytes.create 4, 0, 4, 0))) ) ) ;
                    ignore (Helpers.submit (Op.Close fd)) ) ) )
       ; test "L5: a cancel ends advance_until" advance_cancelled
-      ; test "a cancel at the target of advance_until, with 50 seeds" (fun () ->
-            Helpers.seeds 50 advance_cancel_at_target )
+      ; test "a cancel at the target of advance_until, with 500 seeds"
+          (fun () -> Helpers.seeds 500 advance_cancel_at_target )
       ; test "a Deregister with no Register gives Model_error" (fun () ->
             contains ~sub:"which has no registration"
               (Helpers.model_error (fun _ ->
