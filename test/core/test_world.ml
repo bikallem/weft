@@ -747,6 +747,10 @@ let utc_invalid () =
   is_true (none (1677, 9, 20, 0, 0, 0, 0)) ;
   is_true (none (1677, 9, 21, 0, 12, 43, 0)) ;
   is_true (none (9999, 12, 31, 23, 59, 59, 0)) ;
+  (* The years before 1 have a negative era. *)
+  is_true (none (0, 1, 1, 0, 0, 0, 0)) ;
+  is_true (none (-1, 12, 31, 0, 0, 0, 0)) ;
+  is_true (none (-10000, 3, 1, 0, 0, 0, 0)) ;
   is_true (none (max_int, 1, 1, 0, 0, 0, 0)) ;
   is_true (none (min_int, 1, 1, 0, 0, 0, 0))
 

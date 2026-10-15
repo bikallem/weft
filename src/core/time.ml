@@ -75,9 +75,11 @@ type utc =
 let days_from_civil y m d =
   let y = if m <= 2 then y - 1 else y in
   let era =
-    ( if (y >= 0) [@mutate off "at y = 0, (y - 399) / 400 also gives the era 0"]
-      then y
-      else y - 399 )
+    ( ( if y >= 0 then y else y - 399 )
+    [@mutate
+      off
+        "at y = 0 the two branches give the era 0, and of_utc gives None for \
+         each year before 1 with each era"] )
     / 400
   in
   let yoe = y - (era * 400) in
