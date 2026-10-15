@@ -712,8 +712,8 @@ let advance_cancelled () =
       equal int 1000 (ms_since t0) )
 
 (* A cancel at the target of advance_until: a sleeper on any domain wakes at the
-   target and cancels the advance. The advance ends at the target, with or with
-   no Cancelled, and a new advance can start. *)
+   target and cancels the advance. The advance ends at the target, with or
+   without Cancelled, and a new advance can start. *)
 let advance_cancel_at_target seed =
   Sim.run ~seed ~domains:2 ~auto:false (fun sim ->
       let t0 = Time.now Mono in
