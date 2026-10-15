@@ -1612,6 +1612,16 @@ The protocols that run on many domains at the same time have models in PlusCal, 
 
 Run all of the models with `nix develop -c spec/tla/check.sh`. `MODELS="Ivar Fd"` selects some of them. The script runs `JOBS` cases at the same time (default 4), each one with `-lncheck final`, so that TLC checks the liveness property one time at the end. Each case has its own `-metadir` and its own `java.io.tmpdir`. TLC copies the standard modules, for example `Integers.tla`, from its jar to `java.io.tmpdir`, and deletes them at its exit. With one directory, a case can truncate or delete the module that another case parses, and the parse fails with "Module-Table lookup failure". The 60 cases take about 17 minutes on a machine with 16 CPUs. The slowest case, `Wake.tla` with no bug and 15.3 million states, takes about 11 minutes, and it is the lower limit of the run time. The flake of the repository gives the TLA+ tools.
 
+**The models in CI.** The workflow `tla.yml` runs when a file of `spec/tla` changes, each Monday, and on request. It has three jobs that run at the same time, each on a runner with 4 CPUs: `Wake`, `Scope`, and `Commit, Ivar, Fd, Semaphore, Signal`. Each job gives `MODELS` and `LIMIT` to `check.sh`. A failure of one job does not stop the other jobs. In one job, the models took about 1 h 10 min to 1 h 35 min. Wake used about 61% of the time of TLC, Scope about 37%, and the other five models together about 2%. The times of the three jobs are estimates. A local run of each group with 4 cases at a time and 1 worker each took 1240 s, 891 s and 49 s. The Wake case with no bug took 1140 s on this machine and 3370 s on a CI runner. Thus I estimate that a CI runner is about 3 times slower:
+
+| Job | Slowest case in CI | Job in CI | `LIMIT` of a case | Timeout of the job |
+|---|---|---|---|---|
+| `Wake` | 56 min (measured) | about 1 h | 3 h | 4 h |
+| `Scope` | about 27 min | about 45 min | 1.5 h | 2 h |
+| `Commit, Ivar, Fd, Semaphore, Signal` | about 2 min | about 3 min | 15 min | 30 min |
+
+`LIMIT` is about three times the slowest case or more. A case that is longer stops with an error. The timeout of the job is longer than `LIMIT`, so that `check.sh` gives its list of results also when a case hangs.
+
 | Model | Protocol (section) | Properties | Planted bugs that fail |
 |---|---|---|---|
 | `Commit.tla` | The commit of `choose` (2.4) | At most one resume, correct rendezvous pairs, no lost rendezvous, a correct end state, termination | No `Parked` state, no id order, a partner that gives up on `Claimed`, no channel lock |
