@@ -749,11 +749,28 @@ let planted_lost_wakeup () =
   | exception Sim.Lost_wakeup l ->
       equal (list string) ["victim is committed but not in a queue"] l
 
+type _ Effect.t += No_handler : unit Effect.t
+
+(* The simulator stops only at the world effects. Another effect with no handler
+   raises [Effect.Unhandled] in the fiber that performs it. *)
+let unhandled_effect () =
+  run (fun () ->
+      let r =
+        match Effect.perform No_handler with
+        | () ->
+            "a handler"
+        | exception Effect.Unhandled No_handler ->
+            "Unhandled"
+      in
+      equal string "Unhandled" r )
+
 let checks =
   group "checks"
     [ test "a fiber that waits forever gives Deadlock with its name"
         deadlock_names_fiber
-    ; test "a planted lost wakeup gives Lost_wakeup" planted_lost_wakeup ]
+    ; test "a planted lost wakeup gives Lost_wakeup" planted_lost_wakeup
+    ; test "an effect with no handler raises Effect.Unhandled in the fiber"
+        unhandled_effect ]
 
 let stale_timers () =
   let add, get = log () in
@@ -1101,11 +1118,27 @@ let seeds_differ () =
   let traces = List.init 8 (fun seed -> run ~seed random_program) in
   greater int ~than:1 (List.length (List.sort_uniq compare traces))
 
+(* The [n] bytes of a [Random_bytes] in a run with [seed]. *)
+let random_bytes seed n =
+  run ~seed (fun () ->
+      let b = Bytes.make n '\000' in
+      Private.World.perform "test" (Private.World.Random_bytes b) ;
+      Bytes.to_string b )
+
+let random_bytes_from_seed () =
+  let a = random_bytes 1 64 in
+  equal int 64 (String.length a) ;
+  equal string a (random_bytes 1 64) ;
+  is_true (a <> random_bytes 2 64) ;
+  is_true (a <> String.make 64 '\000') ;
+  equal string "" (random_bytes 1 0)
+
 let properties =
   group "properties"
     [ prop "each sleep ends at exactly its deadline" spans each_sleep_is_exact
     ; prop "a seed gives the same run" Gen.int same_seed_same_run
-    ; test "different seeds give different runs" seeds_differ ]
+    ; test "different seeds give different runs" seeds_differ
+    ; test "a seed gives the same random bytes" random_bytes_from_seed ]
 
 (* The tests of the public API that each world runs. *)
 let portable_world =

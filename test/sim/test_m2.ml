@@ -128,6 +128,53 @@ let detached_at_end seed =
   equal int 0 (Sim.open_fds (Option.get !saved)) ;
   timed_out
 
+(* A write that a cancel detached still occurs at its completion. It gives
+   [true] if the cancel came before the completion. *)
+let detached_write seed =
+  Sim.run ~seed (fun sim ->
+      let f = File.openfile [Read; Write; Create] "/f" in
+      Sim.set_blocking_cost sim (Span.ms 10) ;
+      let timed_out =
+        match
+          Fiber.with_timeout Mono (Span.ms 1) (fun () -> File.write f "data")
+        with
+        | () ->
+            false
+        | exception Fiber.Timeout ->
+            true
+      in
+      Time.sleep Mono (Span.ms 20) ;
+      equal int 4 (File.fstat f).size ;
+      File.close f ;
+      timed_out )
+
+(* F4 on 2 domains: domain 1 starts a read, and a cancel detaches it. Domain 0
+   ends, and domain 1 waits for the completion, so the fd closes. It gives
+   [true] if the read was on domain 1 and the cancel came before the
+   completion. *)
+let detached_on_domain_1 seed =
+  let saved = ref None in
+  let on_1 = ref false in
+  Sim.run ~seed ~domains:2 (fun sim ->
+      saved := Some sim ;
+      let f = File.openfile [Read; Write; Create] "/f" in
+      File.write f "data" ;
+      Sim.set_blocking_cost sim (Span.ms 50) ;
+      Fiber.scope (fun s ->
+          Fiber.fork s (fun () ->
+              let d = Helpers.dom () in
+              match
+                Fiber.with_timeout Mono (Span.ms 1) (fun () ->
+                    File.pread f ~file_offset:0 (Bytes.create 4) 0 4 )
+              with
+              | _ ->
+                  ()
+              | exception Fiber.Timeout ->
+                  on_1 := d = 1 ) ) ;
+      File.close f ) ;
+  equal int 0 (Sim.open_fds (Option.get !saved)) ;
+  !on_1
+
 (* A completion that a fiber waited for leaves no record. *)
 let no_external_left () =
   Sim.run (fun sim ->
@@ -237,6 +284,22 @@ let jobs =
                  let id = Helpers.ok (Helpers.submit (Op.Start (0, j))) in
                  ignore (Helpers.ok (Helpers.submit (Op.Finish (id, j)))) ;
                  ignore (Helpers.submit (Op.Finish (id, j))) ) ) )
+    ; test "a Finish with another operation gives Model_error" (fun () ->
+          contains ~sub:"not the operation of Start"
+            (Helpers.model_error (fun _ ->
+                 let id =
+                   Helpers.ok (Helpers.submit (Op.Start (0, Op.Stat "/")))
+                 in
+                 ignore (Helpers.submit (Op.Finish (id, Op.Mkdir ("/x", 0)))) )
+            ) )
+    ; test "a Detach of a job that does not exist gives Model_error" (fun () ->
+          contains ~sub:"which does not exist"
+            (Helpers.model_error (fun _ ->
+                 ignore (Helpers.submit (Op.Detach 1_000_000)) ) ) )
+    ; test "a write that a cancel detaches occurs, with 20 seeds" (fun () ->
+          is_true (Helpers.some_seed 20 detached_write) )
+    ; test "F4 on 2 domains: a detached job of domain 1 releases its fd"
+        (fun () -> is_true (Helpers.some_seed 50 detached_on_domain_1) )
     ; test "a fiber in a cancelled context does not start a job" cancelled_job
     ]
 
