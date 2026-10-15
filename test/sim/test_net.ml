@@ -251,6 +251,18 @@ let settle_runs_others () =
           Sim.settle sim ;
           equal int 3 !n ) )
 
+(* A settle in a cancelled scope raises at once. Its completion comes later,
+   with no waiter, and the domain ignores it. *)
+let settle_cancelled () =
+  Sim.run (fun sim ->
+      let t0 = Time.now Mono in
+      Fiber.scope (fun s ->
+          Fiber.cancel s Exit ;
+          raises (Fiber.Cancelled Exit) (fun () -> Sim.settle sim) ) ;
+      Time.sleep Mono (Span.ms 1) ;
+      Sim.settle sim ;
+      equal int 1 (ms_since t0) )
+
 let manual_mode () =
   Sim.run ~auto:false (fun sim ->
       let t0 = Time.now Mono in
@@ -1619,6 +1631,7 @@ let tests =
       ; test "the port 0 goes around after 65535" udp_ports_go_around ]
   ; group "sim"
       [ test "settle waits until the others are quiescent" settle_runs_others
+      ; test "a settle in a cancelled scope raises at once" settle_cancelled
       ; test "manual mode: advance_until moves the time" manual_mode
       ; test
           "manual mode: Deadlock tells that only advance_until moves the time"
