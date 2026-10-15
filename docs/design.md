@@ -1933,7 +1933,7 @@ Three subagents reviewed the code of M1 (correctness, conformance to the TLA+ mo
 
 ## 3.8 The review of M2, 2026-10-11
 
-Three subagents reviewed the code of M2 (correctness, conformance to the TLA+ models, and complexity). Each finding of this table is fixed. Each bug has a regression test that fails when the old code is put back, except two: C11 is a race with one reap on another domain, and the NUL check of C12 is one line.
+Three subagents reviewed the code of M2 (correctness, conformance to the TLA+ models, and complexity). Each finding of this table is fixed. Each bug has a regression test that fails when the old code is put back, except two: C11 is a race with one reap on another domain, and the NUL check of C12 is one line. (2026-10-15: the test "C11: a kill on another domain at the time of the reap does not raise, with 500 seeds" covers C11, after the simulator gives ESRCH. The window during a reap is a known survivor, section 2.17.)
 
 | No. | Finding | Fix |
 |---|---|---|
