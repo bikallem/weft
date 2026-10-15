@@ -576,6 +576,34 @@ let processes =
                   (fun () -> Process.wait p)
               done ) ) ]
 
+(* A signal comes while a fiber on domain 1 scans its branches. The fiber sends
+   SIGUSR1 to the process, then it waits for the signal or for a new socket. The
+   Register of the socket is a switch point, so domain 0 can deliver the signal
+   during the scan. Each wait gets the signal one time. It gives the count of
+   the waits on domain 1. *)
+let signal_in_scan seed =
+  let waits = ref 0 in
+  Sim.run ~seed ~domains:2 ~signals:[SIGUSR1] (fun sim ->
+      Fiber.scope (fun s ->
+          Fiber.fork s (fun () ->
+              for _ = 1 to 20 do
+                if Helpers.dom () = 1 then (
+                  let r, w = Sim.socket_pair sim in
+                  Sim.signal sim SIGUSR1 ;
+                  let n =
+                    sync
+                      (choose
+                         [ Signal.received SIGUSR1
+                         ; wrap (Net.readable r) (fun () -> 0) ] )
+                  in
+                  equal ~msg:(Printf.sprintf "seed %d" seed) int 1 n ;
+                  incr waits ;
+                  Net.close r ;
+                  Net.close w )
+                else Fiber.yield ()
+              done ) ) ) ;
+  !waits
+
 (* A graceful shutdown: at SIGTERM, the server stops to accept, and each
    connection ends its request. *)
 let shutdown seed =
@@ -842,4 +870,11 @@ let tests =
   ; group "with faults" (Portable.tests faults_world)
   ; group "signals"
       [ test "SIGTERM gives a graceful shutdown with 100 seeds" shutdown_test
+      ; test
+          "a signal during the scan of a fiber on domain 1 reaches it, with \
+           200 seeds" (fun () ->
+            let waits = ref 0 in
+            Helpers.seeds 200 (fun seed ->
+                waits := !waits + signal_in_scan seed ) ;
+            greater int ~than:0 !waits )
       ; unwatch ] ]
