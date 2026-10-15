@@ -35,7 +35,10 @@ module Spin = struct
         off
           "one domain never contends; test_heap.ml examines the lock with two \
            domains, but a mutation run cannot start a domain"]
-    then ( Domain.cpu_relax () ; lock t )
+    then (
+      Domain.cpu_relax ()
+      [@mutate off "a hint to the CPU only: the loop gives the same result"] ;
+      lock t )
 
   let unlock t = Atomic.set t false
 
@@ -1983,5 +1986,9 @@ let run_domain dom =
     loop dom
   with e ->
     let bt = Printexc.get_raw_backtrace () in
-    Atomic.set dom.sched.finished true ;
+    Atomic.set dom.sched.finished true
+    [@mutate
+      off
+        "Weft.run sets finished again and wakes each domain after the \
+         exception, and the simulator stops each domain at the exception"] ;
     raise (Internal_error (e, bt))

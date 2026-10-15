@@ -155,4 +155,5 @@ module Private = struct
   module Chan = Chan
   module Ring = Ring
   module Job = Job
+  module Process = Process
 end

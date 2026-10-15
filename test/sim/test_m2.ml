@@ -128,6 +128,53 @@ let detached_at_end seed =
   equal int 0 (Sim.open_fds (Option.get !saved)) ;
   timed_out
 
+(* A write that a cancel detached still occurs at its completion. It gives
+   [true] if the cancel came before the completion. *)
+let detached_write seed =
+  Sim.run ~seed (fun sim ->
+      let f = File.openfile [Read; Write; Create] "/f" in
+      Sim.set_blocking_cost sim (Span.ms 10) ;
+      let timed_out =
+        match
+          Fiber.with_timeout Mono (Span.ms 1) (fun () -> File.write f "data")
+        with
+        | () ->
+            false
+        | exception Fiber.Timeout ->
+            true
+      in
+      Time.sleep Mono (Span.ms 20) ;
+      equal int 4 (File.fstat f).size ;
+      File.close f ;
+      timed_out )
+
+(* F4 on 2 domains: domain 1 starts a read, and a cancel detaches it. Domain 0
+   ends, and domain 1 waits for the completion, so the fd closes. It gives
+   [true] if the read was on domain 1 and the cancel came before the
+   completion. *)
+let detached_on_domain_1 seed =
+  let saved = ref None in
+  let on_1 = ref false in
+  Sim.run ~seed ~domains:2 (fun sim ->
+      saved := Some sim ;
+      let f = File.openfile [Read; Write; Create] "/f" in
+      File.write f "data" ;
+      Sim.set_blocking_cost sim (Span.ms 50) ;
+      Fiber.scope (fun s ->
+          Fiber.fork s (fun () ->
+              let d = Helpers.dom () in
+              match
+                Fiber.with_timeout Mono (Span.ms 1) (fun () ->
+                    File.pread f ~file_offset:0 (Bytes.create 4) 0 4 )
+              with
+              | _ ->
+                  ()
+              | exception Fiber.Timeout ->
+                  on_1 := d = 1 ) ) ;
+      File.close f ) ;
+  equal int 0 (Sim.open_fds (Option.get !saved)) ;
+  !on_1
+
 (* A completion that a fiber waited for leaves no record. *)
 let no_external_left () =
   Sim.run (fun sim ->
@@ -237,6 +284,22 @@ let jobs =
                  let id = Helpers.ok (Helpers.submit (Op.Start (0, j))) in
                  ignore (Helpers.ok (Helpers.submit (Op.Finish (id, j)))) ;
                  ignore (Helpers.submit (Op.Finish (id, j))) ) ) )
+    ; test "a Finish with another operation gives Model_error" (fun () ->
+          contains ~sub:"not the operation of Start"
+            (Helpers.model_error (fun _ ->
+                 let id =
+                   Helpers.ok (Helpers.submit (Op.Start (0, Op.Stat "/")))
+                 in
+                 ignore (Helpers.submit (Op.Finish (id, Op.Mkdir ("/x", 0)))) )
+            ) )
+    ; test "a Detach of a job that does not exist gives Model_error" (fun () ->
+          contains ~sub:"which does not exist"
+            (Helpers.model_error (fun _ ->
+                 ignore (Helpers.submit (Op.Detach 1_000_000)) ) ) )
+    ; test "a write that a cancel detaches occurs, with 20 seeds" (fun () ->
+          is_true (Helpers.some_seed 20 detached_write) )
+    ; test "F4 on 2 domains: a detached job of domain 1 releases its fd"
+        (fun () -> is_true (Helpers.some_seed 50 detached_on_domain_1) )
     ; test "a fiber in a cancelled context does not start a job" cancelled_job
     ]
 
@@ -319,6 +382,19 @@ let processes =
                         with Fiber.Timeout -> () ) ;
                     equal string "exited 0" (status_text (Process.wait p)) ) )
           done )
+    ; test
+        "C11: a kill on another domain at the time of the reap does not raise, \
+         with 500 seeds" (fun () ->
+          Helpers.seeds 500 (fun seed ->
+              Sim.run ~seed ~domains:2 (fun sim ->
+                  Sim.add_program sim "p" (fun _ ->
+                      Sim.program ~runs:(Span.ms 1) () ) ;
+                  let p = Process.spawn "p" [] in
+                  Fiber.scope (fun s ->
+                      Fiber.fork s (fun () -> ignore (Process.wait p)) ;
+                      Fiber.fork s (fun () ->
+                          Time.sleep Mono (Span.ms 1) ;
+                          Process.kill p SIGTERM ) ) ) ) )
     ; test "a write to the stdin of a child that exited gives EPIPE" (fun () ->
           Sim.run (fun sim ->
               Sim.add_program sim "quick" (fun _ ->
@@ -479,7 +555,54 @@ let processes =
                 = Some (Exited 0) ) ;
               equal string "ECHILD"
                 (Helpers.op_error (Helpers.submit (Op.Wait_child r.pidfd))) ;
-              Helpers.ok (Helpers.submit (Op.Close r.pidfd)) ) ) ]
+              Helpers.ok (Helpers.submit (Op.Close r.pidfd)) ) )
+    ; test "a child that other code reaped gives ESRCH and ECHILD" (fun () ->
+          Sim.run (fun sim ->
+              Sim.add_program sim "p" (fun _ ->
+                  Sim.program ~runs:(Span.ms 1) () ) ;
+              let p = Process.spawn "p" [] in
+              Time.sleep Mono (Span.ms 2) ;
+              (* Other code reaps the child, as waitpid (-1) does. *)
+              let pidfd = p.Private.Process.pidfd.Private.Sched.os in
+              is_true
+                (Helpers.submit (Op.Wait_child pidfd) = Ok (Some (Exited 0))) ;
+              raises
+                (Process.Error (Other "ESRCH", "Process.kill"))
+                (fun () -> Process.kill p SIGTERM) ;
+              (* Each wait tries the reap again, and gets the error again. *)
+              for _ = 1 to 2 do
+                raises
+                  (Process.Error (Other "ECHILD", "Process.wait"))
+                  (fun () -> Process.wait p)
+              done ) ) ]
+
+(* A signal comes while a fiber on domain 1 scans its branches. The fiber sends
+   SIGUSR1 to the process, then it waits for the signal or for a new socket. The
+   Register of the socket is a switch point, so domain 0 can deliver the signal
+   during the scan. Each wait gets the signal one time. It gives the count of
+   the waits on domain 1. *)
+let signal_in_scan seed =
+  let waits = ref 0 in
+  Sim.run ~seed ~domains:2 ~signals:[SIGUSR1] (fun sim ->
+      Fiber.scope (fun s ->
+          Fiber.fork s (fun () ->
+              for _ = 1 to 20 do
+                if Helpers.dom () = 1 then (
+                  let r, w = Sim.socket_pair sim in
+                  Sim.signal sim SIGUSR1 ;
+                  let n =
+                    sync
+                      (choose
+                         [ Signal.received SIGUSR1
+                         ; wrap (Net.readable r) (fun () -> 0) ] )
+                  in
+                  equal ~msg:(Printf.sprintf "seed %d" seed) int 1 n ;
+                  incr waits ;
+                  Net.close r ;
+                  Net.close w )
+                else Fiber.yield ()
+              done ) ) ) ;
+  !waits
 
 (* A graceful shutdown: at SIGTERM, the server stops to accept, and each
    connection ends its request. *)
@@ -597,6 +720,29 @@ let three_sigints seed =
               Time.sleep Mono (Span.ms 1) ) ) ) ;
   equal int64 3_000_000L !at
 
+(* The guard of the second branch stops the watch after the guard of [received]
+   started it, and before the scan. The waiter raises. *)
+let unwatch_in_guard () =
+  Sim.run ~signals:[SIGUSR1] (fun _ ->
+      raises (Invalid_argument not_watched) (fun () ->
+          sync
+            (choose
+               [ Signal.received SIGUSR1
+               ; guard (fun () -> Signal.unwatch SIGUSR1 ; never) ] ) ) )
+
+(* A waiter that took another branch stays in the list of waiters. The unwatch
+   does not resume it, and the watch ends. *)
+let unwatch_after_other_branch () =
+  Sim.run ~signals:[SIGUSR1] (fun _ ->
+      equal string "timeout"
+        (sync
+           (choose
+              [ wrap (Signal.received SIGUSR1) (fun _ -> "signal")
+              ; wrap (Time.after Mono (Span.ms 1)) (fun () -> "timeout") ] ) ) ;
+      Signal.unwatch SIGUSR1 ;
+      raises (Invalid_argument not_watched) (fun () ->
+          sync (Signal.received SIGUSR1) ) )
+
 let unwatch =
   group "unwatch"
     [ test "the third SIGINT ends the process, with 100 seeds" (fun () ->
@@ -706,7 +852,11 @@ let unwatch =
               raises
                 (Invalid_argument
                    "Signal.unwatch: this signal cannot be an event" ) (fun () ->
-                  Signal.unwatch SIGKILL ) ) ) ]
+                  Signal.unwatch SIGKILL ) ) )
+    ; test "an unwatch in a guard of the same sync makes the waiter raise"
+        unwatch_in_guard
+    ; test "an unwatch does not resume a waiter that took another branch"
+        unwatch_after_other_branch ]
 
 let tests =
   [ Windtrap.group "200 seeds"
@@ -720,4 +870,11 @@ let tests =
   ; group "with faults" (Portable.tests faults_world)
   ; group "signals"
       [ test "SIGTERM gives a graceful shutdown with 100 seeds" shutdown_test
+      ; test
+          "a signal during the scan of a fiber on domain 1 reaches it, with \
+           200 seeds" (fun () ->
+            let waits = ref 0 in
+            Helpers.seeds 200 (fun seed ->
+                waits := !waits + signal_in_scan seed ) ;
+            greater int ~than:0 !waits )
       ; unwatch ] ]

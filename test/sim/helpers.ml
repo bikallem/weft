@@ -77,3 +77,9 @@ let model_error f =
       "no model error"
   | exception Sim.Model_error m ->
       m
+
+(* [with_report f] runs [f]. Then it gives back to [Private.promise_report] the
+   report that it had before [f]. *)
+let with_report f =
+  let old = Atomic.get Private.promise_report in
+  Fun.protect ~finally:(fun () -> Atomic.set Private.promise_report old) f

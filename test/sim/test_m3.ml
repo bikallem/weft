@@ -80,6 +80,18 @@ let refused () =
           ignore (Ivar.fill_from_outside iv ()) ;
           sync (Ivar.read iv) ) )
 
+(* A fill from outside of a full Ivar does nothing. The second fill finds the
+   Ivar full when the domain does it, and the third when the fiber calls it. *)
+let fill_full () =
+  Sim.run ~outside_fills:true (fun _ ->
+      let iv = Ivar.create () in
+      is_true (Ivar.fill_from_outside iv 1) ;
+      is_true (Ivar.fill_from_outside iv 2) ;
+      equal int 1 (sync (Ivar.read iv)) ;
+      is_true (Ivar.fill_from_outside iv 3) ;
+      Time.sleep Mono (Span.ms 1) ;
+      equal (option int) (Some 1) (Ivar.peek iv) )
+
 (* An Ivar of a run that ended: a fill from outside in a later run gives false,
    and the later run does not refuse it. *)
 let earlier_run () =
@@ -336,6 +348,27 @@ let lost_next () =
     (List.mem "the queue of domain 0 is not empty"
        (Private.Sched_debug.lost t ~now:(Clock.of_ns Mono 0L)) )
 
+(* The check of the queues at quiescence sees a close notice, a fiber in the
+   overflow queue and in the pinned queue, and a request in the injection
+   queue. *)
+let lost_queues () =
+  let t = S.create ~domains:2 () in
+  let node () = S.new_node (S.Scope_node (S.new_scope_state ())) in
+  let fdr = S.Fdtab.alloc 7 in
+  S.post t.S.doms.(1) fdr ;
+  Queue.push
+    {S.rfiber= S.new_fiber [node ()]; run= (fun () -> S.Finished)}
+    t.S.overflow ;
+  S.push t.S.doms.(0) (S.new_fiber ~pinned:true [node ()]) (fun () -> S.Finished) ;
+  S.inject t (fun _ -> ()) ;
+  equal (list string)
+    [ "the injection queue is not empty"
+    ; "the pinned queue is not empty"
+    ; "the overflow queue is not empty"
+    ; "domain 1 has close notices" ]
+    (Private.Sched_debug.lost t ~now:(Clock.of_ns Mono 0L)) ;
+  S.Fdtab.release fdr
+
 (* One fiber that a fiber wakes goes to the next slot: it runs before the fiber
    that is at the head of the local queue. *)
 let woken_goes_next () =
@@ -430,6 +463,8 @@ let tests =
               pinned_wake seed
             done )
       ; test "the check of the queues sees a next slot" lost_next
+      ; test "the check of the queues sees each shared queue and the mailbox"
+          lost_queues
       ; test "a fill from outside gives at once while the word is Claimed"
           fill_while_claimed
       ; test "the deadline form of with_timeout has no fiber" deadline_form
@@ -444,6 +479,7 @@ let tests =
           (fun () -> is_true (Helpers.some_seed 20 posix_step) )
       ; test "a finaliser fills an Ivar" finaliser
       ; test "a fill from outside needs ~outside_fills" refused
+      ; test "a fill from outside of a full Ivar does nothing" fill_full
       ; test "a fill of an Ivar of a run that ended gives false" earlier_run
       ; test "a later run does not resume a waiter of a run that ended"
           dead_waiter

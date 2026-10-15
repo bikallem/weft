@@ -457,6 +457,7 @@ module Private : sig
   module Chan = Chan
   module Ring = Ring
   module Job = Job
+  module Process = Process
 end
 
 module Chan : sig
@@ -835,7 +836,7 @@ module Process : sig
   exception Error of Net.error * string
 
   (** A child process. *)
-  type t
+  type t = Private.Process.t
 
   (** How the child gets its fd 0, 1 or 2. *)
   type stdio =
@@ -876,10 +877,17 @@ module Process : sig
 
   val wait : t -> status
   (** [sync (exited t)]. A program must wait for each child: the wait ends the
-      zombie and closes the fd of the child. *)
+      zombie and closes the fd of the child.
+
+      @raise Error
+        with [Other "ECHILD"] if other code reaped the child, for example with
+        [waitid] or with [SIGCHLD] set to [SIG_IGN]. *)
 
   val kill : t -> Signal.t -> unit
-  (** Sends a signal to the child. After the exit, it does nothing. *)
+  (** Sends a signal to the child. After the exit, it does nothing.
+
+      @raise Error
+        with [Other "ESRCH"] if other code reaped the child, as on Linux. *)
 end
 
 (** {1 Names} *)

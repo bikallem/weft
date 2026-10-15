@@ -1249,6 +1249,9 @@ let submit : type a. t -> a Op.t -> (a, Op.error) result =
         Error Op.Bad_fd )
   | Op.Kill (fd, sg) -> (
     match Hashtbl.find_opt n.fds fd with
+    | Some (Pfd p) when p.reaped ->
+        (* As Linux and the kqueue world: the process is gone. *)
+        Error (Op.Other "ESRCH")
     | Some (Pfd p) ->
         ( match (p.status, normal sg) with
         | Some _, _ ->
@@ -1659,7 +1662,12 @@ let quiescent t st =
         ( d >= Array.length st )
         [@mutate off "a domain did not end, so the search stops before"]
       then 0
-      else match st.(d) with Ended_dom -> find (d + 1) | _ -> d
+      else
+        match st.(d) with
+        | Start _ | Pending _ | Sleeping _ ->
+            d
+        | Ended_dom ->
+            find (d + 1)
     in
     find 0
   in

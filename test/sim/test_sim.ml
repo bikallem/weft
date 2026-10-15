@@ -306,6 +306,30 @@ let with_timeout_value () =
              7 ) ) ;
       equal int 10 (ms_since t0) )
 
+(* A span that makes the deadline overflow: the deadline never comes. Thus
+   [with_timeout] adds no timer, and it gives the value of [f]. *)
+let with_timeout_overflow () =
+  Sim.run (fun sim ->
+      Time.sleep Mono (Span.ms 1) ;
+      equal int 7
+        (Fiber.with_timeout Mono (Span.of_ns Int64.max_int) (fun () ->
+             equal int 0 (Private.Sched_debug.live_timers (Sim.sched sim)) ;
+             Time.sleep Mono (Span.ms 10) ;
+             7 ) ) )
+
+(* A cancel is not an error of an isolated fiber: [on_error] does not get it,
+   and the scope ends with no failure. *)
+let isolated_cancel () =
+  run (fun () ->
+      let errors = ref [] in
+      Fiber.scope (fun s ->
+          Fiber.fork_isolated s
+            ~on_error:(fun e _ -> errors := e :: !errors)
+            (fun () -> sync (Ivar.read (Ivar.create ()))) ;
+          Fiber.yield () ;
+          Fiber.cancel s Exit ) ;
+      equal int 0 (List.length !errors) )
+
 let with_timeout_outer_cancel () =
   run (fun () ->
       let r = ref "" in
@@ -679,6 +703,10 @@ let scopes =
     ; test "with_timeout raises Timeout at exactly the deadline"
         with_timeout_exact
     ; test "with_timeout gives the value of f" with_timeout_value
+    ; test "with_timeout with a deadline that overflows adds no timer"
+        with_timeout_overflow
+    ; test "a cancel of an isolated fiber does not go to on_error"
+        isolated_cancel
     ; test "an outer cancel in with_timeout is not a Timeout"
         with_timeout_outer_cancel
     ; test "the scope cancels a daemon when the others end"
@@ -749,11 +777,28 @@ let planted_lost_wakeup () =
   | exception Sim.Lost_wakeup l ->
       equal (list string) ["victim is committed but not in a queue"] l
 
+type _ Effect.t += No_handler : unit Effect.t
+
+(* The simulator stops only at the world effects. Another effect with no handler
+   raises [Effect.Unhandled] in the fiber that performs it. *)
+let unhandled_effect () =
+  run (fun () ->
+      let r =
+        match Effect.perform No_handler with
+        | () ->
+            "a handler"
+        | exception Effect.Unhandled No_handler ->
+            "Unhandled"
+      in
+      equal string "Unhandled" r )
+
 let checks =
   group "checks"
     [ test "a fiber that waits forever gives Deadlock with its name"
         deadlock_names_fiber
-    ; test "a planted lost wakeup gives Lost_wakeup" planted_lost_wakeup ]
+    ; test "a planted lost wakeup gives Lost_wakeup" planted_lost_wakeup
+    ; test "an effect with no handler raises Effect.Unhandled in the fiber"
+        unhandled_effect ]
 
 let stale_timers () =
   let add, get = log () in
@@ -1101,11 +1146,27 @@ let seeds_differ () =
   let traces = List.init 8 (fun seed -> run ~seed random_program) in
   greater int ~than:1 (List.length (List.sort_uniq compare traces))
 
+(* The [n] bytes of a [Random_bytes] in a run with [seed]. *)
+let random_bytes seed n =
+  run ~seed (fun () ->
+      let b = Bytes.make n '\000' in
+      Private.World.perform "test" (Private.World.Random_bytes b) ;
+      Bytes.to_string b )
+
+let random_bytes_from_seed () =
+  let a = random_bytes 1 64 in
+  equal int 64 (String.length a) ;
+  equal string a (random_bytes 1 64) ;
+  is_true (a <> random_bytes 2 64) ;
+  is_true (a <> String.make 64 '\000') ;
+  equal string "" (random_bytes 1 0)
+
 let properties =
   group "properties"
     [ prop "each sleep ends at exactly its deadline" spans each_sleep_is_exact
     ; prop "a seed gives the same run" Gen.int same_seed_same_run
-    ; test "different seeds give different runs" seeds_differ ]
+    ; test "different seeds give different runs" seeds_differ
+    ; test "a seed gives the same random bytes" random_bytes_from_seed ]
 
 (* The tests of the public API that each world runs. *)
 let portable_world =

@@ -46,7 +46,55 @@ let files =
               let f = File.openfile [Write; Create] "/d/x" in
               File.close f ;
               Dir.rename "/d" "/d" ;
-              equal (list string) ["x"] (Dir.readdir "/d") ) ) ]
+              equal (list string) ["x"] (Dir.readdir "/d") ) )
+    ; test "a .. goes to the parent, and stays at the root" (fun () ->
+          Sim.run (fun _ ->
+              Dir.mkdir ~perm:0o700 "/a" ;
+              Dir.mkdir "/a/b" ;
+              File.close (File.openfile [Write; Create] "/a/b/../f") ;
+              File.close (File.openfile [Write; Create] "/../../g") ;
+              equal (list string) ["a"; "g"]
+                (List.sort compare (Dir.readdir "/")) ;
+              equal (list string) ["b"; "f"]
+                (List.sort compare (Dir.readdir "/a/b/..")) ;
+              equal int 0o700 (File.stat "/a/b/..").perm ;
+              let d = File.openfile [Read] "/a/b/.." in
+              equal int 0o700 (File.fstat d).perm ;
+              File.close d ) )
+    ; test "an rmdir of a last .. gives ENOTEMPTY, as on Linux" (fun () ->
+          Sim.run (fun _ ->
+              Dir.mkdir "/a" ;
+              Dir.mkdir "/a/b" ;
+              File.close (File.openfile [Write; Create] "/a/f") ;
+              List.iter
+                (fun path ->
+                  equal ~msg:path string "ENOTEMPTY"
+                    (error_of (fun () -> Dir.rmdir path)) )
+                ["/a/b/.."; "/a/.."; "/.."] ;
+              equal (list string) ["b"; "f"]
+                (List.sort compare (Dir.readdir "/a")) ) )
+    ; test "an open of a directory reads no data" (fun () ->
+          Sim.run (fun _ ->
+              Dir.mkdir "/d" ;
+              List.iter
+                (fun path ->
+                  let d = File.openfile [Read] path in
+                  is_true ((File.fstat d).kind = File.Directory) ;
+                  equal string "EISDIR"
+                    (error_of (fun () -> File.read d (Bytes.create 1) 0 1)) ;
+                  File.close d ;
+                  equal string "EISDIR"
+                    (error_of (fun () -> File.openfile [Write] path)) )
+                ["/"; "/d"] ) )
+    ; test "the root refuses the changes that Linux refuses" (fun () ->
+          Sim.run (fun _ ->
+              Dir.mkdir "/d" ;
+              equal string "EEXIST" (error_of (fun () -> Dir.mkdir "/")) ;
+              equal string "EISDIR" (error_of (fun () -> Dir.unlink "/")) ;
+              equal string "EBUSY" (error_of (fun () -> Dir.rmdir "/")) ;
+              equal string "EBUSY" (error_of (fun () -> Dir.rename "/" "/x")) ;
+              equal string "EBUSY" (error_of (fun () -> Dir.rename "/d" "/")) ;
+              equal (list string) ["d"] (Dir.readdir "/") ) ) ]
 
 (* The edges of all domains. *)
 let edges sim = Helpers.sum_stats sim (fun s -> s.S.edges)

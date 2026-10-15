@@ -1026,7 +1026,7 @@ After `No_resources`, the read flag of the domain stays set, because only `EAGAI
 - `Now Mono` reads `CLOCK_MONOTONIC` with `clock_gettime`, the same clock as the alarm. Go and Tokio also use `CLOCK_MONOTONIC`. This clock does not count a system suspend, so a 10 s timeout does not fire directly at a resume.
 - **The `Posix` alarm (M3).** A second `timerfd` on `CLOCK_REALTIME`, with `TFD_TIMER_CANCEL_ON_SET` (section 2.6).
 - Each domain has an `eventfd` in its own epoll set, for `wake` and for its mailbox.
-- Signals go through a `signalfd` in the epoll set of domain 0. Child processes go through a `pidfd` in the set of the domain where the fiber waits (milestone M2). The `pidfd` tells that the child exited, but the child stays a zombie until `waitid (P_PIDFD, ..., WEXITED)` (Linux 5.4). If other code sets `SIGCHLD` to `SIG_IGN`, the exit status is lost (`ECHILD`).
+- Signals go through a `signalfd` in the epoll set of domain 0. Child processes go through a `pidfd` in the set of the domain where the fiber waits (milestone M2). The `pidfd` tells that the child exited, but the child stays a zombie until `waitid (P_PIDFD, ..., WEXITED)` (Linux 5.4). If other code reaps the child, for example with `waitid` or with `SIGCHLD` set to `SIG_IGN`, the exit status is lost: `Process.wait` gives `ECHILD`, and `Process.kill` gives `ESRCH`.
 
 **BSD and macOS:**
 
@@ -1684,12 +1684,13 @@ The tests use windtrap from the fork `bikallem/windtrap` (decision 9). The fork 
 - `WINDTRAP_MUTATE=1 dune runtest --force --instrument-with ppx_windtrap.mutate`, then `dune exec windtrap -- mutants`.
 - The Makefile has the recipes. `make mutate` tests the mutants on the lines that changed since the merge base with `origin/main` (`--mutate-since`), with one child for each CPU (`--mutate-jobs auto`). Then it merges the verdicts of `test/core` and `test/sim`. `make mutate-linux` tests the Linux suite with the tests that start a domain excluded. `make help` gives all the targets and variables.
 
-**Survivors of a mutation run.** A survivor is a mutant that no test kills. These rules apply to each survivor:
+**Survivors of a mutation run.** A survivor is a mutant that no test kills. These rules apply to each survivor and to each mutant that no test reaches:
 
 - If a suite that runs on one real domain (`test/core` or `test/sim`) can see the mutant, kill it with a test of a behavior. When the effect is internal, use the debug interfaces: `Sched_debug`, the counters of `Sim` and the counters of the measurements.
 - Dismiss only an equivalent mutant, with `[@mutate off "reason"]`. The reason tells in one sentence why no result, resource, effect or debug value changes.
 - Do not dismiss a mutant that only more than one real domain or another world can see. Name the test that covers its behavior, for example a `dscheck` test or `test/linux_md`, or tell that no test covers it.
 - If only a test with one fixed seed or schedule can see the mutant, do not dismiss it. Do not add that test. A change of the schedule can make such a test fail on correct code. Keep the mutant as a known survivor.
+- An error case that only a raw world operation with an incorrect fd can reach stays unreached, because the core never submits the operation with that fd. Do not add a test for it. Such a test makes the error code a part of the contract, but no program can see the error.
 - Record each known survivor in the list that follows, with its reason.
 - Put a test for a mutant in the group of its behavior, not in a group of mutants.
 - `make mutate-arm MUTANT=<id>` runs a suite with one mutant armed. It shows that a new test kills the mutant, and it refuses a dismissed mutant.
@@ -1702,8 +1703,21 @@ The known survivors of `make mutate-all`:
 | `weft.ml`, `run`: the set of `finished` and the wake of the domains after an error of the world | Only more than one real domain sees the stop of the other domains. | "Weft.run › an error of the world on domain 0 stops domain 1". A mutation run skips it, because it starts a domain. |
 | `net.ml`, `reset`: the check that the caller is in a fiber | Only a close on another thread at the same time changes the state. | None. A test of this race is not deterministic. |
 | `pipe.ml`, `read` and `write`: the check of the direction of the end | Linux and the simulator give `EBADF` for the wrong end. Only the pipes of FreeBSD and macOS have two directions. | "pipes › each end has one direction" of the portable suite, in `test/kqueue`. |
+| `process.ml`, `kill`: `reaping` or a full status, as the condition that the error of the send is not an error | Only the reaper fills the status. It sets `reaping` before, and `reaping` stays set after a reap. Thus the mutant (`and`) differs only while a fiber reaps and the status is empty. In the simulator, the domain of the reaper continues from the reap of the world to the fill with no switch point. If other code reaped the child, the result of the kill depends on the schedule also without the mutant. Thus only a kill on another real domain between the reap and the fill can show the mutant. | None. A test of this race on Linux is not deterministic. |
 | `process.ml`, `wait`: the `Ivar.read` branch | The mutant does more effects only in some seeds with more than one virtual domain. | None. Only a test with one fixed seed can see it. |
 | `weft_sim.ml`, the end of a run: the second `Gc.full_major` | Only a chain of finalisers needs it, and the number of GC cycles that a test needs depends on the runtime. | None. A test that counts GC cycles breaks with a change of the runtime. |
+
+The mutants that no test of `test/core` and `test/sim` reaches at this time:
+
+| Site | Why no test reaches it |
+|---|---|
+| `weft_sim.ml`, the error cases of `submit` for the wrong type or state of fd | Only a raw world operation with an incorrect fd reaches them (the rule above). |
+| `chan.ml`, `meet`: `Self_done`. `locks.ml`, the `Error` of `self_commit` of a semaphore. `sched.ml`, the `Error` of `self_commit` in `signal_leaf` | Only a commit on another real domain between the check of the scan and the commit can reach it. No world effect comes between them. |
+| `sched.ml`, `push_ready`: an empty pop of a full ring. `ensure_reg`: the undo after a close | Only a thief or a close on another real domain at the same time can reach it. |
+| `process.ml`, `kill`: `Bad_fd` after a reap | Only a close of the pidfd on another real domain between the peek and the attempt can reach it. |
+| `weft.ml`, `run`: the stop and the undo of the domains that started | Only a failure of `Domain.spawn` reaches it. |
+| `weft.ml`, `run`: the list of the domains that started (`dom :: started`) | Only a run on more than one real domain reaches it. The test "Weft.run › an error of the world on domain 0 stops domain 1" covers it outside a mutation run. |
+| `sched.ml`: `Iv.get` of an empty Ivar, the asserts of `resume`, `state_of`, `reason` and `start`, `Rc.release` of a closed fd, `on_chain` at the root, the path `arrived` of a job. `promise.ml`: the fallback text of the report, `start` of a promise that runs. `chan.ml`: the `None` result of a `recv`. `weft_sim.ml`: `readable` of a file, the lookup of a name with no listener in `Connect`, `step` of a domain that ended, the assert of `step` for an effect that is not of the world, the fallback text of the report | Defensive checks of a contract, or dead code. A correct program and a correct world cannot reach them. |
 
 **The mutation gate of a pull request.** The CI job `mutation (changed lines)` runs `make mutate BASE=HEAD^1` on each pull request. The checkout is the merge commit of the pull request into its base branch, and its first parent is the base at the time of the event. Thus the diff from `HEAD^1` has only the lines of the pull request. This is also true in a stack of pull requests, and when the base branch moves later. These rules apply to the gate:
 
@@ -1952,7 +1966,7 @@ Three subagents reviewed the code of M1 (correctness, conformance to the TLA+ mo
 
 ## 3.8 The review of M2, 2026-10-11
 
-Three subagents reviewed the code of M2 (correctness, conformance to the TLA+ models, and complexity). Each finding of this table is fixed. Each bug has a regression test that fails when the old code is put back, except two: C11 is a race with one reap on another domain, and the NUL check of C12 is one line.
+Three subagents reviewed the code of M2 (correctness, conformance to the TLA+ models, and complexity). Each finding of this table is fixed. Each bug has a regression test that fails when the old code is put back, except two: C11 is a race with one reap on another domain, and the NUL check of C12 is one line. (2026-10-15: the test "C11: a kill on another domain at the time of the reap does not raise, with 500 seeds" covers C11, after the simulator gives ESRCH. The window during a reap is a known survivor, section 2.17.)
 
 | No. | Finding | Fix |
 |---|---|---|
