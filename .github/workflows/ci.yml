@@ -47,20 +47,17 @@ jobs:
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-24.04
     timeout-minutes: 90
-    env:
-      BASE_REF: ${{ github.base_ref }}
     steps:
+      # The checkout of a pull request is a merge commit of the PR into its
+      # base. Its first parent, HEAD^1, is the base at the time of the event.
+      # Thus the diff from HEAD^1 holds only the lines of the PR, also when the
+      # base branch moves later, or when the PR has another branch as base.
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 0
-      # With fetch-depth 0, the checkout fetches all branches. This step makes
-      # sure that the base branch is a remote ref, also without that behavior
-      # of the checkout.
-      - name: Fetch the base branch
-        run: git fetch --no-tags origin "+refs/heads/$BASE_REF:refs/remotes/origin/$BASE_REF"
+          fetch-depth: 2
       - uses: cachix/install-nix-action@v31
       - name: Test the mutants of the changed lines
-        run: nix develop -c make mutate BASE="origin/$BASE_REF"
+        run: nix develop -c make mutate BASE=HEAD^1
 
   # FreeBSD in a VM. OCaml 5.5 and the test tools come from opam.
   freebsd:

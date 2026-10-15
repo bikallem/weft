@@ -1705,7 +1705,7 @@ The known survivors of `make mutate-all`:
 | `process.ml`, `wait`: the `Ivar.read` branch | The mutant does more effects only in some seeds with more than one virtual domain. | None. Only a test with one fixed seed can see it. |
 | `weft_sim.ml`, the end of a run: the second `Gc.full_major` | Only a chain of finalisers needs it, and the number of GC cycles that a test needs depends on the runtime. | None. A test that counts GC cycles breaks with a change of the runtime. |
 
-**The mutation gate of a pull request.** The CI job `mutation (changed lines)` runs `make mutate BASE=origin/<base branch>` on each pull request. The base branch can be other than `main`, for example in a stack of pull requests. The checkout is the merge of the pull request into its base branch. Thus the diff from the base branch has only the lines of the pull request. These rules apply to the gate:
+**The mutation gate of a pull request.** The CI job `mutation (changed lines)` runs `make mutate BASE=HEAD^1` on each pull request. The checkout is the merge commit of the pull request into its base branch, and its first parent is the base at the time of the event. Thus the diff from `HEAD^1` has only the lines of the pull request. This is also true in a stack of pull requests, and when the base branch moves later. These rules apply to the gate:
 
 - The gate is strict. It gives a failure if a mutant on a changed line survives. It has no `MIN_SCORE`.
 - A pull request that changes no line with a mutant passes, for example a change to a comment, a test or this document.
