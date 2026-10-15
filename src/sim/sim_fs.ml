@@ -243,7 +243,9 @@ let rmdir t path =
     let* p = parent t path in
     match p with
     | Whole _ ->
-        Error (Op.Other "EBUSY")
+        (* Linux gives ENOTEMPTY for a last "..", and EBUSY for the root. *)
+        if List.nth_opt last 0 = Some ".." then Error Op.Not_empty
+        else Error (Op.Other "EBUSY")
     | In (d, name) -> (
       match Hashtbl.find_opt d.entries name with
       | Some (Dir e) ->
