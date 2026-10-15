@@ -50,8 +50,9 @@ let walk t comps =
 
 (* The place of a path: [In (d, name)] is the directory that holds the last
    component, and its name. A path with no last name, as the root or a path that
-   ends with "..", gives [Top d], with the directory that the path names. *)
-type place = Top of dir | In of dir * string
+   ends with "..", gives [Whole d], with the directory that the whole path
+   names. *)
+type place = Whole of dir | In of dir * string
 
 let parent t path =
   if path = "" then Error Op.No_entry
@@ -69,7 +70,7 @@ let parent t path =
     match split (components path) with
     | None ->
         let* d = walk t (components path) in
-        Ok (Top d)
+        Ok (Whole d)
     | Some (dirs, last) ->
         let* d = walk t dirs in
         Ok (In (d, last))
@@ -83,7 +84,7 @@ let max_size = 1 lsl 40
 let lookup t path =
   let* p = parent t path in
   match p with
-  | Top d ->
+  | Whole d ->
       Ok (Dir d)
   | In (d, name) -> (
     match Hashtbl.find_opt d.entries name with
@@ -101,7 +102,7 @@ let open_ t path flags perm ~now =
   let* p = parent t path in
   let handle node = {node; pos= 0; rd; wr; append= has Op.O_append} in
   match p with
-  | Top d ->
+  | Whole d ->
       if wr then Error Op.Is_dir else Ok (handle (Dir d))
   | In (d, name) -> (
     match Hashtbl.find_opt d.entries name with
@@ -199,7 +200,7 @@ let stat t path = Result.map stat_of (lookup t path)
 let mkdir t path perm ~now =
   let* p = parent t path in
   match p with
-  | Top _ ->
+  | Whole _ ->
       Error Op.Exists
   | In (d, name) ->
       if Hashtbl.mem d.entries name then Error Op.Exists
@@ -218,7 +219,7 @@ let readdir t path =
 let unlink t path =
   let* p = parent t path in
   match p with
-  | Top _ ->
+  | Whole _ ->
       Error Op.Is_dir
   | In (d, name) -> (
     match Hashtbl.find_opt d.entries name with
@@ -241,7 +242,7 @@ let rmdir t path =
   else
     let* p = parent t path in
     match p with
-    | Top _ ->
+    | Whole _ ->
         Error (Op.Other "EBUSY")
     | In (d, name) -> (
       match Hashtbl.find_opt d.entries name with
@@ -267,7 +268,7 @@ let rename t src dst =
   let* ps = parent t src in
   let* pd = parent t dst in
   match (ps, pd) with
-  | Top _, _ | _, Top _ ->
+  | Whole _, _ | _, Whole _ ->
       Error (Op.Other "EBUSY")
   | In (sd, sname), In (dd, dname) -> (
     match Hashtbl.find_opt sd.entries sname with
