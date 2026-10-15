@@ -28,13 +28,14 @@ let ( let* ) = Result.bind
 let components path =
   List.filter (fun c -> c <> "" && c <> ".") (String.split_on_char '/' path)
 
-(* The directory of the components, with ".." to the parent. *)
+(* The directory of the components, with ".." to the parent. The stack starts
+   with the root, and a ".." at the root stays at the root. *)
 let walk t comps =
   let rec go stack = function
     | [] ->
         Ok stack
     | ".." :: rest ->
-        go (match stack with [_] -> stack | _ :: up -> up | [] -> []) rest
+        go (match stack with _ :: (_ :: _ as up) -> up | _ -> stack) rest
     | name :: rest -> (
       match Hashtbl.find_opt (List.hd stack).entries name with
       | Some (Dir d) ->
