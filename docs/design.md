@@ -1647,7 +1647,7 @@ Run all of the models with `nix develop -c spec/tla/check.sh`. `MODELS="Ivar Fd"
 
 ## 2.17 Tests with windtrap
 
-The tests use windtrap from the fork `bikallem/windtrap` (decision 9). The fork has changes after the release 0.2.0, and it has no release. Thus the flake builds windtrap and `ppx_windtrap` from one commit of its main branch, and the FreeBSD job of CI pins the same commit with opam. Windtrap gives unit tests, property tests, stateful tests, expect tests, coverage and mutation testing from one library.
+The tests use windtrap from the fork `bikallem/windtrap` (decision 9). The fork has changes after the release 0.2.0, and it has no release. Thus the flake uses the flake of the fork as an input. `flake.lock` pins one commit of its main branch, and the flake builds windtrap and `ppx_windtrap` from it with the OCaml of the dev shell. The FreeBSD job of CI pins the same commit with opam. Windtrap gives unit tests, property tests, stateful tests, expect tests, coverage and mutation testing from one library.
 
 **Which test for which part:**
 
