@@ -49,8 +49,8 @@ let lock_calls_outside () =
   is_false (Fiber.Semaphore.try_acquire t)
 
 (* A waiter that a cancel stops, and that gets the mutex from an unlock before
-   it runs again: it releases the mutex to the next owner. Thus the mutex is
-   free after the cancel. *)
+   it runs again: it releases the mutex. Thus the mutex is free after the
+   cancel. *)
 let lock_after_cancel () =
   Helpers.run (fun () ->
       let m = Fiber.Mutex.create () in
@@ -154,8 +154,7 @@ let tests =
           shield_closes_after_wait
       ; test "each lock call outside a fiber raises Not_in_fiber"
           lock_calls_outside
-      ; test
-          "a cancelled waiter that got the mutex releases it to the next owner"
+      ; test "a cancelled waiter that got the mutex releases it"
           lock_after_cancel ]
   ; group "promises"
       [ test "a GC before the await of a failed promise gives no report"
