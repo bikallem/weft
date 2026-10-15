@@ -908,9 +908,6 @@ let udp_port_range () =
       Net.close (Net.udp ("h", 65535)) ;
       Net.close (Net.udp ("h", 1)) )
 
-(* A loop of [readable] and [read_now] on a quiet connection. With
-   [extra_edges], an edge with no data comes: [read_now] gives None and clears
-   the flag, so the next [readable] waits for a new edge. *)
 (* A read of a socket with no data gives [Would_block] to the core, and its text
    is the name of the errno. *)
 let no_data_gives_eagain () =
@@ -922,6 +919,9 @@ let no_data_gives_eagain () =
       Net.close a ;
       Net.close b )
 
+(* A loop of [readable] and [read_now] on a quiet connection. With
+   [extra_edges], an edge with no data comes: [read_now] gives None and clears
+   the flag, so the next [readable] waits for a new edge. *)
 let read_now_no_spin () =
   for seed = 1 to 50 do
     Sim.run ~seed ~domains:2 (fun sim ->
