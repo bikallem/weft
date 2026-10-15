@@ -36,22 +36,21 @@ jobs:
         run: nix develop -c dune runtest --force
 
   # The mutation gate of a pull request (design section 2.17). make mutate
-  # tests the mutants on the lines that the pull request changes. It gives a
-  # failure if one of these mutants survives, and it passes if these lines
-  # have no mutant. The checkout is the merge of the pull request into its
-  # base branch, so the diff from the base branch has only the lines of the
-  # pull request. The base branch can be other than main, for example in a
-  # stack of pull requests.
+  # tests the mutants that test/core and test/sim reach on the lines that the
+  # pull request changes. It gives a failure if one of these mutants
+  # survives. A mutant that no test reaches gives no failure, and the gate
+  # does not test the lines of weft.posix, weft.linux and weft.kqueue.
   mutation:
     name: mutation (changed lines)
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     steps:
-      # The checkout of a pull request is a merge commit of the PR into its
-      # base. Its first parent, HEAD^1, is the base at the time of the event.
-      # Thus the diff from HEAD^1 holds only the lines of the PR, also when the
-      # base branch moves later, or when the PR has another branch as base.
+      # The checkout of a pull request is a merge commit of the pull request
+      # into its base. Its first parent, HEAD^1, is the base at the time of the
+      # event. Thus the diff from HEAD^1 holds only the lines of the pull
+      # request, also when the base branch moves later, or when the base is
+      # another branch.
       - uses: actions/checkout@v4
         with:
           fetch-depth: 2
