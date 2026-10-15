@@ -19,7 +19,8 @@
 # LIMIT (default 10800, 3 h) is the maximum time of one case, in seconds. A
 # case that is longer stops with an error, so that a hang does not stop the
 # script. The Wake case with no bug took 3370 s on a CI runner, so the limit
-# is about three times that time.
+# is about three times that time. In CI, each group of models has its own job
+# and its own LIMIT (.github/workflows/tla.yml).
 # Each result goes to stderr when its case ends, and the list of all results
 # goes to stdout at the end.
 set -u

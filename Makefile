@@ -64,7 +64,10 @@ check-windtrap:
 # The build comes first, so that a compile error stops the target. The run
 # removes the old verdict files: it runs each suite again, and a file of an
 # older windtrap stops the merge. A suite with a survivor gives exit status 1,
-# so the run ignores the status, and the report gives the result.
+# so the run ignores the status, and the report gives the result. The report
+# gives a failure only for a survivor: a mutant that no test reaches, and a
+# line of weft.posix, weft.linux or weft.kqueue, give no failure. The CI job
+# `mutation` runs this target on each pull request.
 mutate: check-windtrap
 	$(DUNE) build $(MUTATE) $(SUITES:%=@%/all)
 	rm -rf _build/_mutants
