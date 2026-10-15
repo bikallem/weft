@@ -382,6 +382,20 @@ let processes =
                         with Fiber.Timeout -> () ) ;
                     equal string "exited 0" (status_text (Process.wait p)) ) )
           done )
+    ; test
+        "C11: a kill on another domain at the time of the reap does not raise, \
+         with 500 seeds" (fun () ->
+          for seed = 1 to 500 do
+            Sim.run ~seed ~domains:2 (fun sim ->
+                Sim.add_program sim "p" (fun _ ->
+                    Sim.program ~runs:(Span.ms 1) () ) ;
+                let p = Process.spawn "p" [] in
+                Fiber.scope (fun s ->
+                    Fiber.fork s (fun () -> ignore (Process.wait p)) ;
+                    Fiber.fork s (fun () ->
+                        Time.sleep Mono (Span.ms 1) ;
+                        Process.kill p SIGTERM ) ) )
+          done )
     ; test "a write to the stdin of a child that exited gives EPIPE" (fun () ->
           Sim.run (fun sim ->
               Sim.add_program sim "quick" (fun _ ->
@@ -542,7 +556,31 @@ let processes =
                 = Some (Exited 0) ) ;
               equal string "ECHILD"
                 (Helpers.op_error (Helpers.submit (Op.Wait_child r.pidfd))) ;
-              Helpers.ok (Helpers.submit (Op.Close r.pidfd)) ) ) ]
+              Helpers.ok (Helpers.submit (Op.Close r.pidfd)) ) )
+    ; test "a child that other code reaped gives ESRCH and ECHILD" (fun () ->
+          Sim.run (fun sim ->
+              Sim.add_program sim "p" (fun _ ->
+                  Sim.program ~runs:(Span.ms 1) () ) ;
+              let p = Process.spawn "p" [] in
+              Time.sleep Mono (Span.ms 2) ;
+              (* Other code reaps the child, as waitpid (-1) does. The fds of
+                 the simulator start at 3. *)
+              let reaps =
+                List.filter
+                  (fun fd ->
+                    Helpers.submit (Op.Wait_child fd) = Ok (Some (Exited 0)) )
+                  (List.init 8 Fun.id)
+              in
+              equal int 1 (List.length reaps) ;
+              raises
+                (Process.Error (Other "ESRCH", "Process.kill"))
+                (fun () -> Process.kill p SIGTERM) ;
+              (* Each wait tries the reap again, and gets the error again. *)
+              for _ = 1 to 2 do
+                raises
+                  (Process.Error (Other "ECHILD", "Process.wait"))
+                  (fun () -> Process.wait p)
+              done ) ) ]
 
 (* A graceful shutdown: at SIGTERM, the server stops to accept, and each
    connection ends its request. *)

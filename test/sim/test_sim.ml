@@ -306,6 +306,30 @@ let with_timeout_value () =
              7 ) ) ;
       equal int 10 (ms_since t0) )
 
+(* A span that makes the deadline overflow: the deadline never comes. Thus
+   [with_timeout] adds no timer, and it gives the value of [f]. *)
+let with_timeout_overflow () =
+  Sim.run (fun sim ->
+      Time.sleep Mono (Span.ms 1) ;
+      equal int 7
+        (Fiber.with_timeout Mono (Span.of_ns Int64.max_int) (fun () ->
+             equal int 0 (Private.Sched_debug.live_timers (Sim.sched sim)) ;
+             Time.sleep Mono (Span.ms 10) ;
+             7 ) ) )
+
+(* A cancel is not an error of an isolated fiber: [on_error] does not get it,
+   and the scope ends with no failure. *)
+let isolated_cancel () =
+  run (fun () ->
+      let errors = ref [] in
+      Fiber.scope (fun s ->
+          Fiber.fork_isolated s
+            ~on_error:(fun e _ -> errors := e :: !errors)
+            (fun () -> sync (Ivar.read (Ivar.create ()))) ;
+          Fiber.yield () ;
+          Fiber.cancel s Exit ) ;
+      equal int 0 (List.length !errors) )
+
 let with_timeout_outer_cancel () =
   run (fun () ->
       let r = ref "" in
@@ -679,6 +703,10 @@ let scopes =
     ; test "with_timeout raises Timeout at exactly the deadline"
         with_timeout_exact
     ; test "with_timeout gives the value of f" with_timeout_value
+    ; test "with_timeout with a deadline that overflows adds no timer"
+        with_timeout_overflow
+    ; test "a cancel of an isolated fiber does not go to on_error"
+        isolated_cancel
     ; test "an outer cancel in with_timeout is not a Timeout"
         with_timeout_outer_cancel
     ; test "the scope cancels a daemon when the others end"

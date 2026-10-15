@@ -7,16 +7,21 @@ module S = Private.Sched
 
 (* A world with a manual clock. A sleep moves the clock to the alarm. Each read
    of [Mono] can also move the clock by [tick] nanoseconds, as the time moves
-   while a domain is busy. *)
+   while a domain is busy. If [on_sleep] holds a function, the next sleep calls
+   it one time, as a thread or a finaliser does while the domain sleeps, and
+   then the sleep ends with a wake. *)
 module Manual = struct
   type t =
     { mutable now: int64
     ; tick: int64
     ; mutable alarms: int64 list  (** The newest first. *)
     ; mutable polls: int
-    ; mutable randoms: int }
+    ; mutable randoms: int
+    ; mutable on_sleep: (unit -> unit) option
+    ; mutable wakes: int }
 
-  let make ?(tick = 0L) () = {now= 0L; tick; alarms= []; polls= 0; randoms= 0}
+  let make ?(tick = 0L) () =
+    {now= 0L; tick; alarms= []; polls= 0; randoms= 0; on_sleep= None; wakes= 0}
 
   let now (type time) t (line : time Clock.line) : time =
     let n = t.now in
@@ -31,16 +36,20 @@ module Manual = struct
         t.polls <- t.polls + 1 ;
         []
     | Sleep -> (
-      match w.deadline with
-      | Some d ->
+      match (t.on_sleep, w.deadline) with
+      | Some f, _ ->
+          t.on_sleep <- None ;
+          f () ;
+          [Private.World.Ready.Woken]
+      | None, Some d ->
           let d = Clock.to_ns Mono d in
           t.alarms <- d :: t.alarms ;
           if Int64.compare d t.now > 0 then t.now <- d ;
           [Private.World.Ready.Alarm]
-      | None ->
+      | None, None ->
           failwith "the program sleeps forever" )
 
-  let wake _ ~domain:_ = ()
+  let wake t ~domain:_ = t.wakes <- t.wakes + 1
 
   let random t n =
     t.randoms <- t.randoms + 1 ;
@@ -313,6 +322,59 @@ let inject_while_busy () =
           is_true (Ivar.fill_from_outside iv ()) ) ) ;
   less int ~than:100 !yields
 
+(* A fill from outside while domain 0 sleeps: the slot of the run takes the idle
+   domain and wakes it. The waiter then gets the value. *)
+let outside_fill_wakes_idle () =
+  let w = Manual.make () and iv = Ivar.create () in
+  w.on_sleep <-
+    Some
+      (fun () ->
+        let before = w.wakes in
+        is_true (Ivar.fill_from_outside iv "late") ;
+        equal int (before + 1) w.wakes ) ;
+  equal string "late" (run w (fun () -> sync (Ivar.read iv))) ;
+  is_true (w.on_sleep = None)
+
+type _ Effect.t += Not_of_the_world : unit Effect.t
+
+(* The world handler gives [Random_bytes] and [Switch] to the world. An effect
+   that is not of the world goes out of the handler, so [run] raises
+   [Effect.Unhandled]. *)
+let world_effects () =
+  let w = Manual.make () in
+  let b =
+    run w (fun () ->
+        let b = Bytes.make 4 'a' in
+        Effect.perform (Private.World.Random_bytes b) ;
+        Effect.perform Private.World.Switch ;
+        Bytes.to_string b )
+  in
+  equal string "xxxx" b ;
+  raises_match
+    (function Effect.Unhandled Not_of_the_world -> true | _ -> false)
+    (fun () -> run w (fun () -> Effect.perform Not_of_the_world))
+
+(* A job that the world refuses raises the error, and it releases the user of
+   its fd. *)
+let job_start_error () =
+  run (Manual.make ()) (fun () ->
+      let fd = S.Fdtab.alloc 7 in
+      raises
+        (Net.Error (Other "no network", "File.fsync"))
+        (fun () -> Private.Job.run ~fd "File.fsync" (Private.Op.Fsync 7)) ;
+      is_true (Atomic.get fd.S.rc = S.Open 0) ;
+      S.Fdtab.release fd )
+
+(* Outside a fiber, a socket call raises [Not_in_fiber], and it keeps no user of
+   the fd. *)
+let socket_call_outside () =
+  let fd = S.Fdtab.alloc 7 in
+  raises_match
+    (function Fiber.Not_in_fiber _ -> true | _ -> false)
+    (fun () -> Net.read_now fd (Bytes.create 1) 0 1) ;
+  is_true (Atomic.get fd.S.rc = S.Open 0) ;
+  S.Fdtab.release fd
+
 (* Outside a fiber, a cancel raises [Not_in_fiber]. *)
 let cancel_outside () =
   let sc = ref None in
@@ -408,6 +470,12 @@ let world =
     ; test "a fill from outside reaches a waiter while a fiber yields"
         inject_while_busy
     ; test "a cancel outside a fiber raises Not_in_fiber" cancel_outside
+    ; test "a fill from outside wakes the idle domain" outside_fill_wakes_idle
+    ; test "the world handler gives Random_bytes and Switch to the world"
+        world_effects
+    ; test "a job that the world refuses releases its fd" job_start_error
+    ; test "a socket call outside a fiber keeps no user of the fd"
+        socket_call_outside
     ; test ~timeout:5. "C4: the alarm near the largest time saturates"
         alarm_saturates
     ; test "on_create gets the scheduler before main" on_create_runs_first
@@ -702,6 +770,10 @@ let utc_invalid () =
   is_true (none (1677, 9, 20, 0, 0, 0, 0)) ;
   is_true (none (1677, 9, 21, 0, 12, 43, 0)) ;
   is_true (none (9999, 12, 31, 23, 59, 59, 0)) ;
+  (* The years before 1 have a negative era. *)
+  is_true (none (0, 1, 1, 0, 0, 0, 0)) ;
+  is_true (none (-1, 12, 31, 0, 0, 0, 0)) ;
+  is_true (none (-10000, 3, 1, 0, 0, 0, 0)) ;
   is_true (none (max_int, 1, 1, 0, 0, 0, 0)) ;
   is_true (none (min_int, 1, 1, 0, 0, 0, 0))
 

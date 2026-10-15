@@ -911,6 +911,17 @@ let udp_port_range () =
 (* A loop of [readable] and [read_now] on a quiet connection. With
    [extra_edges], an edge with no data comes: [read_now] gives None and clears
    the flag, so the next [readable] waits for a new edge. *)
+(* A read of a socket with no data gives [Would_block] to the core, and its text
+   is the name of the errno. *)
+let no_data_gives_eagain () =
+  Sim.run (fun sim ->
+      let a, b = Sim.socket_pair sim in
+      equal string "EAGAIN"
+        (Helpers.op_error
+           (Helpers.submit (Op.Read (a.Sched.os, Bytes.create 1, 0, 1))) ) ;
+      Net.close a ;
+      Net.close b )
+
 let read_now_no_spin () =
   for seed = 1 to 50 do
     Sim.run ~seed ~domains:2 (fun sim ->
@@ -1637,6 +1648,7 @@ let tests =
           reset_by_listener
       ; test "a listener that closes refuses a connect in flight"
           refused_while_connecting
+      ; test "a read of a socket with no data gives EAGAIN" no_data_gives_eagain
       ; test "a loop of readable and read_now does not spin with extra edges"
           read_now_no_spin
       ; test "a reset comes to the peer after the latency" reset_latency

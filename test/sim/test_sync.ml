@@ -48,6 +48,24 @@ let lock_calls_outside () =
   is_true (Fiber.Semaphore.try_acquire t) ;
   is_false (Fiber.Semaphore.try_acquire t)
 
+(* A waiter that a cancel stops, and that gets the mutex from an unlock before
+   it runs again: it gives the mutex on. Thus the mutex is free after the
+   cancel. *)
+let lock_after_cancel () =
+  Helpers.run (fun () ->
+      let m = Fiber.Mutex.create () in
+      Fiber.Mutex.lock m ;
+      let got = ref false in
+      Fiber.scope (fun s ->
+          Fiber.fork s (fun () ->
+              Fiber.Mutex.lock m ;
+              got := true ) ;
+          Fiber.yield () ;
+          Fiber.cancel s Exit ;
+          Fiber.Mutex.unlock m ) ;
+      is_false !got ;
+      equal int 1 (Fiber.Mutex.use_ro m (fun () -> 1)) )
+
 exception Boom
 
 (* The promise holds the cell of its finaliser. Thus a GC before the await does
@@ -87,15 +105,50 @@ let cancel_outside () =
           equal (option string) (Some "Not_in_fiber") !r ;
           equal string "done" (Promise.await p) ) )
 
+(* A second cancel before the start of the fiber does nothing more. The fiber
+   stops at the first cancellation point of [f]. *)
+let cancel_twice_before_start () =
+  Helpers.run (fun () ->
+      let ran = ref false in
+      Fiber.scope (fun s ->
+          let p =
+            Fiber.fork_promise s (fun () ->
+                Fiber.yield () ;
+                ran := true )
+          in
+          Promise.cancel p ;
+          Promise.cancel p ;
+          raises Promise.Cancelled (fun () -> Promise.await p) ) ;
+      is_false !ran )
+
+(* The report of a promise runs in a finaliser. If the report raises, the
+   finaliser drops the exception, so the run goes on. *)
+let report_raises () =
+  let old = Atomic.get Private.promise_report and called = ref false in
+  Fun.protect
+    ~finally:(fun () -> Atomic.set Private.promise_report old)
+    (fun () ->
+      Helpers.run (fun () ->
+          Atomic.set Private.promise_report (fun _ _ ->
+              called := true ;
+              raise Exit ) ;
+          Fiber.scope (fun s ->
+              ignore (Fiber.fork_promise s (fun () -> raise Boom)) ) ) ;
+      is_true !called )
+
 let tests =
   [ group "locks"
       [ test "use_ro unlocks the mutex when f gives a value" use_ro_unlocks
       ; test "the shield of use_rw closes again after Condition.wait"
           shield_closes_after_wait
       ; test "each lock call outside a fiber raises Not_in_fiber"
-          lock_calls_outside ]
+          lock_calls_outside
+      ; test "a waiter that a cancel stops gives on the mutex that it got"
+          lock_after_cancel ]
   ; group "promises"
       [ test "a GC before the await of a failed promise gives no report"
           gc_before_await
       ; test "Promise.cancel outside a fiber raises Not_in_fiber" cancel_outside
-      ] ]
+      ; test "a second cancel before the start does nothing more"
+          cancel_twice_before_start
+      ; test "a report that raises does not stop the run" report_raises ] ]
