@@ -356,7 +356,7 @@ let world_effects () =
 
 (* A job that the world refuses raises the error, and it releases the user of
    its fd. *)
-let job_start_error () =
+let job_start_releases_fd () =
   run (Manual.make ()) (fun () ->
       let fd = S.Fdtab.alloc 7 in
       raises
@@ -473,7 +473,7 @@ let world =
     ; test "a fill from outside wakes the idle domain" outside_fill_wakes_idle
     ; test "the world handler gives Random_bytes and Switch to the world"
         world_effects
-    ; test "a job that the world refuses releases its fd" job_start_error
+    ; test "a job that the world refuses releases its fd" job_start_releases_fd
     ; test "a socket call outside a fiber keeps no user of the fd"
         socket_call_outside
     ; test ~timeout:5. "C4: the alarm near the largest time saturates"
