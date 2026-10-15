@@ -282,14 +282,6 @@ let register_error () =
       equal int 0 (Atomic.get fd.S.doms) ;
       S.Fdtab.release fd )
 
-(* A job that the world refuses to start gives its error to the fiber. *)
-let job_start_error () =
-  let w = Manual.make () in
-  run w (fun () ->
-      raises
-        (Net.Error (Other "no network", "File.stat"))
-        (fun () -> ignore (File.stat "/f")) )
-
 (* A bug in the scheduler stops the run with [Internal_error]. The test plants
    the bug: a request in the injection queue raises. *)
 let internal_error () =
@@ -354,10 +346,14 @@ let world_effects () =
     (function Effect.Unhandled Not_of_the_world -> true | _ -> false)
     (fun () -> run w (fun () -> Effect.perform Not_of_the_world))
 
-(* A job that the world refuses raises the error, and it releases the user of
-   its fd. *)
-let job_start_releases_fd () =
+(* A job that the world refuses to start gives its error to the fiber: a job
+   with no fd, and a job with an fd. The second job releases the user of its
+   fd. *)
+let job_start_error () =
   run (Manual.make ()) (fun () ->
+      raises
+        (Net.Error (Other "no network", "File.stat"))
+        (fun () -> ignore (File.stat "/f")) ;
       let fd = S.Fdtab.alloc 7 in
       raises
         (Net.Error (Other "no network", "File.fsync"))
@@ -465,7 +461,6 @@ let world =
         "K1: a pinned deadline between the poll and the sleep fires"
         (expire_before_sleep ~pinned:true)
     ; test "a Register that fails raises in the waiter" register_error
-    ; test "a job that the world refuses raises Net.Error" job_start_error
     ; test "a bug in the scheduler gives Internal_error" internal_error
     ; test "a fill from outside reaches a waiter while a fiber yields"
         inject_while_busy
@@ -473,7 +468,8 @@ let world =
     ; test "a fill from outside wakes the idle domain" outside_fill_wakes_idle
     ; test "the world handler gives Random_bytes and Switch to the world"
         world_effects
-    ; test "a job that the world refuses releases its fd" job_start_releases_fd
+    ; test "a job that the world refuses raises Net.Error and releases its fd"
+        job_start_error
     ; test "a socket call outside a fiber keeps no user of the fd"
         socket_call_outside
     ; test ~timeout:5. "C4: the alarm near the largest time saturates"
