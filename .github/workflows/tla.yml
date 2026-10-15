@@ -1,26 +1,58 @@
 # The TLA+ models of the design (spec/tla). They check the protocols, not the
-# code, so they run only when a spec changes, each Monday, and on request. The
-# code of each protocol has its dscheck and simulator tests in ci.yml.
+# code, so they run only when a spec or this file changes, each Monday, and on
+# request. The code of each protocol has its dscheck and simulator tests in
+# ci.yml.
 name: TLA+
 
 on:
   push:
     branches: [main]
-    paths: ["spec/tla/**"]
+    paths: ["spec/tla/**", ".github/workflows/tla.yml"]
   pull_request:
-    paths: ["spec/tla/**"]
+    paths: ["spec/tla/**", ".github/workflows/tla.yml"]
   schedule:
     - cron: "0 5 * * 1"
   workflow_dispatch:
 
 jobs:
+  # One job for each group of models, each on its own runner (design section
+  # 2.16). In one job, the models took about 1 h 10 min to 1 h 35 min. Wake
+  # used about 61% of the time of TLC, Scope about 37%, and the other five
+  # models together about 2%. On a runner with 4 CPUs, check.sh runs 4 cases
+  # at the same time, with 1 worker each.
+  #
+  # check.sh stops a case after LIMIT seconds, 2.5 times its slowest case or
+  # more. In each job, the last case starts early enough that its LIMIT ends
+  # before the timeout of the job.
   tla:
+    name: ${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # The case with no bug took 3370 s. The job takes about 1 h.
+          - name: Wake
+            models: Wake
+            limit: 10800
+            timeout: 240
+          # The slowest case took 1420 s on CI. The job takes about 35 min. A
+          # case that hangs stops at LIMIT, also when it starts late.
+          - name: Scope
+            models: Scope
+            limit: 3600
+            timeout: 120
+          # The slowest case takes about 2 min. The job takes about 3 min.
+          - name: Commit, Ivar, Fd, Semaphore, Signal
+            models: Commit Ivar Fd Semaphore Signal
+            limit: 900
+            timeout: 30
     runs-on: ubuntu-24.04
-    # A normal run takes about 1.5 h. check.sh stops each case after
-    # 3 h, and this limit (5 h) stops the job if the script hangs.
-    timeout-minutes: 300
+    timeout-minutes: ${{ matrix.timeout }}
     steps:
       - uses: actions/checkout@v4
       - uses: cachix/install-nix-action@v31
       - name: Model check
+        env:
+          MODELS: ${{ matrix.models }}
+          LIMIT: ${{ matrix.limit }}
         run: nix develop -c spec/tla/check.sh
