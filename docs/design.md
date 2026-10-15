@@ -1680,6 +1680,7 @@ The tests use windtrap from the fork `bikallem/windtrap` (decision 9). The fork 
 - Dismiss only an equivalent mutant, with `[@mutate off "reason"]`. The reason tells in one sentence why no result, resource, effect or debug value changes.
 - Do not dismiss a mutant that only more than one real domain or another world can see. Name the test that covers its behavior, for example a `dscheck` test or `test/linux_md`, or tell that no test covers it.
 - If only a test with one fixed seed or schedule can see the mutant, do not dismiss it. Do not add that test. A change of the schedule can make such a test fail on correct code. Keep the mutant as a known survivor.
+- An error case that only a raw operation of a misuse can reach stays unreached, because the core never submits that operation. Do not add a test for it: such a test fixes an error that no program can see.
 - Record each known survivor in the list that follows, with its reason.
 - Put a test for a mutant in the group of its behavior, not in a group of mutants.
 - `make mutate-arm MUTANT=<id>` runs a suite with one mutant armed. It shows that a new test kills the mutant, and it refuses a dismissed mutant.
