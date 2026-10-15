@@ -1026,7 +1026,7 @@ After `No_resources`, the read flag of the domain stays set, because only `EAGAI
 - `Now Mono` reads `CLOCK_MONOTONIC` with `clock_gettime`, the same clock as the alarm. Go and Tokio also use `CLOCK_MONOTONIC`. This clock does not count a system suspend, so a 10 s timeout does not fire directly at a resume.
 - **The `Posix` alarm (M3).** A second `timerfd` on `CLOCK_REALTIME`, with `TFD_TIMER_CANCEL_ON_SET` (section 2.6).
 - Each domain has an `eventfd` in its own epoll set, for `wake` and for its mailbox.
-- Signals go through a `signalfd` in the epoll set of domain 0. Child processes go through a `pidfd` in the set of the domain where the fiber waits (milestone M2). The `pidfd` tells that the child exited, but the child stays a zombie until `waitid (P_PIDFD, ..., WEXITED)` (Linux 5.4). If other code sets `SIGCHLD` to `SIG_IGN`, the exit status is lost (`ECHILD`).
+- Signals go through a `signalfd` in the epoll set of domain 0. Child processes go through a `pidfd` in the set of the domain where the fiber waits (milestone M2). The `pidfd` tells that the child exited, but the child stays a zombie until `waitid (P_PIDFD, ..., WEXITED)` (Linux 5.4). If other code reaps the child, for example with `waitid` or with `SIGCHLD` set to `SIG_IGN`, the exit status is lost: `Process.wait` gives `ECHILD`, and `Process.kill` gives `ESRCH`.
 
 **BSD and macOS:**
 
