@@ -1,7 +1,7 @@
 # The TLA+ models of the design (spec/tla). They check the protocols, not the
 # code, so they run only when a spec or this file changes, each Monday, and on
-# request. The
-# code of each protocol has its dscheck and simulator tests in ci.yml.
+# request. The code of each protocol has its dscheck and simulator tests in
+# ci.yml.
 name: TLA+
 
 on:
