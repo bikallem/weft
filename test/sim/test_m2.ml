@@ -385,17 +385,16 @@ let processes =
     ; test
         "C11: a kill on another domain at the time of the reap does not raise, \
          with 500 seeds" (fun () ->
-          for seed = 1 to 500 do
-            Sim.run ~seed ~domains:2 (fun sim ->
-                Sim.add_program sim "p" (fun _ ->
-                    Sim.program ~runs:(Span.ms 1) () ) ;
-                let p = Process.spawn "p" [] in
-                Fiber.scope (fun s ->
-                    Fiber.fork s (fun () -> ignore (Process.wait p)) ;
-                    Fiber.fork s (fun () ->
-                        Time.sleep Mono (Span.ms 1) ;
-                        Process.kill p SIGTERM ) ) )
-          done )
+          Helpers.seeds 500 (fun seed ->
+              Sim.run ~seed ~domains:2 (fun sim ->
+                  Sim.add_program sim "p" (fun _ ->
+                      Sim.program ~runs:(Span.ms 1) () ) ;
+                  let p = Process.spawn "p" [] in
+                  Fiber.scope (fun s ->
+                      Fiber.fork s (fun () -> ignore (Process.wait p)) ;
+                      Fiber.fork s (fun () ->
+                          Time.sleep Mono (Span.ms 1) ;
+                          Process.kill p SIGTERM ) ) ) ) )
     ; test "a write to the stdin of a child that exited gives EPIPE" (fun () ->
           Sim.run (fun sim ->
               Sim.add_program sim "quick" (fun _ ->

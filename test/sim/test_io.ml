@@ -74,7 +74,7 @@ let files =
                   equal string "EISDIR"
                     (error_of (fun () -> File.openfile [Write] path)) )
                 ["/"; "/d"] ) )
-    ; test "the root refuses the changes of Linux" (fun () ->
+    ; test "the root refuses the changes that Linux refuses" (fun () ->
           Sim.run (fun _ ->
               Dir.mkdir "/d" ;
               equal string "EEXIST" (error_of (fun () -> Dir.mkdir "/")) ;
