@@ -273,6 +273,27 @@ let register_error () =
       equal int 0 (Atomic.get fd.S.doms) ;
       S.Fdtab.release fd )
 
+(* A job that the world refuses to start gives its error to the fiber. *)
+let job_start_error () =
+  let w = Manual.make () in
+  run w (fun () ->
+      raises
+        (Net.Error (Other "no network", "File.stat"))
+        (fun () -> ignore (File.stat "/f")) )
+
+(* A bug in the scheduler stops the run with [Internal_error]. The test plants
+   the bug: a request in the injection queue raises. *)
+let internal_error () =
+  let w = Manual.make () in
+  raises_match
+    (function Fiber.Internal_error (Boom, _) -> true | _ -> false)
+    (fun () ->
+      Private.run_world
+        ~on_create:(fun t -> S.inject t (fun _ -> raise Boom))
+        (module Manual)
+        w
+        (fun () -> Time.sleep Mono (Span.ms 1)) )
+
 (* A fill from outside reaches its waiter while another fiber yields: the domain
    takes the injection queue at each 61st take. *)
 let inject_while_busy () =
@@ -382,6 +403,8 @@ let world =
         "K1: a pinned deadline between the poll and the sleep fires"
         (expire_before_sleep ~pinned:true)
     ; test "a Register that fails raises in the waiter" register_error
+    ; test "a job that the world refuses raises Net.Error" job_start_error
+    ; test "a bug in the scheduler gives Internal_error" internal_error
     ; test "a fill from outside reaches a waiter while a fiber yields"
         inject_while_busy
     ; test "a cancel outside a fiber raises Not_in_fiber" cancel_outside

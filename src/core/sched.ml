@@ -1983,5 +1983,9 @@ let run_domain dom =
     loop dom
   with e ->
     let bt = Printexc.get_raw_backtrace () in
-    Atomic.set dom.sched.finished true ;
+    Atomic.set dom.sched.finished true
+    [@mutate
+      off
+        "Weft.run sets finished again and wakes each domain after the \
+         exception, and the simulator stops each domain at the exception"] ;
     raise (Internal_error (e, bt))
