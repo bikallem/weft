@@ -145,6 +145,30 @@ let listen_twice () =
       let _l = Net.listen a in
       equal string "EADDRINUSE" (error_of (fun () -> Net.listen a)) )
 
+(* An operation on the wrong type of socket gives the error of Linux. *)
+let wrong_socket () =
+  Sim.run (fun sim ->
+      let a = Sim.addr sim "server:3" in
+      let l = Net.listen a in
+      let u = Net.udp ("wrong", 1) in
+      let c = Net.connect a in
+      let buf = Bytes.create 1 in
+      equal string "ENOTCONN" (error_of (fun () -> Net.read l buf 0 1)) ;
+      equal string "ENOTCONN" (error_of (fun () -> Net.shutdown u)) ;
+      equal string "EOPNOTSUPP" (error_of (fun () -> Net.accept u)) ;
+      equal string "EINVAL" (error_of (fun () -> Net.accept c)) ;
+      List.iter Net.close [c; u; l] )
+
+(* A shutdown after the close of the peer gives no error, as on Linux. *)
+let shutdown_after_peer_close () =
+  Sim.run (fun sim ->
+      let a, b = Sim.socket_pair sim in
+      Net.close b ;
+      Time.sleep Mono (Span.ms 1) ;
+      Net.shutdown a ;
+      equal int 0 (Net.read a (Bytes.create 1) 0 1) ;
+      Net.close a )
+
 let eof_and_epipe () =
   Sim.run (fun sim ->
       let a = Sim.addr sim "server:3" in
@@ -687,6 +711,25 @@ let advance_cancelled () =
       Sim.advance_until sim (at 1) ;
       equal int 1000 (ms_since t0) )
 
+(* A cancel at the target of advance_until: a sleeper on any domain wakes at the
+   target and cancels the advance. The advance ends at the target, with or with
+   no Cancelled, and a new advance can start. *)
+let advance_cancel_at_target seed =
+  Sim.run ~seed ~domains:2 ~auto:false (fun sim ->
+      let t0 = Time.now Mono in
+      let at n = Option.get (Time.add Mono t0 (Span.s n)) in
+      Fiber.scope (fun s ->
+          Fiber.fork s (fun () ->
+              Fiber.scope (fun inner ->
+                  Fiber.fork inner (fun () ->
+                      try Sim.advance_until sim (at 1)
+                      with Fiber.Cancelled Exit -> () ) ;
+                  Time.sleep Mono (Span.s 1) ;
+                  Fiber.cancel inner Exit ) ) ) ;
+      equal ~msg:(Printf.sprintf "seed %d" seed) int 1000 (ms_since t0) ;
+      Sim.advance_until sim (at 2) ;
+      equal int 2000 (ms_since t0) )
+
 (* L6: the connections in flight count against the backlog. *)
 let backlog_counts_in_flight () =
   Sim.run (fun sim ->
@@ -777,6 +820,19 @@ let udp_full_queue () =
         send b a_addr (string_of_int i) ;
         equal (list string) [string_of_int i] (received a)
       done )
+
+(* [Net.read] of a UDP socket takes one datagram, and 0 is an empty datagram. *)
+let udp_read () =
+  Sim.run (fun _ ->
+      let a, a_addr, b = udp_pair () in
+      send b a_addr "hello" ;
+      send b a_addr "" ;
+      let buf = Bytes.create 10 in
+      equal int 5 (Net.read a buf 0 10) ;
+      equal string "hello" (Bytes.sub_string buf 0 5) ;
+      equal int 0 (Net.read a buf 0 10) ;
+      Net.close a ;
+      Net.close b )
 
 let udp_size () =
   Sim.run (fun _ ->
@@ -1541,6 +1597,10 @@ let tests =
       ; test "a connect before the listen gives ECONNREFUSED"
           refused_before_listen
       ; test "a second listen on one address gives EADDRINUSE" listen_twice
+      ; test "an operation on the wrong type of socket gives the error of Linux"
+          wrong_socket
+      ; test "a shutdown after the close of the peer gives no error"
+          shutdown_after_peer_close
       ; test "after the peer closes: the end of the stream, then EPIPE"
           eof_and_epipe
       ; test "shutdown gives the end of the stream to the peer"
@@ -1623,6 +1683,7 @@ let tests =
       [ test "udp_loss loses about one datagram in 8" udp_loss
       ; test "the jitter can reorder datagrams" udp_order
       ; test "a full queue loses the datagrams that do not fit" udp_full_queue
+      ; test "read takes one datagram, and 0 is an empty datagram" udp_read
       ; test "a datagram of more than 65507 bytes gives EMSGSIZE" udp_size
       ; test "the latency delays a datagram" udp_latency
       ; test "the port 0 gives a free port" udp_free_ports
@@ -1654,6 +1715,15 @@ let tests =
                            (Op.Start (0, Op.Pread (fd, Bytes.create 4, 0, 4, 0))) ) ) ;
                    ignore (Helpers.submit (Op.Close fd)) ) ) )
       ; test "L5: a cancel ends advance_until" advance_cancelled
+      ; test "a cancel at the target of advance_until, with 50 seeds" (fun () ->
+            Helpers.seeds 50 advance_cancel_at_target )
+      ; test "a Deregister with no Register gives Model_error" (fun () ->
+            contains ~sub:"which has no registration"
+              (Helpers.model_error (fun _ ->
+                   let fd =
+                     Helpers.job (Op.Open ("/f", [O_read; O_create], 0))
+                   in
+                   ignore (Helpers.submit (Op.Deregister (0, fd))) ) ) )
       ; test "L6: the connections in flight count against the backlog"
           backlog_counts_in_flight
       ; test "a planted lost wakeup on an fd gives Lost_wakeup"

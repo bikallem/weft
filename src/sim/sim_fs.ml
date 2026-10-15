@@ -28,13 +28,14 @@ let ( let* ) = Result.bind
 let components path =
   List.filter (fun c -> c <> "" && c <> ".") (String.split_on_char '/' path)
 
-(* The directory of the components, with ".." to the parent. *)
+(* The directory of the components, with ".." to the parent. The stack starts
+   with the root, and a ".." at the root stays at the root. *)
 let walk t comps =
   let rec go stack = function
     | [] ->
         Ok stack
     | ".." :: rest ->
-        go (match stack with [_] -> stack | _ :: up -> up | [] -> []) rest
+        go (match stack with _ :: (_ :: _ as up) -> up | _ -> stack) rest
     | name :: rest -> (
       match Hashtbl.find_opt (List.hd stack).entries name with
       | Some (Dir d) ->
@@ -47,8 +48,11 @@ let walk t comps =
   let* stack = go [t.root] comps in
   Ok (List.hd stack)
 
-(* The directory that holds the last component, and its name. The root has no
-   name: [None]. *)
+(* The place of a path: [In (d, name)] is the directory that holds the last
+   component, and its name. A path with no last name, as the root or a path that
+   ends with "..", gives [Top d], with the directory that the path names. *)
+type place = Top of dir | In of dir * string
+
 let parent t path =
   if path = "" then Error Op.No_entry
   else
@@ -64,11 +68,11 @@ let parent t path =
     in
     match split (components path) with
     | None ->
-        let* _ = walk t (components path) in
-        Ok None
+        let* d = walk t (components path) in
+        Ok (Top d)
     | Some (dirs, last) ->
         let* d = walk t dirs in
-        Ok (Some (d, last))
+        Ok (In (d, last))
 
 (* A path that ends with "/" names a directory. *)
 let dir_only path = path <> "" && path.[String.length path - 1] = '/'
@@ -79,9 +83,9 @@ let max_size = 1 lsl 40
 let lookup t path =
   let* p = parent t path in
   match p with
-  | None ->
-      Ok (Dir t.root)
-  | Some (d, name) -> (
+  | Top d ->
+      Ok (Dir d)
+  | In (d, name) -> (
     match Hashtbl.find_opt d.entries name with
     | Some (File _) when dir_only path ->
         Error Op.Not_dir
@@ -97,9 +101,9 @@ let open_ t path flags perm ~now =
   let* p = parent t path in
   let handle node = {node; pos= 0; rd; wr; append= has Op.O_append} in
   match p with
-  | None ->
-      if wr then Error Op.Is_dir else Ok (handle (Dir t.root))
-  | Some (d, name) -> (
+  | Top d ->
+      if wr then Error Op.Is_dir else Ok (handle (Dir d))
+  | In (d, name) -> (
     match Hashtbl.find_opt d.entries name with
     | Some _ when has Op.O_create && has Op.O_exclusive ->
         Error Op.Exists
@@ -195,9 +199,9 @@ let stat t path = Result.map stat_of (lookup t path)
 let mkdir t path perm ~now =
   let* p = parent t path in
   match p with
-  | None ->
+  | Top _ ->
       Error Op.Exists
-  | Some (d, name) ->
+  | In (d, name) ->
       if Hashtbl.mem d.entries name then Error Op.Exists
       else (
         Hashtbl.replace d.entries name (Dir (new_dir perm now)) ;
@@ -214,9 +218,9 @@ let readdir t path =
 let unlink t path =
   let* p = parent t path in
   match p with
-  | None ->
+  | Top _ ->
       Error Op.Is_dir
-  | Some (d, name) -> (
+  | In (d, name) -> (
     match Hashtbl.find_opt d.entries name with
     | Some (File _) when dir_only path ->
         Error Op.Not_dir
@@ -237,9 +241,9 @@ let rmdir t path =
   else
     let* p = parent t path in
     match p with
-    | None ->
+    | Top _ ->
         Error (Op.Other "EBUSY")
-    | Some (d, name) -> (
+    | In (d, name) -> (
       match Hashtbl.find_opt d.entries name with
       | Some (Dir e) ->
           if Hashtbl.length e.entries > 0 then Error Op.Not_empty
@@ -263,9 +267,9 @@ let rename t src dst =
   let* ps = parent t src in
   let* pd = parent t dst in
   match (ps, pd) with
-  | None, _ | _, None ->
+  | Top _, _ | _, Top _ ->
       Error (Op.Other "EBUSY")
-  | Some (sd, sname), Some (dd, dname) -> (
+  | In (sd, sname), In (dd, dname) -> (
     match Hashtbl.find_opt sd.entries sname with
     | None ->
         Error Op.No_entry
