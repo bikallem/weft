@@ -60,8 +60,12 @@ let files =
               equal int 0o700 (File.stat "/a/b/..").perm ;
               let d = File.openfile [Read] "/a/b/.." in
               equal int 0o700 (File.fstat d).perm ;
-              File.close d ;
-              (* An rmdir of a last ".." gives ENOTEMPTY, as on Linux. *)
+              File.close d ) )
+    ; test "an rmdir of a last .. gives ENOTEMPTY, as on Linux" (fun () ->
+          Sim.run (fun _ ->
+              Dir.mkdir "/a" ;
+              Dir.mkdir "/a/b" ;
+              File.close (File.openfile [Write; Create] "/a/f") ;
               List.iter
                 (fun path ->
                   equal ~msg:path string "ENOTEMPTY"

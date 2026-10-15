@@ -1674,13 +1674,13 @@ The tests use windtrap from the fork `bikallem/windtrap` (decision 9). The fork 
 - `WINDTRAP_MUTATE=1 dune runtest --force --instrument-with ppx_windtrap.mutate`, then `dune exec windtrap -- mutants`.
 - The Makefile has the recipes. `make mutate` tests the mutants on the lines that changed since the merge base with `origin/main` (`--mutate-since`), with one child for each CPU (`--mutate-jobs auto`). Then it merges the verdicts of `test/core` and `test/sim`. `make mutate-linux` tests the Linux suite with the tests that start a domain excluded. `make help` gives all the targets and variables.
 
-**Survivors of a mutation run.** A survivor is a mutant that no test kills. These rules apply to each survivor:
+**Survivors of a mutation run.** A survivor is a mutant that no test kills. These rules apply to each survivor and to each mutant that no test reaches:
 
 - If a suite that runs on one real domain (`test/core` or `test/sim`) can see the mutant, kill it with a test of a behavior. When the effect is internal, use the debug interfaces: `Sched_debug`, the counters of `Sim` and the counters of the measurements.
 - Dismiss only an equivalent mutant, with `[@mutate off "reason"]`. The reason tells in one sentence why no result, resource, effect or debug value changes.
 - Do not dismiss a mutant that only more than one real domain or another world can see. Name the test that covers its behavior, for example a `dscheck` test or `test/linux_md`, or tell that no test covers it.
 - If only a test with one fixed seed or schedule can see the mutant, do not dismiss it. Do not add that test. A change of the schedule can make such a test fail on correct code. Keep the mutant as a known survivor.
-- An error case that only a raw operation of a misuse can reach stays unreached, because the core never submits that operation. Do not add a test for it: such a test fixes an error that no program can see.
+- An error case that only a raw world operation with an incorrect fd can reach stays unreached, because the core never submits the operation with that fd. Do not add a test for it. Such a test makes the error code a part of the contract, but no program can see the error.
 - Record each known survivor in the list that follows, with its reason.
 - Put a test for a mutant in the group of its behavior, not in a group of mutants.
 - `make mutate-arm MUTANT=<id>` runs a suite with one mutant armed. It shows that a new test kills the mutant, and it refuses a dismissed mutant.
@@ -1696,6 +1696,17 @@ The known survivors of `make mutate-all`:
 | `process.ml`, `kill`: `reaping` or a full status, as the condition that the error of the send is not an error | Only the reaper fills the status. It sets `reaping` before, and `reaping` stays set after a reap. Thus the mutant (`and`) differs only while a fiber reaps and the status is empty. In the simulator, the domain of the reaper continues from the reap of the world to the fill with no switch point. If other code reaped the child, the result of the kill depends on the schedule also without the mutant. Thus only a kill on another real domain between the reap and the fill can show the mutant. | None. A test of this race on Linux is not deterministic. |
 | `process.ml`, `wait`: the `Ivar.read` branch | The mutant does more effects only in some seeds with more than one virtual domain. | None. Only a test with one fixed seed can see it. |
 | `weft_sim.ml`, the end of a run: the second `Gc.full_major` | Only a chain of finalisers needs it, and the number of GC cycles that a test needs depends on the runtime. | None. A test that counts GC cycles breaks with a change of the runtime. |
+
+The mutants that no test of `test/core` and `test/sim` reaches at this time:
+
+| Site | Why no test reaches it |
+|---|---|
+| `weft_sim.ml`, the error cases of `submit` for the wrong type or state of fd | Only a raw world operation with an incorrect fd reaches them (the rule above). |
+| `chan.ml`, `meet`: `Self_done`. `locks.ml`, the `Error` of `self_commit` of a semaphore. `sched.ml`, the `Error` of `self_commit` in `signal_leaf` | Only a commit on another real domain between the check of the scan and the commit. No world effect comes between them. |
+| `sched.ml`, `push_ready`: an empty pop of a full ring. `ensure_reg`: the undo after a close | Only a thief or a close on another real domain at the same time. |
+| `process.ml`, `kill`: `Bad_fd` after a reap | Only a close of the pidfd on another real domain between the peek and the attempt. |
+| `weft.ml`, `run`: the stop and the undo of the domains that started | Only a failure of `Domain.spawn`. |
+| `sched.ml`: `Iv.get` of an empty Ivar, the asserts of `resume`, `Rc.release` of a closed fd, `on_chain` at the root, the path `arrived` of a job. `promise.ml`: the fallback text of the report, `start` of a promise that runs. `chan.ml`: the `None` result of a `recv`. `weft_sim.ml`: `readable` of a file, the lookup of a name with no listener in `Connect`, `step` of a domain that ended, the fallback text of the report | Defensive checks of a contract, or dead code. A correct program and a correct world cannot reach them. |
 
 **Two facts for M1.** I read them in the source of windtrap 0.2.0, but I did not do a test of them with domains:
 

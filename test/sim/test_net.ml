@@ -1661,7 +1661,8 @@ let tests =
       ; test "a read of a socket with no data gives EAGAIN" no_data_gives_eagain
       ; test "a loop of readable and read_now does not spin with extra edges"
           read_now_no_spin
-      ; test "a read_now after a fault raises the error" read_now_error
+      ; test "a read_now after a fault raises the error of the fault"
+          read_now_error
       ; test "a reset comes to the peer after the latency" reset_latency
       ; test "the fault resets ends some connections with ECONNRESET"
           random_resets
