@@ -35,7 +35,10 @@ module Spin = struct
         off
           "one domain never contends; test_heap.ml examines the lock with two \
            domains, but a mutation run cannot start a domain"]
-    then ( Domain.cpu_relax () ; lock t )
+    then (
+      Domain.cpu_relax ()
+      [@mutate off "a hint to the CPU only: the loop gives the same result"] ;
+      lock t )
 
   let unlock t = Atomic.set t false
 
