@@ -999,6 +999,164 @@ let one_signal_world () =
     [0; 63] ;
   Weft_linux.close (Weft_linux.create ~signals:[SIGUSR1] ())
 
+(* The id of the calling thread, from /proc/thread-self ("pid/task/tid"). *)
+let thread_id () = Filename.basename (Unix.readlink "/proc/thread-self")
+
+(* [true] if [sub] is a part of [s]. *)
+let contains s sub =
+  let n = String.length sub in
+  let rec at i =
+    i + n <= String.length s && (String.sub s i n = sub || at (i + 1))
+  in
+  at 0
+
+(* create ~signals writes a warning for each thread that does not block the
+   signals. A domain that starts before the create does not block them. *)
+let unblocked_warning () =
+  let log = Filename.concat (tmp ()) "stderr" in
+  let tid = Atomic.make None and stop = Atomic.make false in
+  let d =
+    Domain.spawn (fun () ->
+        Atomic.set tid (Some (thread_id ())) ;
+        while not (Atomic.get stop) do
+          Unix.sleepf 0.001
+        done )
+  in
+  let rec wait () =
+    match Atomic.get tid with
+    | Some t ->
+        t
+    | None ->
+        Unix.sleepf 0.001 ; wait ()
+  in
+  let tid = wait () in
+  let fd = Unix.openfile log [O_WRONLY; O_CREAT] 0o600 in
+  let saved = Unix.dup Unix.stderr in
+  Unix.dup2 fd Unix.stderr ;
+  Fun.protect
+    ~finally:(fun () ->
+      Unix.dup2 saved Unix.stderr ;
+      Unix.close saved ;
+      Unix.close fd ;
+      Atomic.set stop true ;
+      Domain.join d )
+    (fun () -> Weft_linux.close (Weft_linux.create ~signals:[SIGUSR1] ())) ;
+  let text = In_channel.with_open_text log In_channel.input_all in
+  is_true
+    (contains text
+       ( "weft: thread " ^ tid
+       ^ " does not block the signals of run ~signals: a signal can go to it\n"
+       ) )
+
+(* With stdin closed, the signalfd of the world is fd 0. The world gets a signal
+   on it, an unwatch works, and the close of the world closes it. A world that
+   does not get the signal leaves it pending, and the handler then takes it
+   after the close. *)
+let signalfd_zero () =
+  let old = Sys.signal Sys.sigusr1 (Sys.Signal_handle ignore) in
+  let saved = Unix.dup ~cloexec:true Unix.stdin in
+  Unix.close Unix.stdin ;
+  Fun.protect
+    ~finally:(fun () ->
+      Unix.dup2 ~cloexec:false saved Unix.stdin ;
+      Unix.close saved ;
+      Sys.set_signal Sys.sigusr1 old )
+    (fun () ->
+      Weft_linux.run ~domains:1 ~signals:[SIGUSR1; SIGUSR2] (fun () ->
+          equal string "anon_inode:[signalfd]" (Unix.readlink "/proc/self/fd/0") ;
+          Unix.kill (Unix.getpid ()) Sys.sigusr1 ;
+          at_least int ~than:1
+            (Fiber.with_timeout Mono (Span.ms 500) (fun () ->
+                 sync (Signal.received SIGUSR1) ) ) ;
+          Signal.unwatch SIGUSR2 ) ;
+      is_false (is_open "0") )
+
+(* The soft limit of open fds of this process, from /proc/self/limits. *)
+let fd_soft_limit () =
+  let l =
+    List.find
+      (String.starts_with ~prefix:"Max open files")
+      (In_channel.with_open_text "/proc/self/limits" In_channel.input_lines)
+  in
+  List.nth (List.filter (( <> ) "") (String.split_on_char ' ' l)) 3
+
+(* Run [f] with a soft limit of [n] open fds. prlimit changes the limit of this
+   process. *)
+let with_fd_limit n f =
+  let pid = Unix.getpid () and old = fd_soft_limit () in
+  let set soft =
+    if
+      Sys.command (Printf.sprintf "prlimit --pid %d --nofile=%s:" pid soft) <> 0
+    then fail "prlimit cannot change the limit of open fds"
+  in
+  set (string_of_int n) ;
+  Fun.protect ~finally:(fun () -> set old) f
+
+(* Open fds until EMFILE. *)
+let fill_fds () =
+  let rec go acc =
+    match Unix.dup ~cloexec:true Unix.stderr with
+    | fd ->
+        go (fd :: acc)
+    | exception Unix.Unix_error (EMFILE, _, _) ->
+        acc
+  in
+  go []
+
+(* A create with signals that fails at an fd closes the fds that it made, and it
+   restores the mask of the calling thread. The program few_fds.exe examines
+   this in a process of its own, but a mutation run arms a mutant only in the
+   process of the suite. Thus this test lowers the limit of open fds of the
+   process of the suite. With [k] free fds, the create fails in the call
+   [name]. *)
+let failed_create () =
+  if Sys.command "command -v prlimit > /dev/null" <> 0 then
+    skip ~reason:"prlimit is not installed" () ;
+  let self = string_of_int (Unix.getpid ()) in
+  let before = open_fds () in
+  let top =
+    Array.fold_left
+      (fun m n -> Int.max m (int_of_string n))
+      0
+      (Sys.readdir "/proc/self/fd")
+  in
+  with_fd_limit (top + 16) (fun () ->
+      let spare = ref (fill_fds ()) in
+      let free k =
+        for _ = 1 to k do
+          match !spare with
+          | fd :: l ->
+              Unix.close fd ;
+              spare := l
+          | [] ->
+              fail "no fd"
+        done
+      in
+      List.iter
+        (fun (k, name) ->
+          free k ;
+          ( match Weft_linux.create ~signals:[SIGUSR1] () with
+          | w ->
+              Weft_linux.close w ;
+              fail (name ^ ": no error")
+          | exception Failure m ->
+              equal string (name ^ ": Too many open files") m ) ;
+          let again = fill_fds () in
+          spare := again @ !spare ;
+          equal int k (List.length again) ;
+          (* The check of the mask reads /proc with one fd. *)
+          free 1 ;
+          is_true (List.mem self (Weft_linux.unblocked_threads [SIGUSR1])) ;
+          spare := fill_fds () @ !spare )
+        [ (0, "signalfd")
+        ; (1, "epoll_create1")
+        ; (2, "eventfd")
+        ; (3, "timerfd_create")
+        ; (4, "timerfd_create") ] ;
+      List.iter Unix.close !spare ) ;
+  Weft_linux.close (Weft_linux.create ~signals:[SIGUSR1] ()) ;
+  equal int before (open_fds ())
+
 let linux =
   group "linux"
     [ test "a Unix domain socket echoes" unix_socket
@@ -1041,6 +1199,11 @@ let linux =
         (Portable.unwatch_busy world)
     ; test "a waiter at Signal.unwatch raises" unwatch_waiter
     ; test "only one world at a time watches signals" one_signal_world
+    ; test "create warns for a thread that does not block the signals"
+        unblocked_warning
+    ; test "with stdin closed, the signalfd is fd 0" signalfd_zero
+    ; test "a create that fails closes its fds and restores the mask"
+        failed_create
     ; test "a finaliser fills an Ivar from outside a fiber" finaliser_fill
     ; test "a failed promise that nobody awaits gives a report" promise_report
     ; test "the watchdog reports a fiber that computes 200 ms" watchdog

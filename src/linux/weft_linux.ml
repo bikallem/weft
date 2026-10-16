@@ -153,8 +153,7 @@ let make ~domains ~nums ~undo signals =
       let old = sigmask_block nums in
       undo := (fun () -> sigmask_restore old) :: !undo ;
       let fd = signalfd (-1) nums in
-      if (fd < 0) [@mutate off "fd 0 is the stdin of the process"] then
-        failwith ("signalfd: " ^ strerror (-fd)) ;
+      if fd < 0 then failwith ("signalfd: " ^ strerror (-fd)) ;
       undo := (fun () -> ignore (close_fd fd)) :: !undo ;
       List.iter
         (fun task ->
