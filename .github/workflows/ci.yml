@@ -38,8 +38,9 @@ jobs:
   # The mutation gate of a pull request (design section 2.17). make mutate
   # tests the mutants that test/core and test/sim reach on the lines that the
   # pull request changes. It gives a failure if one of these mutants
-  # survives. A mutant that no test reaches gives no failure, and the gate
-  # does not test the lines of weft.posix, weft.linux and weft.kqueue.
+  # survives. A mutant that no test reaches gives no failure. The two Linux
+  # suites test the lines of weft.posix and weft.linux, and the gate does not
+  # test the lines of weft.kqueue.
   mutation:
     name: mutation (changed lines)
     if: github.event_name == 'pull_request'

@@ -5,20 +5,27 @@ and its events come from Concurrent ML. Each operating system call is an
 effect. Thus the same program runs on Linux or in a deterministic simulator,
 with a virtual clock and an in-memory network.
 
-**Status:** pre-release (version 0.0.0). The API can change. The Linux world
-is complete. The kqueue world for macOS and FreeBSD does not exist yet.
+**Status:** pre-release (version 0.0.0). The API can change. The milestones
+M0 to M3 of the design are complete. The Linux world (epoll) and the kqueue
+world (macOS and FreeBSD) run the same portable tests.
 
 ## Features
 
 - **Fibers and scopes.** `Fiber.scope` waits for all of its fibers. An error
   in a fiber cancels the other fibers of its scope. `Fiber.with_timeout`,
-  `Fiber.shield` and promises are also available.
+  `Fiber.shield` and promises are also available. Pinned fibers stay on
+  domain 0.
 - **Events from Concurrent ML.** `sync`, `choose`, `wrap`, `guard` and
   `with_nack` work on channels, Ivars, timers and sockets.
 - **Many domains.** A domain steals work from the others, as in the Go
   scheduler. `run ~domains:n` selects the number of domains.
+- **Locks for fiber code.** `Fiber.Mutex`, `Fiber.Condition` and
+  `Fiber.Semaphore` suspend the fiber, not the domain.
 - **I/O.** TCP, UDP and Unix sockets, pipes, files, directories, DNS, child
   processes and signals. A C thread pool runs the operations that can block.
+- **A watchdog.** In the Linux and kqueue worlds, `run ~watchdog` writes a
+  warning to `stderr` when a fiber runs for more than the limit with no
+  switch. The default limit is 10 ms.
 - **A simulator.** `Weft_sim.run ~seed` runs the program with a virtual clock,
   a network with latency and faults, a file system in memory, and fake
   processes. A seed always gives the same order of events. The simulator finds
@@ -65,6 +72,8 @@ let () =
   Weft_linux.run (fun () -> Echo.serve (Net.listen (Net.Tcp ("127.0.0.1", 7000))))
 ```
 
+On macOS or FreeBSD, use `Weft_kqueue.run` in place of `Weft_linux.run`.
+
 In the simulator ([`examples/echo/test_echo.ml`](examples/echo/test_echo.ml)),
 the same server runs for 100 seeds on 2 virtual domains. The idle timeout of
 10 s takes no real time, because the virtual clock moves to the next deadline:
@@ -85,6 +94,8 @@ Weft_sim.run ~seed ~domains:2 (fun sim ->
   does not claim an older version.
 - For the Linux world: Linux 5.4 or later (pidfd), and glibc 2.39 or later
   (`pidfd_spawnp`).
+- For the kqueue world: macOS or FreeBSD. The CI tests macOS 15 and
+  FreeBSD 14.3. OpenBSD and NetBSD are not tested.
 - The core and the simulator need no OS calls. They build on each system that
   OCaml 5 supports, and they do not link `unix`.
 
@@ -101,6 +112,31 @@ nix develop -c spec/tla/check.sh     # the TLA+ models of the design
 The libraries are `weft` (the core), `weft.sim` (the simulator),
 `weft.linux` (the Linux world), `weft.kqueue` (the world for macOS and
 FreeBSD) and `weft.posix` (the parts that the two worlds share).
+
+The main test suites are in `test`:
+
+- `test/core` and `test/sim`: the core and the simulator.
+- `test/portable`: the tests that run on each world (the simulator, Linux and
+  kqueue).
+- `test/linux` and `test/linux_md`: the Linux world. `test/linux_md` has the
+  tests of many domains.
+- `test/kqueue`: the kqueue world. It runs only on macOS and FreeBSD.
+
+### Mutation testing
+
+The tests use a fork of [windtrap](https://github.com/bikallem/windtrap), and
+the flake gives it. Mutation testing changes the code of the libraries, one
+mutant at a time. Then it makes sure that a test gives a failure for each
+mutant:
+
+```sh
+make mutate         # the mutants on the lines that changed since origin/main
+make mutate-all     # all the mutants of the libraries
+make help           # the other targets and the variables
+```
+
+The CI tests the mutants of the changed lines of each pull request. Section
+2.17 of the design gives the rules and the known survivors.
 
 ## Use weft from another flake
 
