@@ -331,6 +331,35 @@ end
 module Heap = struct
   let create () = {entries= [||]; size= 0; next_seq= 0; rebuild_at= 64}
 
+  (* The entry of the slots past the size, as the ring clears its slots. Thus
+     the heap does not keep a fiber after its entry left. Its deadline is last,
+     so [lt] is false for it against each entry. *)
+  let dummy =
+    let ctx =
+      { nid= -1
+      ; kind= Daemon_node
+      ; parent= None
+      ; flag= Atomic.make None
+      ; lock= Spin.make ()
+      ; members= Hashtbl.create 1
+      ; children= Hashtbl.create 1
+      ; chain= {handle= (fun f -> f ())}
+      ; fids= Atomic.make 0 }
+    in
+    let owner =
+      { fid= -1
+      ; name= "dummy"
+      ; ctxs= [ctx]
+      ; current= Atomic.make None
+      ; queued= false
+      ; pinned= false }
+    in
+    { deadline= Int64.max_int
+    ; seq= max_int
+    ; esync= {word= C.make 0; owner; sctx= ctx; cancellable= false; k= None}
+    ; branch= -1
+    ; cancels= None }
+
   let lt a b =
     match Int64.compare a.deadline b.deadline with
     | 0 ->
@@ -357,8 +386,8 @@ module Heap = struct
         ( l < h.size )
         [@mutate
           off
-            "at l = size, the slot holds the element that moves down, and lt \
-             of an element with itself is false"]
+            "at l = size, the slot holds the dummy, and lt of the dummy is \
+             false"]
         && lt h.entries.(l) h.entries.(i)
       then l
       else i
@@ -368,8 +397,8 @@ module Heap = struct
         ( r < h.size )
         [@mutate
           off
-            "at r = size, the slot holds the element that moves down, or an \
-             entry that the rebuild compacted past the size"]
+            "at r = size, the slot holds the dummy, and lt of the dummy is \
+             false"]
         && lt h.entries.(r) h.entries.(m)
       then r
       else m
@@ -380,9 +409,10 @@ module Heap = struct
 
   let pop h =
     h.size <- h.size - 1 ;
-    if (h.size > 0) [@mutate off "at 0, down has no child to compare"] then (
-      h.entries.(0) <- h.entries.(h.size) ;
-      down h 0 )
+    h.entries.(0) <- h.entries.(h.size) ;
+    h.entries.(h.size) <- dummy ;
+    if (h.size > 0) [@mutate off "at 0, down has no child to compare"] then
+      down h 0
 
   (* Remove the stale entries in place: their sync committed to another
      branch. *)
@@ -394,6 +424,7 @@ module Heap = struct
         h.entries.(!n) <- e ;
         incr n )
     done ;
+    Array.fill h.entries !n (h.size - !n) dummy ;
     h.size <- !n ;
     for
       i = ((h.size / 2) - 1) [@mutate off "down does nothing on a leaf"]
@@ -423,7 +454,7 @@ module Heap = struct
     if (h.size >= h.rebuild_at) [@mutate off "one more entry before a rebuild"]
     then rebuild h ;
     if h.size = Array.length h.entries then (
-      let a = Array.make (Int.max 16 (2 * h.size)) e in
+      let a = Array.make (Int.max 16 (2 * h.size)) dummy in
       Array.blit h.entries 0 a 0 h.size ;
       h.entries <- a ) ;
     h.entries.(h.size) <- e ;
