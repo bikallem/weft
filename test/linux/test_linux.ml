@@ -706,6 +706,79 @@ let unwatch_waiter () =
        (string_of_int (Unix.getpid ()))
        (Weft_linux.unblocked_threads [SIGUSR2]) )
 
+(* The id of the calling thread, from /proc/thread-self ("pid/task/tid"). *)
+let thread_id () = Filename.basename (Unix.readlink "/proc/thread-self")
+
+let domain_index () = Private.Sched.prog "test" Private.Sched.Dom_index
+
+(* Compute for [s] seconds, or until [stop] gives [true]. *)
+let spin ?(stop = fun () -> false) s =
+  let t0 = Unix.gettimeofday () in
+  while (not (stop ())) && Unix.gettimeofday () -. t0 < s do
+    ()
+  done
+
+(* An unwatch on domain 1 leaves the unblock of the thread of domain 0 to that
+   thread. Domain 1 waits first here: after the unwatch, a pinned fiber computes
+   on domain 0 for 50 ms. The wait of domain 1 must not take the unblock. *)
+let unwatch_unblock0 () =
+  let self = string_of_int (Unix.getpid ()) in
+  Weft_linux.run ~domains:2 ~watchdog:None ~signals:[SIGUSR2] (fun () ->
+      Fiber.scope (fun s ->
+          Fiber.fork ~pinned:true s (fun () ->
+              let rec go tries =
+                if tries = 0 then failwith "no fiber ran on domain 1" ;
+                let ran = Atomic.make None in
+                Fiber.scope (fun s ->
+                    Fiber.fork s (fun () ->
+                        let d = domain_index () in
+                        if d = 1 then Signal.unwatch SIGUSR2 ;
+                        Atomic.set ran (Some d) ) ;
+                    spin ~stop:(fun () -> Atomic.get ran <> None) 0.1 ;
+                    if Atomic.get ran = Some 1 then spin 0.05 ) ;
+                if Atomic.get ran <> Some 1 then go (tries - 1)
+              in
+              go 20 ;
+              Time.sleep Mono (Span.ms 10) ;
+              is_true (List.mem self (Weft_linux.unblocked_threads [SIGUSR2])) ) ) )
+
+(* An unwatch on domain 1 unblocks the signal in its own thread at once. It also
+   wakes domain 0, so that the thread of domain 0 unblocks the signal when
+   domain 0 sleeps with no deadline. A fiber on domain 1 blocks its thread for
+   50 ms, and domain 0 sleeps in this time. *)
+let unwatch_wakes_domain0 () =
+  let self = string_of_int (Unix.getpid ()) in
+  let unblocked t = List.mem t (Weft_linux.unblocked_threads [SIGUSR2]) in
+  Weft_linux.run ~domains:2 ~watchdog:None ~signals:[SIGUSR2] (fun () ->
+      Fiber.scope (fun s ->
+          Fiber.fork ~pinned:true s (fun () ->
+              let rec go tries =
+                if tries = 0 then failwith "no fiber ran on domain 1" ;
+                let started = Atomic.make false and result = Ivar.create () in
+                Fiber.fork s (fun () ->
+                    if domain_index () <> 1 then Ivar.fill result None
+                    else (
+                      Atomic.set started true ;
+                      Unix.sleepf 0.05 ;
+                      Signal.unwatch SIGUSR2 ;
+                      let own = unblocked (thread_id ()) in
+                      let t0 = Unix.gettimeofday () in
+                      while
+                        (not (unblocked self))
+                        && Unix.gettimeofday () -. t0 < 0.5
+                      do
+                        Unix.sleepf 0.001
+                      done ;
+                      Ivar.fill result (Some (own, unblocked self)) ) ) ;
+                spin ~stop:(fun () -> Atomic.get started) 0.1 ;
+                match sync (Ivar.read result) with
+                | None ->
+                    go (tries - 1)
+                | Some (own, zero) ->
+                    is_true own ; is_true zero
+              in
+              go 20 ) ) )
+
 (* M3: a finaliser fills an Ivar from outside a fiber, and the fiber that waits
    wakes. *)
 let finaliser_fill () =
@@ -999,9 +1072,6 @@ let one_signal_world () =
     [0; 63] ;
   Weft_linux.close (Weft_linux.create ~signals:[SIGUSR1] ())
 
-(* The id of the calling thread, from /proc/thread-self ("pid/task/tid"). *)
-let thread_id () = Filename.basename (Unix.readlink "/proc/thread-self")
-
 (* [true] if [sub] is a part of [s]. *)
 let contains s sub =
   let n = String.length sub in
@@ -1198,6 +1268,9 @@ let linux =
     ; test ~timeout:30. "after Signal.unwatch, SIGINT ends a busy process"
         (Portable.unwatch_busy world)
     ; test "a waiter at Signal.unwatch raises" unwatch_waiter
+    ; test "after an unwatch on domain 1, only domain 0 unblocks its thread"
+        unwatch_unblock0
+    ; test "an unwatch on domain 1 wakes domain 0" unwatch_wakes_domain0
     ; test "only one world at a time watches signals" one_signal_world
     ; test "create warns for a thread that does not block the signals"
         unblocked_warning
