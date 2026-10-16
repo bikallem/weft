@@ -18,7 +18,28 @@
     },
     "root": {
       "inputs": {
-        "nixpkgs": "nixpkgs"
+        "nixpkgs": "nixpkgs",
+        "windtrap": "windtrap"
+      }
+    },
+    "windtrap": {
+      "inputs": {
+        "nixpkgs": [
+          "nixpkgs"
+        ]
+      },
+      "locked": {
+        "lastModified": 1792080546,
+        "narHash": "sha256-VOkPQEGjJdXlhEOx1mhIUdZi6g9ZATgCaoFusOwNuZU=",
+        "owner": "bikallem",
+        "repo": "windtrap",
+        "rev": "8054b03cb7c580b3048afde86dc819c27815c7ce",
+        "type": "github"
+      },
+      "original": {
+        "owner": "bikallem",
+        "repo": "windtrap",
+        "type": "github"
       }
     }
   },

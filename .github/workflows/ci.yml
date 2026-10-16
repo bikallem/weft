@@ -77,8 +77,8 @@ jobs:
             opam init --bare --disable-sandboxing
             opam switch create 5.5.0
             eval "$(opam env)"
-            # The fork of windtrap at the commit of flake.nix.
-            wt=git+https://github.com/bikallem/windtrap.git#b80c58524f8ce268dcc6dbfb598b249b7174f351
+            # The fork of windtrap at the commit of flake.lock.
+            wt=git+https://github.com/bikallem/windtrap.git#8054b03cb7c580b3048afde86dc819c27815c7ce
             opam pin add -n windtrap "$wt"
             opam pin add -n ppx_windtrap "$wt"
             opam install dune windtrap ppx_windtrap dscheck

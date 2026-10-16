@@ -1647,7 +1647,7 @@ Run all of the models with `nix develop -c spec/tla/check.sh`. `MODELS="Ivar Fd"
 
 ## 2.17 Tests with windtrap
 
-The tests use windtrap from the fork `bikallem/windtrap` (decision 9). The fork has changes after the release 0.2.0, and it has no release. Thus the flake builds windtrap and `ppx_windtrap` from one commit of its main branch, and the FreeBSD job of CI pins the same commit with opam. Windtrap gives unit tests, property tests, stateful tests, expect tests, coverage and mutation testing from one library.
+The tests use windtrap from the fork `bikallem/windtrap` (decision 9). The fork has changes after the release 0.2.0, and it has no release. Thus the flake uses the flake of the fork as an input. `flake.lock` pins one commit of its main branch, and the flake builds windtrap and `ppx_windtrap` from it with the OCaml of the dev shell. The FreeBSD job of CI pins the same commit with opam. Windtrap gives unit tests, property tests, stateful tests, expect tests, coverage and mutation testing from one library.
 
 **Which test for which part:**
 
@@ -1682,7 +1682,7 @@ The tests use windtrap from the fork `bikallem/windtrap` (decision 9). The fork 
 - `dune runtest`: all suites.
 - `dune runtest --force --instrument-with ppx_windtrap.coverage`, then `dune exec windtrap -- coverage`.
 - `WINDTRAP_MUTATE=1 dune runtest --force --instrument-with ppx_windtrap.mutate`, then `dune exec windtrap -- mutants`.
-- The Makefile has the recipes. `make mutate` tests the mutants on the lines that changed since the merge base with `origin/main` (`--mutate-since`), with one child for each CPU (`--mutate-jobs auto`). Then it merges the verdicts of `test/core` and `test/sim`. `make mutate-linux` tests the Linux suite with the tests that start a domain excluded. `make help` gives all the targets and variables.
+- The Makefile has the recipes. `make mutate` tests the mutants on the lines that changed since the merge base with `origin/main` (`--mutate-since`), with one child for each CPU (`--mutate-jobs auto`). Then it runs `test/linux` and `test/linux_md` one at a time, on Linux only, and merges the verdicts of the four suites. The two Linux suites start domains, so windtrap starts each of their children as a new process (exec mode). They test only the mutants of `weft.linux` and `weft.posix`, because `test/core` and `test/sim` kill each mutant of the core that they kill. A run of `test/linux_md` on `sched.ml` took 297 s and gave no other kill. `make help` gives all the targets and variables.
 
 **Survivors of a mutation run.** A survivor is a mutant that no test kills. These rules apply to each survivor and to each mutant that no test reaches:
 
@@ -1719,10 +1719,12 @@ The mutants that no test of `test/core` and `test/sim` reaches at this time:
 | `weft.ml`, `run`: the list of the domains that started (`dom :: started`) | Only a run on more than one real domain reaches it. The test "Weft.run › an error of the world on domain 0 stops domain 1" covers it outside a mutation run. |
 | `sched.ml`: `Iv.get` of an empty Ivar, the asserts of `resume`, `state_of`, `reason` and `start`, `Rc.release` of a closed fd, `on_chain` at the root, the path `arrived` of a job. `promise.ml`: the fallback text of the report, `start` of a promise that runs. `chan.ml`: the `None` result of a `recv`. `weft_sim.ml`: `readable` of a file, the lookup of a name with no listener in `Connect`, `step` of a domain that ended, the assert of `step` for an effect that is not of the world, the fallback text of the report | Defensive checks of a contract, or dead code. A correct program and a correct world cannot reach them. |
 
+The report also lists 2 sites under "evaluated outside tests". No test runs them, but module initialization runs them: `mask` of `ring.ml` and the list `linux_numbers` of `weft_sim.ml`. Windtrap tests no mutant of these sites, and the score does not include them. Each test depends on the values of these sites.
+
 **The mutation gate of a pull request.** The CI job `mutation (changed lines)` runs `make mutate BASE=HEAD^1` on each pull request. The checkout is the merge commit of the pull request into its base branch, and its first parent is the base at the time of the event. Thus the diff from `HEAD^1` has only the lines of the pull request. This is also true in a stack of pull requests, and when the base branch moves later. These rules apply to the gate:
 
 - The gate is strict. It gives a failure if a mutant on a changed line survives. It has no `MIN_SCORE`.
-- The gate tests only the mutants that `test/core` and `test/sim` reach. A mutant that no test reaches gives no failure, for example in a new function with no test. The gate does not test the lines of `weft.posix`, `weft.linux` and `weft.kqueue`, because these two suites do not link them.
+- The gate tests the mutants that `test/core` and `test/sim` reach, and the mutants of `weft.posix` and `weft.linux` that `test/linux` and `test/linux_md` reach. A mutant that no test reaches gives no failure, for example in a new function with no test. No suite of the gate tests the lines of `weft.kqueue`.
 - A pull request that changes no line with a mutant passes, for example a change to a comment, a test or this document.
 - A change to the line of a known survivor puts that survivor in scope again, and the gate gives a failure. The author must examine the survivor with the rules of this section.
 - A mutant is on the line where its expression starts. A change to a later line of a long expression does not put the mutant in scope. `make mutate-all` finds such a survivor.

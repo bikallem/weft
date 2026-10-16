@@ -3,6 +3,15 @@
 
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
 
+  # The test library and its ppx (expect tests, coverage, mutation). We use
+  # the fork bikallem/windtrap. The fork has changes after the release 0.2.0
+  # of invariant-hq, and it has no release. flake.lock pins a commit of its
+  # main branch, and CI on FreeBSD pins the same commit (ci.yml).
+  inputs.windtrap = {
+    url = "github:bikallem/windtrap";
+    inputs.nixpkgs.follows = "nixpkgs";
+  };
+
   # Another flake can use weft in three ways:
   #
   # - In its own OCaml scope, as for a package of nixpkgs. This uses the
@@ -16,7 +25,11 @@
   # - As weft.packages.${system}.weft, with
   #   inputs.weft.inputs.nixpkgs.follows = "nixpkgs".
   outputs =
-    { self, nixpkgs }:
+    {
+      self,
+      nixpkgs,
+      windtrap,
+    }:
     let
       systems = [
         "x86_64-linux"
@@ -72,39 +85,21 @@
       devShells = forAllSystems (
         pkgs:
         let
-          ocamlPackages = pkgs.ocaml-ng.ocamlPackages_5_5;
-          # The test library and its ppx (expect tests, coverage, mutation).
-          # We use the fork bikallem/windtrap at a commit of its main branch.
-          # The fork has changes after the release 0.2.0 of invariant-hq, and
-          # it has no release. CI on FreeBSD pins the same commit (ci.yml).
-          windtrapVersion = "0.2.0-unstable-2026-10-14";
-          windtrapSrc = pkgs.fetchFromGitHub {
-            owner = "bikallem";
-            repo = "windtrap";
-            rev = "b80c58524f8ce268dcc6dbfb598b249b7174f351";
-            hash = "sha256-VPMbLWQS2MuwcIXqUvGHhh4klndNOyPTNijXLpDOvt0=";
-          };
-          windtrap = ocamlPackages.buildDunePackage {
-            pname = "windtrap";
-            version = windtrapVersion;
-            src = windtrapSrc;
-          };
-          ppx_windtrap = ocamlPackages.buildDunePackage {
-            pname = "ppx_windtrap";
-            version = windtrapVersion;
-            src = windtrapSrc;
-            propagatedBuildInputs = [
-              windtrap
-              ocamlPackages.ppxlib
-            ];
-          };
+          # nixpkgs has the older windtrap 0.2.0. Thus we override the two
+          # packages with the fork, built with the OCaml of this scope.
+          ocamlPackages = pkgs.ocaml-ng.ocamlPackages_5_5.overrideScope (
+            final: _: {
+              windtrap = final.callPackage windtrap.lib.windtrap { };
+              ppx_windtrap = final.callPackage windtrap.lib.ppx_windtrap { };
+            }
+          );
         in
         {
           default = pkgs.mkShell {
             packages = [
               # OCaml 5.5, dune and the test library.
-              windtrap
-              ppx_windtrap
+              ocamlPackages.windtrap
+              ocamlPackages.ppx_windtrap
               ocamlPackages.dscheck
               ocamlPackages.ocaml
               ocamlPackages.dune_3
