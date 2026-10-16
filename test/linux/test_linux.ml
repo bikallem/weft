@@ -1366,6 +1366,26 @@ let linux =
     ; test "a signal that run does not watch is not an event" unwatched
     ; test "Time.to_utc agrees with Unix.gmtime" utc_against_gmtime ]
 
+(* The review of 2026-10-16 (design section 3.12). *)
+
+(* C3: the names of a large directory take linear time on the domain thread. The
+   old code took 6.9 s for 40,000 names. [Resolve] keeps the first copy of each
+   address, in order. *)
+let many_names () =
+  let n = 40_000 in
+  let data =
+    String.concat "" (List.init n (fun i -> Printf.sprintf "file-%06d\000" i))
+  in
+  let t0 = Sys.time () in
+  equal int n (List.length (Weft_posix.names data)) ;
+  equal int n (List.length (Weft_posix.addresses data)) ;
+  less float_exact ~than:1.0 (Sys.time () -. t0) ;
+  equal (list string) ["b"; "a"] (Weft_posix.addresses "b\000a\000b\000a\000")
+
+let review_2026 =
+  group "review of 2026-10-16"
+    [test "C3: the names of 40,000 entries take linear time" many_names]
+
 let () =
   exit
     (Windtrap.run "linux"
@@ -1378,4 +1398,5 @@ let () =
                    name= "linux on 4 domains"
                  ; domains= 4
                  ; run= (fun f -> Weft_linux.run ~domains:4 f) } ]
-         ; linux ] ) )
+         ; linux
+         ; review_2026 ] ) )

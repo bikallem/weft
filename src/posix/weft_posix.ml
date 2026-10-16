@@ -329,13 +329,17 @@ let kind_of_int = function
       Op.Special
 
 (* The names of [Readdir] or the addresses of [Resolve]: each one ends with a
-   NUL byte. [Resolve] can give one address more than one time. *)
+   NUL byte. readdir(3) gives each entry of a directory one time. *)
 let names data =
-  List.fold_left
-    (fun acc x -> if x = "" || List.mem x acc then acc else x :: acc)
-    []
-    (String.split_on_char '\000' data)
-  |> List.rev
+  List.filter (fun x -> x <> "") (String.split_on_char '\000' data)
+
+(* [Resolve] can give one address more than one time. The world keeps the first
+   one, in the order of getaddrinfo(3). A table keeps the time linear. *)
+let addresses data =
+  let seen = Hashtbl.create 16 in
+  List.filter
+    (fun x -> (not (Hashtbl.mem seen x)) && (Hashtbl.replace seen x () ; true))
+    (names data)
 
 let stat_of j =
   let kind, size, perm, mtime = job_stat j in
@@ -375,7 +379,7 @@ let finish : type a. nativeint -> a Op.blocking -> (a, Op.error) result =
       | Op.Readdir _ ->
           Ok (names data)
       | Op.Resolve _ ->
-          Ok (names data)
+          Ok (addresses data)
       | Op.Reverse _ ->
           Ok data
   in
