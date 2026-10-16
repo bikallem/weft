@@ -334,7 +334,8 @@ module World = struct
           !acc )
         else if token = wake_token then (
           ignore (drain d.evfd) ;
-          World.Ready.Woken :: completions t.pool domain acc
+          let acc = completions t.pool domain acc in
+          (World.Ready.Woken :: acc)
           [@mutate off "the scheduler does nothing for Woken (Sched.on_ready)"]
           )
         else World.Ready.Fd {token; read; write} :: acc )

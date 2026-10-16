@@ -434,10 +434,10 @@ let fds_of l =
 (* The Unix fd with the number [n]. On Unix, an fd is its number. *)
 let fd_of_int : int -> Unix.file_descr = Obj.magic
 
-(* The pool does the close of a file, because a close of a file can block
-   (design section 2.7). The close of another fd is at once, also if the fd has
-   the number of a file that closed before. The fibers hold all threads of the
-   pool, so a close in the pool waits in the queue. *)
+(* The pool closes a file, because the close of a file can block (design section
+   2.7). The world closes another fd at once, also if the fd has the number of a
+   file that closed before. The fibers hold all threads of the pool, so a close
+   in the pool waits in the queue. *)
 let pool_closes_files () =
   let fifo = new_fifo () in
   let name = "pool-closes-this-file" in
@@ -449,11 +449,9 @@ let pool_closes_files () =
         match
           List.find_opt
             (fun n ->
-              match Unix.readlink ("/proc/self/fd/" ^ n) with
-              | l ->
-                  String.ends_with ~suffix:("/" ^ name) l
-              | exception Unix.Unix_error _ ->
-                  false )
+              Option.fold ~none:false
+                ~some:(String.ends_with ~suffix:("/" ^ name))
+                (fd_target n) )
             (Array.to_list (Sys.readdir "/proc/self/fd"))
         with
         | Some n ->
@@ -467,12 +465,15 @@ let pool_closes_files () =
           is_true (is_open n) ;
           release fifo held ) ;
       is_false (is_open n) ;
-      (* A socket gets the number of the file. *)
-      let rec socket others =
+      (* A socket gets the number of the file, in a maximum of 64 tries. *)
+      let rec socket tries others =
+        if tries = 0 then (
+          List.iter Net.close others ;
+          fail "no socket got the number of the file" ) ;
         let u = Net.udp ("127.0.0.1", 0) in
-        if is_open n then (u, others) else socket (u :: others)
+        if is_open n then (u, others) else socket (tries - 1) (u :: others)
       in
-      let u, others = socket [] in
+      let u, others = socket 64 [] in
       Fiber.scope (fun s ->
           let held = hold s fifo pool_max in
           Net.close u ;
@@ -724,7 +725,8 @@ let signal_number () =
 
 (* The check of the threads: out of run, the calling thread does not block
    SIGUSR2. In run ~signals, each thread of the process blocks it, and no thread
-   blocks SIGHUP. *)
+   blocks SIGHUP. After the run, the calling thread does not block SIGUSR2
+   again. *)
 let blocked_threads () =
   let self = string_of_int (Unix.getpid ()) in
   is_true (List.mem self (Weft_linux.unblocked_threads [SIGUSR2])) ;
@@ -751,23 +753,27 @@ let spin ?(stop = fun () -> false) s =
 (* Run [f] in a fiber on domain 1, and give its result. The caller forks a fiber
    and computes for a maximum of 100 ms, so domain 1 takes the fiber. If the
    fiber runs on domain 0, the caller forks again, 20 times at most. The caller
-   computes until [f] ends. With [~sleep:true], it computes only until the fiber
-   starts, and then it waits: thus domain 0 can sleep while [f] runs. *)
-let fork_on_domain_1 ?(sleep = false) f =
+   computes until [f] ends, and then [busy] seconds more. With [~sleep:true], it
+   computes only until the fiber starts, and then it waits: thus domain 0 can
+   sleep while [f] runs. *)
+let fork_on_domain_1 ?(sleep = false) ?(busy = 0.) f =
   let rec go tries =
     if tries = 0 then failwith "no fiber ran on domain 1" ;
-    let started = Atomic.make false and ended = Atomic.make false in
+    let ran = Atomic.make None and ended = Atomic.make false in
     let r =
       Fiber.scope (fun s ->
           let p =
             Fiber.fork_promise s (fun () ->
-                Atomic.set started true ;
-                let r = if dom () = 1 then Some (f ()) else None in
+                let d = dom () in
+                Atomic.set ran (Some d) ;
+                let r = if d = 1 then Some (f ()) else None in
                 Atomic.set ended true ; r )
           in
           spin
-            ~stop:(fun () -> Atomic.get (if sleep then started else ended))
+            ~stop:(fun () ->
+              if sleep then Atomic.get ran <> None else Atomic.get ended )
             0.1 ;
+          if Atomic.get ran = Some 1 then spin busy ;
           Promise.await p )
     in
     match r with Some x -> x | None -> go (tries - 1)
@@ -825,8 +831,7 @@ let unwatch_unblock0 () =
   Weft_linux.run ~domains:2 ~watchdog:None ~signals:[SIGUSR2] (fun () ->
       Fiber.scope (fun s ->
           Fiber.fork ~pinned:true s (fun () ->
-              fork_on_domain_1 (fun () -> Signal.unwatch SIGUSR2) ;
-              spin 0.05 ;
+              fork_on_domain_1 ~busy:0.05 (fun () -> Signal.unwatch SIGUSR2) ;
               Time.sleep Mono (Span.ms 10) ;
               is_true (List.mem self (Weft_linux.unblocked_threads [SIGUSR2])) ) ) )
 
@@ -915,6 +920,9 @@ let watchdog () =
   Weft_linux.run ~domains:1 ~watchdog:None (fun () -> busy_ms 50) ;
   equal int (before + 1) (Weft_linux.watchdog_reports ())
 
+(* A new world can watch signals: no open world holds the claim. *)
+let signals_free () = Weft_linux.close (Weft_linux.create ~signals:[SIGUSR1] ())
+
 (* A limit of the watchdog that is not positive raises. The run closes the world
    first, so a later world can watch signals. *)
 let watchdog_limit () =
@@ -927,7 +935,7 @@ let watchdog_limit () =
           Weft_linux.run ~domains:1 ~signals:[SIGUSR1]
             ~watchdog:(Some (Span.ns ns))
             ignore ) ;
-      Weft_linux.close (Weft_linux.create ~signals:[SIGUSR1] ()) )
+      signals_free () )
     [0; -1]
 
 (* M3: a Posix sleep ends after its deadline on the wall clock. A sleep on Mono
@@ -962,26 +970,20 @@ let alarm_sets () =
   equal int 1 (sets (fun () -> Time.sleep Mono (Span.ms 20))) ;
   equal int 1 (sets (fun () -> Time.sleep Posix (Span.ms 20)))
 
-(* The fds of the process of a kind, for example "eventfd", with the value of a
-   field of their fdinfo, for example "ticks:". *)
-let fdinfo kind field =
+(* For each fd of the inode type [inode] (for example "timerfd"), the value of
+   the line that starts with [field] (for example "ticks:") in its fdinfo. *)
+let fdinfo inode field =
+  let k = String.length field in
   List.filter_map
     (fun n ->
-      match Unix.readlink ("/proc/self/fd/" ^ n) with
-      | l when l = "anon_inode:[" ^ kind ^ "]" ->
-          List.find_map
-            (fun l ->
-              if String.starts_with ~prefix:field l then
-                Some
-                  (String.trim
-                     (String.sub l (String.length field)
-                        (String.length l - String.length field) ) )
-              else None )
-            (In_channel.with_open_text ("/proc/self/fdinfo/" ^ n)
-               In_channel.input_lines )
-      | _ | (exception Unix.Unix_error _) ->
-          None )
-    (Array.to_list (Sys.readdir "/proc/self/fd"))
+      List.find_map
+        (fun l ->
+          if String.starts_with ~prefix:field l then
+            Some (String.trim (String.sub l k (String.length l - k)))
+          else None )
+        (In_channel.with_open_text ("/proc/self/fdinfo/" ^ n)
+           In_channel.input_lines ) )
+    (fds_of ("anon_inode:[" ^ inode ^ "]"))
 
 (* The world reads the eventfd after a wake, and each timerfd after its alarm.
    The counts are then 0. A world on one domain has one eventfd and two
@@ -1146,7 +1148,7 @@ let one_signal_world () =
             62" ) (fun () ->
           ignore (Weft_linux.create ~domains ~signals:[SIGUSR1] ()) ) )
     [0; 63] ;
-  Weft_linux.close (Weft_linux.create ~signals:[SIGUSR1] ())
+  signals_free ()
 
 (* create ~signals writes a warning for each thread that does not block the
    signals. A domain that starts before the create does not block them. *)
@@ -1254,9 +1256,6 @@ let failed_create () =
   in
   with_fd_limit (top + 16) (fun () ->
       let spare = ref [] in
-      Fun.protect ~finally:(fun () -> List.iter Unix.close !spare)
-      @@ fun () ->
-      spare := fill_fds () ;
       let free k =
         for _ = 1 to k do
           match !spare with
@@ -1267,28 +1266,34 @@ let failed_create () =
               fail "no fd"
         done
       in
-      List.iter
-        (fun (k, name) ->
-          free k ;
-          ( match Weft_linux.create ~signals:[SIGUSR1] () with
-          | w ->
-              Weft_linux.close w ;
-              fail (name ^ ": no error")
-          | exception Failure m ->
-              equal string (name ^ ": Too many open files") m ) ;
-          let again = fill_fds () in
-          spare := again @ !spare ;
-          equal int k (List.length again) ;
-          (* The check of the mask reads /proc with one fd. *)
-          free 1 ;
-          is_true (List.mem self (Weft_linux.unblocked_threads [SIGUSR1])) ;
-          spare := fill_fds () @ !spare )
-        [ (0, "signalfd")
-        ; (1, "epoll_create1")
-        ; (2, "eventfd") (* The timerfd of Mono, then the timerfd of Posix. *)
-        ; (3, "timerfd_create")
-        ; (4, "timerfd_create") ] ) ;
-  Weft_linux.close (Weft_linux.create ~signals:[SIGUSR1] ()) ;
+      Fun.protect
+        ~finally:(fun () -> List.iter Unix.close !spare)
+        (fun () ->
+          spare := fill_fds () ;
+          (* The two rows of timerfd_create are the timerfd of Mono, then the
+             timerfd of Posix. *)
+          List.iter
+            (fun (k, name) ->
+              free k ;
+              ( match Weft_linux.create ~signals:[SIGUSR1] () with
+              | w ->
+                  Weft_linux.close w ;
+                  fail (name ^ ": no error")
+              | exception Failure m ->
+                  equal string (name ^ ": Too many open files") m ) ;
+              let again = fill_fds () in
+              spare := again @ !spare ;
+              equal int k (List.length again) ;
+              (* The check of the mask reads /proc with one fd. *)
+              free 1 ;
+              is_true (List.mem self (Weft_linux.unblocked_threads [SIGUSR1])) ;
+              spare := fill_fds () @ !spare )
+            [ (0, "signalfd")
+            ; (1, "epoll_create1")
+            ; (2, "eventfd")
+            ; (3, "timerfd_create")
+            ; (4, "timerfd_create") ] ) ) ;
+  signals_free () ;
   equal int before (open_fds ())
 
 let linux =
