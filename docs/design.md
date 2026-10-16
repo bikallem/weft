@@ -902,7 +902,7 @@ The tests of the public API run in the simulator, also with 200 seeds on 4 virtu
 - Finalisers, `Sys.signal` handlers, `Gc.Memprof` callbacks and `Gc.create_alarm` functions. They run through a C callback, so even in a fiber they have no handler. A review verified this for finalisers and signal handlers with a test program.
 - OCaml code that C calls back with `caml_callback`, also inside a fiber. Examples are the callbacks of a TLS library or of sqlite. Here the library raises `Fiber.Not_in_fiber` with a message that names a C callback.
 
-In these places, a world effect raises `Effect.Unhandled`. The library catches it and raises `Fiber.Not_in_fiber` with the name of the function, for example `"Time.now"`.
+In these places, a world effect raises `Effect.Unhandled`. The library catches it and raises `Fiber.Not_in_fiber` with the name of the function, for example `"Time.now"`. A public function that changes a state performs `Self` first, for example `Fiber.fork`, `fork_daemon` and `Condition.wait`. Thus it raises `Fiber.Not_in_fiber` before it changes the state (sections 3.6, T6, and 3.12, C2).
 
 **A value from outside a fiber (M3).** These places must not use `Ivar.fill`, for two reasons:
 
@@ -2057,3 +2057,4 @@ Subagents reviewed the codebase at `dfea347` for correctness, performance and co
 | No. | Finding | Fix |
 |---|---|---|
 | C1 | A scope ignored each `Cancelled` of a member, also one from a scope inside the member that the user cancelled. Then a fork that raised it was lost, and a body that raised it did not cancel the other fibers, so the join could wait forever. `fork_isolated` and `fork_promise` had the same rule | A `Cancelled` is not a failure only if the chain of the member is cancelled (2.5, Errors). The planted bug `BugAnyCancelled` of `Scope.tla` violates `ExnSeen` |
+| C2 | Outside a fiber, `fork` changed the counts of the scope before it raised `Not_in_fiber`, so the scope never ended. `fork_daemon` linked the node of the daemon first. `Condition.wait` added its waiter first, and that waiter then took a signal | The three functions perform `Self` first (2.5, Fiber code with no handler) |

@@ -1296,6 +1296,55 @@ let inner_cancel_promise () =
           | exception Fiber.Cancelled (Boom m) ->
               equal string "inner" m ) )
 
+(* C2: [f] runs in a finaliser, outside a fiber. It must raise
+   [Not_in_fiber]. *)
+let outside_fiber f =
+  let r = ref None in
+  let () =
+    let x = ref 1 in
+    Gc.finalise
+      (fun _ ->
+        r :=
+          Some
+            ( match f () with
+            | () ->
+                "no exception"
+            | exception Fiber.Not_in_fiber _ ->
+                "Not_in_fiber"
+            | exception e ->
+                Printexc.to_string e ) )
+      x
+  in
+  Gc.full_major () ;
+  equal (option string) (Some "Not_in_fiber") !r
+
+(* C2: a fork outside a fiber raises [Not_in_fiber] before it changes the scope.
+   Thus the scope ends. *)
+let fork_outside_fiber () =
+  run (fun () ->
+      Fiber.scope (fun s -> outside_fiber (fun () -> Fiber.fork s ignore)) ;
+      Fiber.scope (fun s ->
+          outside_fiber (fun () -> Fiber.fork_daemon s ignore) ;
+          equal int 0 (Hashtbl.length (Private.scope_ctx s).S.children) ) )
+
+(* C2: a wait outside a fiber raises [Not_in_fiber] before it adds a waiter.
+   Thus the next signal goes to a fiber that waits. *)
+let wait_outside_fiber () =
+  let c = Fiber.Condition.create () and m = Fiber.Mutex.create () in
+  raises_match
+    (function Fiber.Not_in_fiber _ -> true | _ -> false)
+    (fun () -> Fiber.Condition.wait c m) ;
+  run (fun () ->
+      let woken = ref false in
+      Fiber.scope (fun s ->
+          Fiber.fork s (fun () ->
+              Fiber.Mutex.use_rw ~protect:false m (fun () ->
+                  Fiber.Condition.wait c m ;
+                  woken := true ) ) ;
+          Fiber.yield () ;
+          Fiber.Mutex.use_ro m (fun () -> Fiber.Condition.signal c) ) ;
+      is_true !woken )
+
 let review_2026 =
   group "review of 2026-10-16"
     [ test "C1: a Cancelled from an inner scope fails a fork"
@@ -1305,7 +1354,10 @@ let review_2026 =
     ; test "C1: a Cancelled from an inner scope goes to on_error"
         inner_cancel_isolated
     ; test "C1: a Cancelled from an inner scope fails a promise"
-        inner_cancel_promise ]
+        inner_cancel_promise
+    ; test "C2: a fork outside a fiber does not change the scope"
+        fork_outside_fiber
+    ; test "C2: a wait outside a fiber adds no waiter" wait_outside_fiber ]
 
 let () =
   exit

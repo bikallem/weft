@@ -1716,7 +1716,10 @@ let run_body ~ctx scope body =
       let bt = Printexc.get_raw_backtrace () in
       enqueue (fail ~ctx scope e bt)
 
+(* [Self] first: outside a fiber, [fork] raises [Not_in_fiber] before it changes
+   the scope. *)
 let fork ?name ?pinned scope body =
+  ignore (self ()) ;
   add_member scope ~daemon:false ;
   let f = new_fiber ?name ?pinned [scope] in
   add_member_to scope f ;
@@ -1731,8 +1734,9 @@ let fork ?name ?pinned scope body =
 (* A daemon has its own node under the scope. The count and the link of the node
    are one step under the lock of the scope, so the end of the last member that
    is not a daemon sees the node (it reads the daemons under the same lock). The
-   daemon removes its node when it ends. *)
+   daemon removes its node when it ends. [Self] first, as in [fork]. *)
 let fork_daemon ?name scope body =
+  ignore (self ()) ;
   let st = state_of scope in
   let d = new_node ~parent:scope Daemon_node in
   let f = new_fiber ?name [d] in
