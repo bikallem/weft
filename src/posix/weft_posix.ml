@@ -51,6 +51,8 @@ external getrandom : bytes -> int = "weft_getrandom"
 
 external errno_codes : unit -> int array = "weft_errno_codes"
 
+external accept_retry_codes : unit -> int array = "weft_accept_retry_codes"
+
 external strerror : int -> string = "weft_strerror"
 
 external errname : int -> string = "weft_errname"
@@ -157,8 +159,11 @@ let eagain, ebadf, econnrefused, econnreset, epipe, eaddrinuse, ewouldblock =
 let enoent, eexist, enotdir, eisdir, enotempty =
   (codes.(7), codes.(8), codes.(9), codes.(10), codes.(11))
 
-let emfile, enfile, enobufs, enomem, econnaborted =
-  (codes.(12), codes.(13), codes.(14), codes.(15), codes.(16))
+let emfile, enfile, enobufs, enomem =
+  (codes.(12), codes.(13), codes.(14), codes.(15))
+
+(* The errors of accept(2) that the world retries (weft_posix_stubs.c). *)
+let accept_retry = accept_retry_codes ()
 
 let error_of e =
   if
@@ -490,12 +495,14 @@ let submit : type a. pool -> a Op.t -> (a, Op.error) result option =
   | Op.Accept fd ->
       (* FreeBSD gives ECONNABORTED for a connection that the client reset
          before the accept. Linux gives the connection, and a read of the source
-         of macOS shows that macOS also gives it. Thus the world takes the next
-         connection, as Go and libuv do. Each ECONNABORTED removes one
-         connection from the backlog, so the loop ends. *)
+         of macOS shows that macOS also gives it. Linux can give a pending
+         network error of the new connection, for example EPROTO. For these
+         errors, the world takes the next connection (design section 2.7, An
+         aborted connection). Each one removes one connection from the backlog,
+         so the loop ends. *)
       let rec take () =
         let ((r, _, _, _) as a) = accept fd in
-        if r = -econnaborted then take () else a
+        if r < 0 && Array.mem (-r) accept_retry then take () else a
       in
       let r, host, port, unix = take () in
       Some

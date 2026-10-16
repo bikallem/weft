@@ -1382,9 +1382,33 @@ let many_names () =
   less float_exact ~than:1.0 (Sys.time () -. t0) ;
   equal (list string) ["b"; "a"] (Weft_posix.addresses "b\000a\000b\000a\000")
 
+(* C4: on Linux, accept(2) can give a pending network error of the new
+   connection, and the world retries it. A test cannot cause these errors, so
+   this test examines the set of errors. An accept on a UDP socket gives
+   EOPNOTSUPP, and the world does not retry it: the accept raises. *)
+let accept_retry () =
+  equal (list string)
+    [ "ECONNABORTED"
+    ; "EPROTO"
+    ; "ENETDOWN"
+    ; "EHOSTUNREACH"
+    ; "ENETUNREACH"
+    ; "ENOPROTOOPT"
+    ; "EHOSTDOWN"
+    ; "ENONET" ]
+    (List.map Weft_posix.errname (Array.to_list Weft_posix.accept_retry)) ;
+  Weft_linux.run ~domains:1 (fun () ->
+      let s = Net.udp ("127.0.0.1", 0) in
+      raises_match
+        (function Net.Error (Net.Other "EOPNOTSUPP", _) -> true | _ -> false)
+        (fun () -> Net.accept s) ;
+      Net.close s )
+
 let review_2026 =
   group "review of 2026-10-16"
-    [test "C3: the names of 40,000 entries take linear time" many_names]
+    [ test "C3: the names of 40,000 entries take linear time" many_names
+    ; test "C4: accept retries the pending network errors on Linux" accept_retry
+    ]
 
 let () =
   exit
