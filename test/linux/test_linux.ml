@@ -1427,12 +1427,55 @@ let large_file_io () =
       equal string "....." (Bytes.sub_string dst 0 5) ;
       File.close f )
 
+(* P6: a worker writes the wake fd only when it adds an id to an empty mailbox.
+   The wake fd is the write end of a pipe here, so the bytes in the pipe count
+   the writes (8 bytes for each). 10 jobs complete with no take: one write.
+   After the take, the next job writes again. The old code wrote one time for
+   each job. *)
+let one_wake_write () =
+  let module Op = Private.Op in
+  let r, w = Weft_posix.pipe () in
+  is_true (r >= 0) ;
+  let p = Weft_posix.create_pool [|w|] in
+  let start () =
+    match Weft_posix.submit p (Op.Start (0, Op.Stat "/")) with
+    | Some (Ok id) ->
+        id
+    | _ ->
+        fail "the job did not start"
+  in
+  let finish id =
+    match Weft_posix.submit p (Op.Finish (id, Op.Stat "/")) with
+    | Some (Ok _) ->
+        ()
+    | _ ->
+        fail "the job did not finish"
+  in
+  let buf = Bytes.create 1024 in
+  let written () =
+    pool_idle (fun () -> Unix.sleepf 0.001) ;
+    Int.max 0 (Weft_posix.fd_read r buf 0 1024)
+  in
+  let ids = List.init 10 (fun _ -> start ()) in
+  equal int 8 (written ()) ;
+  let taken = Weft_posix.completions p 0 [] in
+  equal int 10 (List.length taken) ;
+  let id = start () in
+  equal int 8 (written ()) ;
+  equal int 1 (List.length (Weft_posix.completions p 0 [])) ;
+  List.iter finish (id :: ids) ;
+  Weft_posix.close_pool p ;
+  ignore (Weft_posix.close_fd r) ;
+  ignore (Weft_posix.close_fd w)
+
 let review_2026 =
   group "review of 2026-10-16"
     [ test "C3: the names of 40,000 entries take linear time" many_names
     ; test "C4: accept retries the pending network errors on Linux" accept_retry
     ; test "P4: a read and a write of 1 MiB allocate no OCaml string"
-        large_file_io ]
+        large_file_io
+    ; test "P6: a worker writes the wake fd only for an empty mailbox"
+        one_wake_write ]
 
 let () =
   exit

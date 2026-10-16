@@ -160,10 +160,17 @@ static void post(struct mbx *w, int dom, int64_t id) {
       b->cap = cap;
     }
     b->ids[b->n++] = id;
-    /* Under the lock: the close of the world cannot close the fd here. */
-    uint64_t one = 1;
-    ssize_t r = write(b->evfd, &one, sizeof one);
-    (void)r;
+    /* Only the add to an empty box writes the wake fd. The domain drains the
+       fd first, and then it takes all ids of the box under this lock. Thus
+       while the box is not empty, the fd holds the write of the first add
+       after the last take: a drain of that write comes before a take that
+       empties the box. Under the lock: the close of the world cannot close
+       the fd here. */
+    if (b->n == 1) {
+      uint64_t one = 1;
+      ssize_t r = write(b->evfd, &one, sizeof one);
+      (void)r;
+    }
   }
   pthread_mutex_unlock(&b->m);
 }

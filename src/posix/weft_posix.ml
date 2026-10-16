@@ -247,8 +247,10 @@ let create_pool wake_fds =
 let close_pool p = mbx_close p.mbx
 
 (* The completions of the jobs of a domain, before the other events [acc]. A
-   worker puts the id in the mailbox before it writes the wake fd, so a take
-   after the drain of the wake fd gets each id of this wake. *)
+   worker puts the id in the mailbox before it writes the wake fd, and it writes
+   the fd only when the mailbox was empty. Thus the world must take after each
+   drain of the wake fd: the take gets each id of this wake and of the adds that
+   did not write (weft_pool.c, post). *)
 let completions p domain acc =
   Array.fold_right
     (fun id acc -> World.Ready.External id :: acc)
