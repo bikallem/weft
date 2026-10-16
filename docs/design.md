@@ -240,7 +240,7 @@ The base events:
 |---|---|---|
 | `Net.readable fd`, `Net.writable fd` | The flag in the registration of the current domain (section 2.7) | Add the fiber to the waiters of that registration. Register the fd if it is new on this domain. |
 | `Time.at Mono t` | `Now Mono >= t` | Add the deadline to the heap of the current domain |
-| `Time.after Mono span` | A guard reads `Now Mono` and gives `Time.at Mono (now + span)` | As `at` |
+| `Time.after Mono span` | A guard reads `Now Mono` and gives the event of `at` for `now + span`. Its poll compares with the `now` of the guard and does not read the clock again (3.12, P8). A deadline that comes between the two goes to the heap, and the next poll expires it | As `at` |
 | `Chan.recv c`, `Chan.send c v` | A waiting partner | Add to the waiter list of `c` |
 | `Ivar.read v` | The value is set | Add to the waiters of `v` with a CAS on its state (The atomic register, below) |
 | `Process.exit pid` | The table of the world | A world interest |
