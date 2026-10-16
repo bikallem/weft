@@ -643,7 +643,9 @@ let blocked_threads () =
   Weft_linux.run ~domains:1 ~signals:[SIGUSR2] (fun () ->
       equal (list string) [] (Weft_linux.unblocked_threads [SIGUSR2]) ;
       (* No thread blocks SIGHUP. *)
-      is_true (Weft_linux.unblocked_threads [SIGUSR2; SIGHUP] <> []) )
+      is_true (Weft_linux.unblocked_threads [SIGUSR2; SIGHUP] <> []) ) ;
+  (* The close of the world restores the mask of the calling thread. *)
+  is_true (List.mem self (Weft_linux.unblocked_threads [SIGUSR2]))
 
 (* Run [f] in a fiber on domain 1. If the caller runs on domain 0, it computes,
    so domain 1 takes the new fiber. The caller can also run on domain 1, for
@@ -763,6 +765,21 @@ let watchdog () =
   equal int (before + 1) (Weft_linux.watchdog_reports ()) ;
   Weft_linux.run ~domains:1 ~watchdog:None (fun () -> busy_ms 50) ;
   equal int (before + 1) (Weft_linux.watchdog_reports ())
+
+(* A limit of the watchdog that is not positive raises. The run closes the world
+   first, so a later world can watch signals. *)
+let watchdog_limit () =
+  List.iter
+    (fun ns ->
+      raises
+        (Invalid_argument
+           "Weft_linux.run: the limit of the watchdog is not positive" )
+        (fun () ->
+          Weft_linux.run ~domains:1 ~signals:[SIGUSR1]
+            ~watchdog:(Some (Span.ns ns))
+            ignore ) ;
+      Weft_linux.close (Weft_linux.create ~signals:[SIGUSR1] ()) )
+    [0; -1]
 
 (* M3: a Posix sleep ends after its deadline on the wall clock. A sleep on Mono
    also passes this test: a step of the clock needs root, so only the simulator
@@ -1027,6 +1044,7 @@ let linux =
     ; test "a finaliser fills an Ivar from outside a fiber" finaliser_fill
     ; test "a failed promise that nobody awaits gives a report" promise_report
     ; test "the watchdog reports a fiber that computes 200 ms" watchdog
+    ; test "a limit of the watchdog that is not positive raises" watchdog_limit
     ; test "a Posix sleep ends after its deadline" posix_sleep
     ; test "a sleep sets the alarm of its clock one time" alarm_sets
     ; test "the world reads its eventfd and its timerfds after an event" drained

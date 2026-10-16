@@ -2427,6 +2427,25 @@ let pipes w =
               Pipe.close r ;
               equal string "EPIPE" (pipe_error (fun () -> Pipe.write wr "x")) ;
               Pipe.close wr ) )
+    ; test "a write after the reader closed gives EPIPE and no SIGPIPE"
+        (fun () ->
+          (* The world ignores SIGPIPE. An earlier world of the process can
+             ignore it already, so the test sets a handler first. The world
+             replaces it. *)
+          let got = Atomic.make false in
+          let old =
+            Sys.signal Sys.sigpipe
+              (Sys.Signal_handle (fun _ -> Atomic.set got true))
+          in
+          Fun.protect
+            ~finally:(fun () -> Sys.set_signal Sys.sigpipe old)
+            (fun () ->
+              w.run (fun () ->
+                  let r, wr = Pipe.create () in
+                  Pipe.close r ;
+                  equal string "EPIPE" (pipe_error (fun () -> Pipe.write wr "x")) ;
+                  Pipe.close wr ) ;
+              is_false (Atomic.get got) ) )
     ; test "each end has one direction" (fun () ->
           w.run (fun () ->
               let r, wr = Pipe.create () in
