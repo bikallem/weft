@@ -269,9 +269,29 @@ let beats_start_at_zero () =
     ignore (Sys.opaque_identity junk) ;
     Gc.full_major () ;
     let t = S.create ~domains:n () in
-    for i = 0 to n - 1 do
+    for i = 0 to Bigarray.Array1.dim t.S.beats - 1 do
       equal int 0 t.S.beats.{i}
     done
+  done
+
+(* Two domains do not write their beats in one cache line: the beats are 128
+   bytes or more apart (review 3.12, P2). *)
+let beats_apart () =
+  for n = 2 to 8 do
+    let t = S.create ~domains:n () in
+    let at = Array.make n (-1) in
+    Array.iteri
+      (fun d dom ->
+        S.beat dom ;
+        for i = 0 to Bigarray.Array1.dim t.S.beats - 1 do
+          if t.S.beats.{i} = 1 && not (Array.mem i at) then at.(d) <- i
+        done )
+      t.S.doms ;
+    Array.iteri
+      (fun d i ->
+        if d > 0 then
+          at_least int ~than:128 ((i - at.(d - 1)) * (Sys.word_size / 8)) )
+      at
   done
 
 let tests =
@@ -280,4 +300,5 @@ let tests =
   ; ring
   ; group "domains"
       [ test "the number of domains is 1 to 62" domains_range
-      ; test "the beats start at 0" beats_start_at_zero ] ]
+      ; test "the beats start at 0" beats_start_at_zero
+      ; test "the beats of two domains are 128 bytes apart" beats_apart ] ]

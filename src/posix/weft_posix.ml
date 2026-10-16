@@ -107,6 +107,7 @@ external pool_busy : unit -> int = "weft_pool_busy"
 
 external watchdog_start :
      (int, Bigarray.int_elt, Bigarray.c_layout) Bigarray.Array1.t
+  -> int
   -> int64
   -> nativeint = "weft_watchdog_start"
 
@@ -632,7 +633,10 @@ let run (type w) ~name (module W : Weft.WORLD with type t = w) (w : w) ~close
   let start (s : Sched.t) =
     Option.iter
       (fun limit ->
-        dog := Some (watchdog_start s.beats (Weft.Span.to_ns limit), s.beats) )
+        dog :=
+          Some
+            ( watchdog_start s.beats Sched.beat_stride (Weft.Span.to_ns limit)
+            , s.beats ) )
       watchdog
   in
   Fun.protect

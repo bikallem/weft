@@ -226,7 +226,9 @@ and t =
   ; beats: (int, Bigarray.int_elt, Bigarray.c_layout) Bigarray.Array1.t
         (** The beat of each domain, out of the OCaml heap: one more at the
             start of a fiber and one more at its end, so an odd value tells that
-            a fiber runs. The watchdog of a world reads it (M3). *)
+            a fiber runs. The watchdog of a world reads it (M3). The beat of
+            domain [i] is at [i * beat_stride], so each domain writes its own
+            cache line. *)
   ; mutable doms: dom array
   ; slack: int64
   ; fibers: (int, fiber) Hashtbl.t  (** The live fibers, for the debug. *)
@@ -1571,11 +1573,16 @@ let work_for dom =
       "a lost steal of the overflow queue costs only parallelism: the domain \
        that filled it takes it when its ring is empty"] )
 
+(* The distance in ints between the beats of two domains: 128 bytes on a 64-bit
+   system. Thus two domains do not write one cache line, also with a CPU that
+   fetches the lines in pairs. The watchdog gets this value from
+   [Weft_posix.run]. *)
+let beat_stride = 16
+
 (* Only the domain writes its beat. *)
 let beat dom =
-  let b = dom.sched.beats in
-  Bigarray.Array1.unsafe_set b dom.index
-    (Bigarray.Array1.unsafe_get b dom.index + 1)
+  let b = dom.sched.beats and i = dom.index * beat_stride in
+  Bigarray.Array1.unsafe_set b i (Bigarray.Array1.unsafe_get b i + 1)
 
 let run_ready dom r =
   r.rfiber.queued <- false ;
@@ -1881,7 +1888,8 @@ let create ?(slack = Span.us 100) ?(simulated = false) ~domains () =
     { run_id= Atomic.fetch_and_add next_run 1
     ; beats=
         (let b =
-           Bigarray.Array1.create Bigarray.int Bigarray.c_layout domains
+           Bigarray.Array1.create Bigarray.int Bigarray.c_layout
+             (domains * beat_stride)
          in
          Bigarray.Array1.fill b 0 ; b )
     ; doms= [||]
