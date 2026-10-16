@@ -455,10 +455,7 @@ let spawn_args (sp : Op.spawn) =
 (* The result of [spawn_child]: (pid or -errno, the pidfd, stdin, stdout,
    stderr), with -1 for no pipe. *)
 let spawned_of (pid, pidfd, i, o, e) =
-  let fd x =
-    if (x < 0) [@mutate off "fd 0 is the stdin of the process"] then None
-    else Some x
-  in
+  let fd x = if x < 0 then None else Some x in
   Result.map
     (fun pid ->
       {Op.pid; pidfd; to_stdin= fd i; from_stdout= fd o; from_stderr= fd e} )

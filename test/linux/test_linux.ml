@@ -379,20 +379,26 @@ let detached_threads () =
           release fifo held ) ) ;
   equal int before (open_fds ())
 
+(* Run [f] with stderr in the file [log]. *)
+let with_stderr log f =
+  let fd = Unix.openfile log [O_WRONLY; O_CREAT] 0o600 in
+  Fun.protect
+    ~finally:(fun () -> Unix.close fd)
+    (fun () ->
+      let saved = Unix.dup Unix.stderr in
+      Fun.protect
+        ~finally:(fun () ->
+          Unix.dup2 saved Unix.stderr ;
+          Unix.close saved )
+        (fun () -> Unix.dup2 fd Unix.stderr ; f ()) )
+
 (* A pool that is full for more than 1 s writes one warning to stderr. *)
 let full_warning () =
   let fifo = new_fifo () in
   let log = Filename.concat (Filename.dirname fifo) "stderr" in
   let before = open_fds () in
-  let fd = Unix.openfile log [O_WRONLY; O_CREAT] 0o600 in
-  let saved = Unix.dup Unix.stderr in
   let w0 = Weft_linux.pool_warnings () in
-  Unix.dup2 fd Unix.stderr ;
-  Fun.protect
-    ~finally:(fun () ->
-      Unix.dup2 saved Unix.stderr ;
-      Unix.close saved )
-    (fun () ->
+  with_stderr log (fun () ->
       Weft_linux.run ~domains:1 (fun () ->
           Fiber.scope (fun s ->
               let held = hold s fifo pool_max in
@@ -400,7 +406,6 @@ let full_warning () =
                   Fiber.with_timeout Mono (Span.ms 1300) (fun () ->
                       File.stat "/" ) ) ;
               release fifo held ) ) ) ;
-  Unix.close fd ;
   equal int before (open_fds ()) ;
   equal int (w0 + 1) (Weft_linux.pool_warnings ()) ;
   let text = In_channel.with_open_text log In_channel.input_all in
@@ -409,13 +414,25 @@ let full_warning () =
      jobs that run 0\n"
     text
 
-(* [true] if the fd with the number [n] (a text) is open. *)
-let is_open n =
+(* The target of the fd with the number [n] (a text), or [None] if the fd is not
+   open. *)
+let fd_target n =
   match Unix.readlink ("/proc/self/fd/" ^ n) with
-  | _ ->
-      true
+  | l ->
+      Some l
   | exception Unix.Unix_error _ ->
-      false
+      None
+
+let is_open n = Option.is_some (fd_target n)
+
+(* The numbers of the open fds with the target [l]. *)
+let fds_of l =
+  List.filter
+    (fun n -> fd_target n = Some l)
+    (Array.to_list (Sys.readdir "/proc/self/fd"))
+
+(* The Unix fd with the number [n]. On Unix, an fd is its number. *)
+let fd_of_int : int -> Unix.file_descr = Obj.magic
 
 (* The pool does the close of a file, because a close of a file can block
    (design section 2.7). The close of another fd is at once, also if the fd has
@@ -463,6 +480,56 @@ let pool_closes_files () =
           release fifo held ) ;
       List.iter Net.close others ) ;
   equal int before (open_fds ())
+
+(* A job that a run detaches can end after the close of the world. The close
+   closes the mailboxes of the pool, so the worker then writes no eventfd. If
+   not, the worker writes 8 bytes to the old number of the eventfd. Here, the
+   write end of a pipe gets that number after the run. *)
+let detached_after_close () =
+  let fifo = new_fifo () in
+  let n =
+    Weft_linux.run ~domains:1 (fun () ->
+        let n =
+          match fds_of "anon_inode:[eventfd]" with
+          | [n] ->
+              fd_of_int (int_of_string n)
+          | _ ->
+              fail "the world does not have one eventfd"
+        in
+        raises Fiber.Timeout (fun () ->
+            Fiber.with_timeout Mono (Span.ms 50) (fun () ->
+                File.openfile [Read] fifo ) ) ;
+        n )
+  in
+  (* Each fd in [opened] has its own number. *)
+  let opened = ref [] in
+  let keep fd =
+    opened := fd :: !opened ;
+    fd
+  in
+  Fun.protect
+    ~finally:(fun () ->
+      List.iter Unix.close !opened ;
+      Sys.remove fifo )
+    (fun () ->
+      let r0, w = Unix.pipe ~cloexec:true () in
+      let r0 = keep r0 and w = keep w in
+      (* If the read end has the number, dup2 replaces it. *)
+      let r = if r0 = n then keep (Unix.dup ~cloexec:true r0) else r0 in
+      if w <> n then (
+        Unix.dup2 ~cloexec:true w n ;
+        if r0 <> n then ignore (keep n) ) ;
+      ignore (keep (Unix.openfile fifo [O_RDWR] 0)) ;
+      pool_idle (fun () -> Unix.sleepf 0.001) ;
+      Unix.set_nonblock r ;
+      let got =
+        match Unix.read r (Bytes.create 8) 0 8 with
+        | k ->
+            k
+        | exception Unix.Unix_error ((EAGAIN | EWOULDBLOCK), _, _) ->
+            0
+      in
+      equal int 0 got )
 
 (* UDP on Linux: IPv6, the size limit, and the sizes of the buffers, which the
    simulator copies. *)
@@ -605,6 +672,27 @@ let child_output () =
       | exception Process.Error (Net.No_entry, "Process.spawn") ->
           () )
 
+(* With stdin closed, the end of the parent for [~stdout:Piped] gets fd 0. The
+   test closes stdin in the run, after the world opened its fds. *)
+let piped_fd_zero () =
+  Weft_linux.run ~domains:1 (fun () ->
+      let saved = Unix.dup ~cloexec:true Unix.stdin in
+      Unix.close Unix.stdin ;
+      Fun.protect
+        ~finally:(fun () ->
+          Unix.dup2 ~cloexec:false saved Unix.stdin ;
+          Unix.close saved )
+        (fun () ->
+          let p = Process.spawn ~stdout:Piped "sh" ["-c"; "echo hi"] in
+          is_true
+            (Option.fold ~none:false
+               ~some:(String.starts_with ~prefix:"pipe:")
+               (fd_target "0") ) ;
+          let out = Option.get (Process.stdout p) in
+          equal string "hi\n" (read_pipe out) ;
+          Pipe.close out ;
+          is_true (Process.wait p = Process.Exited 0) ) )
+
 (* SIGTERM to the process: a fiber that waits gets it, and run ends. *)
 let sigterm () =
   let n =
@@ -647,26 +735,48 @@ let blocked_threads () =
   (* The close of the world restores the mask of the calling thread. *)
   is_true (List.mem self (Weft_linux.unblocked_threads [SIGUSR2]))
 
-(* Run [f] in a fiber on domain 1. If the caller runs on domain 0, it computes,
-   so domain 1 takes the new fiber. The caller can also run on domain 1, for
-   example after a sleep. *)
-let on_domain_1 f =
-  let dom () = Private.Sched.prog "test" Private.Sched.Dom_index in
+(* The id of the calling thread, from /proc/thread-self ("pid/task/tid"). *)
+let thread_id () = Filename.basename (Unix.readlink "/proc/thread-self")
+
+(* The index of the domain of the calling fiber. *)
+let dom () = Private.Sched.prog "test" Private.Sched.Dom_index
+
+(* Compute for [s] seconds, or until [stop] gives [true]. *)
+let spin ?(stop = fun () -> false) s =
+  let t0 = Unix.gettimeofday () in
+  while (not (stop ())) && Unix.gettimeofday () -. t0 < s do
+    ()
+  done
+
+(* Run [f] in a fiber on domain 1, and give its result. The caller forks a fiber
+   and computes for a maximum of 100 ms, so domain 1 takes the fiber. If the
+   fiber runs on domain 0, the caller forks again, 20 times at most. The caller
+   computes until [f] ends. With [~sleep:true], it computes only until the fiber
+   starts, and then it waits: thus domain 0 can sleep while [f] runs. *)
+let fork_on_domain_1 ?(sleep = false) f =
   let rec go tries =
     if tries = 0 then failwith "no fiber ran on domain 1" ;
-    let ran = Atomic.make None in
-    Fiber.scope (fun s ->
-        Fiber.fork s (fun () ->
-            let d = dom () in
-            if d = 1 then f () ;
-            Atomic.set ran (Some d) ) ;
-        let t0 = Unix.gettimeofday () in
-        while Atomic.get ran = None && Unix.gettimeofday () -. t0 < 0.1 do
-          ()
-        done ) ;
-    if Atomic.get ran <> Some 1 then go (tries - 1)
+    let started = Atomic.make false and ended = Atomic.make false in
+    let r =
+      Fiber.scope (fun s ->
+          let p =
+            Fiber.fork_promise s (fun () ->
+                Atomic.set started true ;
+                let r = if dom () = 1 then Some (f ()) else None in
+                Atomic.set ended true ; r )
+          in
+          spin
+            ~stop:(fun () -> Atomic.get (if sleep then started else ended))
+            0.1 ;
+          Promise.await p )
+    in
+    match r with Some x -> x | None -> go (tries - 1)
   in
-  if dom () = 1 then f () else go 20
+  go 20
+
+(* Run [f] in a fiber on domain 1. The caller can also run on domain 1, for
+   example after a sleep. *)
+let on_domain_1 f = if dom () = 1 then f () else fork_on_domain_1 f
 
 (* In the process of the test: the waiter raises, a later received and a second
    unwatch raise, and SIGTERM stays an event. The thread of the unwatch and the
@@ -706,39 +816,17 @@ let unwatch_waiter () =
        (string_of_int (Unix.getpid ()))
        (Weft_linux.unblocked_threads [SIGUSR2]) )
 
-(* The id of the calling thread, from /proc/thread-self ("pid/task/tid"). *)
-let thread_id () = Filename.basename (Unix.readlink "/proc/thread-self")
-
-let domain_index () = Private.Sched.prog "test" Private.Sched.Dom_index
-
-(* Compute for [s] seconds, or until [stop] gives [true]. *)
-let spin ?(stop = fun () -> false) s =
-  let t0 = Unix.gettimeofday () in
-  while (not (stop ())) && Unix.gettimeofday () -. t0 < s do
-    ()
-  done
-
 (* An unwatch on domain 1 leaves the unblock of the thread of domain 0 to that
-   thread. Domain 1 waits first here: after the unwatch, a pinned fiber computes
-   on domain 0 for 50 ms. The wait of domain 1 must not take the unblock. *)
+   thread. Here, domain 1 waits first: after the unwatch, a pinned fiber
+   computes on domain 0 for 50 ms. The wait of domain 1 must not take the
+   unblock, and the thread of run unblocks the signal at its next wait. *)
 let unwatch_unblock0 () =
   let self = string_of_int (Unix.getpid ()) in
   Weft_linux.run ~domains:2 ~watchdog:None ~signals:[SIGUSR2] (fun () ->
       Fiber.scope (fun s ->
           Fiber.fork ~pinned:true s (fun () ->
-              let rec go tries =
-                if tries = 0 then failwith "no fiber ran on domain 1" ;
-                let ran = Atomic.make None in
-                Fiber.scope (fun s ->
-                    Fiber.fork s (fun () ->
-                        let d = domain_index () in
-                        if d = 1 then Signal.unwatch SIGUSR2 ;
-                        Atomic.set ran (Some d) ) ;
-                    spin ~stop:(fun () -> Atomic.get ran <> None) 0.1 ;
-                    if Atomic.get ran = Some 1 then spin 0.05 ) ;
-                if Atomic.get ran <> Some 1 then go (tries - 1)
-              in
-              go 20 ;
+              fork_on_domain_1 (fun () -> Signal.unwatch SIGUSR2) ;
+              spin 0.05 ;
               Time.sleep Mono (Span.ms 10) ;
               is_true (List.mem self (Weft_linux.unblocked_threads [SIGUSR2])) ) ) )
 
@@ -752,32 +840,20 @@ let unwatch_wakes_domain0 () =
   Weft_linux.run ~domains:2 ~watchdog:None ~signals:[SIGUSR2] (fun () ->
       Fiber.scope (fun s ->
           Fiber.fork ~pinned:true s (fun () ->
-              let rec go tries =
-                if tries = 0 then failwith "no fiber ran on domain 1" ;
-                let started = Atomic.make false and result = Ivar.create () in
-                Fiber.fork s (fun () ->
-                    if domain_index () <> 1 then Ivar.fill result None
-                    else (
-                      Atomic.set started true ;
-                      Unix.sleepf 0.05 ;
-                      Signal.unwatch SIGUSR2 ;
-                      let own = unblocked (thread_id ()) in
-                      let t0 = Unix.gettimeofday () in
-                      while
-                        (not (unblocked self))
-                        && Unix.gettimeofday () -. t0 < 0.5
-                      do
-                        Unix.sleepf 0.001
-                      done ;
-                      Ivar.fill result (Some (own, unblocked self)) ) ) ;
-                spin ~stop:(fun () -> Atomic.get started) 0.1 ;
-                match sync (Ivar.read result) with
-                | None ->
-                    go (tries - 1)
-                | Some (own, zero) ->
-                    is_true own ; is_true zero
+              let own, zero =
+                fork_on_domain_1 ~sleep:true (fun () ->
+                    Unix.sleepf 0.05 ;
+                    Signal.unwatch SIGUSR2 ;
+                    let own = unblocked (thread_id ()) in
+                    let t0 = Unix.gettimeofday () in
+                    while
+                      (not (unblocked self)) && Unix.gettimeofday () -. t0 < 0.5
+                    do
+                      Unix.sleepf 0.001
+                    done ;
+                    (own, unblocked self) )
               in
-              go 20 ) ) )
+              is_true own ; is_true zero ) ) )
 
 (* M3: a finaliser fills an Ivar from outside a fiber, and the fiber that waits
    wakes. *)
@@ -883,8 +959,8 @@ let alarm_sets () =
     Weft_linux.run ~domains:1 ~watchdog:None sleep ;
     Weft_linux.alarm_sets () - n
   in
-  equal int 1 (sets (fun () -> Time.sleep Mono (Span.ms 1))) ;
-  equal int 1 (sets (fun () -> Time.sleep Posix (Span.ms 1)))
+  equal int 1 (sets (fun () -> Time.sleep Mono (Span.ms 20))) ;
+  equal int 1 (sets (fun () -> Time.sleep Posix (Span.ms 20)))
 
 (* The fds of the process of a kind, for example "eventfd", with the value of a
    field of their fdinfo, for example "ticks:". *)
@@ -915,9 +991,9 @@ let drained () =
       (* A job of the pool writes the eventfd at its end. *)
       ignore (File.stat "/") ;
       equal (list string) ["0"] (fdinfo "eventfd" "eventfd-count:") ;
-      Time.sleep Mono (Span.ms 1) ;
+      Time.sleep Mono (Span.ms 20) ;
       equal (list string) ["0"; "0"] (fdinfo "timerfd" "ticks:") ;
-      Time.sleep Posix (Span.ms 1) ;
+      Time.sleep Posix (Span.ms 20) ;
       equal (list string) ["0"; "0"] (fdinfo "timerfd" "ticks:") )
 
 (* M3: a reader whose reads always find data yields after 64 KiB, so a timer on
@@ -1072,14 +1148,6 @@ let one_signal_world () =
     [0; 63] ;
   Weft_linux.close (Weft_linux.create ~signals:[SIGUSR1] ())
 
-(* [true] if [sub] is a part of [s]. *)
-let contains s sub =
-  let n = String.length sub in
-  let rec at i =
-    i + n <= String.length s && (String.sub s i n = sub || at (i + 1))
-  in
-  at 0
-
 (* create ~signals writes a warning for each thread that does not block the
    signals. A domain that starts before the create does not block them. *)
 let unblocked_warning () =
@@ -1092,31 +1160,25 @@ let unblocked_warning () =
           Unix.sleepf 0.001
         done )
   in
-  let rec wait () =
-    match Atomic.get tid with
-    | Some t ->
-        t
-    | None ->
-        Unix.sleepf 0.001 ; wait ()
-  in
-  let tid = wait () in
-  let fd = Unix.openfile log [O_WRONLY; O_CREAT] 0o600 in
-  let saved = Unix.dup Unix.stderr in
-  Unix.dup2 fd Unix.stderr ;
   Fun.protect
-    ~finally:(fun () ->
-      Unix.dup2 saved Unix.stderr ;
-      Unix.close saved ;
-      Unix.close fd ;
-      Atomic.set stop true ;
-      Domain.join d )
-    (fun () -> Weft_linux.close (Weft_linux.create ~signals:[SIGUSR1] ())) ;
-  let text = In_channel.with_open_text log In_channel.input_all in
-  is_true
-    (contains text
-       ( "weft: thread " ^ tid
-       ^ " does not block the signals of run ~signals: a signal can go to it\n"
-       ) )
+    ~finally:(fun () -> Atomic.set stop true ; Domain.join d)
+    (fun () ->
+      spin ~stop:(fun () -> Atomic.get tid <> None) 10. ;
+      let tid =
+        match Atomic.get tid with
+        | Some t ->
+            t
+        | None ->
+            fail "the domain did not start in 10 s"
+      in
+      with_stderr log (fun () ->
+          Weft_linux.close (Weft_linux.create ~signals:[SIGUSR1] ()) ) ;
+      contains
+        ~sub:
+          ( "weft: thread " ^ tid
+          ^ " does not block the signals of run ~signals: a signal can go to it\n"
+          )
+        (In_channel.with_open_text log In_channel.input_all) )
 
 (* With stdin closed, the signalfd of the world is fd 0. The world gets a signal
    on it, an unwatch works, and the close of the world closes it. A world that
@@ -1191,7 +1253,10 @@ let failed_create () =
       (Sys.readdir "/proc/self/fd")
   in
   with_fd_limit (top + 16) (fun () ->
-      let spare = ref (fill_fds ()) in
+      let spare = ref [] in
+      Fun.protect ~finally:(fun () -> List.iter Unix.close !spare)
+      @@ fun () ->
+      spare := fill_fds () ;
       let free k =
         for _ = 1 to k do
           match !spare with
@@ -1220,10 +1285,9 @@ let failed_create () =
           spare := fill_fds () @ !spare )
         [ (0, "signalfd")
         ; (1, "epoll_create1")
-        ; (2, "eventfd")
+        ; (2, "eventfd") (* The timerfd of Mono, then the timerfd of Posix. *)
         ; (3, "timerfd_create")
-        ; (4, "timerfd_create") ] ;
-      List.iter Unix.close !spare ) ;
+        ; (4, "timerfd_create") ] ) ;
   Weft_linux.close (Weft_linux.create ~signals:[SIGUSR1] ()) ;
   equal int before (open_fds ())
 
@@ -1258,8 +1322,11 @@ let linux =
         detached_threads
     ; test "a pool that is full for more than 1 s writes a warning" full_warning
     ; test "the pool closes a file, and only a file" pool_closes_files
+    ; test "a job that ends after the close of the world writes no fd"
+        detached_after_close
     ; test "a child stops at SIGINT" child_sigint
     ; test "the pipes of a child" child_output
+    ; test "with stdin closed, the pipe of a child can be fd 0" piped_fd_zero
     ; test "SIGTERM to the process is an event" sigterm
     ; test "C7: Other_signal 10 is SIGUSR1" signal_number
     ; test "each thread of run ~signals blocks the signals" blocked_threads
@@ -1268,7 +1335,9 @@ let linux =
     ; test ~timeout:30. "after Signal.unwatch, SIGINT ends a busy process"
         (Portable.unwatch_busy world)
     ; test "a waiter at Signal.unwatch raises" unwatch_waiter
-    ; test "after an unwatch on domain 1, only domain 0 unblocks its thread"
+    ; test
+        "after an unwatch and a wait on domain 1, the thread of run unblocks \
+         the signal"
         unwatch_unblock0
     ; test "an unwatch on domain 1 wakes domain 0" unwatch_wakes_domain0
     ; test "only one world at a time watches signals" one_signal_world
