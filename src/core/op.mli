@@ -181,15 +181,18 @@ type _ t =
       (** The status of a child that exited, and the end of the zombie. [None]
           while the child runs. *)
   | Kill : fd * signal -> unit t  (** Sends a signal to a child. *)
-  | Watch : signal -> signal t
-      (** [Ok s] if the world gives this signal as [Ready.Signal s]: [s] is the
-          form of the signal in [Ready.Signal], for example [SIGUSR1] for
-          [Other_signal 10] on Linux. *)
-  | Unwatch : signal -> signal t
+  | Watch : signal -> signal option t
+      (** [Ok (Some s)] if the world gives this signal as [Ready.Signal s]: [s]
+          is the form of the signal in [Ready.Signal], for example [SIGUSR1] for
+          [Other_signal 10] on Linux. [Ok None] if the world does not watch the
+          signal. *)
+  | Unwatch : signal -> signal option t
       (** Stops the watch of a signal: the signal gets its action again, the
           action that it had before [run]. A signal that came and that the world
-          did not give yet also gets the action. [Ok s] gives the form of the
-          signal, as [Watch]. *)
+          did not give yet also gets the action. [Ok (Some s)] gives the form of
+          the signal, as [Watch]. [Ok None] if the world does not watch the
+          signal. [Error] is an error of the OS, and the world then still
+          watches the signal. *)
   | Resend : signal -> unit t
       (** Sends the signal to the process itself, after an [Unwatch]: the signal
           gets its action. *)

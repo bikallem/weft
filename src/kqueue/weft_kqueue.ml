@@ -238,14 +238,13 @@ let unwatch t s =
   let s = signal_of (number_of s) in
   Mutex.protect t.lock (fun () ->
       let watched = Atomic.get t.watched in
-      if not (List.mem s watched) then
-        Error (Op.Other "the world does not watch this signal")
+      if not (List.mem s watched) then Ok None
       else
         let n = number_of s in
         Atomic.set t.watched (List.filter (fun x -> x <> s) watched) ;
         sig_restore n (List.assoc n t.old_actions) ;
         if sig_take n > 0 then ignore (resend n) ;
-        Ok s )
+        Ok (Some s) )
 
 (* The signals that came since the last take, for the wait of domain 0. *)
 let signals t acc =
@@ -275,8 +274,7 @@ module World = struct
       match proc t fd with Some p -> kill t p s | None -> Error Op.Bad_fd )
     | Op.Watch s ->
         let s = signal_of (number_of s) in
-        if List.mem s (Atomic.get t.watched) then Ok s
-        else Error (Op.Other "the world does not watch this signal")
+        Ok (if List.mem s (Atomic.get t.watched) then Some s else None)
     | Op.Unwatch s ->
         unwatch t s
     | Op.Register (d, fd, token) ->

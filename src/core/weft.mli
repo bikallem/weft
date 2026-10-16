@@ -828,7 +828,10 @@ module Signal : sig
 
       @raise Invalid_argument
         if the world does not watch [s], also after an earlier [unwatch s], or
-        if [s] cannot be an event. *)
+        if [s] cannot be an event.
+      @raise Net.Error
+        if the OS gives an error, for example [ENOMEM] of [signalfd]. Then the
+        world still watches [s]. *)
 end
 
 module Process : sig

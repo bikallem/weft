@@ -793,7 +793,8 @@ let time =
     ; test "Time.now outside run raises Not_in_fiber" time_outside_fiber ]
 
 (* A world that watches each signal and gives the signals of [batches], one
-   batch at each wait. It records each signal that the core sends again. *)
+   batch at each wait. It records each signal that the core sends again. Its
+   unwatch of SIGHUP gives an error of the OS. *)
 module Signals = struct
   type t =
     { mutable batches: Private.World.Ready.t list list
@@ -805,9 +806,11 @@ module Signals = struct
    fun t op ->
     match op with
     | Private.Op.Watch s ->
-        Ok s
+        Ok (Some s)
+    | Private.Op.Unwatch SIGHUP ->
+        Error (Private.Op.No_resources "ENOMEM")
     | Private.Op.Unwatch s ->
-        Ok s
+        Ok (Some s)
     | Private.Op.Resend s ->
         t.resent <- s :: t.resent ;
         Ok ()
@@ -850,7 +853,26 @@ let signal_count_zero () =
   equal int 2 n ;
   equal int 0 (List.length w.resent)
 
+(* X1: an error of the OS in an unwatch is [Net.Error], not [Invalid_argument]:
+   the world still watches the signal. *)
+let unwatch_error () =
+  let w = {Signals.batches= []; resent= []} in
+  Weft.run
+    (module Signals)
+    w
+    (fun () ->
+      raises_match
+        (function
+          | Net.Error (No_resources "ENOMEM", "Signal.unwatch") ->
+              true
+          | _ ->
+              false )
+        (fun () -> Signal.unwatch SIGHUP) ) ;
+  equal int 0 (List.length w.resent)
+
 let signals =
-  group "signals" [test "a count of 0 is not a signal" signal_count_zero]
+  group "signals"
+    [ test "a count of 0 is not a signal" signal_count_zero
+    ; test "X1: an error of the OS in unwatch raises Net.Error" unwatch_error ]
 
 let tests = [world; events; span; time; signals]

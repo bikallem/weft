@@ -120,8 +120,8 @@ type _ t =
   | Spawn : spawn -> spawned t
   | Wait_child : fd -> status option t
   | Kill : fd * signal -> unit t
-  | Watch : signal -> signal t
-  | Unwatch : signal -> signal t
+  | Watch : signal -> signal option t
+  | Unwatch : signal -> signal option t
   | Resend : signal -> unit t
   | Detach : int -> unit t
 

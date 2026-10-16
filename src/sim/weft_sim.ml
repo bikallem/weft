@@ -1269,14 +1269,13 @@ let submit : type a. t -> a Op.t -> (a, Op.error) result =
         Error Op.Bad_fd )
   | Op.Watch sg ->
       let sg = normal sg in
-      if List.mem sg t.watched then Ok sg
-      else Error (Op.Other "the world does not watch this signal")
+      Ok (if List.mem sg t.watched then Some sg else None)
   | Op.Unwatch sg ->
       let sg = normal sg in
       if List.mem sg t.watched then (
         t.watched <- List.filter (fun x -> x <> sg) t.watched ;
-        Ok sg )
-      else Error (Op.Other "the world does not watch this signal")
+        Ok (Some sg) )
+      else Ok None
   | Op.Resend sg ->
       send_self t sg ; Ok ()
   | Op.Fd_read (fd, buf, off, len) -> (

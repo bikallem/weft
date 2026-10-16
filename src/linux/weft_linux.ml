@@ -222,8 +222,7 @@ let unwatch t s =
   let s = signal_of (number_of s) in
   Mutex.protect t.unwatch_lock (fun () ->
       let watched = Atomic.get t.watched in
-      if not (List.mem s watched) then
-        Error (Op.Other "the world does not watch this signal")
+      if not (List.mem s watched) then Ok None
       else
         let rest = List.filter (fun x -> x <> s) watched in
         let r = signalfd t.sigfd (Array.of_list (List.map number_of rest)) in
@@ -238,7 +237,7 @@ let unwatch t s =
           in
           add () ;
           ignore (eventfd_signal t.doms.(0).evfd) ;
-          Ok s ) )
+          Ok (Some s) ) )
 
 (* The calls of timerfd_settime, for the measurements. *)
 let alarm_sets = Atomic.make 0
@@ -260,8 +259,7 @@ module World = struct
         unit (pidfd_kill fd (number_of s))
     | Op.Watch s ->
         let s = signal_of (number_of s) in
-        if List.mem s (Atomic.get t.watched) then Ok s
-        else Error (Op.Other "the world does not watch this signal")
+        Ok (if List.mem s (Atomic.get t.watched) then Some s else None)
     | Op.Unwatch s ->
         unwatch t s
     | Op.Register (d, fd, token) ->
