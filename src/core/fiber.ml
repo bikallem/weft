@@ -20,15 +20,17 @@ let scope ?handler f = Sched.scope ?handler f
 
 let fork ?name ?pinned scope f = Sched.fork ?name ?pinned scope f
 
-(* A [Cancelled] is not an error of the fiber: it goes to the scope, which
-   ignores it. If [on_error] raises, the scope fails (design section 2.5,
-   Errors). *)
+(* A [Cancelled] of a cancelled scope is not an error of the fiber: it goes to
+   the scope, which ignores it. A [Cancelled] from a scope inside [f] that [f]
+   cancelled is an error as each other exception is. If [on_error] raises, the
+   scope fails (design section 2.5, Errors). *)
 let fork_isolated ?name ?pinned scope ~on_error f =
   fork ?name ?pinned scope (fun () ->
       match f () with
       | () ->
           ()
-      | exception (Cancelled _ as e) ->
+      | exception (Cancelled _ as e)
+        when Option.is_some (Sched.first_flag scope) ->
           raise e
       | exception e ->
           on_error e (Printexc.get_raw_backtrace ()) )

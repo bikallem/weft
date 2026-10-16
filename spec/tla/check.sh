@@ -114,6 +114,7 @@ scope() { want Scope || return 0 # expect scenario joinCancellable shieldNotNode
     "Scenario=\"$2\"" BugJoinCancellable="$3" BugShieldNotNode="$4" SimpNoRecheck="$5" \
     BugNoChainCheck="$6" BugExnAfterEnd="$7" BugNoFlagCheck="$8" \
     SimpNoChildFlags="${9:-FALSE}" BugCondOuterCtx="${10:-FALSE}" \
+    BugAnyCancelled="${11:-FALSE}" \
     defaultInitValue=defaultInitValue
 }
 #     expect scenario join  shield recheck chain exn   flag
@@ -142,6 +143,9 @@ scope fail   condwait FALSE FALSE  FALSE   FALSE FALSE FALSE FALSE TRUE
 # M3: the deadline form of with_timeout. A walk of T can come after T closed.
 scope pass   deadline FALSE FALSE  FALSE   FALSE FALSE FALSE
 scope fail   deadline FALSE TRUE   FALSE   FALSE FALSE FALSE
+# The review of 2026-10-16, C1: the scope ignores each Cancelled of a member,
+# also one from a scope inside the member while S is not cancelled.
+scope fail   error    FALSE FALSE  FALSE   FALSE FALSE FALSE FALSE FALSE TRUE
 
 ivar() { want Ivar || return 0 # expect directFill nonAtomicRegister
   run Ivar "$1" "AtMostOneResume FullNoWaiters OneFill EndState" \

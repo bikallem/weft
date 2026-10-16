@@ -1217,10 +1217,108 @@ let portable_world_4 =
          let d = Printf.sprintf "/tmp%d" !n in
          Dir.mkdir d ; d ) }
 
+(* The review of 2026-10-16 (design section 3.12). *)
+
+(* C1: a fiber cancels a scope inside it, and the Cancelled of that scope goes
+   out of the fiber. Nobody cancelled the scope of the fiber, thus the Cancelled
+   is a failure of that scope. *)
+let inner_cancel_fails_fork () =
+  run (fun () ->
+      match
+        Fiber.scope (fun o ->
+            Fiber.fork o (fun () ->
+                Fiber.scope (fun s ->
+                    Fiber.cancel s (Boom "inner") ;
+                    Fiber.yield () ) ) )
+      with
+      | () ->
+          failwith "the scope gave no failure"
+      | exception Fiber.Cancelled (Boom m) ->
+          equal string "inner" m )
+
+(* C1: the body of a scope raises the Cancelled of a scope inside it. The scope
+   fails, and it cancels the other fiber at once. *)
+let inner_cancel_fails_body () =
+  run (fun () ->
+      let t0 = Time.now Mono in
+      let other = ref "running" in
+      ( match
+          Fiber.scope (fun o ->
+              Fiber.fork o (fun () ->
+                  try
+                    Time.sleep Mono (Span.s 100) ;
+                    other := "ended"
+                  with Fiber.Cancelled _ as e ->
+                    other := "cancelled" ;
+                    raise e ) ;
+              Fiber.scope (fun s ->
+                  Fiber.fork s (fun () -> Fiber.cancel s (Boom "inner")) ;
+                  Time.sleep Mono (Span.s 1) ) )
+        with
+      | () ->
+          failwith "the scope gave no failure"
+      | exception Fiber.Cancelled (Boom m) ->
+          equal string "inner" m ) ;
+      equal string "cancelled" !other ;
+      equal int 0 (ms_since t0) )
+
+(* C1: the Cancelled of a scope inside an isolated fiber goes to [on_error]. *)
+let inner_cancel_isolated () =
+  run (fun () ->
+      let errors = ref [] in
+      Fiber.scope (fun s ->
+          Fiber.fork_isolated s
+            ~on_error:(fun e _ -> errors := e :: !errors)
+            (fun () ->
+              Fiber.scope (fun inner ->
+                  Fiber.cancel inner (Boom "inner") ;
+                  Fiber.yield () ) ) ) ;
+      match !errors with
+      | [Fiber.Cancelled (Boom m)] ->
+          equal string "inner" m
+      | _ ->
+          failwith "on_error did not get one Cancelled" )
+
+(* C1: the Cancelled of a scope inside a promise is a failure of the promise,
+   not a cancel of it. *)
+let inner_cancel_promise () =
+  run (fun () ->
+      Fiber.scope (fun s ->
+          let p =
+            Fiber.fork_promise s (fun () ->
+                Fiber.scope (fun inner ->
+                    Fiber.cancel inner (Boom "inner") ;
+                    Fiber.yield () ) )
+          in
+          match Promise.await p with
+          | () ->
+              failwith "the promise gave no failure"
+          | exception Fiber.Cancelled (Boom m) ->
+              equal string "inner" m ) )
+
+let review_2026 =
+  group "review of 2026-10-16"
+    [ test "C1: a Cancelled from an inner scope fails a fork"
+        inner_cancel_fails_fork
+    ; test "C1: a Cancelled from an inner scope fails the body"
+        inner_cancel_fails_body
+    ; test "C1: a Cancelled from an inner scope goes to on_error"
+        inner_cancel_isolated
+    ; test "C1: a Cancelled from an inner scope fails a promise"
+        inner_cancel_promise ]
+
 let () =
   exit
     (Windtrap.run "sim"
-       ( [time; timers; events; chans; scopes; reviews; checks; properties]
+       ( [ time
+         ; timers
+         ; events
+         ; chans
+         ; scopes
+         ; reviews
+         ; review_2026
+         ; checks
+         ; properties ]
        @ Test_net.tests @ Test_m1.tests @ Test_m2.tests @ Test_m3.tests
        @ Test_wakes.tests @ Test_io.tests @ Test_sync.tests
        @ Portable.tests portable_world

@@ -67,11 +67,24 @@ let fork ?name ?pinned scope f =
     ; cell= None }
   in
   Fiber.fork ?name ?pinned scope (fun () ->
+      (* A [Cancelled] is a cancel of the promise only if the chain of its scope
+         is cancelled when [f] raises it. If not, it comes from a scope inside
+         [f] that [f] cancelled, and it is a failure. The check comes before the
+         end of the scope: a failure cancels the scope. *)
+      let failure = ref false in
+      let body inner =
+        start p inner ;
+        try f ()
+        with
+        | Fiber.Cancelled _ as e when Option.is_none (Sched.first_flag inner) ->
+          failure := true ;
+          Printexc.raise_with_backtrace e (Printexc.get_raw_backtrace ())
+      in
       let r =
-        match Fiber.scope (fun inner -> start p inner ; f ()) with
+        match Fiber.scope body with
         | v ->
             Ok v
-        | exception Fiber.Cancelled _ ->
+        | exception Fiber.Cancelled _ when not !failure ->
             Error (Cancelled, Printexc.get_raw_backtrace ())
         | exception e ->
             let bt = Printexc.get_raw_backtrace () in

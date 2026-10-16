@@ -1656,10 +1656,13 @@ let state_of node =
       assert false (* Only a scope node has members that end. *)
 
 (* A failed member stores its exception before it ends, then it cancels the
-   scope. A [Cancelled] is not a failure. It gives the syncs to resume. *)
-let fail node e bt =
+   scope. A [Cancelled] is not a failure only if the chain of [ctx], the context
+   of the member, is cancelled. If not, it comes from a scope inside the member
+   that the user cancelled, and it is a failure as each other exception is
+   (Scope.tla, BugAnyCancelled). It gives the syncs to resume. *)
+let fail ~ctx node e bt =
   match e with
-  | Cancelled _ ->
+  | Cancelled _ when Option.is_some (first_flag ctx) ->
       []
   | _ ->
       let st = state_of node in
@@ -1703,14 +1706,15 @@ let add_member node ~daemon =
   in
   inc ()
 
-(* The body of a fiber runs inside the chain of handlers of its scope. *)
-let run_body scope body =
+(* The body of a fiber runs inside the chain of handlers of its scope. [ctx] is
+   the context of the fiber: the scope, or the node of a daemon. *)
+let run_body ~ctx scope body =
   match scope.chain.handle body with
   | () ->
       ()
   | exception e ->
       let bt = Printexc.get_raw_backtrace () in
-      enqueue (fail scope e bt)
+      enqueue (fail ~ctx scope e bt)
 
 let fork ?name ?pinned scope body =
   add_member scope ~daemon:false ;
@@ -1720,7 +1724,7 @@ let fork ?name ?pinned scope body =
     (Fork
        ( f
        , fun () ->
-           run_body scope body ;
+           run_body ~ctx:scope scope body ;
            remove_member scope f ;
            enqueue (member_end scope ~daemon:false) ) )
 
@@ -1741,7 +1745,7 @@ let fork_daemon ?name scope body =
     (Fork
        ( f
        , fun () ->
-           run_body scope body ;
+           run_body ~ctx:d scope body ;
            Spin.with_lock scope.lock (fun () ->
                Hashtbl.remove scope.children d.nid ;
                Hashtbl.remove st.daemons d.nid ) ;
@@ -1762,7 +1766,11 @@ let reraise (e, bt) = Printexc.raise_with_backtrace e bt
    gives it, also if the scope was cancelled: [with_timeout] never drops a
    value. *)
 let finish_scope fiber node result =
-  (match result with Error (e, bt) -> enqueue (fail node e bt) | Ok _ -> ()) ;
+  ( match result with
+  | Error (e, bt) ->
+      enqueue (fail ~ctx:node node e bt)
+  | Ok _ ->
+      () ) ;
   remove_member node fiber ;
   enqueue (member_end node ~daemon:false) ;
   let st = state_of node in
