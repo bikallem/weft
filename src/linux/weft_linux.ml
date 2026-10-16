@@ -310,13 +310,17 @@ module World = struct
           ignore (drain d.tfd) ;
           (* A timerfd that fired is not armed. *)
           d.armed <- 0L ;
-          World.Ready.Alarm :: acc )
+          World.Ready.Alarm :: acc
+          [@mutate off "the scheduler does nothing for Alarm (Sched.on_ready)"]
+          )
         else if token = posix_token then (
           (* After a step of the clock, the read gives ECANCELED, and the alarm
              must be set again. *)
           ignore (drain d.ptfd) ;
           d.parmed <- 0L ;
-          World.Ready.Posix_alarm :: acc )
+          World.Ready.Posix_alarm :: acc
+          [@mutate
+            off "the scheduler does nothing for Posix_alarm (Sched.on_ready)"] )
         else if token = signal_token then (
           let counts = signalfd_read t.sigfd in
           let acc = ref acc in
@@ -331,7 +335,9 @@ module World = struct
           !acc )
         else if token = wake_token then (
           ignore (drain d.evfd) ;
-          World.Ready.Woken :: completions t.pool domain acc )
+          World.Ready.Woken :: completions t.pool domain acc
+          [@mutate off "the scheduler does nothing for Woken (Sched.on_ready)"]
+          )
         else World.Ready.Fd {token; read; write} :: acc )
       events []
 

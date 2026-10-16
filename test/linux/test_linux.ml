@@ -409,6 +409,61 @@ let full_warning () =
      jobs that run 0\n"
     text
 
+(* [true] if the fd with the number [n] (a text) is open. *)
+let is_open n =
+  match Unix.readlink ("/proc/self/fd/" ^ n) with
+  | _ ->
+      true
+  | exception Unix.Unix_error _ ->
+      false
+
+(* The pool does the close of a file, because a close of a file can block
+   (design section 2.7). The close of another fd is at once, also if the fd has
+   the number of a file that closed before. The fibers hold all threads of the
+   pool, so a close in the pool waits in the queue. *)
+let pool_closes_files () =
+  let fifo = new_fifo () in
+  let name = "pool-closes-this-file" in
+  let path = Filename.concat (Filename.dirname fifo) name in
+  let before = open_fds () in
+  Weft_linux.run ~domains:1 (fun () ->
+      let f = File.openfile [Write; Create] path in
+      let n =
+        match
+          List.find_opt
+            (fun n ->
+              match Unix.readlink ("/proc/self/fd/" ^ n) with
+              | l ->
+                  String.ends_with ~suffix:("/" ^ name) l
+              | exception Unix.Unix_error _ ->
+                  false )
+            (Array.to_list (Sys.readdir "/proc/self/fd"))
+        with
+        | Some n ->
+            n
+        | None ->
+            fail "the file has no fd"
+      in
+      Fiber.scope (fun s ->
+          let held = hold s fifo pool_max in
+          File.close f ;
+          is_true (is_open n) ;
+          release fifo held ) ;
+      is_false (is_open n) ;
+      (* A socket gets the number of the file. *)
+      let rec socket others =
+        let u = Net.udp ("127.0.0.1", 0) in
+        if is_open n then (u, others) else socket (u :: others)
+      in
+      let u, others = socket [] in
+      Fiber.scope (fun s ->
+          let held = hold s fifo pool_max in
+          Net.close u ;
+          is_false (is_open n) ;
+          release fifo held ) ;
+      List.iter Net.close others ) ;
+  equal int before (open_fds ())
+
 (* UDP on Linux: IPv6, the size limit, and the sizes of the buffers, which the
    simulator copies. *)
 let udp_ipv6 () =
@@ -729,6 +784,52 @@ let posix_sleep () =
   in
   less int64 ~than:30_000_000L (List.nth (List.sort compare all) 3)
 
+(* The world sets the alarm of a clock only for a deadline on that clock. In a
+   new world, one sleep sets the alarm of its clock one time: after the alarm,
+   the timerfd is not armed, and no deadline stays. *)
+let alarm_sets () =
+  let sets sleep =
+    let n = Weft_linux.alarm_sets () in
+    Weft_linux.run ~domains:1 ~watchdog:None sleep ;
+    Weft_linux.alarm_sets () - n
+  in
+  equal int 1 (sets (fun () -> Time.sleep Mono (Span.ms 1))) ;
+  equal int 1 (sets (fun () -> Time.sleep Posix (Span.ms 1)))
+
+(* The fds of the process of a kind, for example "eventfd", with the value of a
+   field of their fdinfo, for example "ticks:". *)
+let fdinfo kind field =
+  List.filter_map
+    (fun n ->
+      match Unix.readlink ("/proc/self/fd/" ^ n) with
+      | l when l = "anon_inode:[" ^ kind ^ "]" ->
+          List.find_map
+            (fun l ->
+              if String.starts_with ~prefix:field l then
+                Some
+                  (String.trim
+                     (String.sub l (String.length field)
+                        (String.length l - String.length field) ) )
+              else None )
+            (In_channel.with_open_text ("/proc/self/fdinfo/" ^ n)
+               In_channel.input_lines )
+      | _ | (exception Unix.Unix_error _) ->
+          None )
+    (Array.to_list (Sys.readdir "/proc/self/fd"))
+
+(* The world reads the eventfd after a wake, and each timerfd after its alarm.
+   The counts are then 0. A world on one domain has one eventfd and two
+   timerfds. *)
+let drained () =
+  Weft_linux.run ~domains:1 ~watchdog:None (fun () ->
+      (* A job of the pool writes the eventfd at its end. *)
+      ignore (File.stat "/") ;
+      equal (list string) ["0"] (fdinfo "eventfd" "eventfd-count:") ;
+      Time.sleep Mono (Span.ms 1) ;
+      equal (list string) ["0"; "0"] (fdinfo "timerfd" "ticks:") ;
+      Time.sleep Posix (Span.ms 1) ;
+      equal (list string) ["0"; "0"] (fdinfo "timerfd" "ticks:") )
+
 (* M3: a reader whose reads always find data yields after 64 KiB, so a timer on
    the same domain is not late by much. The reader of a full pipe works 20 us on
    each chunk, and a fiber sleeps 1 ms 20 times. The OS can stop the thread for
@@ -911,6 +1012,7 @@ let linux =
     ; test "each detached job that runs gives one more thread, up to the limit"
         detached_threads
     ; test "a pool that is full for more than 1 s writes a warning" full_warning
+    ; test "the pool closes a file, and only a file" pool_closes_files
     ; test "a child stops at SIGINT" child_sigint
     ; test "the pipes of a child" child_output
     ; test "SIGTERM to the process is an event" sigterm
@@ -926,6 +1028,8 @@ let linux =
     ; test "a failed promise that nobody awaits gives a report" promise_report
     ; test "the watchdog reports a fiber that computes 200 ms" watchdog
     ; test "a Posix sleep ends after its deadline" posix_sleep
+    ; test "a sleep sets the alarm of its clock one time" alarm_sets
+    ; test "the world reads its eventfd and its timerfds after an event" drained
     ; test "a reader that never waits yields after 64 KiB" busy_reader
     ; test ~timeout:30. "A: a pinned fiber with many short sleeps ends"
         pinned_sleeps
