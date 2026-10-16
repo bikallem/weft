@@ -74,7 +74,8 @@ type[@warning "-69"] job_args =
   ; fd: int
   ; a: int
   ; b: int
-  ; data: string }
+  ; data: bytes
+  ; off: int }
 
 external mbx_create : int array -> nativeint = "weft_mbx_create"
 
@@ -84,7 +85,11 @@ external mbx_take : nativeint -> int -> int array = "weft_mbx_take"
 
 external job_start : nativeint -> job_args -> nativeint = "weft_job_start"
 
-external job_result : nativeint -> int * int * string = "weft_job_result"
+external job_result : nativeint -> int * int = "weft_job_result"
+
+external job_data : nativeint -> string = "weft_job_data"
+
+external job_read : nativeint -> bytes -> int -> int = "weft_job_read"
 
 external job_stat : nativeint -> int * int * int * int64 = "weft_job_stat"
 
@@ -301,15 +306,24 @@ let flag_bits flags =
 let args_of : type a. int -> int -> a Op.blocking -> job_args =
  fun id dom op ->
   let base =
-    {id; dom; kind= kind_of op; s1= ""; s2= ""; fd= -1; a= 0; b= -1; data= ""}
+    { id
+    ; dom
+    ; kind= kind_of op
+    ; s1= ""
+    ; s2= ""
+    ; fd= -1
+    ; a= 0
+    ; b= -1
+    ; data= Bytes.empty
+    ; off= 0 }
   in
   match op with
   | Op.Open (path, flags, perm) ->
       {base with s1= path; a= flag_bits flags; b= perm}
   | Op.Pread (fd, _, _, len, at) ->
       {base with fd; a= len; b= at}
-  | Op.Pwrite (fd, data, at) ->
-      {base with fd; data; b= at}
+  | Op.Pwrite (fd, data, off, len, at) ->
+      {base with fd; data; off; a= len; b= at}
   | Op.Fsync fd | Op.Fstat fd ->
       {base with fd}
   | Op.Stat path | Op.Readdir path | Op.Unlink path | Op.Rmdir path ->
@@ -352,17 +366,16 @@ let stat_of j =
 
 let finish : type a. nativeint -> a Op.blocking -> (a, Op.error) result =
  fun j op ->
-  let res, err, data = job_result j in
+  let res, err = job_result j in
   let r : (a, Op.error) result =
-    if err = -1 then Error (Op.Other data)
+    if err = -1 then Error (Op.Other (job_data j))
     else if err <> 0 then Error (eagain_resource (error_of err))
     else
       match op with
       | Op.Open _ ->
           Ok res
       | Op.Pread (_, buf, off, _, _) ->
-          Bytes.blit_string data 0 buf off res ;
-          Ok res
+          Ok (job_read j buf off)
       | Op.Pwrite _ ->
           Ok res
       | Op.Fsync _ ->
@@ -382,11 +395,11 @@ let finish : type a. nativeint -> a Op.blocking -> (a, Op.error) result =
       | Op.Stat _ ->
           Ok (stat_of j)
       | Op.Readdir _ ->
-          Ok (names data)
+          Ok (names (job_data j))
       | Op.Resolve _ ->
-          Ok (addresses data)
+          Ok (addresses (job_data j))
       | Op.Reverse _ ->
-          Ok data
+          Ok (job_data j)
   in
   job_free j ; r
 

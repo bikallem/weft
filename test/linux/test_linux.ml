@@ -1404,11 +1404,35 @@ let accept_retry () =
         (fun () -> Net.accept s) ;
       Net.close s )
 
+(* P4: a read and a write of 1 MiB copy between the buffer of the user and the C
+   buffer of the job, with no OCaml string between them. Thus 10 reads and 10
+   writes allocate much less than one buffer (131,072 words) on the major heap.
+   The old code allocated a string for each read and for each write. The data at
+   the offsets of the buffers is correct. *)
+let large_file_io () =
+  let size = 1 lsl 20 in
+  let path = Filename.concat (tmp ()) "big" in
+  Weft_linux.run ~domains:1 (fun () ->
+      let f = File.openfile [File.Read; File.Write; File.Create] path in
+      let src = Bytes.init (size + 3) (fun i -> Char.chr (i land 0xff)) in
+      let dst = Bytes.make (size + 5) '.' in
+      let major () = (Gc.quick_stat ()).Gc.major_words in
+      let w0 = major () in
+      for _ = 1 to 10 do
+        equal int size (File.pwrite f ~file_offset:0 src 3 size) ;
+        equal int size (File.pread f ~file_offset:0 dst 5 size)
+      done ;
+      less float_exact ~than:131072. (major () -. w0) ;
+      equal string (Bytes.sub_string src 3 size) (Bytes.sub_string dst 5 size) ;
+      equal string "....." (Bytes.sub_string dst 0 5) ;
+      File.close f )
+
 let review_2026 =
   group "review of 2026-10-16"
     [ test "C3: the names of 40,000 entries take linear time" many_names
     ; test "C4: accept retries the pending network errors on Linux" accept_retry
-    ]
+    ; test "P4: a read and a write of 1 MiB allocate no OCaml string"
+        large_file_io ]
 
 let () =
   exit

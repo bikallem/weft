@@ -42,11 +42,11 @@ module File = struct
     if file_offset < 0 then invalid_arg "File.pread" ;
     Job.run ~fd "File.pread" (Op.Pread (fd.Sched.os, buf, off, len, file_offset))
 
-  (* The world copies the data before the job starts (design section 2.3). *)
+  (* The world copies the data from [buf] when the job starts (design section
+     2.3). *)
   let write_at name fd file_offset buf off len =
     Net.check_range ~read:false name buf off len ;
-    Job.run ~fd name
-      (Op.Pwrite (fd.Sched.os, Bytes.sub_string buf off len, file_offset))
+    Job.run ~fd name (Op.Pwrite (fd.Sched.os, buf, off, len, file_offset))
 
   let write_sub fd buf off len = write_at "File.write" fd (-1) buf off len
 
@@ -54,13 +54,16 @@ module File = struct
     if file_offset < 0 then invalid_arg "File.pwrite" ;
     write_at "File.pwrite" fd file_offset buf off len
 
-  (* The first job gets the string with no copy. *)
+  (* The world only reads the buffer of [Pwrite], so the string goes to it with
+     no copy. *)
   let write fd s =
-    let n = String.length s in
+    let n = String.length s and buf = Bytes.unsafe_of_string s in
     let rec loop off =
       if off < n then
-        let data = if off = 0 then s else String.sub s off (n - off) in
-        loop (off + Job.run ~fd "File.write" (Op.Pwrite (fd.Sched.os, data, -1)))
+        loop
+          ( off
+          + Job.run ~fd "File.write"
+              (Op.Pwrite (fd.Sched.os, buf, off, n - off, -1)) )
     in
     loop 0
 

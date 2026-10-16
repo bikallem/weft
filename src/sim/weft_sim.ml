@@ -446,14 +446,10 @@ let perform : type a. t -> a Op.blocking -> (raw, Op.error) result option =
       Some
         (let* h = handle_of n fd in
          Result.map (fun s -> R_read s) (Sim_fs.pread h len at) )
-  | Op.Pwrite (fd, data, at) ->
-      (* With [short_io], a write of a file can be short too. *)
-      let k = part t (String.length data) in
-      let data =
-        if (k < String.length data) [@mutate off "a copy of the whole string"]
-        then String.sub data 0 k
-        else data
-      in
+  | Op.Pwrite (fd, buf, off, len, at) ->
+      (* With [short_io], a write of a file can be short too. The copy comes at
+         the start, as in the POSIX worlds. *)
+      let data = Bytes.sub_string buf off (part t len) in
       Some
         (let* h = handle_of n fd in
          Result.map (fun k -> R_int k) (Sim_fs.pwrite h data at ~now) )
@@ -562,7 +558,7 @@ let start_job : type a. t -> int -> a Op.blocking -> int =
   let jfd =
     match op with
     | Op.Pread (fd, _, _, _, _)
-    | Op.Pwrite (fd, _, _)
+    | Op.Pwrite (fd, _, _, _, _)
     | Op.Fsync fd
     | Op.Fstat fd
     | Op.Ftruncate (fd, _) ->

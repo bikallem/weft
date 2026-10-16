@@ -646,8 +646,10 @@ value weft_mbx_take(value mbx, value dom) {
   CAMLreturn(r);
 }
 
-/* [args] is the record [Weft_linux.job_args]: id, domain, kind, s1, s2, fd, a,
-   b and data. It gives the job, or raises [Out_of_memory]. */
+/* [args] is the record [Weft_posix.job_args]: id, domain, kind, s1, s2, fd, a,
+   b, data and off. It gives the job, or raises [Out_of_memory]. A write copies
+   [a] bytes of [data] from [off] here, so the job never uses the memory of the
+   user after the submit (design section 2.3). */
 value weft_job_start(value mbx, value args) {
   struct job *j = calloc(1, sizeof *j);
   if (j == NULL) caml_raise_out_of_memory();
@@ -660,9 +662,9 @@ value weft_job_start(value mbx, value args) {
   j->a = Long_val(Field(args, 6));
   j->b = Long_val(Field(args, 7));
   if (j->kind == J_PWRITE) {
-    j->len = caml_string_length(Field(args, 8));
+    j->len = j->a;
     j->buf = malloc(j->len ? j->len : 1);
-    if (j->buf) memcpy(j->buf, String_val(Field(args, 8)), j->len);
+    if (j->buf) memcpy(j->buf, Bytes_val(Field(args, 8)) + Long_val(Field(args, 9)), j->len);
   }
   if (j->s1 == NULL || j->s2 == NULL || (j->kind == J_PWRITE && j->buf == NULL)) {
     free_job(j);
@@ -687,17 +689,32 @@ value weft_close_async(value fd) {
   return Val_unit;
 }
 
-/* The result of a job that is done: (res, err, data). */
+/* The result of a job that is done: (res, err). */
 value weft_job_result(value job) {
   CAMLparam1(job);
-  CAMLlocal2(r, data);
+  CAMLlocal1(r);
   struct job *j = Job_val(job);
-  data = caml_alloc_initialized_string(j->len, j->buf ? j->buf : "");
-  r = caml_alloc_tuple(3);
+  r = caml_alloc_tuple(2);
   Store_field(r, 0, Val_long(j->res));
   Store_field(r, 1, Val_int(j->err));
-  Store_field(r, 2, data);
   CAMLreturn(r);
+}
+
+/* The data of a job that is done, as a new string: the names, the addresses,
+   or the text of an error. */
+value weft_job_data(value job) {
+  struct job *j = Job_val(job);
+  return caml_alloc_initialized_string(j->len, j->buf ? j->buf : "");
+}
+
+/* [weft_job_read job buf off] copies the data of a read that is done into
+   [buf] at [off], with no OCaml string between them. The domain does the copy
+   at the finish, so the job never uses the memory of the user. The caller
+   makes sure that the range of the read is in [buf]. It gives the length. */
+value weft_job_read(value job, value buf, value off) {
+  struct job *j = Job_val(job);
+  if (j->len > 0) memcpy(Bytes_val(buf) + Long_val(off), j->buf, j->len);
+  return Val_long(j->len);
 }
 
 /* The stat of a job that is done: (kind, size, perm, mtime in ns). The kinds

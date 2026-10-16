@@ -103,8 +103,9 @@ type _ blocking =
       (** The fd, the buffer, its range, and the file offset. The offset [-1]
           reads at the offset of the fd. 0 at the end of the file. The world
           copies the data into the buffer only at [Finish]. *)
-  | Pwrite : fd * string * int -> int blocking
-      (** The fd, the data and the file offset, or [-1]. *)
+  | Pwrite : fd * bytes * int * int * int -> int blocking
+      (** The fd, the buffer, its range, and the file offset, or [-1]. The world
+          copies the data from the buffer at [Start]. *)
   | Fsync : fd -> unit blocking
   | Fstat : fd -> stat blocking
   | Stat : string -> stat blocking
