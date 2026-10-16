@@ -6,8 +6,9 @@ effect. Thus the same program runs on Linux or in a deterministic simulator,
 with a virtual clock and an in-memory network.
 
 **Status:** pre-release (version 0.0.0). The API can change. The milestones
-M0 to M3 of the design are complete. The Linux world (epoll) and the kqueue
-world (macOS and FreeBSD) run the same portable tests.
+M0 to M3 of the design are complete on Linux and in the simulator. The kqueue
+world (macOS and FreeBSD) runs the main portable tests in CI. Some of its
+facts are not verified yet (design section 2.7).
 
 ## Features
 
