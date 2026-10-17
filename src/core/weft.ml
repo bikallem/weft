@@ -79,19 +79,18 @@ let run_world (type w) ?slack ?(domains = 1) ?on_create
   let t = Sched.create ?slack ~domains () in
   Option.iter (fun f -> f t) on_create ;
   let result = Sched.start t main in
+  let stop () =
+    Atomic.set t.finished true ;
+    Array.iter (fun d -> W.wake w ~domain:d.Sched.index) t.doms
+  in
   let run_dom d () =
     match handle (module W) w (fun () -> Sched.run_domain d) with
     | () ->
         Ok ()
     | exception e ->
         let bt = Printexc.get_raw_backtrace () in
-        Atomic.set t.finished true ;
-        Array.iter (fun d -> W.wake w ~domain:d.Sched.index) t.doms ;
+        stop () ;
         Error (e, bt)
-  in
-  let stop () =
-    Atomic.set t.finished true ;
-    Array.iter (fun d -> W.wake w ~domain:d.Sched.index) t.doms
   in
   (* The fills from outside a fiber: a push to the injection queue, then a wake
      of an idle domain. The wake of the world is safe from any thread. *)

@@ -557,6 +557,9 @@ module Fdtab = struct
               s
           | [] ->
               let s = !next in
+              (* The token has 32 bits for the slot, and it must stay a positive
+                 [int]. *)
+              assert (s < 1 lsl 30) ;
               incr next ;
               if s >= Array.length !gens then (
                 let a = Array.make (2 * s) 0 in

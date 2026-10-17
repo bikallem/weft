@@ -29,6 +29,23 @@ let growth_keeps_generations () =
   greater int ~than:first.S.gen again.S.gen ;
   List.iter S.Fdtab.release (again :: !held)
 
+(* K11 of the review of 2026-10-16: a token has 32 bits for the slot, so the
+   table refuses a slot of 2^30 or more. The test gives the table the next slot
+   2^30, with no free slot. *)
+let slot_limit () =
+  let next = !S.Fdtab.next and free = !S.Fdtab.free in
+  S.Fdtab.free := [] ;
+  S.Fdtab.next := 1 lsl 30 ;
+  Fun.protect
+    ~finally:(fun () ->
+      S.Fdtab.next := next ;
+      S.Fdtab.free := free )
+    (fun () ->
+      raises_match
+        (function Assert_failure _ -> true | _ -> false)
+        (fun () -> ignore (S.Fdtab.alloc 100)) ;
+      equal int (1 lsl 30) !S.Fdtab.next )
+
 (* A push marks a wake only if a domain is idle and no domain searches (the Go
    rules, design section 2.5). *)
 let wake_rule () =
@@ -79,6 +96,7 @@ let member_list () =
 let tests =
   [ group "fd table"
       [ test "a slot used again gets a new generation" new_generation
+      ; test "the fd table refuses the slot 2^30" slot_limit
       ; test "a growth of the fd table keeps the generations"
           growth_keeps_generations ]
   ; group "cancel"
