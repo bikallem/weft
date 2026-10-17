@@ -1,7 +1,8 @@
-; The measurements of the open questions of design section 2.13.
+; The measurements of the open questions of design section 2.13, and of the
+; scheduler (perf.ml).
 
 (executables
- (names m1 m3 q6)
+ (names m1 m3 q6 perf)
  (enabled_if
   (= %{system} linux))
  (libraries weft weft.linux unix runtime_events))
