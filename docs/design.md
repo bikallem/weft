@@ -1262,6 +1262,7 @@ The simulator copies the edge-triggered behavior of Linux strictly. If it gave m
 
   The simulator has one difference. After a close of the peer, Linux takes the next write of 1 byte or more, and the closed peer answers it with a reset. The simulator gives `EPIPE` at once for this write. After that write, the two give `EPIPE`, also for a write of 0 bytes. The tests `Portable.zero_writes` run on the simulator and on Linux. The results on FreeBSD and macOS are not known, so the kqueue world does not run them.
 - The simulator checks the order of production: a `close(2)` must come after the Deregister of each domain in the set, and a Deregister or an event must never name a closed or reused pair of slot and generation.
+- **The fd numbers.** The simulator never uses an fd number again: each new fd gets the next number of a counter that starts at 3. Linux gives the lowest free number. The difference stays, because some callbacks of the simulator keep an fd number for a later time: the end of a connect after the delay, and the exit of a child (`exit_proc`). Also, the ends of the pipes that a child keeps have numbers, but they are not in the table of the fds. With numbers that come again, such a callback can act on a new fd with the same number. The public API gives no fd number, and the core names an fd with the slot and the generation of its own table. Thus a program cannot see the difference (3.12, K12).
 
 ### The `wait` steps
 
