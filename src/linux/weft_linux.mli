@@ -57,6 +57,9 @@ val alarm_sets : unit -> int
 val watchdog_reports : unit -> int
 (** The number of warnings of all watchdogs, for the tests. *)
 
+val watchdog_checks : unit -> int
+(** The number of checks of all watchdogs, for the tests. *)
+
 val pool_warnings : unit -> int
 (** The number of warnings of the thread pools that were full for more than 1 s,
     for the tests. *)

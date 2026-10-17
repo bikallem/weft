@@ -49,6 +49,9 @@ val run :
 val watchdog_reports : unit -> int
 (** The number of warnings of all watchdogs, for the tests. *)
 
+val watchdog_checks : unit -> int
+(** The number of checks of all watchdogs, for the tests. *)
+
 val pool_warnings : unit -> int
 (** The number of warnings of the thread pools, for the tests. *)
 

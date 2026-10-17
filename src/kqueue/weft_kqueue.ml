@@ -71,7 +71,9 @@ type t =
   ; lock: Mutex.t
   ; procs: (int, proc) Hashtbl.t  (** By the read end of the exit pipe. *)
   ; pids: (int, proc) Hashtbl.t  (** By pid. *)
-  ; closed: bool Atomic.t  (** [close] sets it, one time. *) }
+  ; closed: bool Atomic.t  (** [close] sets it, one time. *)
+  ; watchdog: nativeint Atomic.t
+        (** The watchdog of [run], or [0n] (weft_watchdog.c). *) }
 
 let close_dom d =
   ignore (close_fd d.wake_r) ;
@@ -129,7 +131,8 @@ let create ?(domains = 1) ?(signals = []) () =
       ; lock= Mutex.create ()
       ; procs= Hashtbl.create ~random:false 8
       ; pids= Hashtbl.create ~random:false 8
-      ; closed= Atomic.make false }
+      ; closed= Atomic.make false
+      ; watchdog= Atomic.make 0n }
 
 (* The actions come back first. Then the release waits until no handler can
    write the wake pipe, and the pipe can close. *)
@@ -254,6 +257,8 @@ module Poller = struct
   let pool t = t.pool
 
   let watched t = t.watched
+
+  let watchdog t = t.watchdog
 
   let unwatch_lock t = t.lock
 

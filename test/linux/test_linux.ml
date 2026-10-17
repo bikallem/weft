@@ -861,13 +861,13 @@ let promise_report () =
    more than 10 ms. Thus the check of the fiber that yields uses a limit of 100
    ms. The fiber computes 200 ms in all, so the watchdog must count its
    yields. *)
+let busy_ms ms =
+  let t0 = Unix.gettimeofday () in
+  while Unix.gettimeofday () -. t0 < Float.of_int ms /. 1000. do
+    ()
+  done
+
 let watchdog () =
-  let busy_ms ms =
-    let t0 = Unix.gettimeofday () in
-    while Unix.gettimeofday () -. t0 < Float.of_int ms /. 1000. do
-      ()
-    done
-  in
   let before = Weft_linux.watchdog_reports () in
   Weft_linux.run ~domains:1
     ~watchdog:(Some (Span.ms 100))
@@ -881,6 +881,39 @@ let watchdog () =
   equal int (before + 1) (Weft_linux.watchdog_reports ()) ;
   Weft_linux.run ~domains:1 ~watchdog:None (fun () -> busy_ms 50) ;
   equal int (before + 1) (Weft_linux.watchdog_reports ())
+
+(* The watchdog parks while all domains sleep (design section 3.12, The park of
+   the watchdog). With no park, the watchdog does a check each 5 ms: about 40
+   checks in 200 ms. With the park, it does a check only before the 4 domains
+   sleep and after the first domain wakes. A busy host makes the checks less
+   frequent, not more frequent. Thus the bound of 10 does not depend on the
+   load. *)
+let watchdog_park () =
+  let checks =
+    Weft_linux.run ~domains:4 (fun () ->
+        Time.sleep Mono (Span.ms 20) ;
+        let before = Weft_linux.watchdog_checks () in
+        Time.sleep Mono (Span.ms 200) ;
+        Weft_linux.watchdog_checks () - before )
+  in
+  at_most int ~than:10 checks
+
+(* After a park, the watchdog reports a stall: the first domain that wakes
+   releases the park. The fiber computes for 3 times the limit with no yield.
+   Only domain 0 runs a fiber, so the watchdog gives one report. On 1 domain,
+   only domain 0 wakes, so the test finds a release by a domain other than the
+   first. *)
+let watchdog_after_park () =
+  List.iter
+    (fun domains ->
+      let before = Weft_linux.watchdog_reports () in
+      Weft_linux.run ~domains
+        ~watchdog:(Some (Span.ms 20))
+        (fun () ->
+          Time.sleep Mono (Span.ms 100) ;
+          busy_ms 60 ) ;
+      equal int (before + 1) (Weft_linux.watchdog_reports ()) )
+    [1; 2]
 
 (* A new world can watch signals: no open world holds the claim. *)
 let signals_free () = Weft_linux.close (Weft_linux.create ~signals:[SIGUSR1] ())
@@ -1318,6 +1351,8 @@ let linux =
     ; test "a failed promise that nobody awaits gives a report" promise_report
     ; test "the watchdog reports a fiber that computes 200 ms" watchdog
     ; test "a limit of the watchdog that is not positive raises" watchdog_limit
+    ; test "the watchdog parks while all domains sleep" watchdog_park
+    ; test "after a park, the watchdog reports a stall" watchdog_after_park
     ; test "a Posix sleep ends after its deadline" posix_sleep
     ; test "a sleep sets the alarm of its clock one time" alarm_sets
     ; test "the world reads its eventfd and its timerfds after an event" drained

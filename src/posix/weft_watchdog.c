@@ -3,7 +3,16 @@
    the start of a fiber and one at its end, so an odd beat tells that a fiber
    runs. If the beat of a domain is odd and does not change for the limit, the
    thread writes a warning to stderr, one time for each stall. The thread
-   blocks all signals, and it never runs OCaml code. */
+   blocks all signals, and it never runs OCaml code.
+
+   The park (design section 3.12, The park of the watchdog, and
+   spec/tla/Watchdog.tla). A domain adds 1 to [sleeping] before a sleep, and
+   subtracts 1 after it. At each check, the thread reads [sleeping] under the
+   mutex. If all domains sleep, no fiber runs, and the thread sets [parked] and
+   waits with no timeout. The domain that wakes first sees the old value [n].
+   It takes the mutex, clears [parked] and signals the condition. The read
+   under the mutex and the mutex of the wake prevent a lost wake: a wake after
+   the read waits for the mutex, and then it finds [parked]. */
 
 #define _GNU_SOURCE
 #include <errno.h>
@@ -31,10 +40,13 @@ struct watchdog {
   int n;
   int stride; /* The beat of domain d is at beats[d * stride]. */
   int64_t limit_ns;
+  int sleeping; /* The domains that sleep. Atomic. */
+  int parked;   /* Under [m]. */
 };
 
-/* The reports of all watchdogs, for the tests. */
+/* The reports and the checks of all watchdogs, for the tests. */
 static intnat reports = 0;
+static intnat checks = 0;
 
 #define now_ns weft_now_ns
 
@@ -44,16 +56,31 @@ static void *watch(void *arg) {
   int64_t *since = calloc(w->n, sizeof *since);
   int *told = calloc(w->n, sizeof *told);
   if (last == NULL || since == NULL || told == NULL) return NULL;
-  int64_t t = now_ns();
-  for (int d = 0; d < w->n; d++) {
-    last[d] = w->beats[d * w->stride];
-    since[d] = t;
-  }
+  int64_t t = 0;
+  int start = 1;
   pthread_mutex_lock(&w->m);
   while (!w->stop) {
+    /* At the start and after a park, the stalls start again from now. Thus
+       the time of a park does not count as a stall. */
+    if (start) {
+      start = 0;
+      t = now_ns();
+      for (int d = 0; d < w->n; d++) {
+        last[d] = w->beats[d * w->stride];
+        since[d] = t;
+        told[d] = 0;
+      }
+    }
     /* A check each half of the limit. */
     weft_cond_wait_until(&w->c, &w->m, now_ns() + w->limit_ns / 2);
     if (w->stop) break;
+    __atomic_add_fetch(&checks, 1, __ATOMIC_RELAXED);
+    if (__atomic_load_n(&w->sleeping, __ATOMIC_SEQ_CST) == w->n) {
+      w->parked = 1;
+      while (w->parked && !w->stop) pthread_cond_wait(&w->c, &w->m);
+      start = 1;
+      continue;
+    }
     t = now_ns();
     for (int d = 0; d < w->n; d++) {
       intnat b = w->beats[d * w->stride];
@@ -64,10 +91,15 @@ static void *watch(void *arg) {
       } else if ((b & 1) && !told[d] && t - since[d] >= w->limit_ns) {
         told[d] = 1;
         __atomic_add_fetch(&reports, 1, __ATOMIC_RELAXED);
+        /* The write can block, for example on a full pipe. A domain that
+           wakes after a park takes the mutex, so the thread releases it
+           here. Only this thread uses [last], [since] and [told]. */
+        pthread_mutex_unlock(&w->m);
         fprintf(stderr,
                 "weft: domain %d did not switch for %lld ms: a fiber computes "
                 "with no yield\n",
                 d, (long long)((t - since[d]) / 1000000));
+        pthread_mutex_lock(&w->m);
       }
     }
   }
@@ -117,6 +149,32 @@ value weft_watchdog_stop(value v) {
   return Val_unit;
 }
 
+/* Before a sleep with no timeout. The stubs of a domain do not allocate. */
+value weft_watchdog_sleep(value v) {
+  struct watchdog *w = Watchdog_val(v);
+  __atomic_add_fetch(&w->sleeping, 1, __ATOMIC_SEQ_CST);
+  return Val_unit;
+}
+
+/* After the sleep. If all domains slept, the thread can be parked: the first
+   domain that wakes releases the park. */
+value weft_watchdog_awake(value v) {
+  struct watchdog *w = Watchdog_val(v);
+  if (__atomic_fetch_sub(&w->sleeping, 1, __ATOMIC_SEQ_CST) == w->n) {
+    pthread_mutex_lock(&w->m);
+    if (w->parked) {
+      w->parked = 0;
+      pthread_cond_signal(&w->c);
+    }
+    pthread_mutex_unlock(&w->m);
+  }
+  return Val_unit;
+}
+
 value weft_watchdog_reports(value unit) {
   return Val_long(__atomic_load_n(&reports, __ATOMIC_RELAXED));
+}
+
+value weft_watchdog_checks(value unit) {
+  return Val_long(__atomic_load_n(&checks, __ATOMIC_RELAXED));
 }

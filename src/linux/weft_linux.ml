@@ -75,7 +75,9 @@ type t =
         *)
   ; sigfd: int  (** The signalfd in the poller of domain 0, or [-1]. *)
   ; old_mask: bytes option  (** The signal mask before [create]. *)
-  ; closed: bool Atomic.t  (** [close] sets it, one time. *) }
+  ; closed: bool Atomic.t  (** [close] sets it, one time. *)
+  ; watchdog: nativeint Atomic.t
+        (** The watchdog of [run], or [0n] (weft_watchdog.c). *) }
 
 (* The poller of a domain. [undo] gets the close of each fd when [make_dom]
    opens it. Thus an error in the middle leaves no fd open. *)
@@ -174,7 +176,8 @@ let make ~domains ~nums ~undo signals =
   ; unblock0= Atomic.make []
   ; sigfd
   ; old_mask
-  ; closed= Atomic.make false }
+  ; closed= Atomic.make false
+  ; watchdog= Atomic.make 0n }
 
 (* A write to a pipe with no reader then gives EPIPE (design section 2.7,
    Signals). The signals of [~signals] are blocked in the calling thread before
@@ -247,6 +250,8 @@ module Poller = struct
   let pool t = t.pool
 
   let watched t = t.watched
+
+  let watchdog t = t.watchdog
 
   let unwatch_lock t = t.unwatch_lock
 

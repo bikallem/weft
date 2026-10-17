@@ -230,6 +230,39 @@ let one_signal_world () =
     [0; 63] ;
   Weft_kqueue.close (Weft_kqueue.create ~signals:[SIGUSR1] ())
 
+(* The watchdog parks while all domains sleep, as in test/linux (design section
+   3.12, The park of the watchdog). With no park, an idle run of 200 ms gives
+   about 40 checks. *)
+let watchdog_park () =
+  let checks =
+    Weft_kqueue.run ~domains:4 (fun () ->
+        Time.sleep Mono (Span.ms 20) ;
+        let before = Weft_kqueue.watchdog_checks () in
+        Time.sleep Mono (Span.ms 200) ;
+        Weft_kqueue.watchdog_checks () - before )
+  in
+  at_most int ~than:10 checks
+
+(* After a park, the watchdog reports a fiber that computes for 3 times the
+   limit with no yield, on 1 and on 2 domains, as in test/linux. *)
+let watchdog_after_park () =
+  let busy_ms ms =
+    let t0 = Unix.gettimeofday () in
+    while Unix.gettimeofday () -. t0 < Float.of_int ms /. 1000. do
+      ()
+    done
+  in
+  List.iter
+    (fun domains ->
+      let before = Weft_kqueue.watchdog_reports () in
+      Weft_kqueue.run ~domains
+        ~watchdog:(Some (Span.ms 20))
+        (fun () ->
+          Time.sleep Mono (Span.ms 100) ;
+          busy_ms 60 ) ;
+      equal int (before + 1) (Weft_kqueue.watchdog_reports ()) )
+    [1; 2]
+
 let () =
   exit
     (Windtrap.run "kqueue"
@@ -252,4 +285,6 @@ let () =
              ; test ~timeout:60.
                  "a storm of signals while fibers use small stacks" signal_storm
              ; test "only one world at a time watches signals" one_signal_world
-             ] ] ) )
+             ; test "the watchdog parks while all domains sleep" watchdog_park
+             ; test "after a park, the watchdog reports a stall"
+                 watchdog_after_park ] ] ) )

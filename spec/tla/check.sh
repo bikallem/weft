@@ -9,6 +9,7 @@
 #   Fd.tla      the fd record: Rcfd, the registrations, the close notices
 #   Semaphore.tla  Fiber.Semaphore: the acquire event, the release, FIFO
 #   Signal.tla  Signal.unwatch: the end of a watch, on Linux and kqueue
+#   Watchdog.tla  the park of the watchdog while all domains sleep
 #
 # MODELS selects the models, for example: MODELS="Ivar Scope" check.sh
 # Wake selects all the Wake cases. Wake1 selects only the cases from before
@@ -38,7 +39,7 @@ JOBS=${JOBS:-4}
 WORKERS=${WORKERS:-$(( $(nproc) / JOBS > 0 ? $(nproc) / JOBS : 1 ))}
 export JAVA_TOOL_OPTIONS="-Xmx${HEAP:-2g}"
 LIMIT=${LIMIT:-14400}
-MODELS=${MODELS:-"Commit Scope Ivar Wake Fd Semaphore Signal"}
+MODELS=${MODELS:-"Commit Scope Ivar Wake Fd Semaphore Signal Watchdog"}
 want() { case " $MODELS " in *" $1 "*) return 0 ;; *) return 1 ;; esac; }
 
 # run MODULE EXPECT "INVARIANTS" NAME=VALUE...
@@ -251,6 +252,24 @@ sig fail   linux    FALSE FALSE TRUE   FALSE FALSE   FALSE
 sig fail   kqueue   FALSE FALSE FALSE  TRUE  FALSE   FALSE
 sig fail   kqueue   FALSE FALSE FALSE  FALSE TRUE    FALSE
 sig fail   linux    FALSE FALSE FALSE  FALSE FALSE   TRUE
+
+# The watchdog thread loops forever, so its wait at the end is not a
+# deadlock. The liveness property is NoStuckPark: the watchdog never stays
+# parked while a domain is awake.
+dog() { want Watchdog || return 0 # expect domains readOutside noLock
+  PROPS=NoStuckPark DEADLOCK=FALSE run Watchdog "$1" "${INV:-TypeOK ParkOK}" \
+    N="$2" Rounds=2 BugReadOutside="$3" BugNoLock="$4"
+}
+#   expect domains outside noLock
+dog pass   2       FALSE   FALSE
+dog pass   3       FALSE   FALSE
+dog fail   2       TRUE    FALSE
+dog fail   2       FALSE   TRUE
+# NoStuckPark alone also finds the two bugs.
+INV=TypeOK \
+dog fail   2       TRUE    FALSE
+INV=TypeOK \
+dog fail   2       FALSE   TRUE
 
 # Run the cases. The slow cases come first, so that they start early.
 export -f runone
