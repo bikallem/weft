@@ -305,10 +305,16 @@ let work_stealing w () =
 
 (* A fiber that blocks on one fd from two domains in sequence gets all of its
    data. After the close, a sleep gives the simulator a quiescence, so that a
-   close notice that waits is a lost wakeup. *)
+   close notice that waits is a lost wakeup.
+
+   The test does at least 50 rounds. Under a CPU load, it is possible that no
+   thief takes the fiber in 50 rounds. Thus the rounds continue until a read
+   occurs on two domains. The test gives a failure only if the scheduler does
+   not move the fiber in 1000 rounds. *)
 let fd_from_two_domains w () =
-  let two = ref false in
-  for _ = 1 to 50 do
+  let two = ref false and rounds = ref 0 in
+  while !rounds < 50 || ((not !two) && !rounds < 1000) do
+    incr rounds ;
     w.run (fun () ->
         let l, a = w.listen () in
         Fiber.scope (fun s ->
