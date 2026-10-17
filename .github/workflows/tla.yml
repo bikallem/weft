@@ -48,8 +48,9 @@ jobs:
             limit: 3600
             timeout: 120
           # The slowest case takes about 2 min. The job takes about 3 min.
-          - name: Commit, Ivar, Fd, Semaphore, Signal
-            models: Commit Ivar Fd Semaphore Signal
+          # The Watchdog cases take a few seconds.
+          - name: Commit, Ivar, Fd, Semaphore, Signal, Watchdog
+            models: Commit Ivar Fd Semaphore Signal Watchdog
             limit: 900
             timeout: 30
     runs-on: ubuntu-24.04
