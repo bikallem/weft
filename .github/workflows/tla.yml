@@ -16,10 +16,8 @@ on:
 
 jobs:
   # One job for each group of models, each on its own runner (design section
-  # 2.16). In one job, the models took about 1 h 10 min to 1 h 35 min. Wake
-  # used about 61% of the time of TLC, Scope about 37%, and the other five
-  # models together about 2%. On a runner with 4 CPUs, check.sh runs 4 cases
-  # at the same time, with 1 worker each.
+  # 2.16). On a runner with 4 CPUs, check.sh runs 4 cases at the same time,
+  # with 1 worker each.
   #
   # check.sh stops a case after LIMIT seconds, 2.5 times its slowest case or
   # more. In each job, the last case starts early enough that its LIMIT ends
@@ -32,15 +30,17 @@ jobs:
         include:
           # Wake has two jobs. Wake1 has the cases from before the wake
           # token, and Wake2 has the cases of the token. In one job, the 14
-          # cases took more than 2 h 30 min. The case with no bug took 3370 s.
+          # cases took 2 h 34 min. The slowest case of Wake1 took 5192 s, and
+          # the slowest case of Wake2 took 5736 s. Each job takes about
+          # 1 h 30 min to 1 h 40 min. The last case starts after about 30 min.
           - name: Wake1
             models: Wake1
-            limit: 10800
-            timeout: 240
+            limit: 14400
+            timeout: 300
           - name: Wake2
             models: Wake2
-            limit: 10800
-            timeout: 240
+            limit: 14400
+            timeout: 300
           # The slowest case took 1420 s on CI. The job takes about 35 min. A
           # case that hangs stops at LIMIT, also when it starts late.
           - name: Scope

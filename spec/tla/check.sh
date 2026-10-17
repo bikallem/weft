@@ -19,10 +19,10 @@
 # A "fail" case plants one bug, and TLC must find a violation or a deadlock.
 # The script gives exit status 1 if a result is not the expected one.
 # JOBS (default 4), WORKERS and HEAP (default 2g) control the parallel runs.
-# LIMIT (default 10800, 3 h) is the maximum time of one case, in seconds. A
+# LIMIT (default 14400, 4 h) is the maximum time of one case, in seconds. A
 # case that is longer stops with an error, so that a hang does not stop the
-# script. The Wake case with no bug took 3370 s on a CI runner, so the limit
-# is about three times that time. In CI, each group of models has its own job
+# script. The slowest Wake case took 5736 s on a CI runner, so the limit is
+# 2.5 times that time. In CI, each group of models has its own job
 # and its own LIMIT (.github/workflows/tla.yml).
 # Each result goes to stderr when its case ends, and the list of all results
 # goes to stdout at the end.
@@ -37,7 +37,7 @@ n=0
 JOBS=${JOBS:-4}
 WORKERS=${WORKERS:-$(( $(nproc) / JOBS > 0 ? $(nproc) / JOBS : 1 ))}
 export JAVA_TOOL_OPTIONS="-Xmx${HEAP:-2g}"
-LIMIT=${LIMIT:-10800}
+LIMIT=${LIMIT:-14400}
 MODELS=${MODELS:-"Commit Scope Ivar Wake Fd Semaphore Signal"}
 want() { case " $MODELS " in *" $1 "*) return 0 ;; *) return 1 ;; esac; }
 
