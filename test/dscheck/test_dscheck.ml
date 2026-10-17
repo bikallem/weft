@@ -287,7 +287,9 @@ let ring_steal () =
         List.sort compare all = [1; 2; 3] )
 
 (* The idle protocol (Wake.tla): domain 0 goes idle while domain 1 pushes work.
-   The sleeper sees the work, or the pusher wakes it. *)
+   The sleeper sees the work, or the pusher wakes it. A wake gives its count of
+   [searching] to domain 0 (the token), and a push with no wake leaves no
+   count. *)
 let idle_push () =
   trace (fun () ->
       let t = S.create ~domains:2 () in
@@ -301,7 +303,36 @@ let idle_push () =
       spawn_in w (fun () ->
           S.push d1 f (fun () -> S.Finished) ;
           S.flush_wake d1 ) ;
-      fun () -> (not (Atomic.get slept)) || Atomic.get w.wakes = 1 )
+      fun () ->
+        ((not (Atomic.get slept)) || Atomic.get w.wakes = 1)
+        && Atomic.get t.S.searching = Atomic.get w.wakes
+        && Atomic.get d0.S.got_token = (Atomic.get w.wakes = 1) )
+
+(* The token of a wake (Wake.tla): domain 1 gives the token to domain 0, while
+   the second check of domain 0 finds work. Domain 0 then leaves [idle] and
+   takes. If the waker took domain 0 out of [idle], domain 0 holds the token
+   after its take. If not, domain 0 took the token first, or the waker took it
+   back. Each token stays in [searching]. The order of the first prototype, the
+   removal from [idle] before the token, fails here. *)
+let token_leave () =
+  trace (fun () ->
+      let t = S.create ~domains:2 () in
+      let w = world () in
+      let d0 = t.S.doms.(0) and d1 = t.S.doms.(1) in
+      let taken = Atomic.make false in
+      S.Idle.add t 0 ;
+      spawn_in w (fun () ->
+          if not (S.Idle.remove t 0) then Atomic.set taken true ;
+          S.Idle.take_token d0 ) ;
+      spawn_in w (fun () ->
+          d1.S.wake <- true ;
+          S.flush_wake d1 ) ;
+      fun () ->
+        let taken = Atomic.get taken in
+        ((not taken) || d0.S.token)
+        && (not (Atomic.get d0.S.got_token))
+        && Atomic.get t.S.searching = Bool.to_int d0.S.token
+        && Atomic.get w.wakes = Bool.to_int taken )
 
 (* The Go rules (M3, Wake.tla): domain 0 searches, finds nothing, decreases
    [searching], goes idle and checks again, while domain 1 pushes. A push wakes
@@ -1041,6 +1072,7 @@ let () =
   case "idle: a domain goes idle while another domain pushes work" idle_push ;
   case "idle: a searching domain goes idle while another domain pushes"
     search_push ;
+  case "token: a wake while the domain leaves idle itself" token_leave ;
   case "next slot: a take by the owner and a steal at the same time" next_steal ;
   case "inject: a fill from outside while a domain goes idle" inject_idle ;
   case "pinned: a pinned push while domain 0 goes idle" pinned_push ;

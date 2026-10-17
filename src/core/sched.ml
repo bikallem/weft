@@ -202,6 +202,11 @@ and dom =
   ; mutable wake: bool  (** A push to do a wake at the next safe point. *)
   ; mutable wake0: bool
         (** A push to the pinned queue: wake domain 0 at the next safe point. *)
+  ; got_token: bool Atomic.t
+        (** A waker puts the token here: one count of [searching] (design
+            section 2.5, Idle and wake). *)
+  ; mutable token: bool
+        (** The domain took the token from [got_token] and holds its count. *)
   ; stats: stats  (** The counters of the domain, for the measurements. *)
   ; mutable held: int
         (** The jobs that this domain started, that hold the user of an fd, and
@@ -658,21 +663,49 @@ module Idle = struct
     if v land bit d = 0 then false
     else Atomic.compare_and_set t.idle v (v land lnot (bit d)) || remove t d
 
-  (* Take one domain out of the set, the lowest in [mask], and give it. *)
-  let rec take_in t mask =
-    let v = Atomic.get t.idle land mask in
+  (* The lowest domain in the set [v], which is not empty. *)
+  let lowest v =
+    let rec low i = if v land bit i <> 0 then i else low (i + 1) in
+    low 0
+
+  (* Take the lowest domain out of the set, and give it. *)
+  let rec take_any t =
+    let v = Atomic.get t.idle in
     if v = 0 then None
     else
-      let d =
-        let rec low i = if v land bit i <> 0 then i else low (i + 1) in
-        low 0
-      in
-      if remove t d then Some d else take_in t mask
+      let d = lowest v in
+      if remove t d then Some d else take_any t
 
-  (* The lowest idle domain that is not [self]. *)
-  let take t ~self = take_in t (lnot (bit self))
+  (* The wake of a push (the Go rule of [wakep]). The caller holds the token,
+     the count of [searching] that it changed from 0 to 1. The token goes to the
+     lowest idle domain that is not [self], and the function gives that domain
+     for a wake. If no domain is idle, the count goes back.
 
-  let take_any t = take_in t (-1)
+     The token goes to the domain before the domain leaves the set. Thus the
+     domain sees the token at its next take, also if it leaves the set itself
+     and a poll takes the wake. With the opposite order, the domain could take
+     no token, poll the wake away and sleep, and its count then stops each later
+     wake (Wake.tla, BugTokenAfterRemove). If the domain left the set first, it
+     is awake: it searches, or it checks the queues again before it sleeps. Thus
+     the waker takes the token back and gives back its count. A waker that tries
+     another domain can chase one domain forever (Wake.tla, BugTokenRetry). If
+     the domain took the token first, it searches with it and needs no wake. *)
+  let give_token t ~self =
+    let v = Atomic.get t.idle land lnot (bit self) in
+    if v = 0 then (Atomic.decr t.searching ; None)
+    else
+      let d = lowest v in
+      let got = t.doms.(d).got_token in
+      Atomic.set got true ;
+      if remove t d then Some d
+      else (
+        if Atomic.compare_and_set got true false then Atomic.decr t.searching ;
+        None )
+
+  (* A domain takes a token that a waker gave. *)
+  let take_token dom =
+    if Atomic.get dom.got_token && Atomic.exchange dom.got_token false then
+      dom.token <- true
 end
 
 (* A push to the local queue. A full ring moves its older half and the new fiber
@@ -699,7 +732,9 @@ let push_pinned dom r =
 let has_pinned dom = dom.index = 0 && Atomic.get dom.sched.pinned_n > 0
 
 (* A push wakes an idle domain, but not while a domain searches: that domain
-   finds the fiber (the Go rules). *)
+   finds the fiber (the Go rules). [flush_wake] changes [searching] from 0 to 1
+   before the wake, so the next pushes wake nobody until the woken domain
+   searches. *)
 let mark_wake dom =
   let t = dom.sched in
   if Atomic.get t.idle <> 0 && Atomic.get t.searching = 0 then dom.wake <- true
@@ -745,12 +780,14 @@ let flush_wake dom =
       World.perform "sched" (World.Wake 0) ) ) ;
   if dom.wake then (
     dom.wake <- false ;
-    match Idle.take dom.sched ~self:dom.index with
-    | Some d ->
-        dom.stats.wakes <- dom.stats.wakes + 1 ;
-        World.perform "sched" (World.Wake d)
-    | None ->
-        () )
+    let t = dom.sched in
+    if Atomic.compare_and_set t.searching 0 1 then
+      match Idle.give_token t ~self:dom.index with
+      | Some d ->
+          dom.stats.wakes <- dom.stats.wakes + 1 ;
+          World.perform "sched" (World.Wake d)
+      | None ->
+          () )
 
 (* Resume a parked sync. The caller got [Resume] or a claim with
    [resume_partner], so it is the one owner of this resume. *)
@@ -1428,16 +1465,39 @@ let start_search (t : t) =
   in
   inc ()
 
+(* The end of a search: the domain gives back its count of [searching]. The last
+   searching domain that finds work wakes one idle domain, because the pushes
+   woke nobody while it searched. *)
+let end_search dom found =
+  let t = dom.sched in
+  if
+    ( Atomic.fetch_and_add t.searching (-1)
+    = 1 )
+    [@mutate
+      off
+        "the last wake gives only performance: Wake.tla passes with no last \
+         wake"]
+    && found
+  then
+    if
+      ( Atomic.get t.idle <> 0 )
+      [@mutate
+        off
+          "the last wake gives only performance: Wake.tla passes with no last \
+           wake"]
+    then dom.wake <- true
+
 (* The steal of the Go rules (design section 2.5, Idle and wake, and
-   spec/tla/Wake.tla). A searching domain that finds no work decreases
-   [searching] before its second check. The last searching domain that finds
-   work wakes one idle domain, because the pushes woke nobody while it
-   searched. *)
+   spec/tla/Wake.tla). A domain with the token searches with its count, and
+   another domain increases [searching]. A searching domain that finds no work
+   decreases [searching] before its second check. *)
 let steal dom =
   let t = dom.sched in
   let doms = t.doms in
   let n = Array.length doms in
-  if n = 1 || not (start_search t) then None
+  let token = dom.token in
+  dom.token <- false ;
+  if not (token || (n > 1 && start_search t)) then None
   else
     let start = next_rand dom mod n in
     let rec try_ i =
@@ -1466,22 +1526,7 @@ let steal dom =
             next_of (i + 1)
     in
     let r = match try_ 0 with Some r -> Some r | None -> next_of 0 in
-    if
-      ( Atomic.fetch_and_add t.searching (-1)
-      = 1 )
-      [@mutate
-        off
-          "the last wake gives only performance: Wake.tla passes with no last \
-           wake"]
-      && Option.is_some r
-    then
-      if
-        ( Atomic.get t.idle <> 0 )
-        [@mutate
-          off
-            "the last wake gives only performance: Wake.tla passes with no \
-             last wake"]
-      then dom.wake <- true ;
+    end_search dom (Option.is_some r) ;
     r
 
 (* The next slot runs at most [next_limit] times in sequence. Then its fiber
@@ -1547,7 +1592,7 @@ let take_pinned_first dom =
         dom.pinned_runs <- 0 ;
         None
 
-let take dom =
+let take_work dom =
   dom.ticks <- dom.ticks + 1 ;
   let first =
     if
@@ -1583,6 +1628,17 @@ let take dom =
             | None -> (
               match take_pinned dom with Some r -> Some r | None -> steal dom )
             ) ) ) )
+
+(* A domain that a wake gave the token to searches with it in [steal]. If it
+   finds work before the steal, it ends the search with that work (Go's
+   [resetspinning]). *)
+let take dom =
+  Idle.take_token dom ;
+  let r = take_work dom in
+  if dom.token && Option.is_some r then (
+    dom.token <- false ;
+    end_search dom true ) ;
+  r
 
 (* The second check of a domain that is in [idle]: did [main] end, or is there a
    fiber in a queue that it can take? The check needs [finished]: a poll in the
@@ -1959,6 +2015,8 @@ let create ?(slack = Span.us 100) ?(simulated = false) ~domains () =
         ; rng= 0
         ; wake= false
         ; wake0= false
+        ; got_token= Atomic.make false
+        ; token= false
         ; stats= {wakes= 0; edges= 0; idle_edges= 0; busy_polls= 0; resumes= 0}
         ; held= 0
         ; regs= Hashtbl.create ~random:false 64
