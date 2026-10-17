@@ -496,7 +496,7 @@ let cancel_and_sync () =
       let w = world () in
       let node = scope_node () in
       let f = S.new_fiber [node] in
-      S.add_member_to node f ;
+      ignore (S.add_member_to node f) ;
       spawn_in w (fun () ->
           S.sync t.S.doms.(0) f {S.leaves= [||]; nocancel= false} (cont ()) ) ;
       spawn_in w (fun () ->
@@ -517,7 +517,7 @@ let two_cancels_and_sync () =
       let w = world () in
       let node = scope_node () in
       let f = S.new_fiber [node] in
-      S.add_member_to node f ;
+      ignore (S.add_member_to node f) ;
       spawn_in w (fun () ->
           S.sync t.S.doms.(0) f {S.leaves= [||]; nocancel= false} (cont ()) ) ;
       spawn_in w (fun () ->
@@ -540,9 +540,9 @@ let cancel_and_leave () =
       let parent = scope_node () in
       let node = scope_node ~parent () in
       let f = S.new_fiber [node; parent] in
-      S.add_member_to node f ;
+      let m = S.add_member_to node f in
       spawn_in w (fun () ->
-          S.remove_member node f ;
+          S.remove_member node m ;
           f.S.ctxs <- [parent] ;
           S.sync t.S.doms.(0) f {S.leaves= [||]; nocancel= false} (cont ()) ) ;
       spawn_in w (fun () ->

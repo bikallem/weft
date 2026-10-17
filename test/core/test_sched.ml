@@ -52,7 +52,7 @@ let second_cancel_no_walk () =
   let node = S.new_node (S.Scope_node (S.new_scope_state ())) in
   equal int 0 (List.length (S.cancel_node node Exit)) ;
   let f = S.new_fiber [node] in
-  S.add_member_to node f ;
+  ignore (S.add_member_to node f) ;
   let s =
     {S.word= S.C.make 0; owner= f; sctx= node; cancellable= true; k= None}
   in
@@ -61,13 +61,29 @@ let second_cancel_no_walk () =
   equal int 0 (List.length (S.cancel_node node Exit)) ;
   is_true ~msg:"the sync is still parked" (S.C.state s.S.word = S.C.Parked)
 
+(* The members of a node are a linked list. A member leaves the list in any
+   order, and the walk gets the others in the fork order. *)
+let member_list () =
+  let node = S.new_node (S.Scope_node (S.new_scope_state ())) in
+  let fs = List.init 5 (fun _ -> S.new_fiber [node]) in
+  let ms = Array.of_list (List.map (S.add_member_to node) fs) in
+  List.iter (fun i -> S.remove_member node ms.(i)) [1; 4; 0] ;
+  equal int 2 node.S.members.S.count ;
+  equal (list int)
+    (List.map (fun i -> (List.nth fs i).S.fid) [2; 3])
+    (List.map (fun f -> f.S.fid) (S.member_fibers node.S.members)) ;
+  List.iter (fun i -> S.remove_member node ms.(i)) [3; 2] ;
+  equal int 0 node.S.members.S.count ;
+  is_true (Option.is_none node.S.members.S.head)
+
 let tests =
   [ group "fd table"
       [ test "a slot used again gets a new generation" new_generation
       ; test "a growth of the fd table keeps the generations"
           growth_keeps_generations ]
   ; group "cancel"
-      [test "a second cancel of a node does not walk it" second_cancel_no_walk]
+      [ test "a second cancel of a node does not walk it" second_cancel_no_walk
+      ; test "a member leaves the list in any order" member_list ]
   ; group "wake rule"
       [ test "a push marks a wake only for an idle domain and no search"
           wake_rule ] ]

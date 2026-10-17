@@ -78,7 +78,7 @@ and ctx =
   ; parent: ctx option
   ; flag: exn option Atomic.t  (** The cancel of this node. *)
   ; lock: Spin.t
-  ; members: (int, fiber) Hashtbl.t  (** By fiber id, under [lock]. *)
+  ; members: members  (** Under [lock]. *)
   ; children: (int, ctx) Hashtbl.t
         (** The nested nodes that are not shields, by node id, under [lock]. *)
   ; chain: handler
@@ -87,6 +87,13 @@ and ctx =
   ; fids: int Atomic.t
         (** The next fiber id. All nodes of one run share it (design section
             2.5, The id of a fiber). *) }
+
+(* The members of a node: a doubly linked list, the newest first. A fiber holds
+   its cell, so that it leaves the list in O(1). *)
+and members = {mutable head: member option; mutable count: int}
+
+and member =
+  {mf: fiber; mutable mprev: member option; mutable mnext: member option}
 
 (* A handler of the user (design section 2.5, Effect handlers of a scope). *)
 and handler = {handle: 'a. (unit -> 'a) -> 'a}
@@ -356,7 +363,7 @@ module Heap = struct
       ; parent= None
       ; flag= Atomic.make None
       ; lock= Spin.make ()
-      ; members= Hashtbl.create 1
+      ; members= {head= None; count= 0}
       ; children= Hashtbl.create 1
       ; chain= {handle= (fun f -> f ())}
       ; fids= Atomic.make 0 }
@@ -1172,16 +1179,42 @@ let new_node ?parent ?handler kind =
   ; parent
   ; flag= Atomic.make None
   ; lock= Spin.make ()
-  ; members= Hashtbl.create ~random:false 4
+  ; members= {head= None; count= 0}
   ; children= Hashtbl.create ~random:false 4
   ; chain
   ; fids= (match parent with Some p -> p.fids | None -> Atomic.make 0) }
 
+(* Add [f] to the members of [n], and give its cell. *)
 let add_member_to n f =
-  Spin.with_lock n.lock (fun () -> Hashtbl.replace n.members f.fid f)
+  let l = n.members in
+  Spin.with_lock n.lock (fun () ->
+      let m = {mf= f; mprev= None; mnext= l.head} in
+      let sm = Some m in
+      Option.iter (fun h -> h.mprev <- sm) l.head ;
+      l.head <- sm ;
+      l.count <- l.count + 1 ;
+      m )
 
-let remove_member n f =
-  Spin.with_lock n.lock (fun () -> Hashtbl.remove n.members f.fid)
+let remove_member n m =
+  let l = n.members in
+  Spin.with_lock n.lock (fun () ->
+      ( match m.mprev with
+      | Some p ->
+          p.mnext <- m.mnext
+      | None ->
+          l.head <- m.mnext ) ;
+      Option.iter (fun x -> x.mprev <- m.mprev) m.mnext ;
+      l.count <- l.count - 1 )
+
+(* The fibers of the members, the oldest first: the fork order. *)
+let member_fibers l =
+  let rec go acc = function
+    | None ->
+        acc
+    | Some m ->
+        go (m.mf :: acc) m.mnext
+  in
+  go [] l.head
 
 (* The entries of a table. The caller holds the lock of the table, and it sorts
    the entries with [by_id] after it releases the lock. *)
@@ -1223,9 +1256,10 @@ let walk x =
   let found = ref [] in
   let rec visit n =
     let members, children =
-      Spin.with_lock n.lock (fun () -> (entries n.members, entries n.children))
+      Spin.with_lock n.lock (fun () ->
+          (member_fibers n.members, entries n.children) )
     in
-    let members = by_id members and children = by_id children in
+    let children = by_id children in
     List.iter
       (fun f ->
         match Atomic.get f.current with
@@ -1835,13 +1869,13 @@ let fork ?name ?pinned scope body =
   ignore (self ()) ;
   add_member scope ~daemon:false ;
   let f = new_fiber ?name ?pinned [scope] in
-  add_member_to scope f ;
+  let m = add_member_to scope f in
   prog "Fiber.fork"
     (Fork
        ( f
        , fun () ->
            run_body ~ctx:scope scope body ;
-           remove_member scope f ;
+           remove_member scope m ;
            enqueue (member_end scope ~daemon:false) ) )
 
 (* A daemon has its own node under the scope. The count and the link of the node
@@ -1853,7 +1887,7 @@ let fork_daemon ?name scope body =
   let st = state_of scope in
   let d = new_node ~parent:scope Daemon_node in
   let f = new_fiber ?name [d] in
-  Hashtbl.replace d.members f.fid f ;
+  ignore (add_member_to d f) ;
   Spin.with_lock scope.lock (fun () ->
       add_member scope ~daemon:true ;
       Hashtbl.replace scope.children d.nid d ;
@@ -1882,13 +1916,13 @@ let reraise (e, bt) = Printexc.raise_with_backtrace e bt
    then join. The join ignores cancels. If the body gave a value, the scope
    gives it, also if the scope was cancelled: [with_timeout] never drops a
    value. *)
-let finish_scope fiber node result =
+let finish_scope m node result =
   ( match result with
   | Error (e, bt) ->
       enqueue (fail ~ctx:node node e bt)
   | Ok _ ->
       () ) ;
-  remove_member node fiber ;
+  remove_member node m ;
   enqueue (member_end node ~daemon:false) ;
   let st = state_of node in
   ignore (sync_req ~nocancel:true [|Iv.leaf st.join|]) ;
@@ -1911,7 +1945,7 @@ let scope ?handler f =
   let fiber = self () in
   let parent = List.hd fiber.ctxs in
   let node = new_node ~parent ?handler (Scope_node (new_scope_state ())) in
-  Hashtbl.replace node.members fiber.fid fiber ;
+  let m = add_member_to node fiber in
   Spin.with_lock parent.lock (fun () ->
       Hashtbl.replace parent.children node.nid node ) ;
   fiber.ctxs <- node :: fiber.ctxs ;
@@ -1929,7 +1963,7 @@ let scope ?handler f =
         Error (e, Printexc.get_raw_backtrace ())
   in
   fiber.ctxs <- List.tl fiber.ctxs ;
-  finish_scope fiber node result
+  finish_scope m node result
 
 (* [f] gets the shield node. *)
 let shield_node f =
@@ -2048,7 +2082,7 @@ let create ?(slack = Span.us 100) ?(simulated = false) ~domains () =
 let start t main =
   let root = new_node (Scope_node (new_scope_state ())) in
   let fiber = new_fiber ~name:"main" [root] in
-  Hashtbl.replace root.members fiber.fid fiber ;
+  let m = add_member_to root fiber in
   let result = ref None in
   let body () =
     let r =
@@ -2059,7 +2093,7 @@ let start t main =
           Error (e, Printexc.get_raw_backtrace ())
     in
     let r =
-      match finish_scope fiber root r with
+      match finish_scope m root r with
       | v ->
           fun () -> v
       | exception e ->

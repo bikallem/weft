@@ -619,15 +619,14 @@ let ended_fibers_leave () =
           done ;
           Fiber.yield () ;
           (* Only the fiber of the body stays. *)
-          equal int 1 (Hashtbl.length (Private.scope_ctx s).S.members) ) )
+          equal int 1 (Private.scope_ctx s).S.members.S.count ) )
 
 (* The body of a scope that ended is not a member of the scope any more. *)
 let body_leaves () =
   Sim.run (fun _ ->
       let sc = ref None in
       Fiber.scope (fun s -> sc := Some s) ;
-      equal int 0
-        (Hashtbl.length (Private.scope_ctx (Option.get !sc)).S.members) )
+      equal int 0 (Private.scope_ctx (Option.get !sc)).S.members.S.count )
 
 (* A cancel of a scope reaches its daemons with the reason of the cancel, not
    with the end of the other members. *)
