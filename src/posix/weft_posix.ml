@@ -217,7 +217,7 @@ let check name r = if r < 0 then failwith (name ^ ": " ^ strerror (-r)) else r
    calls it one time at the start of a run, so the cost of a system call is
    small. *)
 let random n =
-  let b = Bytes.create 8 in
+  let b = Bytes.make 8 '\000' in
   ignore (check "getrandom" (getrandom b)) ;
   let x = Int64.to_int (Bytes.get_int64_le b 0) land max_int in
   x mod n
