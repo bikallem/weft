@@ -1534,7 +1534,6 @@ let extra_edge t d =
         t.net.edges <-
           (d, World.Ready.Fd {token; read= true; write= true}) :: t.net.edges
 
-(* Answer the effect of domain [d], continue it, and keep its next state. *)
 (* A switch point with no progress: only [Now], [Switch], [Random], or a [Wait]
    that gives nothing. A loop that yields until a time comes makes no progress,
    because the time moves only at a quiescence (design section 2.8,
@@ -1546,6 +1545,7 @@ let no_progress t =
 
 let progress t = t.no_progress <- 0
 
+(* Answer the effect of domain [d], continue it, and keep its next state. *)
 let step t st d =
   (* A fiber that a commit resumed is progress, for example on a channel. *)
   let resumes = (sched t).doms.(d).stats.resumes in

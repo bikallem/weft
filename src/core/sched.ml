@@ -725,10 +725,6 @@ module Idle = struct
       dom.token <- true
 end
 
-(* A push to the local queue. A full ring moves its older half and the new fiber
-   to the overflow queue, as Go does, so the order stays FIFO. If a domain is
-   idle, the push marks a wake: the scheduler does it at the next safe point,
-   because a wake is a world effect, and a lock can be held here. *)
 (* A pinned fiber goes to the pinned queue, and the push wakes domain 0
    directly: another domain cannot run it (Wake.tla). The count comes after the
    push, and domain 0 reads it after it adds itself to [idle]: a Dekker pair
@@ -756,6 +752,10 @@ let mark_wake dom =
   let t = dom.sched in
   if Atomic.get t.idle <> 0 && Atomic.get t.searching = 0 then dom.wake <- true
 
+(* A push to the local queue. A full ring moves its older half and the new fiber
+   to the overflow queue, as Go does, so the order stays FIFO. If a domain is
+   idle, the push marks a wake: the scheduler does it at the next safe point,
+   because a wake is a world effect, and a lock can be held here. *)
 let push_ready dom r =
   r.rfiber.queued <- true ;
   let t = dom.sched in
@@ -828,10 +828,6 @@ let wake_all dom waiters =
       match C.notify s.word i with C.Resume -> resume dom s | _ -> () )
     (Waiters.to_list waiters)
 
-(* The registration of [fdr] on [dom], in the order of spec/tla/Fd.tla: add a
-   user, set the domain bit, read the state, then add the fd to the poller.
-   [Error None] tells that the fd is closing: the waiter retries and gets
-   [EBADF]. *)
 (* The live registration of [fdr] on [dom], if one. *)
 let live_reg dom fdr =
   match Hashtbl.find_opt dom.regs fdr.slot with
@@ -840,6 +836,10 @@ let live_reg dom fdr =
   | _ ->
       None
 
+(* The registration of [fdr] on [dom], in the order of spec/tla/Fd.tla: add a
+   user, set the domain bit, read the state, then add the fd to the poller.
+   [Error None] tells that the fd is closing: the waiter retries and gets
+   [EBADF]. *)
 let ensure_reg dom fdr =
   match live_reg dom fdr with
   | Some reg ->
@@ -1287,8 +1287,6 @@ let walk x =
 let cancel_node x reason =
   if Atomic.compare_and_set x.flag None (Some reason) then walk x else []
 
-(* The sync of a fiber, in the scheduler (design section 2.4). *)
-
 (* The PRNG of a domain: SplitMix64 on 63 bits. *)
 let next_rand dom =
   dom.rng <-
@@ -1379,6 +1377,7 @@ let rec run_fiber : dom -> fiber -> step -> unit =
   | Suspended (Sync r, k) ->
       sync dom fiber r k
 
+(* The sync of a fiber, in the scheduler (design section 2.4). *)
 and sync dom fiber (r : sync_req) (k : (int, step) Effect.Deep.continuation) =
   let s =
     { word= C.make (Commit.Id.next dom.ids)
@@ -1442,13 +1441,13 @@ let expire_heap dom heap limit =
   in
   loop ()
 
-(* The alarm: the earliest live deadline, rounded up to the slack. The rounding
-   saturates at the largest time. *)
 (* The [Posix] heap reads [Now Posix] only when it holds an entry. *)
 let expire dom =
   expire_heap dom dom.heap (now_ns ()) ;
   if dom.pheap.size > 0 then expire_heap dom dom.pheap (posix_ns ())
 
+(* The alarm: the earliest live deadline, rounded up to the slack. The rounding
+   saturates at the largest time. *)
 let alarm_of dom heap =
   Heap.drop_stale heap ;
   match Heap.top heap with
@@ -1503,8 +1502,6 @@ let wait dom timeout =
 let take_overflow t =
   Spin.with_lock t.overflow_lock (fun () -> Queue.take_opt t.overflow)
 
-(* A steal: try each other domain one time, from a start that the PRNG of the
-   domain selects. *)
 (* A domain searches only if fewer than half of the domains search (at least
    one). It gives [false] if it cannot search. *)
 let start_search (t : t) =
@@ -1540,10 +1537,11 @@ let end_search dom found =
            wake"]
     then dom.wake <- true
 
-(* The steal of the Go rules (design section 2.5, Idle and wake, and
-   spec/tla/Wake.tla). A domain with the token searches with its count, and
-   another domain increases [searching]. A searching domain that finds no work
-   decreases [searching] before its second check. *)
+(* A steal: try each other domain one time, from a start that the PRNG of the
+   domain selects. The steal obeys the Go rules (design section 2.5, Idle and
+   wake, and spec/tla/Wake.tla). A domain with the token searches with its
+   count, and another domain increases [searching]. A searching domain that
+   finds no work decreases [searching] before its second check. *)
 let steal dom =
   let t = dom.sched in
   let doms = t.doms in
@@ -1607,11 +1605,8 @@ let take_next dom =
         push_ready dom r ;
         None )
 
-(* Steps 2 to 4 of the loop: the local queue, the overflow queue, then a steal.
-   Each 61st take tries the overflow queue first, so that its fibers do not
-   starve while the ring is never empty (Go does the same). *)
-(* The requests of the injection queue, the oldest first: each one fills an
-   Ivar on this domain. *)
+(* The requests of the injection queue, the oldest first: each one fills an Ivar
+   on this domain. *)
 let take_injected dom =
   let t = dom.sched in
   if Atomic.get t.inject <> [] then
@@ -1645,6 +1640,9 @@ let take_pinned_first dom =
         dom.pinned_runs <- 0 ;
         None
 
+(* Steps 2 to 4 of the loop: the local queue, the overflow queue, then a steal.
+   Each 61st take tries the overflow queue first, so that its fibers do not
+   starve while the ring is never empty (Go does the same). *)
 let take_work dom =
   dom.ticks <- dom.ticks + 1 ;
   let first =

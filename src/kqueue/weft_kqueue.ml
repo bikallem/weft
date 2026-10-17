@@ -316,7 +316,6 @@ module World = struct
         | Some x, Some y ->
             Int64.min x y )
 
-  (* The exit of a child: its pipe becomes readable. *)
   (* Under the lock: a close removes the child under the same lock before it
      closes [exit_w]. *)
   let exited t token =
