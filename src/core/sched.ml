@@ -703,9 +703,9 @@ module Idle = struct
      for a wake. If no other domain is idle, the function decreases [searching].
 
      The token goes to the domain before the domain leaves the set. Thus the
-     domain sees the token at its next take, also if it leaves the set itself
-     and a poll takes the wake. With the opposite order, the domain could take
-     no token, take the wake in a poll and sleep. Its count then stops each
+     domain sees the token when it leaves the set, also if it leaves the set
+     itself and a poll takes the wake. With the opposite order, the domain could
+     take no token, take the wake in a poll and sleep. Its count then stops each
      later wake (Wake.tla, BugTokenAfterRemove).
 
      If the domain left the set first, it is awake: it searches, or it checks
@@ -1688,8 +1688,7 @@ let take_work dom =
 (* A domain that a wake gave the token to searches with it in [steal]. If it
    finds work before the steal, it ends the search with that work (Go's
    [resetspinning]). *)
-let take dom =
-  Idle.take_token dom ;
+let take_with_token dom =
   let r = take_work dom in
   if dom.token && Option.is_some r then (
     dom.token <- false ;
@@ -1762,7 +1761,7 @@ let rec loop dom =
     take_mail dom ;
     if dom.held > 0 then (wait dom World.Wait.Sleep ; loop dom) )
   else (
-    ( match take dom with
+    ( match take_work dom with
     | Some r ->
         run_ready dom r
     | None ->
@@ -1771,7 +1770,13 @@ let rec loop dom =
            check sees a fiber that the poll made ready, and the end. *)
         Idle.add t dom.index ;
         if not (work_for dom) then wait dom World.Wait.Sleep ;
-        ignore (Idle.remove t dom.index) ) ;
+        ignore (Idle.remove t dom.index) ;
+        (* A waker gives a token only to a domain in [idle]. Thus the domain
+           reads [got_token] only here, and the take of a busy domain does not
+           read it (Wake.tla, tk). Then it takes work, also with no token: this
+           branch is not on the hot path. *)
+        Idle.take_token dom ;
+        Option.iter (run_ready dom) (take_with_token dom) ) ;
     loop dom )
 
 (* The scopes (design section 2.5, Fibers, scopes and cancellation). *)
