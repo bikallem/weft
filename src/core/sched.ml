@@ -27,6 +27,9 @@ module Spin = struct
 
   let make () = Atomic.make false
 
+  (* Test and test-and-set: a waiter reads the lock until it is free, and only
+     then tries the CAS. Thus the waiters do not write the cache line of the
+     lock while its holder works. *)
   let rec lock t =
     if
       not
@@ -35,10 +38,17 @@ module Spin = struct
         off
           "one domain never contends; test_heap.ml examines the lock with two \
            domains, but a mutation run cannot start a domain"]
-    then (
-      Domain.cpu_relax ()
-      [@mutate off "a hint to the CPU only: the loop gives the same result"] ;
-      lock t )
+    then wait t
+
+  and wait t =
+    Domain.cpu_relax ()
+    [@mutate off "a hint to the CPU only: the loop gives the same result"] ;
+    if
+      Atomic.get t
+      [@mutate
+        off "one domain never contends; a mutation run cannot start a domain"]
+    then wait t
+    else lock t
 
   let unlock t = Atomic.set t false
 
