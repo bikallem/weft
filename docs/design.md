@@ -1778,7 +1778,7 @@ An adversarial review found these 20 problems. The design at that time fixed all
 | 12 | A thread pool in OCaml can be slow to report | The thread pool is in C (2.3) |
 | 13 | The next slot can starve the queue. Work can wait while domains sleep. | A limit of 3 runs. The last searching domain wakes one more (2.5). |
 | 14 | `close` is not specified, and fd numbers are used again | A use count and a generation number (2.7) |
-| 15 | A child inherits `SIG_IGN` | `SETSIGDEF` resets `SIGPIPE` and the watched signals (2.7) |
+| 15 | A child inherits `SIG_IGN` | `SETSIGDEF` resets `SIGPIPE`. `SETSIGMASK` unblocks the watched signals in the child (2.7) |
 | 16 | The semantics of `Signal.received` are not clear | One fiber gets each signal (2.7) |
 | 17 | The `Mono` clock is not selected | `CLOCK_MONOTONIC` for the alarm and for `Now` (2.7) |
 | 18 | `Random` cannot give bytes for TLS | `random_bytes` (2.3) |
