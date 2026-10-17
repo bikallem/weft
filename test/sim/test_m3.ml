@@ -6,8 +6,6 @@ module Sim = Weft_sim
 module S = Private.Sched
 module C = S.C
 
-let dom () = S.prog "test" S.Dom_index
-
 (* Pinned fibers run only on domain 0: at the start, after a yield, after a
    sleep, and after a wake by a fiber of another domain. *)
 let pinned seed =
@@ -15,7 +13,7 @@ let pinned seed =
       let off = Atomic.make 0
       and c = Chan.create ()
       and other = Atomic.make 0 in
-      let check () = if dom () <> 0 then Atomic.incr off in
+      let check () = if Helpers.dom () <> 0 then Atomic.incr off in
       Fiber.scope (fun s ->
           for _ = 1 to 4 do
             Fiber.fork ~pinned:true s (fun () ->
@@ -30,7 +28,7 @@ let pinned seed =
           for _ = 1 to 4 do
             Fiber.fork s (fun () ->
                 Fiber.yield () ;
-                if dom () <> 0 then Atomic.incr other ;
+                if Helpers.dom () <> 0 then Atomic.incr other ;
                 sync (Chan.send c ()) )
           done ) ;
       (Atomic.get off, Atomic.get other) )
@@ -230,17 +228,13 @@ let unawaited () =
           let q = Fiber.fork_promise s (fun () -> Time.sleep Mono (Span.s 1)) in
           Promise.cancel q ) )
 
-let mono_ms t0 =
-  Int64.to_int
-    (Int64.div (Span.to_ns (Time.diff Mono (Time.now Mono) t0)) 1_000_000L)
-
 (* Real Posix timers: a step of the wall clock moves a Posix deadline, and not a
    Mono deadline. *)
 let posix_timers () =
   Sim.run (fun sim ->
       let t0 = Time.now Mono in
       Time.sleep Posix (Span.s 10) ;
-      equal int 10_000 (mono_ms t0) ;
+      equal int 10_000 (Helpers.ms_since t0) ;
       (* A step forward: the Posix deadline is due at once. *)
       let p0 = Time.now Posix in
       let at = Option.get (Time.add Posix p0 (Span.s 10)) in
@@ -248,12 +242,12 @@ let posix_timers () =
           let posix =
             Fiber.fork_promise s (fun () ->
                 sync (Time.at Posix at) ;
-                mono_ms t0 )
+                Helpers.ms_since t0 )
           in
           let mono =
             Fiber.fork_promise s (fun () ->
                 Time.sleep Mono (Span.s 5) ;
-                mono_ms t0 )
+                Helpers.ms_since t0 )
           in
           Time.sleep Mono (Span.s 1) ;
           Sim.set_posix sim (Option.get (Time.add Posix p0 (Span.s 20))) ;
@@ -267,7 +261,7 @@ let posix_timers () =
             Fiber.fork_promise s (fun () ->
                 sync
                   (Time.at Posix (Option.get (Time.add Posix p1 (Span.s 10)))) ;
-                mono_ms t1 )
+                Helpers.ms_since t1 )
           in
           Time.sleep Mono (Span.s 1) ;
           Sim.set_posix sim (Option.get (Time.add Posix p1 (Span.s (-99)))) ;
@@ -334,7 +328,7 @@ let pinned_wake seed =
           Fiber.fork s (fun () ->
               Time.sleep Mono (Span.ms 1) ;
               (* The send comes from another domain. *)
-              while dom () = 0 do
+              while Helpers.dom () = 0 do
                 Fiber.yield ()
               done ;
               sync (Chan.send c ()) ) ) )
@@ -429,7 +423,7 @@ let posix_step seed =
       let at = Option.get (Time.add Posix (Time.now Posix) (Span.s 10)) in
       Fiber.scope (fun s ->
           Fiber.fork s (fun () ->
-              on := dom () ;
+              on := Helpers.dom () ;
               sync (Time.at Posix at) ;
               Atomic.set fired true ) ;
           Fiber.fork ~pinned:true s (fun () ->

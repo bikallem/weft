@@ -7,10 +7,6 @@ module Sim = Weft_sim
 module Sched = Private.Sched
 module Op = Private.Op
 
-let ms_since t0 =
-  Int64.to_int
-    (Int64.div (Span.to_ns (Time.diff Mono (Time.now Mono) t0)) 1_000_000L)
-
 let read_n = Portable.read_n
 
 let read_all = Portable.drain Net.read
@@ -74,7 +70,7 @@ let t408 ?(domains = 1) seed =
           Net.write c "GET / HT" ;
           let t0 = Time.now Mono in
           let r = read_all c in
-          (status_of r, ms_since t0) ) )
+          (status_of r, Helpers.ms_since t0) ) )
 
 let t408_1000_seeds () =
   for seed = 0 to 999 do
@@ -220,11 +216,11 @@ let latency_round_trip () =
           Fiber.fork_daemon s (fun () -> echo_server l) ;
           let t0 = Time.now Mono in
           let c = Net.connect a in
-          equal ~msg:"connect" int 5 (ms_since t0) ;
+          equal ~msg:"connect" int 5 (Helpers.ms_since t0) ;
           let t1 = Time.now Mono in
           Net.write c "hi" ;
           equal string "hi" (read_n c 2) ;
-          equal ~msg:"echo" int 10 (ms_since t1) ) )
+          equal ~msg:"echo" int 10 (Helpers.ms_since t1) ) )
 
 let settle_runs_others () =
   Sim.run (fun sim ->
@@ -246,7 +242,7 @@ let settle_cancelled () =
           raises (Fiber.Cancelled Exit) (fun () -> Sim.settle sim) ) ;
       Time.sleep Mono (Span.ms 1) ;
       Sim.settle sim ;
-      equal int 1 (ms_since t0) )
+      equal int 1 (Helpers.ms_since t0) )
 
 let manual_mode () =
   Sim.run ~auto:false (fun sim ->
@@ -255,17 +251,17 @@ let manual_mode () =
       Fiber.scope (fun s ->
           Fiber.fork s (fun () ->
               Time.sleep Mono (Span.s 1) ;
-              woke := ms_since t0 :: !woke ) ;
+              woke := Helpers.ms_since t0 :: !woke ) ;
           Fiber.fork s (fun () ->
               Time.sleep Mono (Span.s 3) ;
-              woke := ms_since t0 :: !woke ) ;
+              woke := Helpers.ms_since t0 :: !woke ) ;
           ( match Time.add Mono t0 (Span.s 2) with
           | Some at ->
               Sim.advance_until sim at
           | None ->
               assert false ) ;
           equal (list int) [1000] !woke ;
-          equal int 2000 (ms_since t0) ;
+          equal int 2000 (Helpers.ms_since t0) ;
           match Time.add Mono t0 (Span.s 5) with
           | Some at ->
               Sim.advance_until sim at
@@ -670,7 +666,7 @@ let advance_cancelled () =
           Fiber.yield () ;
           Fiber.cancel s Exit ) ;
       Sim.advance_until sim (at 1) ;
-      equal int 1000 (ms_since t0) )
+      equal int 1000 (Helpers.ms_since t0) )
 
 (* A cancel at the target of advance_until: a sleeper on any domain wakes at the
    target and cancels the advance. The advance ends at the target, with or
@@ -687,9 +683,9 @@ let advance_cancel_at_target seed =
                       with Fiber.Cancelled Exit -> () ) ;
                   Time.sleep Mono (Span.s 1) ;
                   Fiber.cancel inner Exit ) ) ) ;
-      equal ~msg:(Printf.sprintf "seed %d" seed) int 1000 (ms_since t0) ;
+      equal ~msg:(Printf.sprintf "seed %d" seed) int 1000 (Helpers.ms_since t0) ;
       Sim.advance_until sim (at 2) ;
-      equal int 2000 (ms_since t0) )
+      equal int 2000 (Helpers.ms_since t0) )
 
 (* L6: the connections in flight count against the backlog. *)
 let backlog_counts_in_flight () =
@@ -814,7 +810,7 @@ let udp_latency () =
       let k, from = Net.recvfrom a buf 0 1 in
       equal int 1 k ;
       is_true (from = ("b", 1)) ;
-      equal int 5 (ms_since t0) )
+      equal int 5 (Helpers.ms_since t0) )
 
 let udp_free_ports () =
   Sim.run (fun _ ->
@@ -943,7 +939,7 @@ let reset_latency () =
             (fun () -> ignore (Net.read c (Bytes.create 1) 0 1)) ;
           (* The server accepted at 5 ms and reset at 25 ms, and the reset came
              5 ms later. *)
-          equal int 25 (ms_since t0) ;
+          equal int 25 (Helpers.ms_since t0) ;
           Net.close c ) ;
       Net.close l ;
       equal int 0 (Sim.open_fds sim) )
@@ -1132,7 +1128,7 @@ let accept_loop_pauses () =
           Time.sleep Mono (Span.ms 250) ;
           Sim.set_fd_limit sim None ;
           let s = Promise.await got in
-          equal int 300 (ms_since t0) ;
+          equal int 300 (Helpers.ms_since t0) ;
           equal int 3 !tries ;
           Net.close s ;
           Net.close c ) ;
@@ -1141,7 +1137,7 @@ let accept_loop_pauses () =
       let t1 = Time.now Mono in
       raises Fiber.Timeout (fun () ->
           ignore (Fiber.with_timeout Mono (Span.ms 150) loop) ) ;
-      equal int 150 (ms_since t1) ;
+      equal int 150 (Helpers.ms_since t1) ;
       Net.close c )
 
 (* A socket pair (issue 8) is a TCP connection with no listener: the data goes
@@ -1171,7 +1167,7 @@ let pair_latency () =
       let t0 = Time.now Mono in
       Net.write a "x" ;
       equal string "x" (read_n b 1) ;
-      equal int 5 (ms_since t0) ;
+      equal int 5 (Helpers.ms_since t0) ;
       Net.close a ;
       Net.close b )
 
@@ -1312,7 +1308,7 @@ let fault_reset () =
       equal string "last" (read_n b 4) ;
       equal string "ECONNRESET"
         (error_of (fun () -> Net.read b (Bytes.create 1) 0 1)) ;
-      equal int 5 (ms_since t0) ;
+      equal int 5 (Helpers.ms_since t0) ;
       equal string "" (read_all b) ;
       equal string "EPIPE" (error_of (fun () -> Net.write b "x")) ;
       Net.close a ;
@@ -1375,7 +1371,7 @@ let fault_deterministic () =
         let e = error_of (fun () -> Net.read b (Bytes.create 1) 0 1) in
         Net.close a ;
         Net.close b ;
-        (got, e, ms_since t0) )
+        (got, e, Helpers.ms_since t0) )
   in
   let traces = List.init 10 (fun i -> trace (i + 1)) in
   is_true (traces = List.init 10 (fun i -> trace (i + 1))) ;
@@ -1412,7 +1408,7 @@ let fault_lost_window () =
           raises Fiber.Timeout (fun () ->
               Fiber.with_timeout Mono (Span.ms 100) (fun () ->
                   Net.write b "more" ) ) ;
-          equal int 100 (ms_since t0) ;
+          equal int 100 (Helpers.ms_since t0) ;
           Net.close a ;
           Net.close b ) )
     [0; 5]

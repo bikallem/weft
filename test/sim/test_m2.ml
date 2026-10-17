@@ -38,10 +38,6 @@ let seeds_200 =
 
 module Sched = Private.Sched
 
-let ms_since t0 =
-  Int64.to_int
-    (Int64.div (Span.to_ns (Time.diff Mono (Time.now Mono) t0)) 1_000_000L)
-
 (* With a time cost, each job takes 0 to 10 ms of virtual time. *)
 let cost seed =
   Sim.run ~seed (fun sim ->
@@ -49,7 +45,7 @@ let cost seed =
       let t0 = Time.now Mono in
       Dir.mkdir "/d" ;
       let f = File.openfile [Write; Create] "/d/f" in
-      File.write f "x" ; File.close f ; ms_since t0 )
+      File.write f "x" ; File.close f ; Helpers.ms_since t0 )
 
 (* A cancel during a job: the fiber detaches, and an fd that the job opened
    closes. A read that a cancel ends holds the fd until the job completes, so
@@ -90,7 +86,7 @@ let dns_timeout () =
       raises Fiber.Timeout (fun () ->
           Fiber.with_timeout Mono (Span.s 2) (fun () ->
               Dns.resolve "slow.example" ) ) ;
-      equal int 2000 (ms_since t0) )
+      equal int 2000 (Helpers.ms_since t0) )
 
 let dns () =
   Sim.run (fun sim ->
@@ -245,7 +241,7 @@ let jobs =
                 (fun () -> Sim.set_blocking_cost sim (Span.ms (-1)) ) ;
               let t0 = Time.now Mono in
               Dir.mkdir "/x" ;
-              equal int 0 (ms_since t0) ) )
+              equal int 0 (Helpers.ms_since t0) ) )
     ; test "a cancel detaches from the job, and no fd stays open" (fun () ->
           let total = ref 0 in
           for seed = 1 to 200 do
@@ -333,7 +329,7 @@ let processes =
               equal string "hello you" (pipe_all out) ;
               Pipe.close out ;
               equal string "exited 3" (status_text (Process.wait p)) ;
-              equal int 30 (ms_since t0) ;
+              equal int 30 (Helpers.ms_since t0) ;
               (* A second wait gives the same status. *)
               equal string "exited 3" (status_text (Process.wait p)) ) )
     ; test "a signal ends a fake program, but not one that it ignores"

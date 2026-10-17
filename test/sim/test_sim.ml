@@ -10,10 +10,6 @@ module S = Private.Sched
 let run = Helpers.run
 
 (* The time since [t0], in milliseconds. *)
-let ms_since t0 =
-  Int64.to_int
-    (Int64.div (Span.to_ns (Time.diff Mono (Time.now Mono) t0)) 1_000_000L)
-
 let log = Helpers.log
 
 exception Boom of string
@@ -40,7 +36,7 @@ let sleeps_in_order () =
             (fun (name, ms) ->
               Fiber.fork s (fun () ->
                   Time.sleep Mono (Span.ms ms) ;
-                  add "%s at %d ms" name (ms_since t0) ) )
+                  add "%s at %d ms" name (Helpers.ms_since t0) ) )
             [("c", 30); ("a", 10); ("b", 20); ("a2", 10)] ) ) ;
   equal (list string)
     ["a at 10 ms"; "a2 at 10 ms"; "b at 20 ms"; "c at 30 ms"]
@@ -56,13 +52,13 @@ let choose_first_deadline () =
              ; wrap (Time.after Mono (Span.s 1)) (fun () -> "one") ] )
       in
       equal string "one" r ;
-      equal int 1000 (ms_since t0) )
+      equal int 1000 (Helpers.ms_since t0) )
 
 let negative_span_is_ready () =
   run (fun () ->
       let t0 = Time.now Mono in
       Time.sleep Mono (Span.ms (-5)) ;
-      equal int 0 (ms_since t0) )
+      equal int 0 (Helpers.ms_since t0) )
 
 let overflow_never () =
   run (fun () ->
@@ -220,7 +216,7 @@ let child_error_cancels_body () =
                   Time.sleep Mono (Span.s 1) ;
                   raise (Boom "child") ) ;
               Time.sleep Mono (Span.s 10) ) ) ;
-      equal int 1000 (ms_since t0) )
+      equal int 1000 (Helpers.ms_since t0) )
 
 let cancel_reaches_nested () =
   run (fun () ->
@@ -233,7 +229,7 @@ let cancel_reaches_nested () =
           Time.sleep Mono (Span.s 1) ;
           Fiber.cancel outer (Boom "stop") ) ;
       equal string "stop" !seen ;
-      equal int 1000 (ms_since t0) )
+      equal int 1000 (Helpers.ms_since t0) )
 
 (* The cleanup example of section 2.5: the shield lets the cleanup send its
    frame after a cancel. *)
@@ -260,7 +256,7 @@ let shield_timeout_still_works () =
           Fiber.shield (fun () ->
               Fiber.with_timeout Mono (Span.s 1) (fun () ->
                   Time.sleep Mono (Span.s 10) ) ) ) ;
-      equal int 1000 (ms_since t0) )
+      equal int 1000 (Helpers.ms_since t0) )
 
 let join_waits_for_all () =
   let add, get = log () in
@@ -295,7 +291,7 @@ let with_timeout_exact () =
       raises Fiber.Timeout (fun () ->
           Fiber.with_timeout Mono (Span.ms 250) (fun () ->
               Time.sleep Mono (Span.s 10) ) ) ;
-      equal int 250 (ms_since t0) )
+      equal int 250 (Helpers.ms_since t0) )
 
 let with_timeout_value () =
   run (fun () ->
@@ -304,7 +300,7 @@ let with_timeout_value () =
         (Fiber.with_timeout Mono (Span.s 1) (fun () ->
              Time.sleep Mono (Span.ms 10) ;
              7 ) ) ;
-      equal int 10 (ms_since t0) )
+      equal int 10 (Helpers.ms_since t0) )
 
 (* A span that makes the deadline overflow: the deadline never comes. Thus
    [with_timeout] adds no timer, and it gives the value of [f]. *)
@@ -468,7 +464,7 @@ let daemon_end_keeps_daemons () =
           Fiber.fork_daemon s (fun () ->
               try Time.sleep Mono (Span.s 10)
               with Fiber.Cancelled _ as e ->
-                add "%s at %d ms" "daemon cancelled" (ms_since t0) ;
+                add "%s at %d ms" "daemon cancelled" (Helpers.ms_since t0) ;
                 raise e ) ;
           Time.sleep Mono (Span.s 1) ) ) ;
   (* The end of the first daemon does not cancel the second one: only the end of
@@ -810,7 +806,7 @@ let stale_timers () =
             (fun (name, sec) ->
               Fiber.fork s (fun () ->
                   Time.sleep Mono (Span.s sec) ;
-                  add "%s at %d ms" name (ms_since t0) ) )
+                  add "%s at %d ms" name (Helpers.ms_since t0) ) )
             [("c", 300); ("a", 100); ("d", 400); ("b", 200)] ;
           (* Let the sleepers register their entries first. *)
           Fiber.yield () ;
@@ -820,7 +816,7 @@ let stale_timers () =
             sync (choose [always (); Time.after Mono (Span.ms 500)])
           done ;
           Time.sleep Mono (Span.s 1) ;
-          add "%s at %d ms" "main" (ms_since t0) ) ;
+          add "%s at %d ms" "main" (Helpers.ms_since t0) ) ;
       equal int 0 (Private.Sched_debug.live_timers (Sim.sched sim)) ) ;
   equal (list string)
     [ "main at 1000 ms"
@@ -942,7 +938,7 @@ let stale_offer_skipped () =
               Time.sleep Mono (Span.s 1) ;
               equal string "late" (sync (Chan.recv c)) ) ;
           sync (Chan.send c "late") ;
-          equal int 1000 (ms_since t0) ) )
+          equal int 1000 (Helpers.ms_since t0) ) )
 
 let cancel_in_recv () =
   run (fun () ->
@@ -1118,7 +1114,7 @@ let each_sleep_is_exact ms_list =
               (fun i ms ->
                 Fiber.fork s (fun () ->
                     Time.sleep Mono (Span.ms ms) ;
-                    r := (i, ms_since t0) :: !r ) )
+                    r := (i, Helpers.ms_since t0) :: !r ) )
               ms_list ) ;
         !r )
   in
@@ -1259,7 +1255,7 @@ let inner_cancel_fails_body () =
       | exception Fiber.Cancelled (Boom m) ->
           equal string "inner" m ) ;
       equal string "cancelled" !other ;
-      equal int 0 (ms_since t0) )
+      equal int 0 (Helpers.ms_since t0) )
 
 (* C1: the Cancelled of a scope inside an isolated fiber goes to [on_error]. *)
 let inner_cancel_isolated () =

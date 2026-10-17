@@ -5,13 +5,6 @@ open Weft
 module Sim = Weft_sim
 module S = Private.Sched
 
-(* The domain that runs the fiber. *)
-let dom () = S.prog "test" S.Dom_index
-
-let ms_since t0 =
-  Int64.to_int
-    (Int64.div (Span.to_ns (Time.diff Mono (Time.now Mono) t0)) 1_000_000L)
-
 (* Fibers that start on domain 0 run on other domains too. *)
 let work_stealing seed =
   Sim.run ~seed ~domains:4 (fun _ ->
@@ -20,7 +13,7 @@ let work_stealing seed =
           for _ = 1 to 40 do
             Fiber.fork s (fun () ->
                 for _ = 1 to 20 do
-                  Hashtbl.replace seen (dom ()) () ;
+                  Hashtbl.replace seen (Helpers.dom ()) () ;
                   Fiber.yield ()
                 done ;
                 incr ends )
@@ -37,7 +30,7 @@ let chained_timers seed =
                 let t0 = Time.now Mono in
                 for j = 1 to 25 do
                   Time.sleep Mono (Span.ms i) ;
-                  equal int (i * j) (ms_since t0)
+                  equal int (i * j) (Helpers.ms_since t0)
                 done )
           done ) )
 
@@ -53,7 +46,7 @@ let entry_on_domain seed =
             Fiber.fork s (fun () ->
                 for _ = 1 to 5 do
                   Fiber.yield () ;
-                  let d = dom () in
+                  let d = Helpers.dom () in
                   if d <> 0 then incr stolen ;
                   let me = S.self () in
                   Fiber.scope (fun inner ->
@@ -95,7 +88,7 @@ let trace seed =
                   log :=
                     ( i
                     , j
-                    , dom ()
+                    , Helpers.dom ()
                     , Int64.to_int (Clock.to_ns Mono (Time.now Mono)) )
                     :: !log ;
                   ignore
@@ -125,7 +118,7 @@ let id_trace seed =
                     for j = 1 to 3 do
                       Fiber.fork s (fun () ->
                           let id = Fiber.Id.to_int (Fiber.self ()) in
-                          log := (i, j, parent, id, dom ()) :: !log )
+                          log := (i, j, parent, id, Helpers.dom ()) :: !log )
                     done ) )
           done ) ) ;
   !log
@@ -138,11 +131,11 @@ let id_moves seed =
       Fiber.scope (fun s ->
           for _ = 1 to 20 do
             Fiber.fork s (fun () ->
-                let id = Fiber.self () and d = dom () in
+                let id = Fiber.self () and d = Helpers.dom () in
                 for _ = 1 to 20 do
                   Fiber.yield () ;
                   is_true (Fiber.Id.equal id (Fiber.self ())) ;
-                  if dom () <> d then moved := true
+                  if Helpers.dom () <> d then moved := true
                 done )
           done ) ) ;
   !moved
