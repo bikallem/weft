@@ -96,7 +96,7 @@ Weft_sim.run ~seed ~domains:2 (fun sim ->
 - For the Linux world: Linux 5.4 or later (pidfd), and glibc 2.39 or later
   (`pidfd_spawnp`).
 - For the kqueue world: macOS or FreeBSD. The CI tests macOS 15 and
-  FreeBSD 14.3. OpenBSD and NetBSD are not tested.
+  FreeBSD 15.1. OpenBSD and NetBSD are not tested.
 - The core and the simulator need no OS calls. They build on each system that
   OCaml 5 supports, and they do not link `unix`.
 
@@ -138,6 +138,36 @@ make help           # the other targets and the variables
 
 The CI tests the mutants of the changed lines of each pull request. Section
 2.17 of the design gives the rules and the known survivors.
+
+### The kqueue world in a FreeBSD VM
+
+On a Linux host with KVM, `tools/freebsd-vm.sh` runs a FreeBSD 15.1 VM in
+QEMU (from nixpkgs), with 4 CPUs and 6 GB of memory:
+
+```sh
+tools/freebsd-vm.sh start              # start the VM and wait for SSH
+tools/freebsd-vm.sh test .             # dune build and dune runtest test/kqueue
+tools/freebsd-vm.sh test . runtest     # or other dune arguments
+tools/freebsd-vm.sh ssh                # a shell in the VM
+tools/freebsd-vm.sh stop               # shut down the VM
+```
+
+The `test` command copies the worktree to the VM with rsync (without `_build`
+and `.git`). Then it builds the worktree with the opam switch of the VM. The VM
+covers the kqueue world on FreeBSD. It does not cover the macOS paths.
+
+The VM directory is `~/.local/share/weft-freebsd-vm` (or
+`$WEFT_FREEBSD_VM`). Make it one time:
+
+1. Get `FreeBSD-15.1-RELEASE-amd64-BASIC-CLOUDINIT-ufs.qcow2.xz` from the
+   `VM-IMAGES` directory of download.freebsd.org. Do a check of its SHA256.
+2. Decompress it to `disk.qcow2`, and resize it to 30 GB with `qemu-img`.
+3. Make an SSH key `id_ed25519` in the VM directory.
+4. Make `seed.iso` (volume label `cidata`) with a `meta-data` file and an
+   executable `user-data` script that adds the key to
+   `/root/.ssh/authorized_keys`.
+5. Run `tools/freebsd-vm.sh start`. Then, in the VM, do the steps of the
+   `freebsd` job of `.github/workflows/ci.yml`, and `pkg install -y rsync`.
 
 ## Use weft from another flake
 
