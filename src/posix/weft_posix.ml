@@ -113,6 +113,10 @@ external watchdog_start :
 
 external watchdog_stop : nativeint -> unit = "weft_watchdog_stop"
 
+external watchdog_sleep : nativeint -> unit = "weft_watchdog_sleep" [@@noalloc]
+
+external watchdog_awake : nativeint -> unit = "weft_watchdog_awake" [@@noalloc]
+
 external watchdog_reports : unit -> int = "weft_watchdog_reports"
 
 external watchdog_checks : unit -> int = "weft_watchdog_checks"
@@ -588,6 +592,9 @@ module type POLLER = sig
   val wait : t -> domain:int -> World.Wait.t -> World.Ready.t list
 
   val wake : t -> domain:int -> unit
+
+  val watchdog : t -> nativeint Atomic.t
+  (** The watchdog of [run], or [0n]. [Make.World.wait] tells it each sleep. *)
 end
 
 (* The world and its [run], from the parts of [P]. *)
@@ -696,7 +703,23 @@ module Make (P : POLLER) = struct
       | Op.Resend s ->
           unit (resend (number_of s))
 
-    let wait = P.wait
+    (* A sleep with no timeout tells the watchdog, so that it can park while all
+       domains sleep (weft_watchdog.c). A poll does not count. The wait reads
+       the field one time, so a sleep and its wake tell one watchdog. [run] sets
+       the field before the domains start, and it stops the watchdog after the
+       domains end. *)
+    let wait t ~domain (w : World.Wait.t) =
+      match w.timeout with
+      | Poll ->
+          P.wait t ~domain w
+      | Sleep ->
+          let dog = Atomic.get (P.watchdog t) in
+          if dog = 0n then P.wait t ~domain w
+          else (
+            watchdog_sleep dog ;
+            Fun.protect
+              ~finally:(fun () -> watchdog_awake dog)
+              (fun () -> P.wait t ~domain w) )
 
     let wake = P.wake
 
@@ -734,10 +757,11 @@ module Make (P : POLLER) = struct
     let start (s : Sched.t) =
       Option.iter
         (fun limit ->
-          dog :=
-            Some
-              ( watchdog_start s.beats Sched.beat_stride (Weft.Span.to_ns limit)
-              , s.beats ) )
+          let d =
+            watchdog_start s.beats Sched.beat_stride (Weft.Span.to_ns limit)
+          in
+          dog := Some (d, s.beats) ;
+          Atomic.set (P.watchdog w) d )
         watchdog
     in
     Fun.protect
