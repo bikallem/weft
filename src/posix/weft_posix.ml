@@ -207,22 +207,16 @@ let unit r = Result.map ignore (result r)
 
 let check name r = if r < 0 then failwith (name ^ ": " ^ strerror (-r)) else r
 
-(* The PRNG of a world: SplitMix64, on 63 bits. Each domain can call [random],
-   so the state is one atomic counter. *)
-let new_rng () =
-  let seed = Bytes.create 8 in
-  ignore (check "getrandom" (getrandom seed)) ;
-  Atomic.make (Int64.to_int (Bytes.get_int64_le seed 0))
-
-let next rng =
-  let z =
-    ( Atomic.fetch_and_add rng 0x1E3779B97F4A7C15
-    + 0x1E3779B97F4A7C15 )
-    [@mutate off "a constant of the PRNG"]
-  in
-  let z = z lxor (z lsr 30) * 0x3F58476D1CE4E5B9 in
-  let z = z lxor (z lsr 27) * 0x14D049BB133111EB in
-  z lxor (z lsr 31) land max_int
+(* A random int in the range 0 to [n - 1], from 8 bytes of the OS. The value of
+   the bytes has 62 bits, so [mod] gives a bias of at most [n / 2^62]. The
+   scheduler calls it with [n = 2^30], a divisor of [2^62]: no bias. Each domain
+   calls it one time at the start of a run, so the cost of a system call is
+   small. *)
+let random n =
+  let b = Bytes.create 8 in
+  ignore (check "getrandom" (getrandom b)) ;
+  let x = Int64.to_int (Bytes.get_int64_le b 0) land max_int in
+  x mod n
 
 (* The jobs (weft_pool.c). [jobs] and [files] are under [lock]: each domain can
    start, finish and detach a job. *)

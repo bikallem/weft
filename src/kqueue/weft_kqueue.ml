@@ -62,7 +62,6 @@ type proc =
 
 type t =
   { doms: dom array
-  ; rng: int Atomic.t
   ; pool: pool
   ; watched: Op.signal list Atomic.t
         (** The signals of [run ~signals], with no signal of an unwatch. *)
@@ -124,7 +123,6 @@ let create ?(domains = 1) ?(signals = []) () =
       Printexc.raise_with_backtrace e bt
   | doms, pool ->
       { doms
-      ; rng= new_rng ()
       ; pool
       ; watched=
           Atomic.make (List.map (fun s -> signal_of (number_of s)) signals)
@@ -339,7 +337,7 @@ module World = struct
 
   let wake t ~domain = poke t.doms.(domain).wake_w
 
-  let random t n = next t.rng mod n
+  let random _ n = random n
 
   let random_bytes _ b = ignore (getrandom b)
 end

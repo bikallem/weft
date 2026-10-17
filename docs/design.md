@@ -271,7 +271,7 @@ Two partners on two domains can try to commit to the same `sync` at the same tim
 - A new `sync` starts as `Waiting`.
 - Each domain gives ids from its own counter: id = local count × the maximum number of domains + the domain index. The ids are unique and totally ordered, and no counter is shared between domains.
 
-**The scan.** The fiber that syncs takes its branches in the `Random` order. If the `sync` has only one branch of the user, it does not perform `Random`. For each branch:
+**The scan.** The fiber that syncs takes its branches in a random order, from the PRNG of its domain (2.5, The state of each domain). If the `sync` has only one branch of the user, it does not use the PRNG. For each branch:
 
 1. If a partner offer is present, it tries to commit with that partner (A claim of two words, below).
 2. If no partner offer is present, it registers its own offer on the branch.
@@ -317,7 +317,7 @@ At the end of the scan, the fiber changes its word from `Waiting` to `Parked` wi
 
 Three scenarios pass: two fibers that sync on each other, a stale offer with a timer, and a ready branch with a cancel. To show that the model is useful, four planted bugs each give a failure: no `Parked` state (two resumes), no id order (the deadlock of "Why there is no deadlock"), a one-word partner that gives up on `Claimed` (a cancel that is lost), and no channel lock (a lost rendezvous). Section 2.16 lists all of the TLA+ models. The model is small: two or three fibers, one `sync` for each fiber, and two channels. Thus it does not cover a word that is used again, nacks, or more than three fibers. `dscheck` still examines the OCaml code in M1.
 
-When more than one branch is ready, `choose` uses `Random` from the world to select a branch. In production this prevents starvation. In the simulator, the seed controls it, so a failed run can run again with the same result.
+When more than one branch is ready, `choose` uses the PRNG of the domain to select a branch. One `Random` of the world gives the seed of this PRNG when the domain starts. In production this prevents starvation. In the simulator, the seed of the run controls it, so a failed run can run again with the same result.
 
 ### A variable (issue 5)
 
@@ -714,7 +714,7 @@ The stealing is full, as in affect (decision 7). A thief can take any ready fibe
 | Fd registrations | For each fd in the poller: a read flag, a write flag and the waiters | Only the owner |
 | Deadline heap | The `Mono` deadlines of the fibers that blocked on this domain (section 2.6) | Only the owner adds and pops entries. Other domains change only the sync word of an entry. |
 | Mailbox (M2) | A C queue for the completed `Blocking` operations and the close notices of this domain | Pool threads and other domains push. Only the owner takes. |
-| PRNG | Selects the domain to steal from | Only the owner. Its seed comes from `World.random` when the domain starts. |
+| PRNG | Selects the domain to steal from, and the order of the branches of a `sync` | Only the owner. Its seed comes from `World.random` when the domain starts. |
 | Sync id counter | The ids of section 2.4 | Only the owner |
 
 These parts are shared by all domains:
@@ -1718,7 +1718,6 @@ The known survivors of `make mutate-all`:
 | `process.ml`, `kill`: `reaping` or a full status, as the condition that the error of the send is not an error | Only the reaper fills the status. It sets `reaping` before, and `reaping` stays set after a reap. Thus the mutant (`and`) differs only while a fiber reaps and the status is empty. In the simulator, the domain of the reaper continues from the reap of the world to the fill with no switch point. If other code reaped the child, the result of the kill depends on the schedule also without the mutant. Thus only a kill on another real domain between the reap and the fill can show the mutant. | None. A test of this race on Linux is not deterministic. |
 | `process.ml`, `wait`: the `Ivar.read` branch | The mutant does more effects only in some seeds with more than one virtual domain. | None. Only a test with one fixed seed can see it. |
 | `weft_sim.ml`, the end of a run: the second `Gc.full_major` | Only a chain of finalisers needs it, and the number of GC cycles that a test needs depends on the runtime. | None. A test that counts GC cycles breaks with a change of the runtime. |
-| `weft_posix.ml`, `new_rng`: the `getrandom` of the seed | Without the `getrandom`, the seed is the content of a new `Bytes`, and this content has no fixed value. A test cannot tell this seed from a random seed. | None. |
 | `weft_posix.ml`, `finish`: `job_free` | The mutant leaks the C record of each job that ends. | None. Only the memory of the process shows the leak, and a test of the memory depends on the allocator. |
 | `weft_posix.ml`, `take_job`: the removal of the job from the table | The core takes each job one time. Thus, with the mutant, the entry stays in the table, and it only uses memory. | None. Only the memory of the process shows the leak, and a test of the memory depends on the GC. |
 

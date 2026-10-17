@@ -66,7 +66,6 @@ type dom =
 
 type t =
   { doms: dom array
-  ; rng: int Atomic.t
   ; pool: pool
   ; watched: Op.signal list Atomic.t
         (** The signals of [run ~signals], with no signal of an unwatch. *)
@@ -169,7 +168,6 @@ let make ~domains ~nums ~undo signals =
   if sigfd >= 0 then
     ignore (check "epoll_ctl" (epoll_add_in doms.(0).epfd sigfd signal_token)) ;
   { doms
-  ; rng= new_rng ()
   ; pool= create_pool (Array.map (fun d -> d.evfd) doms)
   ; watched= Atomic.make (List.map (fun s -> signal_of (number_of s)) signals)
   ; unwatch_lock= Mutex.create ()
@@ -341,7 +339,7 @@ module World = struct
 
   let wake t ~domain = ignore (eventfd_signal t.doms.(domain).evfd)
 
-  let random t n = next t.rng mod n
+  let random _ n = random n
 
   let random_bytes _ b = ignore (getrandom b)
 end

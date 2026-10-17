@@ -1431,6 +1431,24 @@ let one_wake_write () =
   ignore (Weft_posix.close_fd r) ;
   ignore (Weft_posix.close_fd w)
 
+(* K6: [random] of the world reads 8 bytes of the OS for each call. Each value
+   is in the range 0 to [n - 1]. 100 values in the range 0 to [2^30 - 1] are
+   almost all different. *)
+let world_random () =
+  let w = Weft_linux.create () in
+  Fun.protect
+    ~finally:(fun () -> Weft_linux.close w)
+    (fun () ->
+      List.iter
+        (fun n ->
+          for _ = 1 to 1000 do
+            let x = Weft_linux.World.random w n in
+            is_true (x >= 0 && x < n)
+          done )
+        [1; 2; 7; 1 lsl 30; max_int] ;
+      let l = List.init 100 (fun _ -> Weft_linux.World.random w (1 lsl 30)) in
+      at_least int ~than:90 (List.length (List.sort_uniq compare l)) )
+
 let review_2026 =
   group "review of 2026-10-16"
     [ test "C3: the names of 40,000 entries take linear time" many_names
@@ -1438,7 +1456,9 @@ let review_2026 =
     ; test "P4: a read and a write of 1 MiB allocate no OCaml string"
         large_file_io
     ; test "P6: a worker writes the wake fd only for an empty mailbox"
-        one_wake_write ]
+        one_wake_write
+    ; test "K6: the random of the world is in the range 0 to n - 1" world_random
+    ]
 
 let () =
   exit
