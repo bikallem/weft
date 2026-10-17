@@ -611,12 +611,7 @@ module Make (P : POLLER) = struct
              connection from the backlog, so the loop ends. *)
           let rec take () =
             let ((r, _, _, _) as a) = accept fd in
-            if
-              ( r < 0 )
-              [@mutate off "0 is not an errno, so Array.mem gives false for 0"]
-              && Array.mem (-r) accept_retry
-            then take ()
-            else a
+            if Array.mem (-r) accept_retry then take () else a
           in
           let r, host, port, unix = take () in
           Result.map
