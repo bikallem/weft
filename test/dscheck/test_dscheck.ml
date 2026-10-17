@@ -510,7 +510,7 @@ let cancel_and_sync () =
 
 (* Two cancels of one scope while a fiber starts a sync. Only the cancel that
    sets the flag walks (Scope.tla). The other cancel ends at once, also while
-   the walk of the first one goes on. The sync does not stay parked. *)
+   the walk of the first one runs. The sync does not stay parked. *)
 let two_cancels_and_sync () =
   trace (fun () ->
       let t = S.create ~domains:3 () in

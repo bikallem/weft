@@ -878,7 +878,7 @@ let signal_count_zero () =
   equal int 0 (List.length w.resent)
 
 (* X1: an error of the OS in an unwatch is [Net.Error], not [Invalid_argument]:
-   the world still watches the signal. *)
+   the world continues to watch the signal. *)
 let unwatch_error () =
   let w = {Signals.batches= []; resent= []} in
   Weft.run

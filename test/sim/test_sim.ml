@@ -9,7 +9,6 @@ module S = Private.Sched
 
 let run = Helpers.run
 
-(* The time since [t0], in milliseconds. *)
 let log = Helpers.log
 
 exception Boom of string

@@ -211,11 +211,13 @@ let close t =
 (* The end of a watch (design section 2.7), under [unwatch_lock]. First, the
    signalfd does not take [s] any more. Then the calling thread unblocks [s],
    and each later signal goes to this thread with its action. A signal that is
-   pending at this time also goes to this thread, so no signal is lost. Each
-   other thread of the world blocks [s], or all signals for the pools and the
-   watchdog. The thread of a domain other than 0 can end before domain 0, for
-   example while domain 0 waits for a detached job. Thus the thread of domain 0,
-   which is the thread of [run], also unblocks [s] at its next wait. *)
+   pending at this time also goes to this thread, so no signal is lost.
+
+   Each other thread of the world blocks [s], or all signals for the pools and
+   the watchdog. The thread of a domain other than 0 can end before domain 0,
+   for example while domain 0 waits for a detached job. Thus the thread of
+   domain 0, which is the thread of [run], also unblocks [s] at its next
+   wait. *)
 let unwatch t s ~rest =
   let r = signalfd t.sigfd (Array.of_list (List.map number_of rest)) in
   if r < 0 then Error (error_of (-r))

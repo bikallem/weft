@@ -557,8 +557,8 @@ module Fdtab = struct
               s
           | [] ->
               let s = !next in
-              (* The token has 32 bits for the slot, and it must stay a positive
-                 [int]. *)
+              (* The token keeps the generation in the low 32 bits and the slot
+                 above them, and it must stay a positive [int]. *)
               assert (s < 1 lsl 30) ;
               incr next ;
               if s >= Array.length !gens then (
@@ -582,7 +582,8 @@ module Fdtab = struct
 
   let release r = Mutex.protect lock (fun () -> free := r.slot :: !free)
 
-  (* The slot and the generation in one [int]. A slot is less than 2^30. *)
+  (* The slot and the generation in one [int]: the generation has the low 32
+     bits, and the slot is above them. A slot is less than 2^30. *)
   let token r = (r.slot lsl 32) lor r.gen
 
   let of_token t = (t lsr 32, t land 0xffff_ffff)
@@ -699,17 +700,19 @@ module Idle = struct
   (* The wake of a push (the Go rule of [wakep]). The caller holds the token,
      the count of [searching] that it changed from 0 to 1. The token goes to the
      lowest idle domain that is not [self], and the function gives that domain
-     for a wake. If no domain is idle, the count goes back.
+     for a wake. If no other domain is idle, the function decreases [searching].
 
      The token goes to the domain before the domain leaves the set. Thus the
      domain sees the token at its next take, also if it leaves the set itself
      and a poll takes the wake. With the opposite order, the domain could take
-     no token, poll the wake away and sleep, and its count then stops each later
-     wake (Wake.tla, BugTokenAfterRemove). If the domain left the set first, it
-     is awake: it searches, or it checks the queues again before it sleeps. Thus
-     the waker takes the token back and gives back its count. A waker that tries
-     another domain can chase one domain forever (Wake.tla, BugTokenRetry). If
-     the domain took the token first, it searches with it and needs no wake. *)
+     no token, take the wake in a poll and sleep. Its count then stops each
+     later wake (Wake.tla, BugTokenAfterRemove).
+
+     If the domain left the set first, it is awake: it searches, or it checks
+     the queues again before it sleeps. Thus the waker removes the token with a
+     CAS and decreases [searching]. A waker that tries another domain can chase
+     one domain forever (Wake.tla, BugTokenRetry). If the domain took the token
+     first, it searches with it, and a wake is not necessary. *)
   let give_token t ~self =
     let v = Atomic.get t.idle land lnot (bit self) in
     if v = 0 then (Atomic.decr t.searching ; None)
@@ -749,8 +752,8 @@ let has_pinned dom = dom.index = 0 && Atomic.get dom.sched.pinned_n > 0
 
 (* A push wakes an idle domain, but not while a domain searches: that domain
    finds the fiber (the Go rules). [flush_wake] changes [searching] from 0 to 1
-   before the wake, so the next pushes wake nobody until the woken domain
-   searches. *)
+   before the wake, so the next pushes wake nobody until the woken domain ends
+   its search. *)
 let mark_wake dom =
   let t = dom.sched in
   if Atomic.get t.idle <> 0 && Atomic.get t.searching = 0 then dom.wake <- true
@@ -1518,12 +1521,11 @@ let start_search (t : t) =
   in
   inc ()
 
-(* The end of a search: the domain gives back its count of [searching]. The last
-   searching domain that finds work wakes one idle domain, because the pushes
-   woke nobody while it searched. The wake occurs at once, before the domain
-   runs the fiber, as Go's [resetspinning] calls [wakep]. If the wake waits for
-   the next effect of the fiber, a fiber that computes stops the chain of
-   wakes. *)
+(* The end of a search: the domain decreases [searching]. The last searching
+   domain that finds work wakes one idle domain, because the pushes woke nobody
+   while it searched. The wake occurs at once, before the domain runs the fiber,
+   as Go's [resetspinning] calls [wakep]. If the wake waits for the next effect
+   of the fiber, a fiber that computes stops the chain of wakes. *)
 let end_search dom found =
   let t = dom.sched in
   if
@@ -1718,8 +1720,8 @@ let work_for dom =
 
 (* The distance in ints between the beats of two domains: 128 bytes on a 64-bit
    system. Thus two domains do not write one cache line, also with a CPU that
-   fetches the lines in pairs. The watchdog gets this value from
-   [Weft_posix.run]. *)
+   fetches the lines in pairs. The watchdog gets this value from [run] of
+   [Weft_posix.Make]. *)
 let beat_stride = 16
 
 (* Only the domain writes its beat. *)

@@ -1033,7 +1033,7 @@ let send_self t sg =
   else if not (sg = Op.SIGPIPE || no_end sg) then t.killed <- Some sg
 
 (* A connect. The connection is established after the delay, if the listener is
-   still open then. *)
+   open at that time. *)
 let connect t addr =
   let n = t.net in
   let ( let* ) = Result.bind in
@@ -1088,8 +1088,8 @@ let connect t addr =
     | _ ->
         refused () )
 
-(* A close. The OS order needs a Deregister of each domain before, and no job
-   that uses the fd. *)
+(* A close. In the OS order, a Deregister of each domain comes before, and no
+   job uses the fd. *)
 let close_fd t fd =
   let n = t.net in
   if Hashtbl.mem n.regs fd then

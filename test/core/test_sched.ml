@@ -29,9 +29,9 @@ let growth_keeps_generations () =
   greater int ~than:first.S.gen again.S.gen ;
   List.iter S.Fdtab.release (again :: !held)
 
-(* K11 of the review of 2026-10-16: a token has 32 bits for the slot, so the
-   table refuses a slot of 2^30 or more. The test gives the table the next slot
-   2^30, with no free slot. *)
+(* K11 of the review of 2026-10-16: a token keeps the generation in the low 32
+   bits and the slot above them, so the table refuses a slot of 2^30 or more.
+   The test gives the table the next slot 2^30, with no free slot. *)
 let slot_limit () =
   let next = !S.Fdtab.next and free = !S.Fdtab.free in
   S.Fdtab.free := [] ;
@@ -120,7 +120,7 @@ let second_cancel_no_walk () =
   Atomic.set f.S.current (Some s) ;
   is_true (S.C.park s.S.word = `Parked) ;
   equal int 0 (List.length (S.cancel_node node Exit)) ;
-  is_true ~msg:"the sync is still parked" (S.C.state s.S.word = S.C.Parked)
+  is_true ~msg:"the sync stays parked" (S.C.state s.S.word = S.C.Parked)
 
 (* The members of a node are a linked list. A member leaves the list in any
    order, and the walk gets the others in the fork order. *)

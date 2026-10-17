@@ -192,8 +192,8 @@ type _ t =
           action that it had before [run]. A signal that came and that the world
           did not give yet also gets the action. [Ok (Some s)] gives the form of
           the signal, as [Watch]. [Ok None] if the world does not watch the
-          signal. [Error] is an error of the OS, and the world then still
-          watches the signal. *)
+          signal. [Error] is an error of the OS, and the world then continues to
+          watch the signal. *)
   | Resend : signal -> unit t
       (** Sends the signal to the process itself, after an [Unwatch]: the signal
           gets its action. *)
