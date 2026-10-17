@@ -115,6 +115,8 @@ external watchdog_stop : nativeint -> unit = "weft_watchdog_stop"
 
 external watchdog_reports : unit -> int = "weft_watchdog_reports"
 
+external watchdog_checks : unit -> int = "weft_watchdog_checks"
+
 (* Signals. The number of each constructor of [Op.signal], in order. *)
 let numbers = signal_numbers ()
 
@@ -707,6 +709,8 @@ module Make (P : POLLER) = struct
   let default_domains = default_domains
 
   let watchdog_reports = watchdog_reports
+
+  let watchdog_checks = watchdog_checks
 
   let pool_warnings = pool_warnings
 

@@ -33,8 +33,9 @@ struct watchdog {
   int64_t limit_ns;
 };
 
-/* The reports of all watchdogs, for the tests. */
+/* The reports and the checks of all watchdogs, for the tests. */
 static intnat reports = 0;
+static intnat checks = 0;
 
 #define now_ns weft_now_ns
 
@@ -54,6 +55,7 @@ static void *watch(void *arg) {
     /* A check each half of the limit. */
     weft_cond_wait_until(&w->c, &w->m, now_ns() + w->limit_ns / 2);
     if (w->stop) break;
+    __atomic_add_fetch(&checks, 1, __ATOMIC_RELAXED);
     t = now_ns();
     for (int d = 0; d < w->n; d++) {
       intnat b = w->beats[d * w->stride];
@@ -119,4 +121,8 @@ value weft_watchdog_stop(value v) {
 
 value weft_watchdog_reports(value unit) {
   return Val_long(__atomic_load_n(&reports, __ATOMIC_RELAXED));
+}
+
+value weft_watchdog_checks(value unit) {
+  return Val_long(__atomic_load_n(&checks, __ATOMIC_RELAXED));
 }
