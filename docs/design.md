@@ -157,6 +157,8 @@ val run :
     then runs [main] as the first fiber. [~domains] is in milestone M1. *)
 ```
 
+No part of the library performs `Random_bytes` at this time. The effect waits for a later user, for example the keys and TLS of decision 18, and the tests of the core and of the simulator cover it.
+
 The signals are an argument of the world, for example `Weft_linux.run ~signals` (M2). The world must block them before it starts a thread, and only the world starts the threads. `Signal.unwatch` stops the watch of one signal while the world runs, and the signal gets its action again (section 2.7, The end of a watch).
 
 The effect constructors (`Now`, `Submit`, `Wait`, `Wake`, `Random`, `Switch`) are private. The `.mli` does not export them. Thus only `run` and `Sim.run` can handle them, and fiber code cannot catch them by accident. Fiber code calls functions such as `Time.now Mono` or `Net.read fd buf`.
