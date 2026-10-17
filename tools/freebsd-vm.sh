@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Run a local FreeBSD 14.3 VM to build and test the kqueue world.
+# Run a local FreeBSD 15.1 VM to build and test the kqueue world.
 #
 # Usage:
 #   tools/freebsd-vm.sh start
