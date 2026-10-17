@@ -44,11 +44,30 @@ let wake_rule () =
   S.mark_wake d ;
   is_true ~msg:"an idle domain, and no search" d.S.wake
 
+(* Only the first cancel of a node walks it (design section 2.5, How a cancel
+   reaches a fiber). A sync that starts after the flag reads the flag, so a
+   second walk finds nothing to commit. This test parks a sync after the first
+   cancel with no read of the flag: only a second walk can commit it. *)
+let second_cancel_no_walk () =
+  let node = S.new_node (S.Scope_node (S.new_scope_state ())) in
+  equal int 0 (List.length (S.cancel_node node Exit)) ;
+  let f = S.new_fiber [node] in
+  S.add_member_to node f ;
+  let s =
+    {S.word= S.C.make 0; owner= f; sctx= node; cancellable= true; k= None}
+  in
+  Atomic.set f.S.current (Some s) ;
+  is_true (S.C.park s.S.word = `Parked) ;
+  equal int 0 (List.length (S.cancel_node node Exit)) ;
+  is_true ~msg:"the sync is still parked" (S.C.state s.S.word = S.C.Parked)
+
 let tests =
   [ group "fd table"
       [ test "a slot used again gets a new generation" new_generation
       ; test "a growth of the fd table keeps the generations"
           growth_keeps_generations ]
+  ; group "cancel"
+      [test "a second cancel of a node does not walk it" second_cancel_no_walk]
   ; group "wake rule"
       [ test "a push marks a wake only for an idle domain and no search"
           wake_rule ] ]

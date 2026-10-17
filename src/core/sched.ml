@@ -1173,11 +1173,12 @@ let add_member_to n f =
 let remove_member n f =
   Spin.with_lock n.lock (fun () -> Hashtbl.remove n.members f.fid)
 
-(* The values of a table, in the order of their ids: the fork order. *)
-let by_id tbl =
-  Hashtbl.fold (fun id v acc -> (id, v) :: acc) tbl []
-  |> List.sort (fun (a, _) (b, _) -> Int.compare a b)
-  |> List.map snd
+(* The entries of a table. The caller holds the lock of the table, and it sorts
+   the entries with [by_id] after it releases the lock. *)
+let entries tbl = Hashtbl.fold (fun id v acc -> (id, v) :: acc) tbl []
+
+(* The values of the entries, in the order of their ids: the fork order. *)
+let by_id l = List.sort (fun (a, _) (b, _) -> Int.compare a b) l |> List.map snd
 
 (* The first cancelled context on the chain from [c], up to a shield. *)
 let rec first_flag c =
@@ -1205,16 +1206,16 @@ let rec on_chain c x =
   | Scope_node _ | Daemon_node -> (
     match c.parent with None -> false | Some p -> on_chain p x )
 
-(* The cancel of [x]: set the flag of [x] only, then walk [x] and its nested
-   nodes, but not into a shield. Commit each sync of a member whose chain
-   reaches [x]. It gives the syncs to resume. *)
-let cancel_node x reason =
-  ignore (Atomic.compare_and_set x.flag None (Some reason)) ;
+(* The walk of a cancel of [x]: walk [x] and its nested nodes, but not into a
+   shield. Commit each sync of a member whose chain reaches [x]. It gives the
+   syncs to resume. *)
+let walk x =
   let found = ref [] in
   let rec visit n =
     let members, children =
-      Spin.with_lock n.lock (fun () -> (by_id n.members, by_id n.children))
+      Spin.with_lock n.lock (fun () -> (entries n.members, entries n.children))
     in
+    let members = by_id members and children = by_id children in
     List.iter
       (fun f ->
         match Atomic.get f.current with
@@ -1233,6 +1234,14 @@ let cancel_node x reason =
         match C.notify s.word (-1) with C.Resume -> Some s | _ -> None
       else None )
     (List.rev !found)
+
+(* The cancel of [x]: set the flag of [x] only, then walk. Only the cancel that
+   sets the flag walks. Its walk finds each sync that started before the flag,
+   and each sync that starts after the flag reads it (the Dekker pair). Thus a
+   second walk finds no sync to commit, and N failures in one scope walk it one
+   time, not N times (Scope.tla). *)
+let cancel_node x reason =
+  if Atomic.compare_and_set x.flag None (Some reason) then walk x else []
 
 (* The sync of a fiber, in the scheduler (design section 2.4). *)
 
@@ -1781,7 +1790,7 @@ let member_end node ~daemon =
   let c = dec () in
   if all_count c = 0 then Option.value ~default:[] (Iv.fill st.join ())
   else if (not daemon) && nd_count c = 0 then
-    let ds = Spin.with_lock node.lock (fun () -> by_id st.daemons) in
+    let ds = by_id (Spin.with_lock node.lock (fun () -> entries st.daemons)) in
     List.concat_map (fun d -> cancel_node d Daemons_end) ds
   else []
 
