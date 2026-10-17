@@ -897,6 +897,6 @@ let unwatch_error () =
 let signals =
   group "signals"
     [ test "a count of 0 is not a signal" signal_count_zero
-    ; test "X1: an error of the OS in unwatch raises Net.Error" unwatch_error ]
+    ; test "an error of the OS in unwatch raises Net.Error" unwatch_error ]
 
 let tests = [world; events; span; time; signals]

@@ -1344,17 +1344,15 @@ let wait_outside_fiber () =
 
 let review_2026 =
   group "review of 2026-10-16"
-    [ test "C1: a Cancelled from an inner scope fails a fork"
-        inner_cancel_fails_fork
-    ; test "C1: a Cancelled from an inner scope fails the body"
+    [ test "a Cancelled from an inner scope fails a fork" inner_cancel_fails_fork
+    ; test "a Cancelled from an inner scope fails the body"
         inner_cancel_fails_body
-    ; test "C1: a Cancelled from an inner scope goes to on_error"
+    ; test "a Cancelled from an inner scope goes to on_error"
         inner_cancel_isolated
-    ; test "C1: a Cancelled from an inner scope fails a promise"
+    ; test "a Cancelled from an inner scope fails a promise"
         inner_cancel_promise
-    ; test "C2: a fork outside a fiber does not change the scope"
-        fork_outside_fiber
-    ; test "C2: a wait outside a fiber adds no waiter" wait_outside_fiber ]
+    ; test "a fork outside a fiber does not change the scope" fork_outside_fiber
+    ; test "a wait outside a fiber adds no waiter" wait_outside_fiber ]
 
 let () =
   exit

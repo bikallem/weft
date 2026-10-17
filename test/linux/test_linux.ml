@@ -1470,15 +1470,13 @@ let limit_before_create () =
 
 let review_2026 =
   group "review of 2026-10-16"
-    [ test "C3: the names of 40,000 entries take linear time" many_names
-    ; test "C4: accept retries the pending network errors on Linux" accept_retry
-    ; test "P4: a read and a write of 1 MiB allocate no OCaml string"
-        large_file_io
-    ; test "P6: a worker writes the wake fd only for an empty mailbox"
+    [ test "the names of 40,000 entries take linear time" many_names
+    ; test "accept retries the pending network errors on Linux" accept_retry
+    ; test "a read and a write of 1 MiB allocate no OCaml string" large_file_io
+    ; test "a worker writes the wake fd only for an empty mailbox"
         one_wake_write
-    ; test "K5: a bad limit of the watchdog makes no world" limit_before_create
-    ; test "K6: the random of the world is in the range 0 to n - 1" world_random
-    ]
+    ; test "a bad limit of the watchdog makes no world" limit_before_create
+    ; test "the random of the world is in the range 0 to n - 1" world_random ]
 
 let () =
   exit
