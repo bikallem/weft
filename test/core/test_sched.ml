@@ -61,6 +61,17 @@ let wake_rule () =
   S.mark_wake d ;
   is_true ~msg:"an idle domain, and no search" d.S.wake
 
+(* A waker with no other idle domain decreases [searching] again, because no
+   domain gets its token. Domain 0 is the waker, and only domain 0 is in
+   [idle]. *)
+let give_with_no_idle () =
+  let t = S.create ~domains:2 () in
+  Atomic.set t.S.searching 1 ;
+  Atomic.set t.S.idle (S.Idle.bit 0) ;
+  is_true ~msg:"no domain to wake"
+    (Option.is_none (S.Idle.give_token t ~self:0)) ;
+  equal ~msg:"no domain holds the token" int 0 (Atomic.get t.S.searching)
+
 (* The last searching domain that finds work wakes an idle domain before it runs
    the fiber. Domain 1 holds the token of a wake, and it steals the fiber of
    domain 0. Domain 2 is idle. The steal must wake domain 2 at once: a fiber
@@ -138,5 +149,7 @@ let tests =
   ; group "wake rule"
       [ test "a push marks a wake only for an idle domain and no search"
           wake_rule
+      ; test "a waker with no other idle domain decreases searching"
+          give_with_no_idle
       ; test "the last searching domain wakes before it runs the fiber"
           wake_after_search ] ]
