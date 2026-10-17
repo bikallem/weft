@@ -90,7 +90,7 @@ and ctx =
 
 (* The members of a node: a doubly linked list, the newest first. A fiber holds
    its cell, so that it leaves the list in O(1). *)
-and members = {mutable head: member option; mutable count: int}
+and members = {mutable head: member option}
 
 and member =
   {mf: fiber; mutable mprev: member option; mutable mnext: member option}
@@ -363,7 +363,7 @@ module Heap = struct
       ; parent= None
       ; flag= Atomic.make None
       ; lock= Spin.make ()
-      ; members= {head= None; count= 0}
+      ; members= {head= None}
       ; children= Hashtbl.create 1
       ; chain= {handle= (fun f -> f ())}
       ; fids= Atomic.make 0 }
@@ -1185,7 +1185,7 @@ let new_node ?parent ?handler kind =
   ; parent
   ; flag= Atomic.make None
   ; lock= Spin.make ()
-  ; members= {head= None; count= 0}
+  ; members= {head= None}
   ; children= Hashtbl.create ~random:false 4
   ; chain
   ; fids= (match parent with Some p -> p.fids | None -> Atomic.make 0) }
@@ -1198,7 +1198,6 @@ let add_member_to n f =
       let sm = Some m in
       Option.iter (fun h -> h.mprev <- sm) l.head ;
       l.head <- sm ;
-      l.count <- l.count + 1 ;
       m )
 
 let remove_member n m =
@@ -1209,8 +1208,7 @@ let remove_member n m =
           p.mnext <- m.mnext
       | None ->
           l.head <- m.mnext ) ;
-      Option.iter (fun x -> x.mprev <- m.mprev) m.mnext ;
-      l.count <- l.count - 1 )
+      Option.iter (fun x -> x.mprev <- m.mprev) m.mnext )
 
 (* The fibers of the members, the oldest first: the fork order. *)
 let member_fibers l =

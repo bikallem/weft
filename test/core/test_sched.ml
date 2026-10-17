@@ -129,12 +129,12 @@ let member_list () =
   let fs = List.init 5 (fun _ -> S.new_fiber [node]) in
   let ms = Array.of_list (List.map (S.add_member_to node) fs) in
   List.iter (fun i -> S.remove_member node ms.(i)) [1; 4; 0] ;
-  equal int 2 node.S.members.S.count ;
+  equal int 2 (List.length (S.member_fibers node.S.members)) ;
   equal (list int)
     (List.map (fun i -> (List.nth fs i).S.fid) [2; 3])
     (List.map (fun f -> f.S.fid) (S.member_fibers node.S.members)) ;
   List.iter (fun i -> S.remove_member node ms.(i)) [3; 2] ;
-  equal int 0 node.S.members.S.count ;
+  equal int 0 (List.length (S.member_fibers node.S.members)) ;
   is_true (Option.is_none node.S.members.S.head)
 
 let tests =
