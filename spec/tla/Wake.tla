@@ -29,8 +29,10 @@ CONSTANTS
   SimpNoLastWake,     \* a simplification: the last searching domain wakes nobody
   SimpNoSearching,    \* a simplification: no `searching` count, a push wakes each time
   BugTokenAfterRemove,\* the waker gives the token after it takes the domain out of `idle`
-  BugTokenRetry,      \* a waker that takes its token back tries another idle domain
-  SimpNoToken         \* the Go rules before the review of 2026-10-16: no token
+  BugTokenRetry,      \* a waker that removes its token tries another idle domain
+  SimpNoToken,        \* the Go rules before the review of 2026-10-16: no token
+  SimpTokenEachTake,  \* the domain reads `got` at each take, not only when it leaves `idle`
+  BugTokenAfterSleep  \* the domain reads `got` only after a sleep, not after its second check
 
 Doms  == {0, 1, 2}
 Items == {1, 2, 3, 4}
@@ -73,8 +75,10 @@ variables cur = 0, isSearch = FALSE, victims = {}, wv = NoDom, back = "run";
 {
 take:
   while (TRUE) {
-    \* A token that a waker gave: the domain searches with it.
-    if (got[self]) { got[self] := FALSE; isSearch := TRUE; };
+    \* A token that a waker gave: the domain searches with it. A waker gives
+    \* a token only to a domain in `idle`, so the domain reads `got` only when
+    \* it leaves `idle` (tk), unless SimpTokenEachTake.
+    if (SimpTokenEachTake /\ got[self]) { got[self] := FALSE; isSearch := TRUE; };
     \* Steps 1 to 3 of the loop: the pinned queue (domain 0), the next slot,
     \* the local queue, the injection queue.
     if (self = 0 /\ pinned # <<>>) { cur := Head(pinned); pinned := Tail(pinned); }
@@ -134,7 +138,7 @@ id2:
     if (~BugNoRecheck /\ WorkFor(self)) {
       idle := idle \ {self};
       if (isSearch) { searching := searching - 1; isSearch := FALSE; };
-      goto take;
+      if (BugTokenAfterSleep) { goto take; } else { goto tk; };
     };
 id3:
     if (isSearch) { searching := searching - 1; isSearch := FALSE; };   \* the bug order
@@ -142,6 +146,9 @@ sleep:
     await wakeCnt[self] > 0;
     wakeCnt[self] := wakeCnt[self] - 1;
     idle := idle \ {self};
+tk:
+    \* The domain left `idle`: it takes a token that a waker gave.
+    if (~SimpTokenEachTake /\ got[self]) { got[self] := FALSE; isSearch := TRUE; };
     goto take;
 run:
     \* Run the item. Item 1 wakes item 2 and the pinned item 3.
@@ -171,27 +178,31 @@ w1:
     else if (back = "run") { goto run; } else { goto r3; };
 w2:
     \* Select an idle domain. The token comes before the removal from `idle`.
+    \* The read of `idle` and the write of `got` are two steps, as in the code:
+    \* the domain can leave `idle` between them.
     if (idle = {}) {
       searching := searching - 1;
       if (back = "run") { goto run; } else { goto r3; };
     } else {
       with (v \in idle) {
         wv := v;
-        if (BugTokenAfterRemove) { idle := idle \ {v}; } else { got[v] := TRUE; };
+        if (BugTokenAfterRemove) { idle := idle \ {v}; };
       };
     };
+w2b:
+    if (~BugTokenAfterRemove) { got[wv] := TRUE; };
 w3:
     if (BugTokenAfterRemove) {
       got[wv] := TRUE;
     } else if (wv \in idle) {
       idle := idle \ {wv};
     } else if (got[wv]) {
-      \* The domain left `idle` and did not take the token: take it back. The
+      \* The domain left `idle` and did not take the token: remove it. The
       \* domain is awake, so it searches or checks again before it sleeps.
       got[wv] := FALSE; wv := NoDom;
       if (BugTokenRetry) { goto w2; } else { goto w5; };
     } else {
-      \* The domain took the token: it searches, so it needs no wake.
+      \* The domain took the token: it searches, so a wake is not necessary.
       wv := NoDom;
       if (back = "run") { goto run; } else { goto r3; };
     };
@@ -200,7 +211,7 @@ w4:
     wv := NoDom;
     if (back = "run") { goto run; } else { goto r3; };
 w5:
-    \* The count of the token goes back.
+    \* The waker decreases `searching`: the count of the token.
     searching := searching - 1;
     if (back = "run") { goto run; } else { goto r3; };
   };
@@ -257,7 +268,7 @@ Init == (* Global variables *)
                                         [] self = 10 -> "x1"]
 
 take(self) == /\ pc[self] = "take"
-              /\ IF got[self]
+              /\ IF SimpTokenEachTake /\ got[self]
                     THEN /\ got' = [got EXCEPT ![self] = FALSE]
                          /\ isSearch' = [isSearch EXCEPT ![self] = TRUE]
                     ELSE /\ TRUE
@@ -391,7 +402,9 @@ id2(self) == /\ pc[self] = "id2"
                                    /\ isSearch' = [isSearch EXCEPT ![self] = FALSE]
                               ELSE /\ TRUE
                                    /\ UNCHANGED << searching, isSearch >>
-                        /\ pc' = [pc EXCEPT ![self] = "take"]
+                        /\ IF BugTokenAfterSleep
+                              THEN /\ pc' = [pc EXCEPT ![self] = "take"]
+                              ELSE /\ pc' = [pc EXCEPT ![self] = "tk"]
                    ELSE /\ pc' = [pc EXCEPT ![self] = "id3"]
                         /\ UNCHANGED << idle, searching, isSearch >>
              /\ UNCHANGED << local, next, pinned, inj, got, wakeCnt, ran, 
@@ -411,9 +424,19 @@ sleep(self) == /\ pc[self] = "sleep"
                /\ wakeCnt[self] > 0
                /\ wakeCnt' = [wakeCnt EXCEPT ![self] = wakeCnt[self] - 1]
                /\ idle' = idle \ {self}
-               /\ pc' = [pc EXCEPT ![self] = "take"]
+               /\ pc' = [pc EXCEPT ![self] = "tk"]
                /\ UNCHANGED << local, next, pinned, inj, searching, got, ran, 
                                ranOn, cur, isSearch, victims, wv, back >>
+
+tk(self) == /\ pc[self] = "tk"
+            /\ IF ~SimpTokenEachTake /\ got[self]
+                  THEN /\ got' = [got EXCEPT ![self] = FALSE]
+                       /\ isSearch' = [isSearch EXCEPT ![self] = TRUE]
+                  ELSE /\ TRUE
+                       /\ UNCHANGED << got, isSearch >>
+            /\ pc' = [pc EXCEPT ![self] = "take"]
+            /\ UNCHANGED << local, next, pinned, inj, idle, searching, wakeCnt, 
+                            ran, ranOn, cur, victims, wv, back >>
 
 run(self) == /\ pc[self] = "run"
              /\ ran' = (ran \cup {cur[self]})
@@ -490,18 +513,27 @@ w2(self) == /\ pc[self] = "w2"
                        /\ IF back[self] = "run"
                              THEN /\ pc' = [pc EXCEPT ![self] = "run"]
                              ELSE /\ pc' = [pc EXCEPT ![self] = "r3"]
-                       /\ UNCHANGED << idle, got, wv >>
+                       /\ UNCHANGED << idle, wv >>
                   ELSE /\ \E v \in idle:
                             /\ wv' = [wv EXCEPT ![self] = v]
                             /\ IF BugTokenAfterRemove
                                   THEN /\ idle' = idle \ {v}
-                                       /\ got' = got
-                                  ELSE /\ got' = [got EXCEPT ![v] = TRUE]
+                                  ELSE /\ TRUE
                                        /\ idle' = idle
-                       /\ pc' = [pc EXCEPT ![self] = "w3"]
+                       /\ pc' = [pc EXCEPT ![self] = "w2b"]
                        /\ UNCHANGED searching
-            /\ UNCHANGED << local, next, pinned, inj, wakeCnt, ran, ranOn, cur, 
-                            isSearch, victims, back >>
+            /\ UNCHANGED << local, next, pinned, inj, got, wakeCnt, ran, ranOn, 
+                            cur, isSearch, victims, back >>
+
+w2b(self) == /\ pc[self] = "w2b"
+             /\ IF ~BugTokenAfterRemove
+                   THEN /\ got' = [got EXCEPT ![wv[self]] = TRUE]
+                   ELSE /\ TRUE
+                        /\ got' = got
+             /\ pc' = [pc EXCEPT ![self] = "w3"]
+             /\ UNCHANGED << local, next, pinned, inj, idle, searching, 
+                             wakeCnt, ran, ranOn, cur, isSearch, victims, wv, 
+                             back >>
 
 w3(self) == /\ pc[self] = "w3"
             /\ IF BugTokenAfterRemove
@@ -546,9 +578,10 @@ w5(self) == /\ pc[self] = "w5"
 
 dom(self) == take(self) \/ st0(self) \/ st1(self) \/ st2(self) \/ st3(self)
                 \/ st4(self) \/ id0(self) \/ id1(self) \/ id2(self)
-                \/ id3(self) \/ sleep(self) \/ run(self) \/ r2(self)
-                \/ r3(self) \/ r4(self) \/ r5(self) \/ w1(self) \/ w2(self)
-                \/ w3(self) \/ w4(self) \/ w5(self)
+                \/ id3(self) \/ sleep(self) \/ tk(self) \/ run(self)
+                \/ r2(self) \/ r3(self) \/ r4(self) \/ r5(self) \/ w1(self)
+                \/ w2(self) \/ w2b(self) \/ w3(self) \/ w4(self)
+                \/ w5(self)
 
 x1 == /\ pc[10] = "x1"
       /\ inj' = Append(inj, 4)

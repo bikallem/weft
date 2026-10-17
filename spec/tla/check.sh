@@ -169,7 +169,8 @@ wake() { want Wake || return 0 # expect decAfterCheck noRecheck pinnedGeneric no
   PROPS=AllRun DEADLOCK=FALSE run Wake "$1" "${INV:-PinnedOnZero SearchingOK NoLostWakeup TokenOK}" \
     BugDecAfterCheck="$2" BugNoRecheck="$3" BugPinnedGeneric="$4" BugNoNextSteal="$5" \
     SimpNoSearchLimit="${6:-FALSE}" SimpNoLastWake="${7:-FALSE}" SimpNoSearching="${8:-FALSE}" \
-    BugTokenAfterRemove="${9:-FALSE}" SimpNoToken="${10:-FALSE}" BugTokenRetry="${11:-FALSE}"
+    BugTokenAfterRemove="${9:-FALSE}" SimpNoToken="${10:-FALSE}" BugTokenRetry="${11:-FALSE}" \
+    SimpTokenEachTake="${12:-FALSE}" BugTokenAfterSleep="${13:-FALSE}"
 }
 #    expect decAfter noRecheck pinned noNext
 wake pass   FALSE    FALSE     FALSE  FALSE
@@ -191,10 +192,17 @@ wake pass   FALSE    FALSE     FALSE  FALSE  FALSE FALSE FALSE FALSE TRUE
 wake fail   FALSE    FALSE     FALSE  FALSE  FALSE FALSE FALSE TRUE
 INV="PinnedOnZero SearchingOK NoLostWakeup" \
 wake fail   FALSE    FALSE     FALSE  FALSE  FALSE FALSE FALSE TRUE
-# A waker that takes its token back and tries again can chase one domain
+# A waker that removes its token and tries again can chase one domain
 # forever: the domain leaves `idle` each time, and it cannot search, because
 # the token of the waker fills the limit. AllRun finds it.
 wake fail   FALSE    FALSE     FALSE  FALSE  FALSE FALSE FALSE FALSE FALSE TRUE
+# The review of the fixes, F2: a waker gives a token only to a domain in
+# `idle`, so a domain reads `got` only when it leaves `idle`. The form before,
+# with a read at each take, also passes. A domain that reads `got` only after
+# a sleep, and not when its second check finds work, keeps the token while it
+# runs, and then a push wakes nobody.
+wake pass   FALSE    FALSE     FALSE  FALSE  FALSE FALSE FALSE FALSE FALSE FALSE TRUE
+wake fail   FALSE    FALSE     FALSE  FALSE  FALSE FALSE FALSE FALSE FALSE FALSE FALSE TRUE
 
 fd() { want Fd || return 0 # expect dupAlive countOnly noBitCas registerOrder regNoUser
   run Fd "$1" "CloseOnce NoWrongClose NoUseAfterClose NoWrongDel UsersOK DelBeforeClose" \
