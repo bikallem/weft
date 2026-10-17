@@ -1640,45 +1640,42 @@ let take_pinned_first dom =
         dom.pinned_runs <- 0 ;
         None
 
-(* Steps 2 to 4 of the loop: the local queue, the overflow queue, then a steal.
-   Each 61st take tries the overflow queue first, so that its fibers do not
-   starve while the ring is never empty (Go does the same). *)
+(* A take tries the injection queue and the overflow queue first each
+   [fair_period] takes, so that their fibers do not starve while the ring is
+   never empty. Go uses 61 for the same check. [k_poll], the period of the poll
+   of a busy domain, also starts at 61, but it counts switches, and it is a
+   different rule. *)
+let fair_period = 61
+
+(* Step 1 of the loop. The inline keeps the yield loop on one domain as fast as
+   before the split into steps. *)
+let[@inline] take_fair dom =
+  if
+    ( dom.ticks >= fair_period )
+    [@mutate off "61 or 62 takes: 61 is a start value, as in Go"]
+  then (
+    dom.ticks <- 0 ;
+    take_injected dom ;
+    take_overflow dom.sched )
+  else None
+
+(* The fills from outside resume their fibers to this domain. *)
+let take_injected_local dom = take_injected dom ; Ring.pop dom.ring
+
+(* Steps 1 to 4 of the loop (design section 2.5), in order. The first source
+   that gives a fiber ends the take. Step 1 is [take_fair], step 2 is
+   [take_pinned_first], step 3 is the next slot, the local queue, the overflow
+   queue, the injection queue and the pinned queue, and step 4 is [steal]. *)
 let take_work dom =
   dom.ticks <- dom.ticks + 1 ;
-  let first =
-    if
-      ( dom.ticks >= 61 )
-      [@mutate off "61 or 62 takes: 61 is a start value, as in Go"]
-    then (
-      dom.ticks <- 0 ;
-      take_injected dom ;
-      take_overflow dom.sched )
-    else None
-  in
-  match match first with Some r -> Some r | None -> take_pinned_first dom with
-  | Some r ->
-      Some r
-  | None -> (
-    match take_next dom with
-    | Some r ->
-        Some r
-    | None -> (
-      match Ring.pop dom.ring with
-      | Some r ->
-          Some r
-      | None -> (
-        match take_overflow dom.sched with
-        | Some r ->
-            Some r
-        | None -> (
-            (* The fills from outside resume their fibers to this domain. *)
-            take_injected dom ;
-            match Ring.pop dom.ring with
-            | Some r ->
-                Some r
-            | None -> (
-              match take_pinned dom with Some r -> Some r | None -> steal dom )
-            ) ) ) )
+  let r = take_fair dom in
+  let r = if Option.is_none r then take_pinned_first dom else r in
+  let r = if Option.is_none r then take_next dom else r in
+  let r = if Option.is_none r then Ring.pop dom.ring else r in
+  let r = if Option.is_none r then take_overflow dom.sched else r in
+  let r = if Option.is_none r then take_injected_local dom else r in
+  let r = if Option.is_none r then take_pinned dom else r in
+  if Option.is_none r then steal dom else r
 
 (* A domain that a wake gave the token to searches with it in [steal]. If it
    finds work before the steal, it ends the search with that work (Go's

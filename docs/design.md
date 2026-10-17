@@ -758,11 +758,11 @@ I changed one point from my earlier answer. A Chase-Lev deque gives the owner LI
 
 ### The loop of one domain
 
-Steps 1 and 3 and the next slot come in milestone M3. Before M3, step 2 takes only from the local queue, and step 4 does not try the next slots.
+The pinned queue, the injection queue and the next slot come in milestone M3. Before M3, step 1 takes only from the overflow queue, and steps 3 and 4 do not try the next slots. `take_work` in `sched.ml` has the steps 1 to 4 in this order.
 
-1. On domain 0, take a fiber from the pinned queue first. affect has the same rule for `only_main`.
-2. Take a fiber from the next slot, else from the head of the local queue.
-3. Each 61st time, take from the overflow queue first (from M1), and in M3 also from the global injection queue. This prevents starvation of these queues. Go uses the same rule. A full ring moves its older half and the new fiber to the overflow queue, as Go's `runqputslow` does, so the order stays FIFO. The review of M1 found that without this rule, a fiber in the overflow queue never runs while more than 256 fibers yield.
+1. Each 61st time, take the global injection queue, and then take from the overflow queue first. This prevents starvation of these queues. Go uses the same rule (61 is the value of Go). A full ring moves its older half and the new fiber to the overflow queue, as Go's `runqputslow` does, so the order stays FIFO. The review of M1 found that without this rule, a fiber in the overflow queue never runs while more than 256 fibers yield. The busy poll below also starts at 61, but it counts switches, and it is a different rule (`k_poll`).
+2. On domain 0, take a fiber from the pinned queue, but at most 3 times in sequence (`next_limit`). affect has the same rule for `only_main`.
+3. Take a fiber from the next slot (at most 3 times in sequence), else from the head of the local queue. If the two are empty, take from the overflow queue. Then take the global injection queue, and take from the local queue again. Then, on domain 0, take from the pinned queue.
 4. If there is no fiber, steal. Select a domain with the PRNG and take half of its local queue. Try each domain one time. Then try the next slots. A domain that a wake gave the token to searches with it, and gives it back if it finds a fiber before the steal (Idle and wake, below).
 5. If there is a fiber, perform `Switch`, then run the fiber until it blocks, yields or ends. Go to step 1.
 6. If there is no fiber, poll. Read `Now`, expire the deadlines of this domain, take the mailbox, and `Wait` with timeout 0. If this made a fiber ready, go to step 1.
