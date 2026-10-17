@@ -71,6 +71,24 @@ val error_of : (unit -> 'a) -> string
 val host_port : Weft.Net.t -> string * int
 (** The local host and port of a TCP or UDP socket. *)
 
+val tmp : unit -> string
+(** A new empty directory for each call, in the temporary directory. The
+    directories go at the exit. *)
+
+(** The [run] of a world, for example [Weft_linux.run ~domains:1]. *)
+type runner = {call: 'a. (unit -> 'a) -> 'a}
+
+val loopback_world : name:string -> domains:int -> runner -> world
+(** A world whose sockets use 127.0.0.1, and whose [tmp] is [tmp]. *)
+
+val elapsed_ns : world -> (unit -> unit) -> int
+(** [elapsed_ns w f] runs [f] in [w] and gives the time of the Mono clock that
+    [f] took, in ns. *)
+
+val sleep_10ms : median:int -> world -> unit -> unit
+(** The test of 20 sleeps of 10 ms in [w]. Each sleep takes 10 ms to 500 ms, and
+    the median takes less than [median] ns. *)
+
 val with_default_sigint : (unit -> 'a) -> 'a
 (** [with_default_sigint f] runs [f] with the default action of SIGINT, and then
     restores the old action. A shell starts a background job with SIGINT

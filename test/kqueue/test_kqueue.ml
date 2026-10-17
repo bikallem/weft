@@ -5,49 +5,11 @@
 open Windtrap
 open Weft
 
-(* A new directory for each test that needs one. The directories go at the
-   exit. *)
-let tmp =
-  let base = Filename.temp_dir "weft-test" "" and n = ref 0 in
-  at_exit (fun () -> ignore (Sys.command ("rm -rf " ^ Filename.quote base))) ;
-  fun () ->
-    incr n ;
-    let d = Filename.concat base (string_of_int !n) in
-    Sys.mkdir d 0o755 ; d
-
 let world domains =
-  { Portable.name= Printf.sprintf "kqueue on %d domains" domains
-  ; domains
-  ; run= (fun f -> Weft_kqueue.run ~domains f)
-  ; listen=
-      (fun () ->
-        let l = Net.listen (Net.Tcp ("127.0.0.1", 0)) in
-        (l, Net.local_addr l) )
-  ; udp=
-      (fun () ->
-        let s = Net.udp ("127.0.0.1", 0) in
-        (s, Portable.host_port s) )
-  ; tmp }
-
-let elapsed_ns f =
-  Weft_kqueue.run ~domains:1 (fun () ->
-      let t0 = Time.now Mono in
-      f () ;
-      Int64.to_int (Span.to_ns (Time.diff Mono (Time.now Mono) t0)) )
-
-(* A sleep never ends before its deadline. A shared machine can delay one sleep
-   for a long time. Thus the median of the 20 sleeps checks the precision (less
-   than 20 ms), and the limit of 500 ms for each sleep finds a timer that fires
-   much too late. *)
-let sleep_10ms () =
-  let all =
-    List.init 20 (fun _ ->
-        let ns = elapsed_ns (fun () -> Time.sleep Mono (Span.ms 10)) in
-        at_least int ~than:10_000_000 ns ;
-        less int ~than:500_000_000 ns ;
-        ns )
-  in
-  less int ~than:20_000_000 (List.nth (List.sort compare all) 10)
+  Portable.loopback_world
+    ~name:(Printf.sprintf "kqueue on %d domains" domains)
+    ~domains
+    {Portable.call= (fun f -> Weft_kqueue.run ~domains f)}
 
 let read_pipe = Portable.drain Pipe.read
 
@@ -274,7 +236,8 @@ let () =
        ( Portable.tests (world 1)
        @ Portable.tests (world 4)
        @ [ group "kqueue"
-             [ test "a 10 ms sleep ends after 10 ms" sleep_10ms
+             [ test "a 10 ms sleep ends after 10 ms"
+                 (Portable.sleep_10ms ~median:20_000_000 (world 1))
              ; test "the pipes and the exit status of a child" child_output
              ; test "a child that exits at once" child_fast_exit
              ; test "a child stops at SIGINT" child_kill
