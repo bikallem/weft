@@ -1401,15 +1401,15 @@ let one_wake_write () =
   is_true (r >= 0) ;
   let p = Weft_posix.create_pool [|w|] in
   let start () =
-    match Weft_posix.submit p (Op.Start (0, Op.Stat "/")) with
-    | Some (Ok id) ->
+    match Weft_posix.start_job p 0 (Op.Stat "/") with
+    | Ok id ->
         id
     | _ ->
         fail "the job did not start"
   in
   let finish id =
-    match Weft_posix.submit p (Op.Finish (id, Op.Stat "/")) with
-    | Some (Ok _) ->
+    match Weft_posix.finish_job p id (Op.Stat "/") with
+    | Ok _ ->
         ()
     | _ ->
         fail "the job did not finish"
@@ -1449,6 +1449,25 @@ let world_random () =
       let l = List.init 100 (fun _ -> Weft_linux.World.random w (1 lsl 30)) in
       at_least int ~than:90 (List.length (List.sort_uniq compare l)) )
 
+(* K5: [run] checks the limit of the watchdog before it makes the world. Thus a
+   bad limit makes no fd, and it raises its own error also while another world
+   holds the claim of the signals. The old code made the world first, and then
+   [create] raised the error of the claim. *)
+let limit_before_create () =
+  let a = Weft_linux.create ~signals:[SIGUSR1] () in
+  Fun.protect
+    ~finally:(fun () -> Weft_linux.close a)
+    (fun () ->
+      let before = open_fds () in
+      raises
+        (Invalid_argument
+           "Weft_linux.run: the limit of the watchdog is not positive" )
+        (fun () ->
+          Weft_linux.run ~domains:1 ~signals:[SIGUSR2]
+            ~watchdog:(Some (Span.ns 0))
+            ignore ) ;
+      equal int before (open_fds ()) )
+
 let review_2026 =
   group "review of 2026-10-16"
     [ test "C3: the names of 40,000 entries take linear time" many_names
@@ -1457,6 +1476,7 @@ let review_2026 =
         large_file_io
     ; test "P6: a worker writes the wake fd only for an empty mailbox"
         one_wake_write
+    ; test "K5: a bad limit of the watchdog makes no world" limit_before_create
     ; test "K6: the random of the world is in the range 0 to n - 1" world_random
     ]
 

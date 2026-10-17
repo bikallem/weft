@@ -155,6 +155,10 @@ let signal_of n =
   in
   find 0
 
+(* The form of a signal in [Ready.Signal], for example [SIGUSR1] for
+   [Other_signal 10] on Linux. *)
+let normal s = signal_of (number_of s)
+
 (* Errors *)
 
 let codes = errno_codes ()
@@ -493,120 +497,45 @@ let status_of (kind, code) =
   | e ->
       Error (error_of (-e))
 
-(* The operations that do not depend on the poller. [None] for the others:
-   [Register], [Deregister], [Spawn], [Wait_child], [Kill], [Watch] and
-   [Unwatch]. *)
-let submit : type a. pool -> a Op.t -> (a, Op.error) result option =
- fun p op ->
-  match op with
-  | Op.Listen (addr, backlog) ->
-      let kind, h, port = host_port addr in
-      Some (result (listen kind h port backlog))
-  | Op.Accept fd ->
-      (* FreeBSD gives ECONNABORTED for a connection that the client reset
-         before the accept. Linux gives the connection, and a read of the source
-         of macOS shows that macOS also gives it. Linux can give a pending
-         network error of the new connection, for example EPROTO. For these
-         errors, the world takes the next connection (design section 2.7, An
-         aborted connection). Each one removes one connection from the backlog,
-         so the loop ends. *)
-      let rec take () =
-        let ((r, _, _, _) as a) = accept fd in
-        if r < 0 && Array.mem (-r) accept_retry then take () else a
-      in
-      let r, host, port, unix = take () in
-      Some
-        (Result.map
-           (fun fd -> (fd, if unix then Op.Unix "" else Op.Tcp (host, port)))
-           (result r) )
-  | Op.Connect addr ->
-      let kind, h, port = host_port addr in
-      let r = connect kind h port in
-      (* A Unix socket gives EAGAIN when the backlog of the listener is full.
-         This is not a connect that continues. *)
-      if r = -eagain then Some (Error (Op.Other "EAGAIN: the backlog is full"))
-      else Some (result r)
-  | Op.Connect_result fd ->
-      Some (unit (connect_result fd))
-  | Op.Local_addr fd ->
-      let r, host, port, unix = local_addr fd in
-      Some
-        (Result.map
-           (fun () -> if unix then Op.Unix host else Op.Tcp (host, port))
-           (unit r) )
-  | Op.Read (fd, buf, off, len) ->
-      Some (result (recv fd buf off len))
-  | Op.Write (fd, buf, off, len) ->
-      Some (result (send fd buf off len))
-  | Op.Shutdown fd ->
-      Some (unit (shutdown_send fd))
-  | Op.Reset_on_close fd ->
-      Some (unit (reset_on_close fd))
-  | Op.Udp (host, port) ->
-      Some (result (udp host port))
-  | Op.Sendto (fd, buf, off, len, host, port) ->
-      Some (result (sendto fd buf off len (host, port)))
-  | Op.Recvfrom (fd, buf, off, len) ->
-      let n, host, port = recvfrom fd buf off len in
-      Some (Result.map (fun n -> (n, host, port)) (result n))
-  | Op.Set_option (fd, opt, v) ->
-      Some (unit (setsockopt fd (option_code opt) (option_int opt v)))
-  | Op.Get_option (fd, opt) ->
-      Some
-        (Result.map (option_value opt)
-           (result (getsockopt fd (option_code opt))) )
-  | Op.Pipe ->
-      let r, w = pipe () in
-      Some (Result.map (fun r -> (r, w)) (result r))
-  | Op.Fd_read (fd, buf, off, len) ->
-      Some (result (fd_read fd buf off len))
-  | Op.Fd_write (fd, buf, off, len) ->
-      Some (result (fd_write fd buf off len))
-  | Op.Close fd ->
-      (* close(2) of a file can block: the pool does it (design section 2.7). *)
-      if
-        Mutex.protect p.lock (fun () ->
-            let file = Hashtbl.mem p.files fd in
-            Hashtbl.remove p.files fd ; file )
-      then Some (Ok (close_async fd))
-      else Some (unit (close_fd fd))
-  | Op.Start (dom, op) ->
-      let id = Atomic.fetch_and_add p.next_job 1 in
-      let args = args_of id dom op in
-      (* The lock covers the start, so the job is in the table before its
-         completion can come. *)
-      Some
-        (Mutex.protect p.lock (fun () ->
-             Hashtbl.replace p.jobs id (job_start p.mbx args) ;
-             Ok id ) )
-  | Op.Finish (id, op) -> (
-    match take_job p id with
-    | Some j ->
-        let r = finish j op in
-        ( match (op, r) with
-        | Op.Open _, Ok fd ->
-            Mutex.protect p.lock (fun () -> Hashtbl.replace p.files fd ())
-        | _ ->
-            () ) ;
-        Some r
-    | None ->
-        Some (Error Op.Bad_fd) )
-  | Op.Detach id -> (
-    match take_job p id with
-    | Some j ->
-        Some (Ok (job_detach j))
-    | None ->
-        Some (Error Op.Bad_fd) )
-  | Op.Register _
-  | Op.Deregister _
-  | Op.Spawn _
-  | Op.Wait_child _
-  | Op.Kill _
-  | Op.Watch _
-  | Op.Unwatch _ ->
-      None
-  | Op.Resend s ->
-      Some (unit (resend (number_of s)))
+(* The pool operations. The lock covers the start, so the job is in the table
+   before its completion can come. *)
+let start_job p dom op =
+  let id = Atomic.fetch_and_add p.next_job 1 in
+  let args = args_of id dom op in
+  Mutex.protect p.lock (fun () ->
+      Hashtbl.replace p.jobs id (job_start p.mbx args) ;
+      Ok id )
+
+let finish_job : type a. pool -> int -> a Op.blocking -> (a, Op.error) result =
+ fun p id op ->
+  match take_job p id with
+  | Some j ->
+      let r = finish j op in
+      ( match (op, r) with
+      | Op.Open _, Ok fd ->
+          Mutex.protect p.lock (fun () -> Hashtbl.replace p.files fd ())
+      | _ ->
+          () ) ;
+      r
+  | None ->
+      Error Op.Bad_fd
+
+let detach_job p id =
+  match take_job p id with
+  | Some j ->
+      Ok (job_detach j)
+  | None ->
+      Error Op.Bad_fd
+
+(* The close of an fd. close(2) of a file can block: the pool does it (design
+   section 2.7). *)
+let close_op p fd =
+  if
+    Mutex.protect p.lock (fun () ->
+        let file = Hashtbl.mem p.files fd in
+        Hashtbl.remove p.files fd ; file )
+  then Ok (close_async fd)
+  else unit (close_fd fd)
 
 let now (type time) (line : time Weft.Clock.line) : time =
   Weft.Clock.of_ns line
@@ -614,30 +543,210 @@ let now (type time) (line : time Weft.Clock.line) : time =
 
 let default_domains () = Int.min 4 (Domain.recommended_domain_count ())
 
-(* Run [main] in the world [w], with the watchdog, and [close] the world at the
-   end. The watchdog reads the beats of the scheduler. The pair keeps the
-   Bigarray alive until the stop. *)
-let run (type w) ~name (module W : Weft.WORLD with type t = w) (w : w) ~close
-    ?slack ~domains ~watchdog main =
-  ( match watchdog with
-  | Some l when Int64.compare (Weft.Span.to_ns l) 0L <= 0 ->
-      close w ;
-      invalid_arg (name ^ ": the limit of the watchdog is not positive")
-  | _ ->
-      () ) ;
-  let dog = ref None in
-  let start (s : Sched.t) =
-    Option.iter
-      (fun limit ->
-        dog :=
-          Some
-            ( watchdog_start s.beats Sched.beat_stride (Weft.Span.to_ns limit)
-            , s.beats ) )
-      watchdog
-  in
-  Fun.protect
-    ~finally:(fun () ->
-      Option.iter (fun (d, _) -> watchdog_stop d) !dog ;
-      close w )
-    (fun () ->
-      Weft.Private.run_world ?slack ~domains ~on_create:start (module W) w main )
+(* The parts of a world that depend on its poller, its signals and its child
+   processes. *)
+module type POLLER = sig
+  type t
+
+  val name : string
+  (** The name of the module of the world, for the errors. *)
+
+  val create : ?domains:int -> ?signals:Op.signal list -> unit -> t
+
+  val close : t -> unit
+
+  val pool : t -> pool
+
+  val watched : t -> Op.signal list Atomic.t
+  (** The signals of [run ~signals], with no signal of an unwatch, in their
+      [normal] form. *)
+
+  val unwatch_lock : t -> Mutex.t
+
+  val unwatch : t -> Op.signal -> rest:Op.signal list -> (unit, Op.error) result
+  (** [unwatch t s ~rest] stops the watch of [s], under [unwatch_lock]. [rest]
+      are the other watched signals. After [Ok], [submit] removes [s] from
+      [watched]. *)
+
+  val register : t -> int -> Op.fd -> int -> (unit, Op.error) result
+  (** [register t domain fd token] *)
+
+  val deregister : t -> int -> Op.fd -> (unit, Op.error) result
+
+  val spawn : t -> Op.spawn -> (Op.spawned, Op.error) result
+
+  val wait_child : t -> Op.fd -> (Op.status option, Op.error) result
+
+  val kill : t -> Op.fd -> Op.signal -> (unit, Op.error) result
+
+  val close_fd : t -> Op.fd -> (unit, Op.error) result
+  (** The close of an fd, with [close_op] for each fd that is not of the poller.
+  *)
+
+  val wait : t -> domain:int -> World.Wait.t -> World.Ready.t list
+
+  val wake : t -> domain:int -> unit
+end
+
+(* The world and its [run], from the parts of [P]. *)
+module Make (P : POLLER) = struct
+  module World = struct
+    type t = P.t
+
+    let now _ line = now line
+
+    let submit : type a. t -> a Op.t -> (a, Op.error) result =
+     fun t op ->
+      match op with
+      | Op.Listen (addr, backlog) ->
+          let kind, h, port = host_port addr in
+          result (listen kind h port backlog)
+      | Op.Accept fd ->
+          (* FreeBSD gives ECONNABORTED for a connection that the client reset
+             before the accept. Linux gives the connection, and a read of the
+             source of macOS shows that macOS also gives it. Linux can give a
+             pending network error of the new connection, for example EPROTO.
+             For these errors, the world takes the next connection (design
+             section 2.7, An aborted connection). Each one removes one
+             connection from the backlog, so the loop ends. *)
+          let rec take () =
+            let ((r, _, _, _) as a) = accept fd in
+            if
+              ( r < 0 )
+              [@mutate off "0 is not an errno, so Array.mem gives false for 0"]
+              && Array.mem (-r) accept_retry
+            then take ()
+            else a
+          in
+          let r, host, port, unix = take () in
+          Result.map
+            (fun fd -> (fd, if unix then Op.Unix "" else Op.Tcp (host, port)))
+            (result r)
+      | Op.Connect addr ->
+          let kind, h, port = host_port addr in
+          let r = connect kind h port in
+          (* A Unix socket gives EAGAIN when the backlog of the listener is
+             full. This is not a connect that continues. *)
+          if r = -eagain then Error (Op.Other "EAGAIN: the backlog is full")
+          else result r
+      | Op.Connect_result fd ->
+          unit (connect_result fd)
+      | Op.Local_addr fd ->
+          let r, host, port, unix = local_addr fd in
+          Result.map
+            (fun () -> if unix then Op.Unix host else Op.Tcp (host, port))
+            (unit r)
+      | Op.Read (fd, buf, off, len) ->
+          result (recv fd buf off len)
+      | Op.Write (fd, buf, off, len) ->
+          result (send fd buf off len)
+      | Op.Shutdown fd ->
+          unit (shutdown_send fd)
+      | Op.Reset_on_close fd ->
+          unit (reset_on_close fd)
+      | Op.Udp (host, port) ->
+          result (udp host port)
+      | Op.Sendto (fd, buf, off, len, host, port) ->
+          result (sendto fd buf off len (host, port))
+      | Op.Recvfrom (fd, buf, off, len) ->
+          let n, host, port = recvfrom fd buf off len in
+          Result.map (fun n -> (n, host, port)) (result n)
+      | Op.Set_option (fd, opt, v) ->
+          unit (setsockopt fd (option_code opt) (option_int opt v))
+      | Op.Get_option (fd, opt) ->
+          Result.map (option_value opt)
+            (result (getsockopt fd (option_code opt)))
+      | Op.Pipe ->
+          let r, w = pipe () in
+          Result.map (fun r -> (r, w)) (result r)
+      | Op.Fd_read (fd, buf, off, len) ->
+          result (fd_read fd buf off len)
+      | Op.Fd_write (fd, buf, off, len) ->
+          result (fd_write fd buf off len)
+      | Op.Close fd ->
+          P.close_fd t fd
+      | Op.Register (d, fd, token) ->
+          P.register t d fd token
+      | Op.Deregister (d, fd) ->
+          P.deregister t d fd
+      | Op.Start (dom, op) ->
+          start_job (P.pool t) dom op
+      | Op.Finish (id, op) ->
+          finish_job (P.pool t) id op
+      | Op.Detach id ->
+          detach_job (P.pool t) id
+      | Op.Spawn sp ->
+          P.spawn t sp
+      | Op.Wait_child fd ->
+          P.wait_child t fd
+      | Op.Kill (fd, s) ->
+          P.kill t fd s
+      | Op.Watch s ->
+          let s = normal s in
+          Ok (if List.mem s (Atomic.get (P.watched t)) then Some s else None)
+      | Op.Unwatch s ->
+          let s = normal s in
+          Mutex.protect (P.unwatch_lock t) (fun () ->
+              let watched = Atomic.get (P.watched t) in
+              if not (List.mem s watched) then Ok None
+              else
+                let rest = List.filter (fun x -> x <> s) watched in
+                Result.map
+                  (fun () ->
+                    Atomic.set (P.watched t) rest ;
+                    Some s )
+                  (P.unwatch t s ~rest) )
+      | Op.Resend s ->
+          unit (resend (number_of s))
+
+    let wait = P.wait
+
+    let wake = P.wake
+
+    let random _ n = random n
+
+    let random_bytes _ b = ignore (getrandom b)
+  end
+
+  (* The default number of domains is a start value (open question 6). *)
+  let default_domains = default_domains
+
+  let watchdog_reports = watchdog_reports
+
+  let pool_warnings = pool_warnings
+
+  let pool_busy = pool_busy
+
+  (* Run [main] in a new world, with the watchdog, and close the world at the
+     end. The check of the limit comes before [create], so a bad limit makes no
+     world. The watchdog reads the beats of the scheduler. The pair keeps the
+     Bigarray alive until the stop. *)
+  let run ?slack ?domains ?signals ?(watchdog = Some (Weft.Span.ms 10)) main =
+    ( match watchdog with
+    | Some l when Int64.compare (Weft.Span.to_ns l) 0L <= 0 ->
+        invalid_arg (P.name ^ ".run: the limit of the watchdog is not positive")
+    | _ ->
+        () ) ;
+    let domains =
+      match domains with Some n -> n | None -> default_domains ()
+    in
+    let w = P.create ~domains ?signals () in
+    let dog = ref None in
+    let start (s : Sched.t) =
+      Option.iter
+        (fun limit ->
+          dog :=
+            Some
+              ( watchdog_start s.beats Sched.beat_stride (Weft.Span.to_ns limit)
+              , s.beats ) )
+        watchdog
+    in
+    Fun.protect
+      ~finally:(fun () ->
+        Option.iter (fun (d, _) -> watchdog_stop d) !dog ;
+        P.close w )
+      (fun () ->
+        Weft.Private.run_world ?slack ~domains ~on_create:start
+          (module World)
+          w main )
+end

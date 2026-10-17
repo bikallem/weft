@@ -124,8 +124,7 @@ let create ?(domains = 1) ?(signals = []) () =
   | doms, pool ->
       { doms
       ; pool
-      ; watched=
-          Atomic.make (List.map (fun s -> signal_of (number_of s)) signals)
+      ; watched= Atomic.make (List.map normal signals)
       ; old_actions= !old_actions
       ; lock= Mutex.create ()
       ; procs= Hashtbl.create ~random:false 8
@@ -191,13 +190,6 @@ let spawn t sp =
 
 let proc t fd = Mutex.protect t.lock (fun () -> Hashtbl.find_opt t.procs fd)
 
-let posix t op =
-  match Weft_posix.submit t.pool op with
-  | Some r ->
-      r
-  | None ->
-      assert false (* The arms of [submit] take each other operation. *)
-
 (* Remove a child from the tables. A later child can have the same pid, so the
    entry of the pid goes only if it is this child. *)
 let take_proc t fd =
@@ -226,23 +218,17 @@ let wait_child t p =
         (match r with Ok (Some _) -> p.reaped <- true | _ -> ()) ;
         r )
 
-(* The end of a watch (design section 2.7). The old action comes back first:
-   after it, the kernel gives each new signal its action. Then the world takes
-   the count of the signals that came before and that domain 0 did not take, and
-   it sends them again, so they get the action. A handler that started before
-   the restore can add to the count later: domain 0 takes it, and the scheduler
-   sends it again. *)
-let unwatch t s =
-  let s = signal_of (number_of s) in
-  Mutex.protect t.lock (fun () ->
-      let watched = Atomic.get t.watched in
-      if not (List.mem s watched) then Ok None
-      else
-        let n = number_of s in
-        Atomic.set t.watched (List.filter (fun x -> x <> s) watched) ;
-        sig_restore n (List.assoc n t.old_actions) ;
-        if sig_take n > 0 then ignore (resend n) ;
-        Ok (Some s) )
+(* The end of a watch (design section 2.7), under [lock]. The old action comes
+   back first: after it, the kernel gives each new signal its action. Then the
+   world takes the count of the signals that came before and that domain 0 did
+   not take, and it sends them again, so they get the action. A handler that
+   started before the restore can add to the count later: domain 0 takes it, and
+   the scheduler sends it again. *)
+let unwatch t s ~rest:_ =
+  let n = number_of s in
+  sig_restore n (List.assoc n t.old_actions) ;
+  if sig_take n > 0 then ignore (resend n) ;
+  Ok ()
 
 (* The signals that came since the last take, for the wait of domain 0. *)
 let signals t acc =
@@ -256,38 +242,43 @@ let kill t p s =
   Mutex.protect t.lock (fun () ->
       if p.reaped then esrch else unit (kq_kill p.pid (number_of s)) )
 
-module World = struct
+module Poller = struct
   type nonrec t = t
 
-  let now _ line = now line
+  let name = "Weft_kqueue"
 
-  let submit : type a. t -> a Op.t -> (a, Op.error) result =
-   fun t op ->
-    match op with
-    | Op.Spawn sp ->
-        spawn t sp
-    | Op.Wait_child fd -> (
-      match proc t fd with Some p -> wait_child t p | None -> Error Op.Bad_fd )
-    | Op.Kill (fd, s) -> (
-      match proc t fd with Some p -> kill t p s | None -> Error Op.Bad_fd )
-    | Op.Watch s ->
-        let s = signal_of (number_of s) in
-        Ok (if List.mem s (Atomic.get t.watched) then Some s else None)
-    | Op.Unwatch s ->
-        unwatch t s
-    | Op.Register (d, fd, token) ->
-        unit (kq_add t.doms.(d).kq fd token)
-    | Op.Deregister (d, fd) ->
-        unit (kq_del t.doms.(d).kq fd)
-    | Op.Close fd -> (
-      match take_proc t fd with
-      | Some p ->
-          ignore (close_fd p.exit_w) ;
-          unit (close_fd p.exit_r)
-      | None ->
-          posix t op )
-    | op ->
-        posix t op
+  let create = create
+
+  let close = close
+
+  let pool t = t.pool
+
+  let watched t = t.watched
+
+  let unwatch_lock t = t.lock
+
+  let unwatch = unwatch
+
+  let register t d fd token = unit (kq_add t.doms.(d).kq fd token)
+
+  let deregister t d fd = unit (kq_del t.doms.(d).kq fd)
+
+  let spawn = spawn
+
+  let wait_child t fd =
+    match proc t fd with Some p -> wait_child t p | None -> Error Op.Bad_fd
+
+  let kill t fd s =
+    match proc t fd with Some p -> kill t p s | None -> Error Op.Bad_fd
+
+  (* The close of the exit pipe of a child removes the child. *)
+  let close_fd t fd =
+    match take_proc t fd with
+    | Some p ->
+        ignore (close_fd p.exit_w) ;
+        unit (close_fd p.exit_r)
+    | None ->
+        close_op t.pool fd
 
   (* The timeout of kevent: the earliest deadline, or none. A step of the wall
      clock does not end a wait, so a wait for a [Posix] deadline ends after 1 s
@@ -336,23 +327,6 @@ module World = struct
       []
 
   let wake t ~domain = poke t.doms.(domain).wake_w
-
-  let random _ n = random n
-
-  let random_bytes _ b = ignore (getrandom b)
 end
 
-let default_domains = default_domains
-
-let watchdog_reports = watchdog_reports
-
-let pool_warnings = pool_warnings
-
-let pool_busy = pool_busy
-
-let run ?slack ?domains ?signals ?(watchdog = Some (Weft.Span.ms 10)) main =
-  let domains = match domains with Some n -> n | None -> default_domains () in
-  Weft_posix.run ~name:"Weft_kqueue.run"
-    (module World)
-    (create ~domains ?signals ())
-    ~close ?slack ~domains ~watchdog main
+include Weft_posix.Make (Poller)
