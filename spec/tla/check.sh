@@ -159,9 +159,10 @@ ivar fail   FALSE  TRUE
 # The domains loop forever, so a sleep at the end is not a deadlock. The
 # liveness property is AllRun: each item runs.
 wake() { want Wake || return 0 # expect decAfterCheck noRecheck pinnedGeneric noNextSteal
-  PROPS=AllRun DEADLOCK=FALSE run Wake "$1" "PinnedOnZero SearchingOK NoLostWakeup" \
+  PROPS=AllRun DEADLOCK=FALSE run Wake "$1" "${INV:-PinnedOnZero SearchingOK NoLostWakeup TokenOK}" \
     BugDecAfterCheck="$2" BugNoRecheck="$3" BugPinnedGeneric="$4" BugNoNextSteal="$5" \
-    SimpNoSearchLimit="${6:-FALSE}" SimpNoLastWake="${7:-FALSE}" SimpNoSearching="${8:-FALSE}"
+    SimpNoSearchLimit="${6:-FALSE}" SimpNoLastWake="${7:-FALSE}" SimpNoSearching="${8:-FALSE}" \
+    BugTokenAfterRemove="${9:-FALSE}" SimpNoToken="${10:-FALSE}" BugTokenRetry="${11:-FALSE}"
 }
 #    expect decAfter noRecheck pinned noNext
 wake pass   FALSE    FALSE     FALSE  FALSE
@@ -173,7 +174,20 @@ wake pass   FALSE    FALSE     FALSE  TRUE
 wake pass   FALSE    FALSE     FALSE  FALSE  TRUE  FALSE
 wake pass   FALSE    FALSE     FALSE  FALSE  FALSE TRUE
 # A simplification: no `searching` count. A push wakes an idle domain each time.
-wake pass   FALSE    FALSE     FALSE  FALSE  FALSE FALSE TRUE
+wake pass   FALSE    FALSE     FALSE  FALSE  FALSE FALSE TRUE  FALSE TRUE
+# The review of 2026-10-16, P1: a wake gives its `searching` count to the woken
+# domain (the token). The form before the review, with no token, also passes.
+wake pass   FALSE    FALSE     FALSE  FALSE  FALSE FALSE FALSE FALSE TRUE
+# The bug of the first prototype: the token comes after the removal from
+# `idle`. The domain can poll the wake away and sleep with the token, and then
+# a push wakes nobody. TokenOK finds it, and NoLostWakeup alone finds it too.
+wake fail   FALSE    FALSE     FALSE  FALSE  FALSE FALSE FALSE TRUE
+INV="PinnedOnZero SearchingOK NoLostWakeup" \
+wake fail   FALSE    FALSE     FALSE  FALSE  FALSE FALSE FALSE TRUE
+# A waker that takes its token back and tries again can chase one domain
+# forever: the domain leaves `idle` each time, and it cannot search, because
+# the token of the waker fills the limit. AllRun finds it.
+wake fail   FALSE    FALSE     FALSE  FALSE  FALSE FALSE FALSE FALSE FALSE TRUE
 
 fd() { want Fd || return 0 # expect dupAlive countOnly noBitCas registerOrder regNoUser
   run Fd "$1" "CloseOnce NoWrongClose NoUseAfterClose NoWrongDel UsersOK DelBeforeClose" \
