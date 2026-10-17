@@ -30,9 +30,15 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # The case with no bug took 3370 s. The job takes about 1 h.
-          - name: Wake
-            models: Wake
+          # Wake has two jobs. Wake1 has the cases from before the wake
+          # token, and Wake2 has the cases of the token. In one job, the 14
+          # cases took more than 2 h 30 min. The case with no bug took 3370 s.
+          - name: Wake1
+            models: Wake1
+            limit: 10800
+            timeout: 240
+          - name: Wake2
+            models: Wake2
             limit: 10800
             timeout: 240
           # The slowest case took 1420 s on CI. The job takes about 35 min. A

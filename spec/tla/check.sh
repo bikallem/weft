@@ -11,6 +11,9 @@
 #   Signal.tla  Signal.unwatch: the end of a watch, on Linux and kqueue
 #
 # MODELS selects the models, for example: MODELS="Ivar Scope" check.sh
+# Wake selects all the Wake cases. Wake1 selects only the cases from before
+# the wake token, and Wake2 only the cases of the token. CI runs Wake1 and
+# Wake2 in two jobs.
 #
 # Each line runs one case. A "pass" case uses the protocol of the design.
 # A "fail" case plants one bug, and TLC must find a violation or a deadlock.
@@ -164,8 +167,9 @@ ivar fail   TRUE   FALSE
 ivar fail   FALSE  TRUE
 
 # The domains loop forever, so a sleep at the end is not a deadlock. The
-# liveness property is AllRun: each item runs.
-wake() { want Wake || return 0 # expect decAfterCheck noRecheck pinnedGeneric noNextSteal
+# liveness property is AllRun: each item runs. WG is the group of the case
+# (Wake1 or Wake2).
+wake() { want Wake || want "$WG" || return 0 # expect decAfterCheck noRecheck pinnedGeneric noNextSteal
   PROPS=AllRun DEADLOCK=FALSE run Wake "$1" "${INV:-PinnedOnZero SearchingOK NoLostWakeup TokenOK}" \
     BugDecAfterCheck="$2" BugNoRecheck="$3" BugPinnedGeneric="$4" BugNoNextSteal="$5" \
     SimpNoSearchLimit="${6:-FALSE}" SimpNoLastWake="${7:-FALSE}" SimpNoSearching="${8:-FALSE}" \
@@ -173,6 +177,7 @@ wake() { want Wake || return 0 # expect decAfterCheck noRecheck pinnedGeneric no
     SimpTokenEachTake="${12:-FALSE}" BugTokenAfterSleep="${13:-FALSE}"
 }
 #    expect decAfter noRecheck pinned noNext
+WG=Wake1
 wake pass   FALSE    FALSE     FALSE  FALSE
 wake fail   TRUE     FALSE     FALSE  FALSE
 wake fail   FALSE    TRUE      FALSE  FALSE
@@ -183,6 +188,7 @@ wake pass   FALSE    FALSE     FALSE  FALSE  TRUE  FALSE
 wake pass   FALSE    FALSE     FALSE  FALSE  FALSE TRUE
 # A simplification: no `searching` count. A push wakes an idle domain each time.
 wake pass   FALSE    FALSE     FALSE  FALSE  FALSE FALSE TRUE  FALSE TRUE
+WG=Wake2
 # The review of 2026-10-16, P1: a wake gives its `searching` count to the woken
 # domain (the token). The form before the review, with no token, also passes.
 wake pass   FALSE    FALSE     FALSE  FALSE  FALSE FALSE FALSE FALSE TRUE
