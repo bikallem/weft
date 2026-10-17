@@ -1000,8 +1000,8 @@ let linux_numbers =
     ; (28, SIGWINCH) ]
 
 (* The normal form of a signal, with the numbers of Linux: [Other_signal 10] is
-   [SIGUSR1]. The Linux and kqueue worlds do the same with [signal_of (number_of
-   s)]. The simulator cannot use their code, because it comes from C. *)
+   [SIGUSR1]. The Linux and kqueue worlds do the same with [Weft_posix.normal].
+   The simulator cannot use their code, because it comes from C. *)
 let normal = function
   | Op.Other_signal n as sg ->
       Option.value (List.assoc_opt n linux_numbers) ~default:sg
@@ -1031,6 +1031,114 @@ let send_self t sg =
   if List.mem sg t.watched then
     t.net.edges <- (0, World.Ready.Signal (sg, 1)) :: t.net.edges
   else if not (sg = Op.SIGPIPE || no_end sg) then t.killed <- Some sg
+
+(* A connect. The connection is established after the delay, if the listener is
+   still open then. *)
+let connect t addr =
+  let n = t.net in
+  let ( let* ) = Result.bind in
+  let* () = path_fits addr in
+  let* () = room n 1 in
+  let refused () = Error Op.Refused in
+  match Hashtbl.find_opt n.names (key addr) with
+  | None ->
+      refused ()
+  | Some lfd -> (
+    (* The client has the host "client" and a port from [client_port]. As on
+       Linux, the port comes before the check of the backlog. A Unix client has
+       no path. *)
+    match
+      match Hashtbl.find_opt n.fds lfd with
+      | Some (Lsn l) when l.ltcp ->
+          (Some l, Result.map (fun p -> Op.Tcp ("client", p)) (client_port n))
+      | Some (Lsn l) ->
+          (Some l, Ok (Op.Unix ""))
+      | _ ->
+          (None, Ok (Op.Unix ""))
+    with
+    | _, Error e ->
+        Error e
+    | Some l, Ok client when Queue.length l.backlog + l.pending < l.limit ->
+        l.pending <- l.pending + 1 ;
+        let c = new_sock ~tcp:l.ltcp ~local:client addr
+        and s = new_sock ~tcp:l.ltcp ~local:l.laddr client in
+        c.peer <- Some s ;
+        s.peer <- Some c ;
+        s.established <- true ;
+        c.cfd <- new_fd n ;
+        Hashtbl.replace n.fds c.cfd (Conn c) ;
+        ( match client with
+        | Op.Tcp (_, p) ->
+            Hashtbl.replace n.client_ports p c.cfd
+        | Op.Unix _ ->
+            () ) ;
+        later t (fun () ->
+            l.pending <- l.pending - 1 ;
+            match Hashtbl.find_opt n.fds lfd with
+            | Some (Lsn l') when l' == l ->
+                Queue.push s l.backlog ;
+                c.established <- true ;
+                edge n lfd ~read:true ~write:false ;
+                edge n c.cfd ~read:false ~write:true
+            | _ ->
+                c.refused <- true ;
+                c.peer <- None ;
+                edge n c.cfd ~read:true ~write:true ) ;
+        Ok c.cfd
+    | _ ->
+        refused () )
+
+(* A close. The OS order needs a Deregister of each domain before, and no job
+   that uses the fd. *)
+let close_fd t fd =
+  let n = t.net in
+  if Hashtbl.mem n.regs fd then
+    model_error "close(2) of fd %d before the Deregister of each domain" fd ;
+  Hashtbl.iter
+    (fun id j ->
+      (* Also after a detach: the job holds a user of the fd. *)
+      if j.jfd = Some fd && Option.is_none j.result then
+        model_error "close(2) of fd %d while job %d uses it" fd id )
+    t.jobs ;
+  match Hashtbl.find_opt n.fds fd with
+  | None ->
+      Error Op.Bad_fd
+  | Some sfd ->
+      Hashtbl.remove n.fds fd ;
+      Hashtbl.remove n.opts fd
+      [@mutate
+        off
+          "the simulator does not use an fd number again, thus no operation \
+           reads the options of a closed fd"] ;
+      ( match sfd with
+      | Conn c ->
+          ( match c.local with
+          | Op.Tcp (_, p) when Hashtbl.find_opt n.client_ports p = Some fd ->
+              Hashtbl.remove n.client_ports p
+          | Op.Tcp _ | Op.Unix _ ->
+              () ) ;
+          (* Linux also sends a reset at the close of a TCP or Unix stream
+             socket with unread data. *)
+          if c.abort || (c.role = Sock && avail c > 0) then reset_conn t c
+          else close_conn t c
+      | Dgm g ->
+          Hashtbl.remove n.udp_names g.dkey
+      | Lsn l ->
+          Hashtbl.remove n.names l.key ;
+          Queue.iter
+            (fun s ->
+              match s.peer with
+              | Some c when Option.is_some c.peer ->
+                  (* The connection is established: it gets a reset, as from
+                     [reset_conn]. *)
+                  take_reset n c
+              | _ ->
+                  (* The client has no peer after a [Sim.fault]. *)
+                  () )
+            l.backlog
+      | Fil _ | Pfd _ ->
+          () ) ;
+      Ok ()
 
 let submit : type a. t -> a Op.t -> (a, Op.error) result =
  fun t op ->
@@ -1077,58 +1185,8 @@ let submit : type a. t -> a Op.t -> (a, Op.error) result =
              ; laddr= addr } ) ;
         Hashtbl.replace n.names k fd ;
         Ok fd
-  | Op.Connect addr -> (
-      let* () = path_fits addr in
-      let* () = room n 1 in
-      let refused () = Error Op.Refused in
-      match Hashtbl.find_opt n.names (key addr) with
-      | None ->
-          refused ()
-      | Some lfd -> (
-        (* The client has the host "client" and a port from [client_port]. As on
-           Linux, the port comes before the check of the backlog. A Unix client
-           has no path. *)
-        match
-          match Hashtbl.find_opt n.fds lfd with
-          | Some (Lsn l) when l.ltcp ->
-              ( Some l
-              , Result.map (fun p -> Op.Tcp ("client", p)) (client_port n) )
-          | Some (Lsn l) ->
-              (Some l, Ok (Op.Unix ""))
-          | _ ->
-              (None, Ok (Op.Unix ""))
-        with
-        | _, Error e ->
-            Error e
-        | Some l, Ok client when Queue.length l.backlog + l.pending < l.limit ->
-            l.pending <- l.pending + 1 ;
-            let c = new_sock ~tcp:l.ltcp ~local:client addr
-            and s = new_sock ~tcp:l.ltcp ~local:l.laddr client in
-            c.peer <- Some s ;
-            s.peer <- Some c ;
-            s.established <- true ;
-            c.cfd <- new_fd n ;
-            Hashtbl.replace n.fds c.cfd (Conn c) ;
-            ( match client with
-            | Op.Tcp (_, p) ->
-                Hashtbl.replace n.client_ports p c.cfd
-            | Op.Unix _ ->
-                () ) ;
-            later t (fun () ->
-                l.pending <- l.pending - 1 ;
-                match Hashtbl.find_opt n.fds lfd with
-                | Some (Lsn l') when l' == l ->
-                    Queue.push s l.backlog ;
-                    c.established <- true ;
-                    edge n lfd ~read:true ~write:false ;
-                    edge n c.cfd ~read:false ~write:true
-                | _ ->
-                    c.refused <- true ;
-                    c.peer <- None ;
-                    edge n c.cfd ~read:true ~write:true ) ;
-            Ok c.cfd
-        | _ ->
-            refused () ) )
+  | Op.Connect addr ->
+      connect t addr
   | Op.Connect_result fd ->
       conn fd (fun c ->
           if c.refused then Error Op.Refused
@@ -1312,55 +1370,8 @@ let submit : type a. t -> a Op.t -> (a, Op.error) result =
         Ok ()
     | None ->
         Error Op.Bad_fd )
-  | Op.Close fd -> (
-      if Hashtbl.mem n.regs fd then
-        model_error "close(2) of fd %d before the Deregister of each domain" fd ;
-      Hashtbl.iter
-        (fun id j ->
-          (* Also after a detach: the job holds a user of the fd. *)
-          if j.jfd = Some fd && Option.is_none j.result then
-            model_error "close(2) of fd %d while job %d uses it" fd id )
-        t.jobs ;
-      match Hashtbl.find_opt n.fds fd with
-      | None ->
-          Error Op.Bad_fd
-      | Some sfd ->
-          Hashtbl.remove n.fds fd ;
-          Hashtbl.remove n.opts fd
-          [@mutate
-            off
-              "the simulator does not use an fd number again, thus no \
-               operation reads the options of a closed fd"] ;
-          ( match sfd with
-          | Conn c ->
-              ( match c.local with
-              | Op.Tcp (_, p) when Hashtbl.find_opt n.client_ports p = Some fd
-                ->
-                  Hashtbl.remove n.client_ports p
-              | Op.Tcp _ | Op.Unix _ ->
-                  () ) ;
-              (* Linux also sends a reset at the close of a TCP or Unix stream
-                 socket with unread data. *)
-              if c.abort || (c.role = Sock && avail c > 0) then reset_conn t c
-              else close_conn t c
-          | Dgm g ->
-              Hashtbl.remove n.udp_names g.dkey
-          | Lsn l ->
-              Hashtbl.remove n.names l.key ;
-              Queue.iter
-                (fun s ->
-                  match s.peer with
-                  | Some c when Option.is_some c.peer ->
-                      (* The connection is established: it gets a reset, as from
-                         [reset_conn]. *)
-                      take_reset n c
-                  | _ ->
-                      (* The client has no peer after a [Sim.fault]. *)
-                      () )
-                l.backlog
-          | Fil _ | Pfd _ ->
-              () ) ;
-          Ok () )
+  | Op.Close fd ->
+      close_fd t fd
   | Op.Register (d, fd, token) ->
       if not (Hashtbl.mem n.fds fd) then
         model_error "Register of fd %d, which is closed" fd ;
