@@ -1520,7 +1520,10 @@ let start_search (t : t) =
 
 (* The end of a search: the domain gives back its count of [searching]. The last
    searching domain that finds work wakes one idle domain, because the pushes
-   woke nobody while it searched. *)
+   woke nobody while it searched. The wake occurs at once, before the domain
+   runs the fiber, as Go's [resetspinning] calls [wakep]. If the wake waits for
+   the next effect of the fiber, a fiber that computes stops the chain of
+   wakes. *)
 let end_search dom found =
   let t = dom.sched in
   if
@@ -1538,7 +1541,9 @@ let end_search dom found =
         off
           "the last wake gives only performance: Wake.tla passes with no last \
            wake"]
-    then dom.wake <- true
+    then (
+      dom.wake <- true ;
+      flush_wake dom )
 
 (* A steal: try each other domain one time, from a start that the PRNG of the
    domain selects. The steal obeys the Go rules (design section 2.5, Idle and

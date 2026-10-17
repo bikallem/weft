@@ -61,6 +61,39 @@ let wake_rule () =
   S.mark_wake d ;
   is_true ~msg:"an idle domain, and no search" d.S.wake
 
+(* The last searching domain that finds work wakes an idle domain before it runs
+   the fiber. Domain 1 holds the token of a wake, and it steals the fiber of
+   domain 0. Domain 2 is idle. The steal must wake domain 2 at once: a fiber
+   that computes gives no effect, so a wake at the next effect can come late.
+   The handler records the wakes of the world. *)
+let wake_after_search () =
+  let t = S.create ~domains:3 () in
+  let d1 = t.S.doms.(1) in
+  let node = S.new_node (S.Scope_node (S.new_scope_state ())) in
+  S.push t.S.doms.(0) (S.new_fiber [node]) (fun () -> S.Finished) ;
+  Atomic.set t.S.searching 1 ;
+  d1.S.token <- true ;
+  Atomic.set t.S.idle (S.Idle.bit 2) ;
+  let woken = ref [] in
+  let r =
+    Effect.Deep.try_with S.steal d1
+      { effc=
+          (fun (type a) (e : a Effect.t) ->
+            match e with
+            | Weft.Private.World.Wake d ->
+                Some
+                  (fun (k : (a, _) Effect.Deep.continuation) ->
+                    woken := d :: !woken ;
+                    Effect.Deep.continue k () )
+            | _ ->
+                None ) }
+  in
+  is_true ~msg:"the steal gets the fiber" (Option.is_some r) ;
+  equal ~msg:"the steal wakes domain 2" (list int) [2] !woken ;
+  is_false ~msg:"no wake waits" d1.S.wake ;
+  equal ~msg:"domain 2 holds the count" int 1 (Atomic.get t.S.searching) ;
+  is_true (Atomic.get t.S.doms.(2).S.got_token)
+
 (* Only the first cancel of a node walks it (design section 2.5, How a cancel
    reaches a fiber). A sync that starts after the flag reads the flag, so a
    second walk finds nothing to commit. This test parks a sync after the first
@@ -104,4 +137,6 @@ let tests =
       ; test "a member leaves the list in any order" member_list ]
   ; group "wake rule"
       [ test "a push marks a wake only for an idle domain and no search"
-          wake_rule ] ]
+          wake_rule
+      ; test "the last searching domain wakes before it runs the fiber"
+          wake_after_search ] ]
