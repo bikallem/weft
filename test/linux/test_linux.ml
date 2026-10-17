@@ -4,49 +4,11 @@
 open Windtrap
 open Weft
 
-(* A new directory for each test that needs one. The directories go at the
-   exit. *)
-let tmp =
-  let base = Filename.temp_dir "weft-test" "" and n = ref 0 in
-  at_exit (fun () -> ignore (Sys.command ("rm -rf " ^ Filename.quote base))) ;
-  fun () ->
-    incr n ;
-    let d = Filename.concat base (string_of_int !n) in
-    Sys.mkdir d 0o755 ; d
-
 let world =
-  { Portable.name= "linux"
-  ; domains= 1
-  ; run= (fun f -> Weft_linux.run ~domains:1 f)
-  ; listen=
-      (fun () ->
-        let l = Net.listen (Net.Tcp ("127.0.0.1", 0)) in
-        (l, Net.local_addr l) )
-  ; udp=
-      (fun () ->
-        let s = Net.udp ("127.0.0.1", 0) in
-        (s, Portable.host_port s) )
-  ; tmp }
+  Portable.loopback_world ~name:"linux" ~domains:1
+    {Portable.call= (fun f -> Weft_linux.run ~domains:1 f)}
 
-let elapsed_ns f =
-  Weft_linux.run ~domains:1 (fun () ->
-      let t0 = Time.now Mono in
-      f () ;
-      Int64.to_int (Span.to_ns (Time.diff Mono (Time.now Mono) t0)) )
-
-(* A sleep never ends before its deadline. A shared machine can delay one sleep
-   for a long time. Thus the median of the 20 sleeps checks the precision (less
-   than 12 ms), and the limit of 500 ms for each sleep finds a timer that fires
-   much too late. *)
-let sleep_10ms () =
-  let all =
-    List.init 20 (fun _ ->
-        let ns = elapsed_ns (fun () -> Time.sleep Mono (Span.ms 10)) in
-        at_least int ~than:10_000_000 ns ;
-        less int ~than:500_000_000 ns ;
-        ns )
-  in
-  less int ~than:12_000_000 (List.nth (List.sort compare all) 10)
+let elapsed_ns = Portable.elapsed_ns world
 
 let sleep_10s () =
   if Sys.getenv_opt "WEFT_LONG" = None then
@@ -232,7 +194,7 @@ let dns_localhost () =
    as in [release]: on a busy host, the detach can remove the open from the
    queue before it starts, and then a writer that waits for a reader blocks. *)
 let detach_from_open () =
-  let fifo = Filename.concat (tmp ()) "fifo" in
+  let fifo = Filename.concat (Portable.tmp ()) "fifo" in
   Unix.mkfifo fifo 0o600 ;
   let before = open_fds () in
   let t =
@@ -251,7 +213,7 @@ let detach_from_open () =
 
 (* C4: a job that blocks does not stop the next job of the pool. *)
 let blocked_job () =
-  let fifo = Filename.concat (tmp ()) "fifo" in
+  let fifo = Filename.concat (Portable.tmp ()) "fifo" in
   Unix.mkfifo fifo 0o600 ;
   let before = open_fds () in
   Weft_linux.run ~domains:1 (fun () ->
@@ -285,7 +247,7 @@ let blocked_job () =
 
 (* 1,000 files open and close, and the pool closes each fd. *)
 let no_file_leak () =
-  let d = tmp () in
+  let d = Portable.tmp () in
   let before = open_fds () in
   Weft_linux.run ~domains:1 (fun () ->
       Fiber.scope (fun s ->
@@ -333,7 +295,7 @@ let hold s fifo n =
   l
 
 let new_fifo () =
-  let fifo = Filename.concat (tmp ()) "fifo" in
+  let fifo = Filename.concat (Portable.tmp ()) "fifo" in
   Unix.mkfifo fifo 0o600 ; fifo
 
 (* A detach of a job in the queue removes it: the open never creates the
@@ -604,7 +566,7 @@ let no_threads () =
   if Sys.command "command -v prlimit > /dev/null" <> 0 then
     skip ~reason:"prlimit is not installed" () ;
   if Unix.getuid () = 0 then skip ~reason:"root has no process limit" () ;
-  let out = Filename.concat (tmp ()) "out" in
+  let out = Filename.concat (Portable.tmp ()) "out" in
   let code =
     Sys.command
       (Printf.sprintf "prlimit --nproc=1:1 %s > %s 2>&1" (Filename.quote helper)
@@ -625,7 +587,7 @@ let few_fds () =
   in
   if Sys.command "command -v prlimit > /dev/null" <> 0 then
     skip ~reason:"prlimit is not installed" () ;
-  let out = Filename.concat (tmp ()) "out" in
+  let out = Filename.concat (Portable.tmp ()) "out" in
   let code =
     Sys.command
       (Printf.sprintf "prlimit --nofile=64:64 %s > %s 2>&1"
@@ -1104,7 +1066,7 @@ let utc_against_gmtime () =
 (* A Unix path of 107 bytes fits in sun_path with its NUL byte, and a path of
    108 bytes gives ENAMETOOLONG. The simulator has the same limit. *)
 let unix_path_limit () =
-  let dir = tmp () in
+  let dir = Portable.tmp () in
   let path n =
     Filename.concat dir (String.make (n - String.length dir - 1) 'p')
   in
@@ -1153,7 +1115,7 @@ let one_signal_world () =
 (* create ~signals writes a warning for each thread that does not block the
    signals. A domain that starts before the create does not block them. *)
 let unblocked_warning () =
-  let log = Filename.concat (tmp ()) "stderr" in
+  let log = Filename.concat (Portable.tmp ()) "stderr" in
   let tid = Atomic.make None and stop = Atomic.make false in
   let d =
     Domain.spawn (fun () ->
@@ -1306,7 +1268,8 @@ let linux =
     ; test "a Unix path of 108 bytes gives ENAMETOOLONG" unix_path_limit
     ; test "Time.now Posix is the time of the system" posix_time
     ; test "an address that is not an IP address gives an error" invalid_address
-    ; test "a 10 ms sleep ends between 10 ms and 12 ms" sleep_10ms
+    ; test "a 10 ms sleep ends between 10 ms and 12 ms"
+        (Portable.sleep_10ms ~median:12_000_000 world)
     ; slow "a 10 s sleep ends between 10 s and 10.002 s" sleep_10s
     ; test "the echo server answers a client in another process" other_process
     ; slow "10,000 connections open and close with no fd leak" no_fd_leak
@@ -1366,6 +1329,155 @@ let linux =
     ; test "a signal that run does not watch is not an event" unwatched
     ; test "Time.to_utc agrees with Unix.gmtime" utc_against_gmtime ]
 
+(* The review of 2026-10-16 (design section 3.12). *)
+
+(* C3: the names of a large directory take linear time on the domain thread. The
+   old code took 6.9 s for 40,000 names. [Resolve] keeps the first copy of each
+   address, in order. *)
+let many_names () =
+  let n = 40_000 in
+  let data =
+    String.concat "" (List.init n (fun i -> Printf.sprintf "file-%06d\000" i))
+  in
+  let t0 = Sys.time () in
+  equal int n (List.length (Weft_posix.names data)) ;
+  equal int n (List.length (Weft_posix.addresses data)) ;
+  less float_exact ~than:1.0 (Sys.time () -. t0) ;
+  equal (list string) ["b"; "a"] (Weft_posix.addresses "b\000a\000b\000a\000")
+
+(* C4: on Linux, accept(2) can give a pending network error of the new
+   connection, and the world retries it. A test cannot cause these errors, so
+   this test examines the set of errors. An accept on a UDP socket gives
+   EOPNOTSUPP, and the world does not retry it: the accept raises. *)
+let accept_retry () =
+  equal (list string)
+    [ "ECONNABORTED"
+    ; "EPROTO"
+    ; "ENETDOWN"
+    ; "EHOSTUNREACH"
+    ; "ENETUNREACH"
+    ; "ENOPROTOOPT"
+    ; "EHOSTDOWN"
+    ; "ENONET" ]
+    (List.map Weft_posix.errname (Array.to_list Weft_posix.accept_retry)) ;
+  Weft_linux.run ~domains:1 (fun () ->
+      let s = Net.udp ("127.0.0.1", 0) in
+      raises_match
+        (function Net.Error (Net.Other "EOPNOTSUPP", _) -> true | _ -> false)
+        (fun () -> Net.accept s) ;
+      Net.close s )
+
+(* P4: a read and a write of 1 MiB copy between the buffer of the user and the C
+   buffer of the job, with no OCaml string between them. Thus 10 reads and 10
+   writes allocate much less than one buffer (131,072 words) on the major heap.
+   The old code allocated a string for each read and for each write. The data at
+   the offsets of the buffers is correct. *)
+let large_file_io () =
+  let size = 1 lsl 20 in
+  let path = Filename.concat (Portable.tmp ()) "big" in
+  Weft_linux.run ~domains:1 (fun () ->
+      let f = File.openfile [File.Read; File.Write; File.Create] path in
+      let src = Bytes.init (size + 3) (fun i -> Char.chr (i land 0xff)) in
+      let dst = Bytes.make (size + 5) '.' in
+      let major () = (Gc.quick_stat ()).Gc.major_words in
+      let w0 = major () in
+      for _ = 1 to 10 do
+        equal int size (File.pwrite f ~file_offset:0 src 3 size) ;
+        equal int size (File.pread f ~file_offset:0 dst 5 size)
+      done ;
+      less float_exact ~than:131072. (major () -. w0) ;
+      equal string (Bytes.sub_string src 3 size) (Bytes.sub_string dst 5 size) ;
+      equal string "....." (Bytes.sub_string dst 0 5) ;
+      File.close f )
+
+(* P6: a worker writes the wake fd only when it adds an id to an empty mailbox.
+   The wake fd is the write end of a pipe here, so the bytes in the pipe count
+   the writes (8 bytes for each). 10 jobs complete with no take: one write.
+   After the take, the next job writes again. The old code wrote one time for
+   each job. *)
+let one_wake_write () =
+  let module Op = Private.Op in
+  let r, w = Weft_posix.pipe () in
+  is_true (r >= 0) ;
+  let p = Weft_posix.create_pool [|w|] in
+  let start () =
+    match Weft_posix.start_job p 0 (Op.Stat "/") with
+    | Ok id ->
+        id
+    | _ ->
+        fail "the job did not start"
+  in
+  let finish id =
+    match Weft_posix.finish_job p id (Op.Stat "/") with
+    | Ok _ ->
+        ()
+    | _ ->
+        fail "the job did not finish"
+  in
+  let buf = Bytes.create 1024 in
+  let written () =
+    pool_idle (fun () -> Unix.sleepf 0.001) ;
+    Int.max 0 (Weft_posix.fd_read r buf 0 1024)
+  in
+  let ids = List.init 10 (fun _ -> start ()) in
+  equal int 8 (written ()) ;
+  let taken = Weft_posix.completions p 0 [] in
+  equal int 10 (List.length taken) ;
+  let id = start () in
+  equal int 8 (written ()) ;
+  equal int 1 (List.length (Weft_posix.completions p 0 [])) ;
+  List.iter finish (id :: ids) ;
+  Weft_posix.close_pool p ;
+  ignore (Weft_posix.close_fd r) ;
+  ignore (Weft_posix.close_fd w)
+
+(* K6: [random] of the world reads 8 bytes of the OS for each call. Each value
+   is in the range 0 to [n - 1]. 100 values in the range 0 to [2^30 - 1] are
+   almost all different. *)
+let world_random () =
+  let w = Weft_linux.create () in
+  Fun.protect
+    ~finally:(fun () -> Weft_linux.close w)
+    (fun () ->
+      List.iter
+        (fun n ->
+          for _ = 1 to 1000 do
+            let x = Weft_linux.World.random w n in
+            is_true (x >= 0 && x < n)
+          done )
+        [1; 2; 7; 1 lsl 30; max_int] ;
+      let l = List.init 100 (fun _ -> Weft_linux.World.random w (1 lsl 30)) in
+      at_least int ~than:90 (List.length (List.sort_uniq compare l)) )
+
+(* K5: [run] checks the limit of the watchdog before it makes the world. Thus a
+   bad limit makes no fd, and it raises its own error also while another world
+   holds the claim of the signals. The old code made the world first, and then
+   [create] raised the error of the claim. *)
+let limit_before_create () =
+  let a = Weft_linux.create ~signals:[SIGUSR1] () in
+  Fun.protect
+    ~finally:(fun () -> Weft_linux.close a)
+    (fun () ->
+      let before = open_fds () in
+      raises
+        (Invalid_argument
+           "Weft_linux.run: the limit of the watchdog is not positive" )
+        (fun () ->
+          Weft_linux.run ~domains:1 ~signals:[SIGUSR2]
+            ~watchdog:(Some (Span.ns 0))
+            ignore ) ;
+      equal int before (open_fds ()) )
+
+let review_2026 =
+  group "review of 2026-10-16"
+    [ test "the names of 40,000 entries take linear time" many_names
+    ; test "accept retries the pending network errors on Linux" accept_retry
+    ; test "a read and a write of 1 MiB allocate no OCaml string" large_file_io
+    ; test "a worker writes the wake fd only for an empty mailbox"
+        one_wake_write
+    ; test "a bad limit of the watchdog makes no world" limit_before_create
+    ; test "the random of the world is in the range 0 to n - 1" world_random ]
+
 let () =
   exit
     (Windtrap.run "linux"
@@ -1378,4 +1490,5 @@ let () =
                    name= "linux on 4 domains"
                  ; domains= 4
                  ; run= (fun f -> Weft_linux.run ~domains:4 f) } ]
-         ; linux ] ) )
+         ; linux
+         ; review_2026 ] ) )

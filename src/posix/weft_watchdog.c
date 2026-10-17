@@ -29,6 +29,7 @@ struct watchdog {
   int stop;
   volatile intnat *beats; /* The data of the Bigarray: OCaml keeps it alive. */
   int n;
+  int stride; /* The beat of domain d is at beats[d * stride]. */
   int64_t limit_ns;
 };
 
@@ -45,7 +46,7 @@ static void *watch(void *arg) {
   if (last == NULL || since == NULL || told == NULL) return NULL;
   int64_t t = now_ns();
   for (int d = 0; d < w->n; d++) {
-    last[d] = w->beats[d];
+    last[d] = w->beats[d * w->stride];
     since[d] = t;
   }
   pthread_mutex_lock(&w->m);
@@ -55,7 +56,7 @@ static void *watch(void *arg) {
     if (w->stop) break;
     t = now_ns();
     for (int d = 0; d < w->n; d++) {
-      intnat b = w->beats[d];
+      intnat b = w->beats[d * w->stride];
       if (b != last[d]) {
         last[d] = b;
         since[d] = t;
@@ -79,13 +80,14 @@ static void *watch(void *arg) {
 
 #define Watchdog_val(v) ((struct watchdog *)Nativeint_val(v))
 
-/* [beats] is the Bigarray of the beats. The caller keeps it alive until the
-   stop. */
-value weft_watchdog_start(value beats, value limit_ns) {
+/* [beats] is the Bigarray of the beats, with [stride] ints for each domain
+   (Sched.beat_stride). The caller keeps it alive until the stop. */
+value weft_watchdog_start(value beats, value stride, value limit_ns) {
   struct watchdog *w = calloc(1, sizeof *w);
   if (w == NULL) caml_raise_out_of_memory();
   w->beats = (volatile intnat *)Caml_ba_data_val(beats);
-  w->n = Caml_ba_array_val(beats)->dim[0];
+  w->stride = Int_val(stride);
+  w->n = Caml_ba_array_val(beats)->dim[0] / w->stride;
   w->limit_ns = Int64_val(limit_ns);
   pthread_mutex_init(&w->m, NULL);
   /* The timed wait uses the clock of the deadlines. */

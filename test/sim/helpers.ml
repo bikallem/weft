@@ -19,6 +19,11 @@ let log () =
 (* The domain that runs the fiber. *)
 let dom () = S.prog "test" S.Dom_index
 
+(* The milliseconds of the Mono clock since [t0]. *)
+let ms_since t0 =
+  Int64.to_int
+    (Int64.div (Span.to_ns (Time.diff Mono (Time.now Mono) t0)) 1_000_000L)
+
 (* [seeds n f] runs [f seed] for each seed from 1 to [n]. *)
 let seeds n f =
   for seed = 1 to n do

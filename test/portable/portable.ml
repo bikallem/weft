@@ -102,6 +102,64 @@ let host_port s =
   | Net.Unix _ ->
       invalid_arg "host_port"
 
+(* A new directory for each call. The first call makes the base directory, so a
+   suite that does not call [tmp] makes no directory. The directories go at the
+   exit. A lock serializes the calls of many domains. *)
+let tmp =
+  let lock = Mutex.create () and base = ref None and n = ref 0 in
+  fun () ->
+    Mutex.protect lock (fun () ->
+        let b =
+          match !base with
+          | Some b ->
+              b
+          | None ->
+              let b = Filename.temp_dir "weft-test" "" in
+              at_exit (fun () ->
+                  ignore (Sys.command ("rm -rf " ^ Filename.quote b)) ) ;
+              base := Some b ;
+              b
+        in
+        incr n ;
+        let d = Filename.concat b (string_of_int !n) in
+        Sys.mkdir d 0o755 ; d )
+
+type runner = {call: 'a. (unit -> 'a) -> 'a}
+
+let loopback_world ~name ~domains r =
+  { name
+  ; domains
+  ; run= r.call
+  ; listen=
+      (fun () ->
+        let l = Net.listen (Net.Tcp ("127.0.0.1", 0)) in
+        (l, Net.local_addr l) )
+  ; udp=
+      (fun () ->
+        let s = Net.udp ("127.0.0.1", 0) in
+        (s, host_port s) )
+  ; tmp }
+
+let elapsed_ns w f =
+  w.run (fun () ->
+      let t0 = Time.now Mono in
+      f () ;
+      Int64.to_int (Span.to_ns (Time.diff Mono (Time.now Mono) t0)) )
+
+(* A sleep never ends before its deadline. A shared machine can delay one sleep
+   for a long time. Thus the median of the 20 sleeps checks the precision (less
+   than [median] ns), and the limit of 500 ms for each sleep finds a timer that
+   fires much too late. *)
+let sleep_10ms ~median w () =
+  let all =
+    List.init 20 (fun _ ->
+        let ns = elapsed_ns w (fun () -> Time.sleep Mono (Span.ms 10)) in
+        at_least int ~than:10_000_000 ns ;
+        less int ~than:500_000_000 ns ;
+        ns )
+  in
+  less int ~than:median (List.nth (List.sort compare all) 10)
+
 let events w =
   group "events"
     [ test "always, never, wrap and guard" (fun () ->
@@ -247,10 +305,16 @@ let work_stealing w () =
 
 (* A fiber that blocks on one fd from two domains in sequence gets all of its
    data. After the close, a sleep gives the simulator a quiescence, so that a
-   close notice that waits is a lost wakeup. *)
+   close notice that waits is a lost wakeup.
+
+   The test does at least 50 rounds. Under a CPU load, it is possible that no
+   thief takes the fiber in 50 rounds. Thus the rounds continue until a read
+   occurs on two domains. The test gives a failure only if the scheduler does
+   not move the fiber in 1000 rounds. *)
 let fd_from_two_domains w () =
-  let two = ref false in
-  for _ = 1 to 50 do
+  let two = ref false and rounds = ref 0 in
+  while !rounds < 50 || ((not !two) && !rounds < 1000) do
+    incr rounds ;
     w.run (fun () ->
         let l, a = w.listen () in
         Fiber.scope (fun s ->

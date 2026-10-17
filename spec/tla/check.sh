@@ -114,7 +114,8 @@ scope() { want Scope || return 0 # expect scenario joinCancellable shieldNotNode
     "Scenario=\"$2\"" BugJoinCancellable="$3" BugShieldNotNode="$4" SimpNoRecheck="$5" \
     BugNoChainCheck="$6" BugExnAfterEnd="$7" BugNoFlagCheck="$8" \
     SimpNoChildFlags="${9:-FALSE}" BugCondOuterCtx="${10:-FALSE}" \
-    defaultInitValue=defaultInitValue
+    BugAnyCancelled="${11:-FALSE}" SimpWalkAgain="${12:-FALSE}" \
+    BugSkipOnChain="${13:-FALSE}" defaultInitValue=defaultInitValue
 }
 #     expect scenario join  shield recheck chain exn   flag
 scope pass   error    FALSE FALSE  FALSE   FALSE FALSE FALSE
@@ -142,6 +143,16 @@ scope fail   condwait FALSE FALSE  FALSE   FALSE FALSE FALSE FALSE TRUE
 # M3: the deadline form of with_timeout. A walk of T can come after T closed.
 scope pass   deadline FALSE FALSE  FALSE   FALSE FALSE FALSE
 scope fail   deadline FALSE TRUE   FALSE   FALSE FALSE FALSE
+# The review of 2026-10-16, C1: the scope ignores each Cancelled of a member,
+# also one from a scope inside the member while S is not cancelled.
+scope fail   error    FALSE FALSE  FALSE   FALSE FALSE FALSE FALSE FALSE TRUE
+# The review of 2026-10-16, P3: only the cancel that sets the flag of x walks.
+# The form before the review, a walk at each cancel, also passes.
+scope pass   error    FALSE FALSE  FALSE   FALSE FALSE FALSE FALSE FALSE FALSE TRUE
+scope pass   condwait FALSE FALSE  FALSE   FALSE FALSE FALSE FALSE FALSE FALSE TRUE
+# A cancel that does not walk if a flag on the chain of x is set: the timer
+# of with_timeout can end before the cancel of S reaches the condition wait.
+scope fail   condwait FALSE FALSE  FALSE   FALSE FALSE FALSE FALSE FALSE FALSE FALSE TRUE
 
 ivar() { want Ivar || return 0 # expect directFill nonAtomicRegister
   run Ivar "$1" "AtMostOneResume FullNoWaiters OneFill EndState" \
@@ -155,9 +166,11 @@ ivar fail   FALSE  TRUE
 # The domains loop forever, so a sleep at the end is not a deadlock. The
 # liveness property is AllRun: each item runs.
 wake() { want Wake || return 0 # expect decAfterCheck noRecheck pinnedGeneric noNextSteal
-  PROPS=AllRun DEADLOCK=FALSE run Wake "$1" "PinnedOnZero SearchingOK NoLostWakeup" \
+  PROPS=AllRun DEADLOCK=FALSE run Wake "$1" "${INV:-PinnedOnZero SearchingOK NoLostWakeup TokenOK}" \
     BugDecAfterCheck="$2" BugNoRecheck="$3" BugPinnedGeneric="$4" BugNoNextSteal="$5" \
-    SimpNoSearchLimit="${6:-FALSE}" SimpNoLastWake="${7:-FALSE}" SimpNoSearching="${8:-FALSE}"
+    SimpNoSearchLimit="${6:-FALSE}" SimpNoLastWake="${7:-FALSE}" SimpNoSearching="${8:-FALSE}" \
+    BugTokenAfterRemove="${9:-FALSE}" SimpNoToken="${10:-FALSE}" BugTokenRetry="${11:-FALSE}" \
+    SimpTokenEachTake="${12:-FALSE}" BugTokenAfterSleep="${13:-FALSE}"
 }
 #    expect decAfter noRecheck pinned noNext
 wake pass   FALSE    FALSE     FALSE  FALSE
@@ -169,7 +182,27 @@ wake pass   FALSE    FALSE     FALSE  TRUE
 wake pass   FALSE    FALSE     FALSE  FALSE  TRUE  FALSE
 wake pass   FALSE    FALSE     FALSE  FALSE  FALSE TRUE
 # A simplification: no `searching` count. A push wakes an idle domain each time.
-wake pass   FALSE    FALSE     FALSE  FALSE  FALSE FALSE TRUE
+wake pass   FALSE    FALSE     FALSE  FALSE  FALSE FALSE TRUE  FALSE TRUE
+# The review of 2026-10-16, P1: a wake gives its `searching` count to the woken
+# domain (the token). The form before the review, with no token, also passes.
+wake pass   FALSE    FALSE     FALSE  FALSE  FALSE FALSE FALSE FALSE TRUE
+# The bug of the first prototype: the token comes after the removal from
+# `idle`. The domain can poll the wake away and sleep with the token, and then
+# a push wakes nobody. TokenOK finds it, and NoLostWakeup alone finds it too.
+wake fail   FALSE    FALSE     FALSE  FALSE  FALSE FALSE FALSE TRUE
+INV="PinnedOnZero SearchingOK NoLostWakeup" \
+wake fail   FALSE    FALSE     FALSE  FALSE  FALSE FALSE FALSE TRUE
+# A waker that removes its token and tries again can chase one domain
+# forever: the domain leaves `idle` each time, and it cannot search, because
+# the token of the waker fills the limit. AllRun finds it.
+wake fail   FALSE    FALSE     FALSE  FALSE  FALSE FALSE FALSE FALSE FALSE TRUE
+# The review of the fixes, F2: a waker gives a token only to a domain in
+# `idle`, so a domain reads `got` only when it leaves `idle`. The form before,
+# with a read at each take, also passes. A domain that reads `got` only after
+# a sleep, and not when its second check finds work, keeps the token while it
+# runs, and then a push wakes nobody.
+wake pass   FALSE    FALSE     FALSE  FALSE  FALSE FALSE FALSE FALSE FALSE FALSE TRUE
+wake fail   FALSE    FALSE     FALSE  FALSE  FALSE FALSE FALSE FALSE FALSE FALSE FALSE TRUE
 
 fd() { want Fd || return 0 # expect dupAlive countOnly noBitCas registerOrder regNoUser
   run Fd "$1" "CloseOnce NoWrongClose NoUseAfterClose NoWrongDel UsersOK DelBeforeClose" \

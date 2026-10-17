@@ -18,12 +18,21 @@ module Manual = struct
     ; mutable polls: int
     ; mutable randoms: int
     ; mutable on_sleep: (unit -> unit) option
-    ; mutable wakes: int }
+    ; mutable wakes: int
+    ; mutable reads: int  (** The reads of the clock. *) }
 
   let make ?(tick = 0L) () =
-    {now= 0L; tick; alarms= []; polls= 0; randoms= 0; on_sleep= None; wakes= 0}
+    { now= 0L
+    ; tick
+    ; alarms= []
+    ; polls= 0
+    ; randoms= 0
+    ; on_sleep= None
+    ; wakes= 0
+    ; reads= 0 }
 
   let now (type time) t (line : time Clock.line) : time =
+    t.reads <- t.reads + 1 ;
     let n = t.now in
     t.now <- Int64.add t.now t.tick ;
     Clock.of_ns line n
@@ -778,6 +787,20 @@ let time_outside_fiber () =
     (function Fiber.Not_in_fiber "Time.now" -> true | _ -> false)
     (fun () -> Time.now Mono)
 
+(* P8: a sleep reads the clock one time, in its guard. The old code read it
+   again in the leaf. A sleep of 0 commits at once, and a sleep of 1 ms waits
+   for its alarm. *)
+let sleep_reads_once () =
+  let w = Manual.make () in
+  run w (fun () ->
+      let r0 = w.reads in
+      Time.sleep Mono Span.zero ;
+      equal int 1 (w.reads - r0) ;
+      equal int 0 w.polls ;
+      let t0 = now_ns () in
+      Time.sleep Mono (Span.ms 1) ;
+      at_least int64 ~than:(Int64.add t0 (ms 1)) (now_ns ()) )
+
 let time =
   group "Time"
     [ prop "add gives None exactly on overflow"
@@ -790,10 +813,12 @@ let time =
     ; test "to_utc: the months of a leap year and a common year" utc_months
     ; test "of_utc: a date out of range gives None" utc_invalid
     ; test "to_utc and of_utc agree with a walk of each day" utc_each_day
-    ; test "Time.now outside run raises Not_in_fiber" time_outside_fiber ]
+    ; test "Time.now outside run raises Not_in_fiber" time_outside_fiber
+    ; test "Time.sleep reads the clock one time" sleep_reads_once ]
 
 (* A world that watches each signal and gives the signals of [batches], one
-   batch at each wait. It records each signal that the core sends again. *)
+   batch at each wait. It records each signal that the core sends again. Its
+   unwatch of SIGHUP gives an error of the OS. *)
 module Signals = struct
   type t =
     { mutable batches: Private.World.Ready.t list list
@@ -805,9 +830,11 @@ module Signals = struct
    fun t op ->
     match op with
     | Private.Op.Watch s ->
-        Ok s
+        Ok (Some s)
+    | Private.Op.Unwatch SIGHUP ->
+        Error (Private.Op.No_resources "ENOMEM")
     | Private.Op.Unwatch s ->
-        Ok s
+        Ok (Some s)
     | Private.Op.Resend s ->
         t.resent <- s :: t.resent ;
         Ok ()
@@ -850,7 +877,26 @@ let signal_count_zero () =
   equal int 2 n ;
   equal int 0 (List.length w.resent)
 
+(* X1: an error of the OS in an unwatch is [Net.Error], not [Invalid_argument]:
+   the world continues to watch the signal. *)
+let unwatch_error () =
+  let w = {Signals.batches= []; resent= []} in
+  Weft.run
+    (module Signals)
+    w
+    (fun () ->
+      raises_match
+        (function
+          | Net.Error (No_resources "ENOMEM", "Signal.unwatch") ->
+              true
+          | _ ->
+              false )
+        (fun () -> Signal.unwatch SIGHUP) ) ;
+  equal int 0 (List.length w.resent)
+
 let signals =
-  group "signals" [test "a count of 0 is not a signal" signal_count_zero]
+  group "signals"
+    [ test "a count of 0 is not a signal" signal_count_zero
+    ; test "an error of the OS in unwatch raises Net.Error" unwatch_error ]
 
 let tests = [world; events; span; time; signals]

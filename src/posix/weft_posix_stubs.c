@@ -431,7 +431,28 @@ value weft_errno_codes(value unit) {
   CAMLlocal1(r);
   int codes[] = {EAGAIN, EBADF,  ECONNREFUSED, ECONNRESET, EPIPE,  EADDRINUSE,
                  EWOULDBLOCK, ENOENT, EEXIST, ENOTDIR, EISDIR, ENOTEMPTY,
-                 EMFILE, ENFILE, ENOBUFS, ENOMEM, ECONNABORTED};
+                 EMFILE, ENFILE, ENOBUFS, ENOMEM};
+  int n = sizeof codes / sizeof codes[0];
+  r = caml_alloc_tuple(n);
+  for (int i = 0; i < n; i++) Store_field(r, i, Val_int(codes[i]));
+  CAMLreturn(r);
+}
+
+/* The errors of accept(2) that the world retries. FreeBSD gives ECONNABORTED
+   for a connection that the client reset. Linux gives the pending network
+   error of the new connection, and accept(2) tells a program to retry these
+   as EAGAIN. Linux also gives EOPNOTSUPP for a socket that is not
+   SOCK_STREAM. A retry of that error never ends, so the world does not retry
+   it. */
+value weft_accept_retry_codes(value unit) {
+  CAMLparam0();
+  CAMLlocal1(r);
+#ifdef __linux__
+  int codes[] = {ECONNABORTED, EPROTO,    ENETDOWN,  EHOSTUNREACH,
+                 ENETUNREACH,  ENOPROTOOPT, EHOSTDOWN, ENONET};
+#else
+  int codes[] = {ECONNABORTED};
+#endif
   int n = sizeof codes / sizeof codes[0];
   r = caml_alloc_tuple(n);
   for (int i = 0; i < n; i++) Store_field(r, i, Val_int(codes[i]));
@@ -461,7 +482,12 @@ static const struct {
              E(EADDRINUSE),   E(EADDRNOTAVAIL),   E(ENETDOWN),      E(ENETUNREACH),
              E(ECONNABORTED), E(ECONNRESET),      E(ENOBUFS),       E(EISCONN),
              E(ENOTCONN),     E(ETIMEDOUT),       E(ECONNREFUSED),  E(EHOSTUNREACH),
-             E(EALREADY),     E(EINPROGRESS),     E(ECANCELED),     E(EWOULDBLOCK)};
+             E(EALREADY),     E(EINPROGRESS),     E(ECANCELED),     E(EWOULDBLOCK),
+             E(EPROTO),       E(EHOSTDOWN),
+#ifdef ENONET
+             E(ENONET),
+#endif
+};
 #undef E
 
 value weft_errname(value code) {

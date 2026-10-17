@@ -122,6 +122,34 @@ let rebuild_keeps_live () =
   in
   equal (list int) (List.init 32 (fun i -> (2 * i) + 1) @ [100; 101]) (all [])
 
+(* P7: the slots past the size hold no sync of an entry that left the heap, so
+   the heap does not keep its fiber alive. The test does pushes that grow the
+   array, a rebuild, and pops. The old code kept the entries in the slots. *)
+let slots_past_size () =
+  let h = S.Heap.create () in
+  let syncs = List.init 64 (fun _ -> dummy_sync ()) in
+  let check () =
+    for i = h.S.size to Array.length h.S.entries - 1 do
+      let e = h.S.entries.(i) in
+      is_false (List.exists (fun s -> e.S.esync == s) syncs)
+    done
+  in
+  List.iteri
+    (fun i s ->
+      S.Heap.push h ~deadline:(Int64.of_int (i + 1)) s 0 ;
+      check () )
+    syncs ;
+  List.iteri
+    (fun i s -> if i mod 2 = 1 then ignore (S.C.self_commit s.S.word 1))
+    syncs ;
+  S.Heap.push h ~deadline:100L (dummy_sync ()) 0 ;
+  S.Heap.push h ~deadline:101L (dummy_sync ()) 0 ;
+  equal int 34 h.S.size ;
+  check () ;
+  while h.S.size > 2 do
+    S.Heap.pop h ; check ()
+  done
+
 let heap =
   group "heap"
     [ prop "the heap gives the order of a sorted list"
@@ -130,7 +158,8 @@ let heap =
     ; test "a drop takes the stale entries at the head" drop_stale
     ; test "an add drops the stale entries at the head" push_drops_stale
     ; test "the alarm skips a stale entry" alarm_skips_stale
-    ; test "a rebuild keeps only the live entries" rebuild_keeps_live ]
+    ; test "a rebuild keeps only the live entries" rebuild_keeps_live
+    ; test "the slots past the size hold no entry that left" slots_past_size ]
 
 (* Two domains increment a counter under the lock. *)
 let spin_excludes () =
@@ -269,9 +298,29 @@ let beats_start_at_zero () =
     ignore (Sys.opaque_identity junk) ;
     Gc.full_major () ;
     let t = S.create ~domains:n () in
-    for i = 0 to n - 1 do
+    for i = 0 to Bigarray.Array1.dim t.S.beats - 1 do
       equal int 0 t.S.beats.{i}
     done
+  done
+
+(* Two domains do not write their beats in one cache line: the beats are 128
+   bytes or more apart (review 3.12, P2). *)
+let beats_apart () =
+  for n = 2 to 8 do
+    let t = S.create ~domains:n () in
+    let at = Array.make n (-1) in
+    Array.iteri
+      (fun d dom ->
+        S.beat dom ;
+        for i = 0 to Bigarray.Array1.dim t.S.beats - 1 do
+          if t.S.beats.{i} = 1 && not (Array.mem i at) then at.(d) <- i
+        done )
+      t.S.doms ;
+    Array.iteri
+      (fun d i ->
+        if d > 0 then
+          at_least int ~than:128 ((i - at.(d - 1)) * (Sys.word_size / 8)) )
+      at
   done
 
 let tests =
@@ -280,4 +329,5 @@ let tests =
   ; ring
   ; group "domains"
       [ test "the number of domains is 1 to 62" domains_range
-      ; test "the beats start at 0" beats_start_at_zero ] ]
+      ; test "the beats start at 0" beats_start_at_zero
+      ; test "the beats of two domains are 128 bytes apart" beats_apart ] ]

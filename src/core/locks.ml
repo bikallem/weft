@@ -169,8 +169,10 @@ module Condition = struct
      sees the cancels from outside and from the scopes inside. The node opens
      before the sync publishes its record, so a cancel walk that sees the sync
      sees the open node. The lock again is in a shield, so the fiber always
-     holds [m] when [wait] returns or raises. *)
+     holds [m] when [wait] returns or raises. [Self] first: outside a fiber,
+     [wait] raises [Not_in_fiber] before it adds its waiter. *)
   let wait c (m : Mutex.t) =
+    ignore (self ()) ;
     let w = new_waiter () in
     Spin.with_lock c.clock (fun () -> Queue.push w c.cwaiters) ;
     let node = m.shield in

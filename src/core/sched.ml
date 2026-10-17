@@ -27,6 +27,9 @@ module Spin = struct
 
   let make () = Atomic.make false
 
+  (* Test and test-and-set: a waiter reads the lock until it is free, and only
+     then tries the CAS. Thus the waiters do not write the cache line of the
+     lock while its holder works. *)
   let rec lock t =
     if
       not
@@ -35,10 +38,17 @@ module Spin = struct
         off
           "one domain never contends; test_heap.ml examines the lock with two \
            domains, but a mutation run cannot start a domain"]
-    then (
-      Domain.cpu_relax ()
-      [@mutate off "a hint to the CPU only: the loop gives the same result"] ;
-      lock t )
+    then wait t
+
+  and wait t =
+    Domain.cpu_relax ()
+    [@mutate off "a hint to the CPU only: the loop gives the same result"] ;
+    if
+      Atomic.get t
+      [@mutate
+        off "one domain never contends; a mutation run cannot start a domain"]
+    then wait t
+    else lock t
 
   let unlock t = Atomic.set t false
 
@@ -68,7 +78,7 @@ and ctx =
   ; parent: ctx option
   ; flag: exn option Atomic.t  (** The cancel of this node. *)
   ; lock: Spin.t
-  ; members: (int, fiber) Hashtbl.t  (** By fiber id, under [lock]. *)
+  ; members: members  (** Under [lock]. *)
   ; children: (int, ctx) Hashtbl.t
         (** The nested nodes that are not shields, by node id, under [lock]. *)
   ; chain: handler
@@ -77,6 +87,13 @@ and ctx =
   ; fids: int Atomic.t
         (** The next fiber id. All nodes of one run share it (design section
             2.5, The id of a fiber). *) }
+
+(* The members of a node: a doubly linked list, the newest first. A fiber holds
+   its cell, so that it leaves the list in O(1). *)
+and members = {mutable head: member option}
+
+and member =
+  {mf: fiber; mutable mprev: member option; mutable mnext: member option}
 
 (* A handler of the user (design section 2.5, Effect handlers of a scope). *)
 and handler = {handle: 'a. (unit -> 'a) -> 'a}
@@ -202,6 +219,11 @@ and dom =
   ; mutable wake: bool  (** A push to do a wake at the next safe point. *)
   ; mutable wake0: bool
         (** A push to the pinned queue: wake domain 0 at the next safe point. *)
+  ; got_token: bool Atomic.t
+        (** A waker puts the token here: one count of [searching] (design
+            section 2.5, Idle and wake). *)
+  ; mutable token: bool
+        (** The domain took the token from [got_token] and holds its count. *)
   ; stats: stats  (** The counters of the domain, for the measurements. *)
   ; mutable held: int
         (** The jobs that this domain started, that hold the user of an fd, and
@@ -226,7 +248,9 @@ and t =
   ; beats: (int, Bigarray.int_elt, Bigarray.c_layout) Bigarray.Array1.t
         (** The beat of each domain, out of the OCaml heap: one more at the
             start of a fiber and one more at its end, so an odd value tells that
-            a fiber runs. The watchdog of a world reads it (M3). *)
+            a fiber runs. The watchdog of a world reads it (M3). The beat of
+            domain [i] is at [i * beat_stride], so each domain writes its own
+            cache line. *)
   ; mutable doms: dom array
   ; slack: int64
   ; fibers: (int, fiber) Hashtbl.t  (** The live fibers, for the debug. *)
@@ -329,6 +353,35 @@ end
 module Heap = struct
   let create () = {entries= [||]; size= 0; next_seq= 0; rebuild_at= 64}
 
+  (* The entry of the slots past the size, as the ring clears its slots. Thus
+     the heap does not keep a fiber after its entry left. Its deadline is last,
+     so [lt] is false for it against each entry. *)
+  let dummy =
+    let ctx =
+      { nid= -1
+      ; kind= Daemon_node
+      ; parent= None
+      ; flag= Atomic.make None
+      ; lock= Spin.make ()
+      ; members= {head= None}
+      ; children= Hashtbl.create 1
+      ; chain= {handle= (fun f -> f ())}
+      ; fids= Atomic.make 0 }
+    in
+    let owner =
+      { fid= -1
+      ; name= "dummy"
+      ; ctxs= [ctx]
+      ; current= Atomic.make None
+      ; queued= false
+      ; pinned= false }
+    in
+    { deadline= Int64.max_int
+    ; seq= max_int
+    ; esync= {word= C.make 0; owner; sctx= ctx; cancellable= false; k= None}
+    ; branch= -1
+    ; cancels= None }
+
   let lt a b =
     match Int64.compare a.deadline b.deadline with
     | 0 ->
@@ -355,8 +408,8 @@ module Heap = struct
         ( l < h.size )
         [@mutate
           off
-            "at l = size, the slot holds the element that moves down, and lt \
-             of an element with itself is false"]
+            "at l = size, the slot holds the dummy, and lt of the dummy is \
+             false"]
         && lt h.entries.(l) h.entries.(i)
       then l
       else i
@@ -366,8 +419,8 @@ module Heap = struct
         ( r < h.size )
         [@mutate
           off
-            "at r = size, the slot holds the element that moves down, or an \
-             entry that the rebuild compacted past the size"]
+            "at r = size, the slot holds the dummy, and lt of the dummy is \
+             false"]
         && lt h.entries.(r) h.entries.(m)
       then r
       else m
@@ -378,9 +431,10 @@ module Heap = struct
 
   let pop h =
     h.size <- h.size - 1 ;
-    if (h.size > 0) [@mutate off "at 0, down has no child to compare"] then (
-      h.entries.(0) <- h.entries.(h.size) ;
-      down h 0 )
+    h.entries.(0) <- h.entries.(h.size) ;
+    h.entries.(h.size) <- dummy ;
+    if (h.size > 0) [@mutate off "at 0, down has no child to compare"] then
+      down h 0
 
   (* Remove the stale entries in place: their sync committed to another
      branch. *)
@@ -392,6 +446,7 @@ module Heap = struct
         h.entries.(!n) <- e ;
         incr n )
     done ;
+    Array.fill h.entries !n (h.size - !n) dummy ;
     h.size <- !n ;
     for
       i = ((h.size / 2) - 1) [@mutate off "down does nothing on a leaf"]
@@ -421,7 +476,7 @@ module Heap = struct
     if (h.size >= h.rebuild_at) [@mutate off "one more entry before a rebuild"]
     then rebuild h ;
     if h.size = Array.length h.entries then (
-      let a = Array.make (Int.max 16 (2 * h.size)) e in
+      let a = Array.make (Int.max 16 (2 * h.size)) dummy in
       Array.blit h.entries 0 a 0 h.size ;
       h.entries <- a ) ;
     h.entries.(h.size) <- e ;
@@ -502,6 +557,9 @@ module Fdtab = struct
               s
           | [] ->
               let s = !next in
+              (* The token keeps the generation in the low 32 bits and the slot
+                 above them, and it must stay a positive [int]. *)
+              assert (s < 1 lsl 30) ;
               incr next ;
               if s >= Array.length !gens then (
                 let a = Array.make (2 * s) 0 in
@@ -524,7 +582,8 @@ module Fdtab = struct
 
   let release r = Mutex.protect lock (fun () -> free := r.slot :: !free)
 
-  (* The slot and the generation in one [int]. A slot is less than 2^30. *)
+  (* The slot and the generation in one [int]: the generation has the low 32
+     bits, and the slot is above them. A slot is less than 2^30. *)
   let token r = (r.slot lsl 32) lor r.gen
 
   let of_token t = (t lsr 32, t land 0xffff_ffff)
@@ -625,27 +684,53 @@ module Idle = struct
     if v land bit d = 0 then false
     else Atomic.compare_and_set t.idle v (v land lnot (bit d)) || remove t d
 
-  (* Take one domain out of the set, the lowest in [mask], and give it. *)
-  let rec take_in t mask =
-    let v = Atomic.get t.idle land mask in
+  (* The lowest domain in the set [v], which is not empty. *)
+  let lowest v =
+    let rec low i = if v land bit i <> 0 then i else low (i + 1) in
+    low 0
+
+  (* Take the lowest domain out of the set, and give it. *)
+  let rec take_any t =
+    let v = Atomic.get t.idle in
     if v = 0 then None
     else
-      let d =
-        let rec low i = if v land bit i <> 0 then i else low (i + 1) in
-        low 0
-      in
-      if remove t d then Some d else take_in t mask
+      let d = lowest v in
+      if remove t d then Some d else take_any t
 
-  (* The lowest idle domain that is not [self]. *)
-  let take t ~self = take_in t (lnot (bit self))
+  (* The wake of a push (the Go rule of [wakep]). The caller holds the token,
+     the count of [searching] that it changed from 0 to 1. The token goes to the
+     lowest idle domain that is not [self], and the function gives that domain
+     for a wake. If no other domain is idle, the function decreases [searching].
 
-  let take_any t = take_in t (-1)
+     The token goes to the domain before the domain leaves the set. Thus the
+     domain sees the token when it leaves the set, also if it leaves the set
+     itself and a poll takes the wake. With the opposite order, the domain could
+     take no token, take the wake in a poll and sleep. Its count then stops each
+     later wake (Wake.tla, BugTokenAfterRemove).
+
+     If the domain left the set first, it is awake: it searches, or it checks
+     the queues again before it sleeps. Thus the waker removes the token with a
+     CAS and decreases [searching]. A waker that tries another domain can chase
+     one domain forever (Wake.tla, BugTokenRetry). If the domain took the token
+     first, it searches with it, and a wake is not necessary. *)
+  let give_token t ~self =
+    let v = Atomic.get t.idle land lnot (bit self) in
+    if v = 0 then (Atomic.decr t.searching ; None)
+    else
+      let d = lowest v in
+      let got = t.doms.(d).got_token in
+      Atomic.set got true ;
+      if remove t d then Some d
+      else (
+        if Atomic.compare_and_set got true false then Atomic.decr t.searching ;
+        None )
+
+  (* A domain takes a token that a waker gave. *)
+  let take_token dom =
+    if Atomic.get dom.got_token && Atomic.exchange dom.got_token false then
+      dom.token <- true
 end
 
-(* A push to the local queue. A full ring moves its older half and the new fiber
-   to the overflow queue, as Go does, so the order stays FIFO. If a domain is
-   idle, the push marks a wake: the scheduler does it at the next safe point,
-   because a wake is a world effect, and a lock can be held here. *)
 (* A pinned fiber goes to the pinned queue, and the push wakes domain 0
    directly: another domain cannot run it (Wake.tla). The count comes after the
    push, and domain 0 reads it after it adds itself to [idle]: a Dekker pair
@@ -666,11 +751,17 @@ let push_pinned dom r =
 let has_pinned dom = dom.index = 0 && Atomic.get dom.sched.pinned_n > 0
 
 (* A push wakes an idle domain, but not while a domain searches: that domain
-   finds the fiber (the Go rules). *)
+   finds the fiber (the Go rules). [flush_wake] changes [searching] from 0 to 1
+   before the wake, so the next pushes wake nobody until the woken domain ends
+   its search. *)
 let mark_wake dom =
   let t = dom.sched in
   if Atomic.get t.idle <> 0 && Atomic.get t.searching = 0 then dom.wake <- true
 
+(* A push to the local queue. A full ring moves its older half and the new fiber
+   to the overflow queue, as Go does, so the order stays FIFO. If a domain is
+   idle, the push marks a wake: the scheduler does it at the next safe point,
+   because a wake is a world effect, and a lock can be held here. *)
 let push_ready dom r =
   r.rfiber.queued <- true ;
   let t = dom.sched in
@@ -712,12 +803,14 @@ let flush_wake dom =
       World.perform "sched" (World.Wake 0) ) ) ;
   if dom.wake then (
     dom.wake <- false ;
-    match Idle.take dom.sched ~self:dom.index with
-    | Some d ->
-        dom.stats.wakes <- dom.stats.wakes + 1 ;
-        World.perform "sched" (World.Wake d)
-    | None ->
-        () )
+    let t = dom.sched in
+    if Atomic.compare_and_set t.searching 0 1 then
+      match Idle.give_token t ~self:dom.index with
+      | Some d ->
+          dom.stats.wakes <- dom.stats.wakes + 1 ;
+          World.perform "sched" (World.Wake d)
+      | None ->
+          () )
 
 (* Resume a parked sync. The caller got [Resume] or a claim with
    [resume_partner], so it is the one owner of this resume. *)
@@ -741,10 +834,6 @@ let wake_all dom waiters =
       match C.notify s.word i with C.Resume -> resume dom s | _ -> () )
     (Waiters.to_list waiters)
 
-(* The registration of [fdr] on [dom], in the order of spec/tla/Fd.tla: add a
-   user, set the domain bit, read the state, then add the fd to the poller.
-   [Error None] tells that the fd is closing: the waiter retries and gets
-   [EBADF]. *)
 (* The live registration of [fdr] on [dom], if one. *)
 let live_reg dom fdr =
   match Hashtbl.find_opt dom.regs fdr.slot with
@@ -753,6 +842,10 @@ let live_reg dom fdr =
   | _ ->
       None
 
+(* The registration of [fdr] on [dom], in the order of spec/tla/Fd.tla: add a
+   user, set the domain bit, read the state, then add the fd to the poller.
+   [Error None] tells that the fd is closing: the waiter retries and gets
+   [EBADF]. *)
 let ensure_reg dom fdr =
   match live_reg dom fdr with
   | Some reg ->
@@ -1092,22 +1185,47 @@ let new_node ?parent ?handler kind =
   ; parent
   ; flag= Atomic.make None
   ; lock= Spin.make ()
-  ; members= Hashtbl.create ~random:false 4
+  ; members= {head= None}
   ; children= Hashtbl.create ~random:false 4
   ; chain
   ; fids= (match parent with Some p -> p.fids | None -> Atomic.make 0) }
 
+(* Add [f] to the members of [n], and give its cell. *)
 let add_member_to n f =
-  Spin.with_lock n.lock (fun () -> Hashtbl.replace n.members f.fid f)
+  let l = n.members in
+  Spin.with_lock n.lock (fun () ->
+      let m = {mf= f; mprev= None; mnext= l.head} in
+      let sm = Some m in
+      Option.iter (fun h -> h.mprev <- sm) l.head ;
+      l.head <- sm ;
+      m )
 
-let remove_member n f =
-  Spin.with_lock n.lock (fun () -> Hashtbl.remove n.members f.fid)
+let remove_member n m =
+  let l = n.members in
+  Spin.with_lock n.lock (fun () ->
+      ( match m.mprev with
+      | Some p ->
+          p.mnext <- m.mnext
+      | None ->
+          l.head <- m.mnext ) ;
+      Option.iter (fun x -> x.mprev <- m.mprev) m.mnext )
 
-(* The values of a table, in the order of their ids: the fork order. *)
-let by_id tbl =
-  Hashtbl.fold (fun id v acc -> (id, v) :: acc) tbl []
-  |> List.sort (fun (a, _) (b, _) -> Int.compare a b)
-  |> List.map snd
+(* The fibers of the members, the oldest first: the fork order. *)
+let member_fibers l =
+  let rec go acc = function
+    | None ->
+        acc
+    | Some m ->
+        go (m.mf :: acc) m.mnext
+  in
+  go [] l.head
+
+(* The entries of a table. The caller holds the lock of the table, and it sorts
+   the entries with [by_id] after it releases the lock. *)
+let entries tbl = Hashtbl.fold (fun id v acc -> (id, v) :: acc) tbl []
+
+(* The values of the entries, in the order of their ids: the fork order. *)
+let by_id l = List.sort (fun (a, _) (b, _) -> Int.compare a b) l |> List.map snd
 
 (* The first cancelled context on the chain from [c], up to a shield. *)
 let rec first_flag c =
@@ -1135,16 +1253,17 @@ let rec on_chain c x =
   | Scope_node _ | Daemon_node -> (
     match c.parent with None -> false | Some p -> on_chain p x )
 
-(* The cancel of [x]: set the flag of [x] only, then walk [x] and its nested
-   nodes, but not into a shield. Commit each sync of a member whose chain
-   reaches [x]. It gives the syncs to resume. *)
-let cancel_node x reason =
-  ignore (Atomic.compare_and_set x.flag None (Some reason)) ;
+(* The walk of a cancel of [x]: walk [x] and its nested nodes, but not into a
+   shield. Commit each sync of a member whose chain reaches [x]. It gives the
+   syncs to resume. *)
+let walk x =
   let found = ref [] in
   let rec visit n =
     let members, children =
-      Spin.with_lock n.lock (fun () -> (by_id n.members, by_id n.children))
+      Spin.with_lock n.lock (fun () ->
+          (member_fibers n.members, entries n.children) )
     in
+    let children = by_id children in
     List.iter
       (fun f ->
         match Atomic.get f.current with
@@ -1164,7 +1283,13 @@ let cancel_node x reason =
       else None )
     (List.rev !found)
 
-(* The sync of a fiber, in the scheduler (design section 2.4). *)
+(* The cancel of [x]: set the flag of [x] only, then walk. Only the cancel that
+   sets the flag walks. Its walk finds each sync that started before the flag,
+   and each sync that starts after the flag reads it (the Dekker pair). Thus a
+   second walk finds no sync to commit, and N failures in one scope walk it one
+   time, not N times (Scope.tla). *)
+let cancel_node x reason =
+  if Atomic.compare_and_set x.flag None (Some reason) then walk x else []
 
 (* The PRNG of a domain: SplitMix64 on 63 bits. *)
 let next_rand dom =
@@ -1256,6 +1381,7 @@ let rec run_fiber : dom -> fiber -> step -> unit =
   | Suspended (Sync r, k) ->
       sync dom fiber r k
 
+(* The sync of a fiber, in the scheduler (design section 2.4). *)
 and sync dom fiber (r : sync_req) (k : (int, step) Effect.Deep.continuation) =
   let s =
     { word= C.make (Commit.Id.next dom.ids)
@@ -1319,13 +1445,13 @@ let expire_heap dom heap limit =
   in
   loop ()
 
-(* The alarm: the earliest live deadline, rounded up to the slack. The rounding
-   saturates at the largest time. *)
 (* The [Posix] heap reads [Now Posix] only when it holds an entry. *)
 let expire dom =
   expire_heap dom dom.heap (now_ns ()) ;
   if dom.pheap.size > 0 then expire_heap dom dom.pheap (posix_ns ())
 
+(* The alarm: the earliest live deadline, rounded up to the slack. The rounding
+   saturates at the largest time. *)
 let alarm_of dom heap =
   Heap.drop_stale heap ;
   match Heap.top heap with
@@ -1380,8 +1506,6 @@ let wait dom timeout =
 let take_overflow t =
   Spin.with_lock t.overflow_lock (fun () -> Queue.take_opt t.overflow)
 
-(* A steal: try each other domain one time, from a start that the PRNG of the
-   domain selects. *)
 (* A domain searches only if fewer than half of the domains search (at least
    one). It gives [false] if it cannot search. *)
 let start_search (t : t) =
@@ -1395,16 +1519,44 @@ let start_search (t : t) =
   in
   inc ()
 
-(* The steal of the Go rules (design section 2.5, Idle and wake, and
-   spec/tla/Wake.tla). A searching domain that finds no work decreases
-   [searching] before its second check. The last searching domain that finds
-   work wakes one idle domain, because the pushes woke nobody while it
-   searched. *)
+(* The end of a search: the domain decreases [searching]. The last searching
+   domain that finds work wakes one idle domain, because the pushes woke nobody
+   while it searched. The wake occurs at once, before the domain runs the fiber,
+   as Go's [resetspinning] calls [wakep]. If the wake waits for the next effect
+   of the fiber, a fiber that computes stops the chain of wakes. *)
+let end_search dom found =
+  let t = dom.sched in
+  if
+    ( Atomic.fetch_and_add t.searching (-1)
+    = 1 )
+    [@mutate
+      off
+        "the last wake gives only performance: Wake.tla passes with no last \
+         wake"]
+    && found
+  then
+    if
+      ( Atomic.get t.idle <> 0 )
+      [@mutate
+        off
+          "the last wake gives only performance: Wake.tla passes with no last \
+           wake"]
+    then (
+      dom.wake <- true ;
+      flush_wake dom )
+
+(* A steal: try each other domain one time, from a start that the PRNG of the
+   domain selects. The steal obeys the Go rules (design section 2.5, Idle and
+   wake, and spec/tla/Wake.tla). A domain with the token searches with its
+   count, and another domain increases [searching]. A searching domain that
+   finds no work decreases [searching] before its second check. *)
 let steal dom =
   let t = dom.sched in
   let doms = t.doms in
   let n = Array.length doms in
-  if n = 1 || not (start_search t) then None
+  let token = dom.token in
+  dom.token <- false ;
+  if n = 1 || not (token || start_search t) then None
   else
     let start = next_rand dom mod n in
     let rec try_ i =
@@ -1433,22 +1585,7 @@ let steal dom =
             next_of (i + 1)
     in
     let r = match try_ 0 with Some r -> Some r | None -> next_of 0 in
-    if
-      ( Atomic.fetch_and_add t.searching (-1)
-      = 1 )
-      [@mutate
-        off
-          "the last wake gives only performance: Wake.tla passes with no last \
-           wake"]
-      && Option.is_some r
-    then
-      if
-        ( Atomic.get t.idle <> 0 )
-        [@mutate
-          off
-            "the last wake gives only performance: Wake.tla passes with no \
-             last wake"]
-      then dom.wake <- true ;
+    end_search dom (Option.is_some r) ;
     r
 
 (* The next slot runs at most [next_limit] times in sequence. Then its fiber
@@ -1476,11 +1613,8 @@ let take_next dom =
         push_ready dom r ;
         None )
 
-(* Steps 2 to 4 of the loop: the local queue, the overflow queue, then a steal.
-   Each 61st take tries the overflow queue first, so that its fibers do not
-   starve while the ring is never empty (Go does the same). *)
-(* The requests of the injection queue, the oldest first: each one fills an
-   Ivar on this domain. *)
+(* The requests of the injection queue, the oldest first: each one fills an Ivar
+   on this domain. *)
 let take_injected dom =
   let t = dom.sched in
   if Atomic.get t.inject <> [] then
@@ -1514,42 +1648,52 @@ let take_pinned_first dom =
         dom.pinned_runs <- 0 ;
         None
 
-let take dom =
+(* A take tries the injection queue and the overflow queue first each
+   [fair_period] takes, so that their fibers do not starve while the ring is
+   never empty. Go uses 61 for the same check. [k_poll], the period of the poll
+   of a busy domain, also starts at 61, but it counts switches, and it is a
+   different rule. *)
+let fair_period = 61
+
+(* Step 1 of the loop. The inline keeps the yield loop on one domain as fast as
+   before the split into steps. *)
+let[@inline] take_fair dom =
+  if
+    ( dom.ticks >= fair_period )
+    [@mutate off "61 or 62 takes: 61 is a start value, as in Go"]
+  then (
+    dom.ticks <- 0 ;
+    take_injected dom ;
+    take_overflow dom.sched )
+  else None
+
+(* The fills from outside resume their fibers to this domain. *)
+let take_injected_local dom = take_injected dom ; Ring.pop dom.ring
+
+(* Steps 1 to 4 of the loop (design section 2.5), in order. The first source
+   that gives a fiber ends the take. Step 1 is [take_fair], step 2 is
+   [take_pinned_first], step 3 is the next slot, the local queue, the overflow
+   queue, the injection queue and the pinned queue, and step 4 is [steal]. *)
+let take_work dom =
   dom.ticks <- dom.ticks + 1 ;
-  let first =
-    if
-      ( dom.ticks >= 61 )
-      [@mutate off "61 or 62 takes: 61 is a start value, as in Go"]
-    then (
-      dom.ticks <- 0 ;
-      take_injected dom ;
-      take_overflow dom.sched )
-    else None
-  in
-  match match first with Some r -> Some r | None -> take_pinned_first dom with
-  | Some r ->
-      Some r
-  | None -> (
-    match take_next dom with
-    | Some r ->
-        Some r
-    | None -> (
-      match Ring.pop dom.ring with
-      | Some r ->
-          Some r
-      | None -> (
-        match take_overflow dom.sched with
-        | Some r ->
-            Some r
-        | None -> (
-            (* The fills from outside resume their fibers to this domain. *)
-            take_injected dom ;
-            match Ring.pop dom.ring with
-            | Some r ->
-                Some r
-            | None -> (
-              match take_pinned dom with Some r -> Some r | None -> steal dom )
-            ) ) ) )
+  let r = take_fair dom in
+  let r = if Option.is_none r then take_pinned_first dom else r in
+  let r = if Option.is_none r then take_next dom else r in
+  let r = if Option.is_none r then Ring.pop dom.ring else r in
+  let r = if Option.is_none r then take_overflow dom.sched else r in
+  let r = if Option.is_none r then take_injected_local dom else r in
+  let r = if Option.is_none r then take_pinned dom else r in
+  if Option.is_none r then steal dom else r
+
+(* A domain that a wake gave the token to searches with it in [steal]. If it
+   finds work before the steal, it ends the search with that work (Go's
+   [resetspinning]). *)
+let take_with_token dom =
+  let r = take_work dom in
+  if dom.token && Option.is_some r then (
+    dom.token <- false ;
+    end_search dom true ) ;
+  r
 
 (* The second check of a domain that is in [idle]: did [main] end, or is there a
    fiber in a queue that it can take? The check needs [finished]: a poll in the
@@ -1571,11 +1715,16 @@ let work_for dom =
       "a lost steal of the overflow queue costs only parallelism: the domain \
        that filled it takes it when its ring is empty"] )
 
+(* The distance in ints between the beats of two domains: 128 bytes on a 64-bit
+   system. Thus two domains do not write one cache line, also with a CPU that
+   fetches the lines in pairs. The watchdog gets this value from [run] of
+   [Weft_posix.Make]. *)
+let beat_stride = 16
+
 (* Only the domain writes its beat. *)
 let beat dom =
-  let b = dom.sched.beats in
-  Bigarray.Array1.unsafe_set b dom.index
-    (Bigarray.Array1.unsafe_get b dom.index + 1)
+  let b = dom.sched.beats and i = dom.index * beat_stride in
+  Bigarray.Array1.unsafe_set b i (Bigarray.Array1.unsafe_get b i + 1)
 
 let run_ready dom r =
   r.rfiber.queued <- false ;
@@ -1612,7 +1761,7 @@ let rec loop dom =
     take_mail dom ;
     if dom.held > 0 then (wait dom World.Wait.Sleep ; loop dom) )
   else (
-    ( match take dom with
+    ( match take_work dom with
     | Some r ->
         run_ready dom r
     | None ->
@@ -1621,7 +1770,13 @@ let rec loop dom =
            check sees a fiber that the poll made ready, and the end. *)
         Idle.add t dom.index ;
         if not (work_for dom) then wait dom World.Wait.Sleep ;
-        ignore (Idle.remove t dom.index) ) ;
+        ignore (Idle.remove t dom.index) ;
+        (* A waker gives a token only to a domain in [idle]. Thus the domain
+           reads [got_token] only here, and the take of a busy domain does not
+           read it (Wake.tla, tk). Then it takes work, also with no token: this
+           branch is not on the hot path. *)
+        Idle.take_token dom ;
+        Option.iter (run_ready dom) (take_with_token dom) ) ;
     loop dom )
 
 (* The scopes (design section 2.5, Fibers, scopes and cancellation). *)
@@ -1656,10 +1811,13 @@ let state_of node =
       assert false (* Only a scope node has members that end. *)
 
 (* A failed member stores its exception before it ends, then it cancels the
-   scope. A [Cancelled] is not a failure. It gives the syncs to resume. *)
-let fail node e bt =
+   scope. A [Cancelled] is not a failure only if the chain of [ctx], the context
+   of the member, is cancelled. If not, it comes from a scope inside the member
+   that the user cancelled, and it is a failure as each other exception is
+   (Scope.tla, BugAnyCancelled). It gives the syncs to resume. *)
+let fail ~ctx node e bt =
   match e with
-  | Cancelled _ ->
+  | Cancelled _ when Option.is_some (first_flag ctx) ->
       []
   | _ ->
       let st = state_of node in
@@ -1684,7 +1842,7 @@ let member_end node ~daemon =
   let c = dec () in
   if all_count c = 0 then Option.value ~default:[] (Iv.fill st.join ())
   else if (not daemon) && nd_count c = 0 then
-    let ds = Spin.with_lock node.lock (fun () -> by_id st.daemons) in
+    let ds = by_id (Spin.with_lock node.lock (fun () -> entries st.daemons)) in
     List.concat_map (fun d -> cancel_node d Daemons_end) ds
   else []
 
@@ -1703,36 +1861,41 @@ let add_member node ~daemon =
   in
   inc ()
 
-(* The body of a fiber runs inside the chain of handlers of its scope. *)
-let run_body scope body =
+(* The body of a fiber runs inside the chain of handlers of its scope. [ctx] is
+   the context of the fiber: the scope, or the node of a daemon. *)
+let run_body ~ctx scope body =
   match scope.chain.handle body with
   | () ->
       ()
   | exception e ->
       let bt = Printexc.get_raw_backtrace () in
-      enqueue (fail scope e bt)
+      enqueue (fail ~ctx scope e bt)
 
+(* [Self] first: outside a fiber, [fork] raises [Not_in_fiber] before it changes
+   the scope. *)
 let fork ?name ?pinned scope body =
+  ignore (self ()) ;
   add_member scope ~daemon:false ;
   let f = new_fiber ?name ?pinned [scope] in
-  add_member_to scope f ;
+  let m = add_member_to scope f in
   prog "Fiber.fork"
     (Fork
        ( f
        , fun () ->
-           run_body scope body ;
-           remove_member scope f ;
+           run_body ~ctx:scope scope body ;
+           remove_member scope m ;
            enqueue (member_end scope ~daemon:false) ) )
 
 (* A daemon has its own node under the scope. The count and the link of the node
    are one step under the lock of the scope, so the end of the last member that
    is not a daemon sees the node (it reads the daemons under the same lock). The
-   daemon removes its node when it ends. *)
+   daemon removes its node when it ends. [Self] first, as in [fork]. *)
 let fork_daemon ?name scope body =
+  ignore (self ()) ;
   let st = state_of scope in
   let d = new_node ~parent:scope Daemon_node in
   let f = new_fiber ?name [d] in
-  Hashtbl.replace d.members f.fid f ;
+  ignore (add_member_to d f) ;
   Spin.with_lock scope.lock (fun () ->
       add_member scope ~daemon:true ;
       Hashtbl.replace scope.children d.nid d ;
@@ -1741,7 +1904,7 @@ let fork_daemon ?name scope body =
     (Fork
        ( f
        , fun () ->
-           run_body scope body ;
+           run_body ~ctx:d scope body ;
            Spin.with_lock scope.lock (fun () ->
                Hashtbl.remove scope.children d.nid ;
                Hashtbl.remove st.daemons d.nid ) ;
@@ -1761,9 +1924,13 @@ let reraise (e, bt) = Printexc.raise_with_backtrace e bt
    then join. The join ignores cancels. If the body gave a value, the scope
    gives it, also if the scope was cancelled: [with_timeout] never drops a
    value. *)
-let finish_scope fiber node result =
-  (match result with Error (e, bt) -> enqueue (fail node e bt) | Ok _ -> ()) ;
-  remove_member node fiber ;
+let finish_scope m node result =
+  ( match result with
+  | Error (e, bt) ->
+      enqueue (fail ~ctx:node node e bt)
+  | Ok _ ->
+      () ) ;
+  remove_member node m ;
   enqueue (member_end node ~daemon:false) ;
   let st = state_of node in
   ignore (sync_req ~nocancel:true [|Iv.leaf st.join|]) ;
@@ -1786,7 +1953,7 @@ let scope ?handler f =
   let fiber = self () in
   let parent = List.hd fiber.ctxs in
   let node = new_node ~parent ?handler (Scope_node (new_scope_state ())) in
-  Hashtbl.replace node.members fiber.fid fiber ;
+  let m = add_member_to node fiber in
   Spin.with_lock parent.lock (fun () ->
       Hashtbl.replace parent.children node.nid node ) ;
   fiber.ctxs <- node :: fiber.ctxs ;
@@ -1804,7 +1971,7 @@ let scope ?handler f =
         Error (e, Printexc.get_raw_backtrace ())
   in
   fiber.ctxs <- List.tl fiber.ctxs ;
-  finish_scope fiber node result
+  finish_scope m node result
 
 (* [f] gets the shield node. *)
 let shield_node f =
@@ -1869,7 +2036,8 @@ let create ?(slack = Span.us 100) ?(simulated = false) ~domains () =
     { run_id= Atomic.fetch_and_add next_run 1
     ; beats=
         (let b =
-           Bigarray.Array1.create Bigarray.int Bigarray.c_layout domains
+           Bigarray.Array1.create Bigarray.int Bigarray.c_layout
+             (domains * beat_stride)
          in
          Bigarray.Array1.fill b 0 ; b )
     ; doms= [||]
@@ -1908,6 +2076,8 @@ let create ?(slack = Span.us 100) ?(simulated = false) ~domains () =
         ; rng= 0
         ; wake= false
         ; wake0= false
+        ; got_token= Atomic.make false
+        ; token= false
         ; stats= {wakes= 0; edges= 0; idle_edges= 0; busy_polls= 0; resumes= 0}
         ; held= 0
         ; regs= Hashtbl.create ~random:false 64
@@ -1920,7 +2090,7 @@ let create ?(slack = Span.us 100) ?(simulated = false) ~domains () =
 let start t main =
   let root = new_node (Scope_node (new_scope_state ())) in
   let fiber = new_fiber ~name:"main" [root] in
-  Hashtbl.replace root.members fiber.fid fiber ;
+  let m = add_member_to root fiber in
   let result = ref None in
   let body () =
     let r =
@@ -1931,7 +2101,7 @@ let start t main =
           Error (e, Printexc.get_raw_backtrace ())
     in
     let r =
-      match finish_scope fiber root r with
+      match finish_scope m root r with
       | v ->
           fun () -> v
       | exception e ->

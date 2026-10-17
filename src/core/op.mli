@@ -103,8 +103,9 @@ type _ blocking =
       (** The fd, the buffer, its range, and the file offset. The offset [-1]
           reads at the offset of the fd. 0 at the end of the file. The world
           copies the data into the buffer only at [Finish]. *)
-  | Pwrite : fd * string * int -> int blocking
-      (** The fd, the data and the file offset, or [-1]. *)
+  | Pwrite : fd * bytes * int * int * int -> int blocking
+      (** The fd, the buffer, its range, and the file offset, or [-1]. The world
+          copies the data from the buffer at [Start]. *)
   | Fsync : fd -> unit blocking
   | Fstat : fd -> stat blocking
   | Stat : string -> stat blocking
@@ -181,15 +182,18 @@ type _ t =
       (** The status of a child that exited, and the end of the zombie. [None]
           while the child runs. *)
   | Kill : fd * signal -> unit t  (** Sends a signal to a child. *)
-  | Watch : signal -> signal t
-      (** [Ok s] if the world gives this signal as [Ready.Signal s]: [s] is the
-          form of the signal in [Ready.Signal], for example [SIGUSR1] for
-          [Other_signal 10] on Linux. *)
-  | Unwatch : signal -> signal t
+  | Watch : signal -> signal option t
+      (** [Ok (Some s)] if the world gives this signal as [Ready.Signal s]: [s]
+          is the form of the signal in [Ready.Signal], for example [SIGUSR1] for
+          [Other_signal 10] on Linux. [Ok None] if the world does not watch the
+          signal. *)
+  | Unwatch : signal -> signal option t
       (** Stops the watch of a signal: the signal gets its action again, the
           action that it had before [run]. A signal that came and that the world
-          did not give yet also gets the action. [Ok s] gives the form of the
-          signal, as [Watch]. *)
+          did not give yet also gets the action. [Ok (Some s)] gives the form of
+          the signal, as [Watch]. [Ok None] if the world does not watch the
+          signal. [Error] is an error of the OS, and the world then continues to
+          watch the signal. *)
   | Resend : signal -> unit t
       (** Sends the signal to the process itself, after an [Unwatch]: the signal
           gets its action. *)

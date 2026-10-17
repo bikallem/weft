@@ -19,17 +19,20 @@ let diff line a b =
   else Span.of_ns Int64.max_int
 
 (* A [Posix] deadline goes to the [Posix] heap of the domain. Its alarm follows
-   a step of the clock (M3). *)
-let at (type time) (line : time Clock.line) (t : time) =
-  let deadline = Clock.to_ns line t in
+   a step of the clock (M3). [now] is a time that the caller read in the same
+   sync, or [None]: then the leaf reads the clock. *)
+let deadline_event (type time) (line : time Clock.line) deadline now =
   let leaf : Sched.leaf =
    fun dom s i ->
-    let now, heap =
-      match line with
-      | Mono ->
-          (Sched.now_ns (), dom.heap)
-      | Posix ->
-          (Sched.posix_ns (), dom.pheap)
+    let heap = match line with Mono -> dom.heap | Posix -> dom.pheap in
+    let now =
+      match (now, line) with
+      | Some n, _ ->
+          n
+      | None, Mono ->
+          Sched.now_ns ()
+      | None, Posix ->
+          Sched.posix_ns ()
     in
     if
       ( Int64.compare now deadline >= 0 )
@@ -39,14 +42,20 @@ let at (type time) (line : time Clock.line) (t : time) =
   in
   Event.Base (fun () -> {Event.leaf; result= ignore})
 
+let at line t = deadline_event line (Clock.to_ns line t) None
+
+(* The guard reads the clock one time, and the leaf compares the deadline with
+   that read (review 3.12, P8). A deadline that comes between the guard and the
+   leaf goes to the heap, and the next poll expires it. *)
 let after line span =
   Event.Guard
     (fun () ->
-      match add line (now line) span with
+      let now = now line in
+      match add line now span with
       | None ->
           Event.never
       | Some t ->
-          at line t )
+          deadline_event line (Clock.to_ns line t) (Some (Clock.to_ns line now)) )
 
 let sleep line span = Event.sync (after line span)
 

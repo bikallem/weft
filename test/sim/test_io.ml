@@ -127,6 +127,11 @@ let net =
                       Time.sleep Mono (Span.ms 1)
                     done ;
                     Pipe.write w "x" ) ;
+                (* The registration of [r] stays with no waiter: an extra edge
+                   of a wait here is idle. *)
+                for _ = 1 to 50 do
+                  Time.sleep Mono (Span.ms 1)
+                done ;
                 idle := !idle + Helpers.sum_stats sim (fun s -> s.S.idle_edges) ;
                 Pipe.close r ;
                 Pipe.close w )

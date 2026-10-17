@@ -128,6 +128,11 @@ module Fiber : sig
       scope end. The wait ignores cancels. If a member failed, it raises the
       first exception, or [Multiple].
 
+      A [Cancelled] of a member is not a failure only if the chain of the member
+      is cancelled, by this scope or by an outer scope. A [Cancelled] from a
+      different scope, for example a nested scope that the user cancelled, is a
+      failure of the scope, as each other exception is.
+
       With [~handler], [f] and each fiber of the scope and of its nested scopes
       run inside [handler.handle]. A nested scope runs its fibers as
       [outer.handle (fun () -> inner.handle g)]. *)
@@ -150,15 +155,18 @@ module Fiber : sig
     -> on_error:(exn -> Printexc.raw_backtrace -> unit)
     -> (unit -> unit)
     -> unit
-  (** As [fork], but if [f] raises an exception that is not [Cancelled],
-      [on_error] gets it with its backtrace, and the scope does not fail. A
-      server forks each connection in this way. If [on_error] raises, the scope
-      fails. *)
+  (** As [fork], but if [f] raises, [on_error] gets the exception with its
+      backtrace, and the scope does not fail. A [Cancelled] does not go to
+      [on_error] only if the chain of the fiber is cancelled. If not, it goes to
+      [on_error], as each other exception does. A server forks each connection
+      in this way. If [on_error] raises, the scope fails. *)
 
   val fork_promise :
     ?name:string -> ?pinned:bool -> scope -> (unit -> 'a) -> 'a Promise.t
   (** If the fiber raises, the promise holds the exception, and the scope does
-      not fail. *)
+      not fail. A [Cancelled] is a cancel of the promise only if the chain of
+      the fiber is cancelled: then [Promise.await] raises [Promise.Cancelled].
+      If not, the promise holds the [Cancelled] as a failure. *)
 
   val cancel : scope -> exn -> unit
   (** [cancel scope e] cancels the scope and its nested scopes, but not the code
@@ -814,7 +822,10 @@ module Signal : sig
       @raise Invalid_argument
         at [sync], if the world does not watch [s] (also after [unwatch s]), or
         if [s] cannot be an event: [SIGILL], [SIGFPE], [SIGSEGV], [SIGBUS],
-        [SIGKILL] and [SIGSTOP]. *)
+        [SIGKILL] and [SIGSTOP].
+      @raise Net.Error
+        at [sync], if the OS gives an error, for example [ENOMEM] of [signalfd].
+  *)
 
   val unwatch : t -> unit
   (** [unwatch s] stops the watch of [s] for the remaining time of the run. The
@@ -828,7 +839,10 @@ module Signal : sig
 
       @raise Invalid_argument
         if the world does not watch [s], also after an earlier [unwatch s], or
-        if [s] cannot be an event. *)
+        if [s] cannot be an event.
+      @raise Net.Error
+        if the OS gives an error, for example [ENOMEM] of [signalfd]. Then the
+        world continues to watch [s]. *)
 end
 
 module Process : sig

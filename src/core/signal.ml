@@ -31,7 +31,9 @@ let check name s =
   | _ ->
       ()
 
-let not_watched = "Signal.received: the world does not watch this signal"
+(* Raise the error of a signal that the world does not watch. *)
+let not_watched name =
+  invalid_arg (name ^ ": the world does not watch this signal")
 
 let received s =
   Event.guard (fun () ->
@@ -39,10 +41,12 @@ let received s =
       (* The world gives the form of [s] that it delivers. *)
       let s =
         match Net.submit "Signal.received" (Op.Watch s) with
-        | Ok s ->
+        | Ok (Some s) ->
             s
-        | Error _ ->
-            invalid_arg not_watched
+        | Ok None ->
+            not_watched "Signal.received"
+        | Error e ->
+            raise (Net.Error (e, "Signal.received"))
       in
       Event.Base
         (fun () ->
@@ -54,7 +58,7 @@ let received s =
                 if
                   ( !cell < 0 )
                   [@mutate off "a commit gives -1 or a count of 1 or more"]
-                then invalid_arg not_watched
+                then not_watched "Signal.received"
                 else !cell ) } ) )
 
 (* The world stops the watch first, so a signal that it reads later is not lost:
@@ -63,10 +67,12 @@ let unwatch s =
   check "Signal.unwatch" s ;
   let s =
     match Net.submit "Signal.unwatch" (Op.Unwatch s) with
-    | Ok s ->
+    | Ok (Some s) ->
         s
-    | Error _ ->
-        invalid_arg "Signal.unwatch: the world does not watch this signal"
+    | Ok None ->
+        not_watched "Signal.unwatch"
+    | Error e ->
+        raise (Net.Error (e, "Signal.unwatch"))
   in
   let n = Sched.prog "Signal.unwatch" (Sched.Unwatch_signal s) in
   if n > 0 then ignore (Net.submit "Signal.unwatch" (Op.Resend s))

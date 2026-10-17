@@ -9,11 +9,6 @@ module S = Private.Sched
 
 let run = Helpers.run
 
-(* The time since [t0], in milliseconds. *)
-let ms_since t0 =
-  Int64.to_int
-    (Int64.div (Span.to_ns (Time.diff Mono (Time.now Mono) t0)) 1_000_000L)
-
 let log = Helpers.log
 
 exception Boom of string
@@ -40,7 +35,7 @@ let sleeps_in_order () =
             (fun (name, ms) ->
               Fiber.fork s (fun () ->
                   Time.sleep Mono (Span.ms ms) ;
-                  add "%s at %d ms" name (ms_since t0) ) )
+                  add "%s at %d ms" name (Helpers.ms_since t0) ) )
             [("c", 30); ("a", 10); ("b", 20); ("a2", 10)] ) ) ;
   equal (list string)
     ["a at 10 ms"; "a2 at 10 ms"; "b at 20 ms"; "c at 30 ms"]
@@ -56,13 +51,13 @@ let choose_first_deadline () =
              ; wrap (Time.after Mono (Span.s 1)) (fun () -> "one") ] )
       in
       equal string "one" r ;
-      equal int 1000 (ms_since t0) )
+      equal int 1000 (Helpers.ms_since t0) )
 
 let negative_span_is_ready () =
   run (fun () ->
       let t0 = Time.now Mono in
       Time.sleep Mono (Span.ms (-5)) ;
-      equal int 0 (ms_since t0) )
+      equal int 0 (Helpers.ms_since t0) )
 
 let overflow_never () =
   run (fun () ->
@@ -220,7 +215,7 @@ let child_error_cancels_body () =
                   Time.sleep Mono (Span.s 1) ;
                   raise (Boom "child") ) ;
               Time.sleep Mono (Span.s 10) ) ) ;
-      equal int 1000 (ms_since t0) )
+      equal int 1000 (Helpers.ms_since t0) )
 
 let cancel_reaches_nested () =
   run (fun () ->
@@ -233,7 +228,7 @@ let cancel_reaches_nested () =
           Time.sleep Mono (Span.s 1) ;
           Fiber.cancel outer (Boom "stop") ) ;
       equal string "stop" !seen ;
-      equal int 1000 (ms_since t0) )
+      equal int 1000 (Helpers.ms_since t0) )
 
 (* The cleanup example of section 2.5: the shield lets the cleanup send its
    frame after a cancel. *)
@@ -260,7 +255,7 @@ let shield_timeout_still_works () =
           Fiber.shield (fun () ->
               Fiber.with_timeout Mono (Span.s 1) (fun () ->
                   Time.sleep Mono (Span.s 10) ) ) ) ;
-      equal int 1000 (ms_since t0) )
+      equal int 1000 (Helpers.ms_since t0) )
 
 let join_waits_for_all () =
   let add, get = log () in
@@ -295,7 +290,7 @@ let with_timeout_exact () =
       raises Fiber.Timeout (fun () ->
           Fiber.with_timeout Mono (Span.ms 250) (fun () ->
               Time.sleep Mono (Span.s 10) ) ) ;
-      equal int 250 (ms_since t0) )
+      equal int 250 (Helpers.ms_since t0) )
 
 let with_timeout_value () =
   run (fun () ->
@@ -304,7 +299,7 @@ let with_timeout_value () =
         (Fiber.with_timeout Mono (Span.s 1) (fun () ->
              Time.sleep Mono (Span.ms 10) ;
              7 ) ) ;
-      equal int 10 (ms_since t0) )
+      equal int 10 (Helpers.ms_since t0) )
 
 (* A span that makes the deadline overflow: the deadline never comes. Thus
    [with_timeout] adds no timer, and it gives the value of [f]. *)
@@ -468,7 +463,7 @@ let daemon_end_keeps_daemons () =
           Fiber.fork_daemon s (fun () ->
               try Time.sleep Mono (Span.s 10)
               with Fiber.Cancelled _ as e ->
-                add "%s at %d ms" "daemon cancelled" (ms_since t0) ;
+                add "%s at %d ms" "daemon cancelled" (Helpers.ms_since t0) ;
                 raise e ) ;
           Time.sleep Mono (Span.s 1) ) ) ;
   (* The end of the first daemon does not cancel the second one: only the end of
@@ -619,7 +614,8 @@ let ended_fibers_leave () =
           done ;
           Fiber.yield () ;
           (* Only the fiber of the body stays. *)
-          equal int 1 (Hashtbl.length (Private.scope_ctx s).S.members) ) )
+          equal int 1
+            (List.length (S.member_fibers (Private.scope_ctx s).S.members)) ) )
 
 (* The body of a scope that ended is not a member of the scope any more. *)
 let body_leaves () =
@@ -627,7 +623,8 @@ let body_leaves () =
       let sc = ref None in
       Fiber.scope (fun s -> sc := Some s) ;
       equal int 0
-        (Hashtbl.length (Private.scope_ctx (Option.get !sc)).S.members) )
+        (List.length
+           (S.member_fibers (Private.scope_ctx (Option.get !sc)).S.members) ) )
 
 (* A cancel of a scope reaches its daemons with the reason of the cancel, not
    with the end of the other members. *)
@@ -811,7 +808,7 @@ let stale_timers () =
             (fun (name, sec) ->
               Fiber.fork s (fun () ->
                   Time.sleep Mono (Span.s sec) ;
-                  add "%s at %d ms" name (ms_since t0) ) )
+                  add "%s at %d ms" name (Helpers.ms_since t0) ) )
             [("c", 300); ("a", 100); ("d", 400); ("b", 200)] ;
           (* Let the sleepers register their entries first. *)
           Fiber.yield () ;
@@ -821,7 +818,7 @@ let stale_timers () =
             sync (choose [always (); Time.after Mono (Span.ms 500)])
           done ;
           Time.sleep Mono (Span.s 1) ;
-          add "%s at %d ms" "main" (ms_since t0) ) ;
+          add "%s at %d ms" "main" (Helpers.ms_since t0) ) ;
       equal int 0 (Private.Sched_debug.live_timers (Sim.sched sim)) ) ;
   equal (list string)
     [ "main at 1000 ms"
@@ -943,7 +940,7 @@ let stale_offer_skipped () =
               Time.sleep Mono (Span.s 1) ;
               equal string "late" (sync (Chan.recv c)) ) ;
           sync (Chan.send c "late") ;
-          equal int 1000 (ms_since t0) ) )
+          equal int 1000 (Helpers.ms_since t0) ) )
 
 let cancel_in_recv () =
   run (fun () ->
@@ -1119,7 +1116,7 @@ let each_sleep_is_exact ms_list =
               (fun i ms ->
                 Fiber.fork s (fun () ->
                     Time.sleep Mono (Span.ms ms) ;
-                    r := (i, ms_since t0) :: !r ) )
+                    r := (i, Helpers.ms_since t0) :: !r ) )
               ms_list ) ;
         !r )
   in
@@ -1217,10 +1214,158 @@ let portable_world_4 =
          let d = Printf.sprintf "/tmp%d" !n in
          Dir.mkdir d ; d ) }
 
+(* The review of 2026-10-16 (design section 3.12). *)
+
+(* C1: a fiber cancels a scope inside it, and the Cancelled of that scope goes
+   out of the fiber. Nobody cancelled the scope of the fiber, thus the Cancelled
+   is a failure of that scope. *)
+let inner_cancel_fails_fork () =
+  run (fun () ->
+      match
+        Fiber.scope (fun o ->
+            Fiber.fork o (fun () ->
+                Fiber.scope (fun s ->
+                    Fiber.cancel s (Boom "inner") ;
+                    Fiber.yield () ) ) )
+      with
+      | () ->
+          failwith "the scope gave no failure"
+      | exception Fiber.Cancelled (Boom m) ->
+          equal string "inner" m )
+
+(* C1: the body of a scope raises the Cancelled of a scope inside it. The scope
+   fails, and it cancels the other fiber at once. *)
+let inner_cancel_fails_body () =
+  run (fun () ->
+      let t0 = Time.now Mono in
+      let other = ref "running" in
+      ( match
+          Fiber.scope (fun o ->
+              Fiber.fork o (fun () ->
+                  try
+                    Time.sleep Mono (Span.s 100) ;
+                    other := "ended"
+                  with Fiber.Cancelled _ as e ->
+                    other := "cancelled" ;
+                    raise e ) ;
+              Fiber.scope (fun s ->
+                  Fiber.fork s (fun () -> Fiber.cancel s (Boom "inner")) ;
+                  Time.sleep Mono (Span.s 1) ) )
+        with
+      | () ->
+          failwith "the scope gave no failure"
+      | exception Fiber.Cancelled (Boom m) ->
+          equal string "inner" m ) ;
+      equal string "cancelled" !other ;
+      equal int 0 (Helpers.ms_since t0) )
+
+(* C1: the Cancelled of a scope inside an isolated fiber goes to [on_error]. *)
+let inner_cancel_isolated () =
+  run (fun () ->
+      let errors = ref [] in
+      Fiber.scope (fun s ->
+          Fiber.fork_isolated s
+            ~on_error:(fun e _ -> errors := e :: !errors)
+            (fun () ->
+              Fiber.scope (fun inner ->
+                  Fiber.cancel inner (Boom "inner") ;
+                  Fiber.yield () ) ) ) ;
+      match !errors with
+      | [Fiber.Cancelled (Boom m)] ->
+          equal string "inner" m
+      | _ ->
+          failwith "on_error did not get one Cancelled" )
+
+(* C1: the Cancelled of a scope inside a promise is a failure of the promise,
+   not a cancel of it. *)
+let inner_cancel_promise () =
+  run (fun () ->
+      Fiber.scope (fun s ->
+          let p =
+            Fiber.fork_promise s (fun () ->
+                Fiber.scope (fun inner ->
+                    Fiber.cancel inner (Boom "inner") ;
+                    Fiber.yield () ) )
+          in
+          match Promise.await p with
+          | () ->
+              failwith "the promise gave no failure"
+          | exception Fiber.Cancelled (Boom m) ->
+              equal string "inner" m ) )
+
+(* C2: [f] runs in a finaliser, outside a fiber. It must raise
+   [Not_in_fiber]. *)
+let outside_fiber f =
+  let r = ref None in
+  let () =
+    let x = ref 1 in
+    Gc.finalise
+      (fun _ ->
+        r :=
+          Some
+            ( match f () with
+            | () ->
+                "no exception"
+            | exception Fiber.Not_in_fiber _ ->
+                "Not_in_fiber"
+            | exception e ->
+                Printexc.to_string e ) )
+      x
+  in
+  Gc.full_major () ;
+  equal (option string) (Some "Not_in_fiber") !r
+
+(* C2: a fork outside a fiber raises [Not_in_fiber] before it changes the scope.
+   Thus the scope ends. *)
+let fork_outside_fiber () =
+  run (fun () ->
+      Fiber.scope (fun s -> outside_fiber (fun () -> Fiber.fork s ignore)) ;
+      Fiber.scope (fun s ->
+          outside_fiber (fun () -> Fiber.fork_daemon s ignore) ;
+          equal int 0 (Hashtbl.length (Private.scope_ctx s).S.children) ) )
+
+(* C2: a wait outside a fiber raises [Not_in_fiber] before it adds a waiter.
+   Thus the next signal goes to a fiber that waits. *)
+let wait_outside_fiber () =
+  let c = Fiber.Condition.create () and m = Fiber.Mutex.create () in
+  raises_match
+    (function Fiber.Not_in_fiber _ -> true | _ -> false)
+    (fun () -> Fiber.Condition.wait c m) ;
+  run (fun () ->
+      let woken = ref false in
+      Fiber.scope (fun s ->
+          Fiber.fork s (fun () ->
+              Fiber.Mutex.use_rw ~protect:false m (fun () ->
+                  Fiber.Condition.wait c m ;
+                  woken := true ) ) ;
+          Fiber.yield () ;
+          Fiber.Mutex.use_ro m (fun () -> Fiber.Condition.signal c) ) ;
+      is_true !woken )
+
+let review_2026 =
+  group "review of 2026-10-16"
+    [ test "a Cancelled from an inner scope fails a fork" inner_cancel_fails_fork
+    ; test "a Cancelled from an inner scope fails the body"
+        inner_cancel_fails_body
+    ; test "a Cancelled from an inner scope goes to on_error"
+        inner_cancel_isolated
+    ; test "a Cancelled from an inner scope fails a promise"
+        inner_cancel_promise
+    ; test "a fork outside a fiber does not change the scope" fork_outside_fiber
+    ; test "a wait outside a fiber adds no waiter" wait_outside_fiber ]
+
 let () =
   exit
     (Windtrap.run "sim"
-       ( [time; timers; events; chans; scopes; reviews; checks; properties]
+       ( [ time
+         ; timers
+         ; events
+         ; chans
+         ; scopes
+         ; reviews
+         ; review_2026
+         ; checks
+         ; properties ]
        @ Test_net.tests @ Test_m1.tests @ Test_m2.tests @ Test_m3.tests
        @ Test_wakes.tests @ Test_io.tests @ Test_sync.tests
        @ Portable.tests portable_world

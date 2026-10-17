@@ -66,7 +66,6 @@ type dom =
 
 type t =
   { doms: dom array
-  ; rng: int Atomic.t
   ; pool: pool
   ; watched: Op.signal list Atomic.t
         (** The signals of [run ~signals], with no signal of an unwatch. *)
@@ -169,9 +168,8 @@ let make ~domains ~nums ~undo signals =
   if sigfd >= 0 then
     ignore (check "epoll_ctl" (epoll_add_in doms.(0).epfd sigfd signal_token)) ;
   { doms
-  ; rng= new_rng ()
   ; pool= create_pool (Array.map (fun d -> d.evfd) doms)
-  ; watched= Atomic.make (List.map (fun s -> signal_of (number_of s)) signals)
+  ; watched= Atomic.make (List.map normal signals)
   ; unwatch_lock= Mutex.create ()
   ; unblock0= Atomic.make []
   ; sigfd
@@ -210,70 +208,63 @@ let close t =
     if Option.is_some t.old_mask then Atomic.set signal_world false ;
     Array.iter close_dom t.doms )
 
-(* The end of a watch (design section 2.7). First, the signalfd does not take
-   [s] any more. Then the calling thread unblocks [s], and each later signal
-   goes to this thread with its action. A signal that is pending at this time
-   also goes to this thread, so no signal is lost. Each other thread of the
-   world blocks [s], or all signals for the pools and the watchdog. The thread
-   of a domain other than 0 can end before domain 0, for example while domain 0
-   waits for a detached job. Thus the thread of domain 0, which is the thread of
-   [run], also unblocks [s] at its next wait. *)
-let unwatch t s =
-  let s = signal_of (number_of s) in
-  Mutex.protect t.unwatch_lock (fun () ->
-      let watched = Atomic.get t.watched in
-      if not (List.mem s watched) then
-        Error (Op.Other "the world does not watch this signal")
-      else
-        let rest = List.filter (fun x -> x <> s) watched in
-        let r = signalfd t.sigfd (Array.of_list (List.map number_of rest)) in
-        if r < 0 then Error (error_of (-r))
-        else (
-          Atomic.set t.watched rest ;
-          sigmask_unblock [|number_of s|] ;
-          let rec add () =
-            let l = Atomic.get t.unblock0 in
-            if not (Atomic.compare_and_set t.unblock0 l (number_of s :: l)) then
-              add ()
-          in
-          add () ;
-          ignore (eventfd_signal t.doms.(0).evfd) ;
-          Ok s ) )
+(* The end of a watch (design section 2.7), under [unwatch_lock]. First, the
+   signalfd does not take [s] any more. Then the calling thread unblocks [s],
+   and each later signal goes to this thread with its action. A signal that is
+   pending at this time also goes to this thread, so no signal is lost.
+
+   Each other thread of the world blocks [s], or all signals for the pools and
+   the watchdog. The thread of a domain other than 0 can end before domain 0,
+   for example while domain 0 waits for a detached job. Thus the thread of
+   domain 0, which is the thread of [run], also unblocks [s] at its next
+   wait. *)
+let unwatch t s ~rest =
+  let r = signalfd t.sigfd (Array.of_list (List.map number_of rest)) in
+  if r < 0 then Error (error_of (-r))
+  else (
+    sigmask_unblock [|number_of s|] ;
+    let rec add () =
+      let l = Atomic.get t.unblock0 in
+      if not (Atomic.compare_and_set t.unblock0 l (number_of s :: l)) then
+        add ()
+    in
+    add () ;
+    ignore (eventfd_signal t.doms.(0).evfd) ;
+    Ok () )
 
 (* The calls of timerfd_settime, for the measurements. *)
 let alarm_sets = Atomic.make 0
 
-module World = struct
+module Poller = struct
   type nonrec t = t
 
-  let now _ line = now line
+  let name = "Weft_linux"
 
-  let submit : type a. t -> a Op.t -> (a, Op.error) result =
-   fun t op ->
-    match op with
-    | Op.Spawn sp ->
-        (* The world ignores only SIGPIPE: it blocks the watched signals. *)
-        spawned_of (spawn_child (spawn_args sp) [|number_of Op.SIGPIPE|])
-    | Op.Wait_child fd ->
-        status_of (wait_child fd)
-    | Op.Kill (fd, s) ->
-        unit (pidfd_kill fd (number_of s))
-    | Op.Watch s ->
-        let s = signal_of (number_of s) in
-        if List.mem s (Atomic.get t.watched) then Ok s
-        else Error (Op.Other "the world does not watch this signal")
-    | Op.Unwatch s ->
-        unwatch t s
-    | Op.Register (d, fd, token) ->
-        unit (epoll_add t.doms.(d).epfd fd token)
-    | Op.Deregister (d, fd) ->
-        unit (epoll_del t.doms.(d).epfd fd)
-    | op -> (
-      match Weft_posix.submit t.pool op with
-      | Some r ->
-          r
-      | None ->
-          assert false (* The arms above take each other operation. *) )
+  let create = create
+
+  let close = close
+
+  let pool t = t.pool
+
+  let watched t = t.watched
+
+  let unwatch_lock t = t.unwatch_lock
+
+  let unwatch = unwatch
+
+  let register t d fd token = unit (epoll_add t.doms.(d).epfd fd token)
+
+  let deregister t d fd = unit (epoll_del t.doms.(d).epfd fd)
+
+  (* The world ignores only SIGPIPE: it blocks the watched signals. *)
+  let spawn _ sp =
+    spawned_of (spawn_child (spawn_args sp) [|number_of Op.SIGPIPE|])
+
+  let wait_child _ fd = status_of (wait_child fd)
+
+  let kill _ fd s = unit (pidfd_kill fd (number_of s))
+
+  let close_fd t fd = close_op t.pool fd
 
   (* Set an alarm only when its earliest deadline changed. *)
   let target to_ns = function None -> 0L | Some x -> Int64.max 1L (to_ns x)
@@ -342,26 +333,8 @@ module World = struct
       events []
 
   let wake t ~domain = ignore (eventfd_signal t.doms.(domain).evfd)
-
-  let random t n = next t.rng mod n
-
-  let random_bytes _ b = ignore (getrandom b)
 end
 
-(* The default number of domains is a start value (open question 6). *)
-let default_domains = default_domains
-
-let watchdog_reports = watchdog_reports
-
-let pool_warnings = pool_warnings
-
-let pool_busy = pool_busy
-
-let run ?slack ?domains ?signals ?(watchdog = Some (Weft.Span.ms 10)) main =
-  let domains = match domains with Some n -> n | None -> default_domains () in
-  Weft_posix.run ~name:"Weft_linux.run"
-    (module World)
-    (create ~domains ?signals ())
-    ~close ?slack ~domains ~watchdog main
+include Weft_posix.Make (Poller)
 
 let alarm_sets () = Atomic.get alarm_sets

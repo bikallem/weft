@@ -14,7 +14,8 @@
 (*                                                                         *)
 (* Three scenarios keep the state space small. Each one runs F0 and the   *)
 (* canceller, and some of the other fibers:                                *)
-(*   "error"   G1 fails, and G2 is a daemon of S.                          *)
+(*   "error"   G1 fails, and G2 is a daemon of S. G1 raises E1 or a     *)
+(*             Cancelled.                                                  *)
 (*   "shield"  G1 runs its cleanup in a shield with a with_timeout (TT).   *)
 (*   "fork"    K forks G3 into S while S can end.                          *)
 (*   "deadline" as "shield", but with_timeout has the deadline form (M3):  *)
@@ -39,12 +40,17 @@
 (*     scopes. It does not go into a shield node. It commits the sync of a *)
 (*     member only if the context chain of that sync reaches X with no     *)
 (*     shield between them (W or P to D).                                  *)
+(*   - A cancel of X that finds the flag of X set does not walk: the first *)
+(*     walk found each sync that started before the flag, and each sync    *)
+(*     that starts after it reads the flag.                                *)
 (*   - A scope made inside a shield links under the shield node.           *)
 (*   - A new nested scope reads the flag of its parent again.              *)
 (*   - The join of a scope waits for all members, and it ignores cancels.  *)
 (*     When the body and the other members end, the scope cancels its     *)
 (*     daemons.                                                            *)
 (*   - A member that fails stores its exception before it ends.            *)
+(*   - A Cancelled of a member is not a failure only if the chain of the   *)
+(*     scope is cancelled.                                                 *)
 (*   - A fork and the end of the last member are one CAS on the scope.     *)
 (*                                                                         *)
 (* The commit protocol itself (Claimed, two-word claims) is in Commit.tla. *)
@@ -61,7 +67,10 @@ CONSTANTS
   BugNoChainCheck,    \* the walk commits any sync of a member
   BugExnAfterEnd,     \* a failed member ends before it stores its exception
   BugNoFlagCheck,     \* a sync parks without a read of the flags
-  SimpNoChildFlags    \* a simplification: the walk sets only the flag of x
+  BugAnyCancelled,    \* a scope ignores each Cancelled of a member
+  SimpNoChildFlags,   \* a simplification: the walk sets only the flag of x
+  SimpWalkAgain,      \* the form before the review of 2026-10-16: each cancel walks
+  BugSkipOnChain      \* a cancel of x does not walk if a flag on the chain of x is set
 
 Fibers == {"F0", "G1", "G2", "G3", "K", "TT"}
 Nodes  == {"R", "S", "D2", "H", "T"}
@@ -124,8 +133,13 @@ procedure walk(x)
 variables wt = {}, wf = {}, fx = "none";
 {
 w1:
-  cancelled[x] := TRUE;
-  wt := {x};
+  \* The flag of x is set: the first cancel of x walks, and the others end.
+  if ((~SimpWalkAgain /\ cancelled[x]) \/ (BugSkipOnChain /\ FirstFlag(x) # "none")) {
+    return;
+  } else {
+    cancelled[x] := TRUE;
+    wt := {x};
+  };
 w2:
   \* One node at a time, under the lock of that node: take its members, and
   \* mark and visit its nested scopes. The walk does not go into a shield.
@@ -206,6 +220,17 @@ bw:
   await "G1" \in members["S"];
   if (Scenario = "error") {
     g1Path := "error";
+b1c:
+    \* G1 raises E1 or a Cancelled. A Cancelled is not a failure only if the
+    \* chain of S is cancelled. If not, it comes from a scope inside G1 that G1
+    \* cancelled, and it is a failure as E1 is.
+    either { skip; } or {
+      if (BugAnyCancelled \/ FirstFlag("S") # "none") {
+        if (FirstFlag("S") # "none") { g1Path := "cancelled"; };
+        members["S"] := members["S"] \ {"G1"};
+        goto Done;
+      };
+    };
 b1:
     if (BugExnAfterEnd) { members["S"] := members["S"] \ {"G1"}; }
     else { exnS := IF exnS = "none" THEN "E1" ELSE exnS; };
@@ -384,11 +409,20 @@ Init == (* Global variables *)
                                         [] self = "C" -> "x0"]
 
 w1(self) == /\ pc[self] = "w1"
-            /\ cancelled' = [cancelled EXCEPT ![x[self]] = TRUE]
-            /\ wt' = [wt EXCEPT ![self] = {x[self]}]
-            /\ pc' = [pc EXCEPT ![self] = "w2"]
+            /\ IF (~SimpWalkAgain /\ cancelled[x[self]]) \/ (BugSkipOnChain /\ FirstFlag(x[self]) # "none")
+                  THEN /\ pc' = [pc EXCEPT ![self] = Head(stack[self]).pc]
+                       /\ wt' = [wt EXCEPT ![self] = Head(stack[self]).wt]
+                       /\ wf' = [wf EXCEPT ![self] = Head(stack[self]).wf]
+                       /\ fx' = [fx EXCEPT ![self] = Head(stack[self]).fx]
+                       /\ x' = [x EXCEPT ![self] = Head(stack[self]).x]
+                       /\ stack' = [stack EXCEPT ![self] = Tail(stack[self])]
+                       /\ UNCHANGED cancelled
+                  ELSE /\ cancelled' = [cancelled EXCEPT ![x[self]] = TRUE]
+                       /\ wt' = [wt EXCEPT ![self] = {x[self]}]
+                       /\ pc' = [pc EXCEPT ![self] = "w2"]
+                       /\ UNCHANGED << stack, x, wf, fx >>
             /\ UNCHANGED << linked, members, closed, exnS, rec, g1Path, g3, 
-                            sRes, tRes, toRes, hOpen, ttWord, stack, x, wf, fx >>
+                            sRes, tRes, toRes, hOpen, ttWord >>
 
 w2(self) == /\ pc[self] = "w2"
             /\ IF wt[self] # {}
@@ -586,11 +620,27 @@ bw == /\ pc["G1"] = "bw"
       /\ "G1" \in members["S"]
       /\ IF Scenario = "error"
             THEN /\ g1Path' = "error"
-                 /\ pc' = [pc EXCEPT !["G1"] = "b1"]
+                 /\ pc' = [pc EXCEPT !["G1"] = "b1c"]
             ELSE /\ g1Path' = "shield"
                  /\ pc' = [pc EXCEPT !["G1"] = "c1"]
       /\ UNCHANGED << cancelled, linked, members, closed, exnS, rec, g3, sRes, 
                       tRes, toRes, hOpen, ttWord, stack, x, wt, wf, fx >>
+
+b1c == /\ pc["G1"] = "b1c"
+       /\ \/ /\ TRUE
+             /\ pc' = [pc EXCEPT !["G1"] = "b1"]
+             /\ UNCHANGED <<members, g1Path>>
+          \/ /\ IF BugAnyCancelled \/ FirstFlag("S") # "none"
+                   THEN /\ IF FirstFlag("S") # "none"
+                              THEN /\ g1Path' = "cancelled"
+                              ELSE /\ TRUE
+                                   /\ UNCHANGED g1Path
+                        /\ members' = [members EXCEPT !["S"] = members["S"] \ {"G1"}]
+                        /\ pc' = [pc EXCEPT !["G1"] = "Done"]
+                   ELSE /\ pc' = [pc EXCEPT !["G1"] = "b1"]
+                        /\ UNCHANGED << members, g1Path >>
+       /\ UNCHANGED << cancelled, linked, closed, exnS, rec, g3, sRes, tRes, 
+                       toRes, hOpen, ttWord, stack, x, wt, wf, fx >>
 
 b1 == /\ pc["G1"] = "b1"
       /\ IF BugExnAfterEnd
@@ -749,8 +799,8 @@ c12 == /\ pc["G1"] = "c12"
        /\ UNCHANGED << cancelled, linked, closed, exnS, rec, g1Path, g3, sRes, 
                        tRes, toRes, hOpen, ttWord, stack, x, wt, wf, fx >>
 
-g1 == b0 \/ bw \/ b1 \/ b2 \/ b3 \/ c1 \/ c2 \/ c3 \/ c4 \/ c4p \/ c5 \/ c6
-         \/ c7 \/ c7d \/ c8 \/ c9 \/ c10 \/ c11 \/ c12
+g1 == b0 \/ bw \/ b1c \/ b1 \/ b2 \/ b3 \/ c1 \/ c2 \/ c3 \/ c4 \/ c4p
+         \/ c5 \/ c6 \/ c7 \/ c7d \/ c8 \/ c9 \/ c10 \/ c11 \/ c12
 
 d0 == /\ pc["G2"] = "d0"
       /\ IF Scenario # "error"
@@ -983,7 +1033,8 @@ Termination == <>(\A self \in ProcSet: pc[self] = "Done")
 \* No fiber outlives its scope: when Fiber.scope S returns, S has no member.
 NoOrphan == sRes # "none" => (members["S"] = {} /\ members["D2"] = {})
 
-\* The exception of a failed member is never lost.
+\* The exception of a failed member is never lost. A Cancelled is a failure
+\* when the chain of S is not cancelled: then g1Path stays "error".
 ExnNotLost == (g1Path = "error" /\ exnS # "none" /\ sRes # "none") => sRes = "exn"
 ExnSeen == (g1Path = "error" /\ pc["G1"] = "Done" /\ sRes # "none") => sRes = "exn"
 
