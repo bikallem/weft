@@ -11,45 +11,11 @@ let ms_since t0 =
   Int64.to_int
     (Int64.div (Span.to_ns (Time.diff Mono (Time.now Mono) t0)) 1_000_000L)
 
-(* Read until [n] bytes or the end of the stream. *)
-let read_n c n =
-  let buf = Bytes.create n in
-  let rec loop off =
-    if off = n then off
-    else match Net.read c buf off (n - off) with 0 -> off | k -> loop (off + k)
-  in
-  let got = loop 0 in
-  Bytes.sub_string buf 0 got
+let read_n = Portable.read_n
 
-let read_all c =
-  let b = Buffer.create 64 and buf = Bytes.create 4096 in
-  let rec loop () =
-    match Net.read c buf 0 4096 with
-    | 0 ->
-        Buffer.contents b
-    | k ->
-        Buffer.add_subbytes b buf 0 k ;
-        loop ()
-  in
-  loop ()
+let read_all = Portable.drain Net.read
 
-(* An echo server: each connection sends back what it reads. *)
-let echo_server l =
-  Fiber.scope (fun s ->
-      while true do
-        let c, _ = Net.accept l in
-        Fiber.fork ~name:"echo" s (fun () ->
-            let buf = Bytes.create 1024 in
-            let rec loop () =
-              match Net.read c buf 0 1024 with
-              | 0 ->
-                  Net.close c
-              | k ->
-                  ignore (Net.write_sub c buf 0 k) ;
-                  loop ()
-            in
-            loop () )
-      done )
+let echo_server = Portable.echo_server
 
 let echo_once ?(domains = 1) seed =
   Sim.run ~seed ~domains (fun sim ->
@@ -127,12 +93,7 @@ let t200_full_head () =
           Net.write c "GET / HTTP/1.1\r\n\r\n" ;
           equal string "200" (status_of (read_all c)) ) )
 
-let error_of f =
-  match f () with
-  | _ ->
-      "no error"
-  | exception Net.Error (e, _) ->
-      Format.asprintf "%a" Private.Op.pp_error e
+let error_of = Portable.error_of
 
 let refused_before_listen () =
   Sim.run (fun sim ->
