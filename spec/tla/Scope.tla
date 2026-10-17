@@ -40,6 +40,9 @@
 (*     scopes. It does not go into a shield node. It commits the sync of a *)
 (*     member only if the context chain of that sync reaches X with no     *)
 (*     shield between them (W or P to D).                                  *)
+(*   - A cancel of X that finds the flag of X set does not walk: the first *)
+(*     walk found each sync that started before the flag, and each sync    *)
+(*     that starts after it reads the flag.                                *)
 (*   - A scope made inside a shield links under the shield node.           *)
 (*   - A new nested scope reads the flag of its parent again.              *)
 (*   - The join of a scope waits for all members, and it ignores cancels.  *)
@@ -65,7 +68,9 @@ CONSTANTS
   BugExnAfterEnd,     \* a failed member ends before it stores its exception
   BugNoFlagCheck,     \* a sync parks without a read of the flags
   BugAnyCancelled,    \* a scope ignores each Cancelled of a member
-  SimpNoChildFlags    \* a simplification: the walk sets only the flag of x
+  SimpNoChildFlags,   \* a simplification: the walk sets only the flag of x
+  SimpWalkAgain,      \* the form before the review of 2026-10-16: each cancel walks
+  BugSkipOnChain      \* a cancel of x does not walk if a flag on the chain of x is set
 
 Fibers == {"F0", "G1", "G2", "G3", "K", "TT"}
 Nodes  == {"R", "S", "D2", "H", "T"}
@@ -128,8 +133,13 @@ procedure walk(x)
 variables wt = {}, wf = {}, fx = "none";
 {
 w1:
-  cancelled[x] := TRUE;
-  wt := {x};
+  \* The flag of x is set: the first cancel of x walks, and the others end.
+  if ((~SimpWalkAgain /\ cancelled[x]) \/ (BugSkipOnChain /\ FirstFlag(x) # "none")) {
+    return;
+  } else {
+    cancelled[x] := TRUE;
+    wt := {x};
+  };
 w2:
   \* One node at a time, under the lock of that node: take its members, and
   \* mark and visit its nested scopes. The walk does not go into a shield.
@@ -399,11 +409,20 @@ Init == (* Global variables *)
                                         [] self = "C" -> "x0"]
 
 w1(self) == /\ pc[self] = "w1"
-            /\ cancelled' = [cancelled EXCEPT ![x[self]] = TRUE]
-            /\ wt' = [wt EXCEPT ![self] = {x[self]}]
-            /\ pc' = [pc EXCEPT ![self] = "w2"]
+            /\ IF (~SimpWalkAgain /\ cancelled[x[self]]) \/ (BugSkipOnChain /\ FirstFlag(x[self]) # "none")
+                  THEN /\ pc' = [pc EXCEPT ![self] = Head(stack[self]).pc]
+                       /\ wt' = [wt EXCEPT ![self] = Head(stack[self]).wt]
+                       /\ wf' = [wf EXCEPT ![self] = Head(stack[self]).wf]
+                       /\ fx' = [fx EXCEPT ![self] = Head(stack[self]).fx]
+                       /\ x' = [x EXCEPT ![self] = Head(stack[self]).x]
+                       /\ stack' = [stack EXCEPT ![self] = Tail(stack[self])]
+                       /\ UNCHANGED cancelled
+                  ELSE /\ cancelled' = [cancelled EXCEPT ![x[self]] = TRUE]
+                       /\ wt' = [wt EXCEPT ![self] = {x[self]}]
+                       /\ pc' = [pc EXCEPT ![self] = "w2"]
+                       /\ UNCHANGED << stack, x, wf, fx >>
             /\ UNCHANGED << linked, members, closed, exnS, rec, g1Path, g3, 
-                            sRes, tRes, toRes, hOpen, ttWord, stack, x, wf, fx >>
+                            sRes, tRes, toRes, hOpen, ttWord >>
 
 w2(self) == /\ pc[self] = "w2"
             /\ IF wt[self] # {}
