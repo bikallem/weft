@@ -1556,7 +1556,7 @@ let steal dom =
   let n = Array.length doms in
   let token = dom.token in
   dom.token <- false ;
-  if not (token || (n > 1 && start_search t)) then None
+  if n = 1 || not (token || start_search t) then None
   else
     let start = next_rand dom mod n in
     let rec try_ i =
