@@ -91,10 +91,15 @@ static void *watch(void *arg) {
       } else if ((b & 1) && !told[d] && t - since[d] >= w->limit_ns) {
         told[d] = 1;
         __atomic_add_fetch(&reports, 1, __ATOMIC_RELAXED);
+        /* The write can block, for example on a full pipe. A domain that
+           wakes after a park takes the mutex, so the thread releases it
+           here. Only this thread uses [last], [since] and [told]. */
+        pthread_mutex_unlock(&w->m);
         fprintf(stderr,
                 "weft: domain %d did not switch for %lld ms: a fiber computes "
                 "with no yield\n",
                 d, (long long)((t - since[d]) / 1000000));
+        pthread_mutex_lock(&w->m);
       }
     }
   }
