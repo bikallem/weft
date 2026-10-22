@@ -899,10 +899,21 @@ let watchdog_park () =
   at_most int ~than:10 checks
 
 (* After a park, the watchdog reports a stall: the first domain that wakes
-   releases the park. The fiber computes for 3 times the limit with no yield.
-   Only domain 0 runs a fiber, so the watchdog gives one report. On 1 domain,
-   only domain 0 wakes, so the test finds a release by a domain other than the
-   first. *)
+   releases the park. The fiber computes with no yield until the report comes,
+   for at most 2 s. With a fixed time of 3 times the limit, the test gave
+   failures on the macOS runners of CI: the fiber stopped before the report. The
+   probable cause is a late wake of the watchdog thread. A park that no domain
+   releases gives no report in 2 s. Only domain 0 runs a fiber, so the watchdog
+   gives one report. On 1 domain, only domain 0 wakes, so the test finds a
+   release by a domain other than the first. *)
+let busy_until_report before =
+  let t0 = Unix.gettimeofday () in
+  while
+    Weft_linux.watchdog_reports () = before && Unix.gettimeofday () -. t0 < 2.
+  do
+    ()
+  done
+
 let watchdog_after_park () =
   List.iter
     (fun domains ->
@@ -911,7 +922,7 @@ let watchdog_after_park () =
         ~watchdog:(Some (Span.ms 20))
         (fun () ->
           Time.sleep Mono (Span.ms 100) ;
-          busy_ms 60 ) ;
+          busy_until_report before ) ;
       equal int (before + 1) (Weft_linux.watchdog_reports ()) )
     [1; 2]
 
