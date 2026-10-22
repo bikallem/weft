@@ -374,6 +374,18 @@ let scopes w =
                   Fiber.yield () ;
                   Fiber.cancel outer (Boom "stop") ) ;
               equal string "stop" !seen ) )
+    ; test "check_cancel raises in a cancelled scope, and not in a shield"
+        (fun () ->
+          w.run (fun () ->
+              Fiber.check_cancel () ;
+              Fiber.scope (fun s ->
+                  Fiber.check_cancel () ;
+                  Fiber.cancel s (Boom "stop") ;
+                  Fiber.shield Fiber.check_cancel ;
+                  raises (Fiber.Cancelled (Boom "stop")) Fiber.check_cancel ;
+                  (* A scope inside the cancelled scope is cancelled too. *)
+                  Fiber.scope (fun _ ->
+                      raises (Fiber.Cancelled (Boom "stop")) Fiber.check_cancel ) ) ) )
     ; test "the cleanup in a shield runs after a cancel" (fun () ->
           let sent = ref false in
           w.run (fun () ->
@@ -2052,6 +2064,14 @@ let semaphores w =
                   equal bool false (Sem.try_acquire s) ;
                   Promise.await p ;
                   Sem.release s ) ;
+              all_free s 1 ) )
+    ; test "use raises if f released the permit of use" (fun () ->
+          w.run (fun () ->
+              let s = Sem.create 1 in
+              raises
+                (Invalid_argument
+                   "Fiber.Semaphore.release: the free permits are at the \
+                    maximum" ) (fun () -> Sem.use s (fun () -> Sem.release s) ) ;
               all_free s 1 ) )
     ; test "acquire is a cancellation point when a permit is free" (fun () ->
           w.run (fun () ->

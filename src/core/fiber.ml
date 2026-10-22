@@ -59,6 +59,8 @@ let shield = Sched.shield
 
 let yield = Event.yield
 
+let check_cancel = Sched.check_cancel
+
 module Mutex = struct
   include Locks.Mutex
 

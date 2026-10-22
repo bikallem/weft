@@ -6,7 +6,10 @@
    other N times on two channels. par D F N Each of F fibers yields N times. q8
    D 100,000 short fibers (open question 8). cpus D F R N R rounds: a fiber
    forks F fibers that each compute N steps with no yield, and joins them. It
-   gives the time for each round: the spread of work to the idle domains. *)
+   gives the time for each round: the spread of work to the idle domains. ready
+   D N The time and the allocation of N operations that do not wait (issue 37):
+   a sync of [always ()], [Semaphore.use] on a free permit, [try_acquire] and
+   [release], and [check_cancel]. *)
 
 open Weft
 module S = Private.Sched
@@ -121,6 +124,35 @@ let cpus ~domains ~fibers ~rounds n =
     (secs /. float rounds *. 1e3)
     w
 
+(* The time and the minor words of one operation, from N operations. *)
+let per_op n name f =
+  let w0 = Gc.minor_words () and t0 = now_s () in
+  for _ = 1 to n do
+    f ()
+  done ;
+  let secs = now_s () -. t0 and words = Gc.minor_words () -. w0 in
+  Printf.printf "%-34s %6.1f ns %6.1f words\n%!" name
+    (secs /. float n *. 1e9)
+    (words /. float n)
+
+let ready ~domains n =
+  ignore
+    (run ~domains (fun () ->
+         let sem = Fiber.Semaphore.create 1 in
+         let ops =
+           [ ("sync (always ())", fun () -> sync (always ()))
+           ; ("Semaphore.use", fun () -> Fiber.Semaphore.use sem ignore)
+           ; ( "Semaphore.try_acquire and release"
+             , fun () ->
+                 ignore (Fiber.Semaphore.try_acquire sem) ;
+                 Fiber.Semaphore.release sem )
+           ; ("check_cancel", S.check_cancel) ]
+         in
+         (* A first pass warms the caches and the minor heap. *)
+         List.iter (fun (name, f) -> per_op (n / 10) name f) ops ;
+         print_endline "--" ;
+         List.iter (fun (name, f) -> per_op n name f) ops ) )
+
 let () =
   let i = int_of_string in
   match List.tl (Array.to_list Sys.argv) with
@@ -134,6 +166,8 @@ let () =
       q8 ~domains:(i d)
   | ["cpus"; d; f; r; n] ->
       cpus ~domains:(i d) ~fibers:(i f) ~rounds:(i r) (i n)
+  | ["ready"; d; n] ->
+      ready ~domains:(i d) (i n)
   | _ ->
       prerr_endline
         "usage: perf.exe MODE DOMAINS [ARGS] (the comment of perf.ml)" ;
