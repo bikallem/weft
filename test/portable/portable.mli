@@ -46,6 +46,11 @@ val unwatch_busy : world -> unit -> unit
 (** As [unwatch_modes], in the mode "busy": a SIGINT ends a process whose only
     domain computes with no switch. It is not in [tests]. *)
 
+val child_signal_actions : world -> unit -> unit
+(** The parent ignores SIGINT, and a child keeps this action. A child gets the
+    default action for SIGPIPE, which the world ignores. It is not in [tests].
+*)
+
 (**/**)
 
 val echo_server : ?reset:bool -> Weft.Net.t -> unit

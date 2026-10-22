@@ -274,6 +274,10 @@ let () =
              ; test "the pipes and the exit status of a child" child_output
              ; test "a child that exits at once" child_fast_exit
              ; test "a child stops at SIGINT" child_kill
+             ; test
+                 "a child keeps an ignored signal, and gets the default action \
+                  for SIGPIPE"
+                 (Portable.child_signal_actions (world 1))
              ; test "SIGTERM to the process is an event" sigterm
              ; test "run restores the action of a signal" signal_restored
              ; test ~timeout:60. "after Signal.unwatch, SIGINT ends the process"

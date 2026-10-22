@@ -1326,6 +1326,10 @@ let linux =
     ; test "a job that ends after the close of the world writes no fd"
         detached_after_close
     ; test "a child stops at SIGINT" child_sigint
+    ; test
+        "a child keeps an ignored signal, and gets the default action for \
+         SIGPIPE"
+        (Portable.child_signal_actions world)
     ; test "the pipes of a child" child_output
     ; test "with stdin closed, the pipe of a child can be fd 0" piped_fd_zero
     ; test "SIGTERM to the process is an event" sigterm
