@@ -2,7 +2,7 @@
 ; scheduler (perf.ml).
 
 (executables
- (names m1 m3 q6 perf)
+ (names m1 m3 q6 perf yield_io)
  (enabled_if
   (= %{system} linux))
  (libraries weft weft.linux unix runtime_events))

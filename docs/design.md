@@ -756,6 +756,19 @@ The next slot makes a hand-off fast. When F1 sends to F2 and then blocks, F2 run
 
 I changed one point from my earlier answer. A Chase-Lev deque gives the owner LIFO order, and LIFO order is not fair to old fibers. Thus the local queue is FIFO, and only the next slot is LIFO.
 
+**The cost of a yield (issue 36).** caravan measured slow accepts on a busy domain when its accept loop yielded after each accept: 515 to 1421 ms for 256 accepts, against 29 to 318 ms with a yield after each 16 accepts. A yield goes to the tail, so the fiber runs again after each other ready fiber ran one time. `bench/yield_io.exe K 2` makes K pairs of Unix sockets that send 16 bytes back and forth with no pause on one domain, and one fiber that yields in a loop. Each run of a fiber took about 3 µs:
+
+| K | Ready fibers at a yield (ring + overflow) | One round of them | Mean gap between two yields | p50 | p99 |
+|---|---|---|---|---|---|
+| 128 | 121 + 0 | 0.36 ms | 0.36 ms | 0.34 ms | 0.56 ms |
+| 256 | 243 + 0 | 0.73 ms | 0.79 ms | 0.75 ms | 1.15 ms |
+| 512 | 157 + 323 | 1.44 ms | 1.77 ms | 0.53 ms | 54.3 ms |
+| 1024 | 156 + 841 | 3.0 ms | 4.2 ms | 0.54 ms | 160.5 ms |
+
+Thus most of the cost is the FIFO order: 256 yields wait for 256 rounds of all ready fibers. With more than 256 ready fibers, the overflow queue also gives a long tail. The poll of a busy domain fills the ring each 61 switches, so the ring is never empty, and the overflow queue gets only the 61st take (step 1 that follows). A fiber that yields into a full ring then waits for each fiber before it in the overflow queue, at one fiber for each 61 takes. A fiber in the ring runs sooner. The issue guessed that the next slot delays the yield. An fd event goes to the tail (table above), and the probe has no wake from fiber to fiber. Thus the next slot is not necessary for this effect.
+
+A trial kept the order FIFO: while the overflow queue had a fiber, each push went to the overflow queue. The p99 at K = 512 went from 54 ms to 2.5 ms, but the mean gap did not change (1.76 ms), and the round trips per second went down by 9 % (K = 512) and 18 % (K = 1024), because each take then held the lock of the overflow queue. Thus the main branch keeps the rule of Go, and the doc of `Fiber.yield` tells its cost. A loop yields after a batch, as caravan does.
+
 ### The loop of one domain
 
 The pinned queue, the injection queue and the next slot come in milestone M3. Before M3, step 1 takes only from the overflow queue, and steps 3 and 4 do not try the next slots. `take_work` in `sched.ml` has the steps 1 to 4 in this order.
