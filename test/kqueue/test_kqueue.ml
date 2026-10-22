@@ -275,8 +275,8 @@ let () =
              ; test "a child that exits at once" child_fast_exit
              ; test "a child stops at SIGINT" child_kill
              ; test
-                 "a child gets the default action for a signal that the parent \
-                  ignores"
+                 "a child keeps an ignored signal, and gets the default action \
+                  for SIGPIPE"
                  (Portable.child_signal_actions (world 1))
              ; test "SIGTERM to the process is an event" sigterm
              ; test "run restores the action of a signal" signal_restored
