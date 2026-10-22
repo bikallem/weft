@@ -870,8 +870,14 @@ module Process : sig
     -> string list
     -> t
   (** [spawn prog args] starts [prog] with the arguments [args]. A [prog] with
-      no [/] is found in [PATH]. The child gets the default action for each
-      signal, and no blocked signals. Each stdio is [Inherit] by default.
+      no [/] is found in [PATH]. The child gets no blocked signals, and the
+      default action for [SIGPIPE], which the world ignores. The other signals
+      get the actions that [exec] gives: a signal with a handler gets the
+      default action, and a signal that the process ignores stays ignored, as
+      with a shell or [nohup]. The Linux world watches a signal with no handler,
+      so the child gets the action from before [run]. The kqueue world watches a
+      signal with a handler, so the child gets the default action. Each stdio is
+      [Inherit] by default.
 
       @raise Error
         with [No_entry] if the program does not exist, or [No_resources] if the

@@ -809,6 +809,21 @@ let unwatch_busy w () =
           Pipe.close out ;
           is_true (st = Process.Signaled SIGINT) ) )
 
+(* Issue 39: a signal that the parent ignores stays ignored in the child, as
+   with a shell or nohup. SIGPIPE, which the world ignores, gets its default
+   action. *)
+let child_signal_actions w () =
+  let old = Sys.signal Sys.sigint Sys.Signal_ignore in
+  Fun.protect
+    ~finally:(fun () -> Sys.set_signal Sys.sigint old)
+    (fun () ->
+      w.run (fun () ->
+          let self s =
+            Process.spawn "sh" ["-c"; "kill -" ^ s ^ " $$; exit 3"]
+          in
+          is_true (Process.wait (self "INT") = Process.Exited 3) ;
+          is_true (Process.wait (self "PIPE") = Process.Signaled SIGPIPE) ) )
+
 (* The writes of 0 bytes, as on Linux 7.1. The simulator and the Linux world run
    them. I am not sure that FreeBSD and macOS give the same results. *)
 let zero_writes w =
