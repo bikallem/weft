@@ -523,7 +523,9 @@ module Net : sig
             [Weft_sim.set_fd_limit]. *)
     | Other of string
 
-  (** The error, and the name of the function. It is [Private.Net.Error]. *)
+  (** The error, and the name of the function. It is [Private.Net.Error].
+      [Printexc.to_string] shows the name of the constructor, for example
+      [Weft.Net.Error(In_use, "Net.listen")]. *)
   exception Error of error * string
 
   val listen : ?backlog:int -> addr -> t

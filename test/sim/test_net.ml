@@ -1567,9 +1567,43 @@ let close_outside_fiber () =
   outside (fun () -> Net.reset b) ;
   is_true (Atomic.get a.Sched.rc = Sched.Open 0)
 
+(* Issue 38: an uncaught error shows the name of its constructor. *)
+let error_printer () =
+  let show e = Printexc.to_string (Net.Error (e, "Net.listen")) in
+  equal string {|Weft.Net.Error(In_use, "Net.listen")|} (show In_use) ;
+  equal string {|Weft.Net.Error(Other "ETIMEDOUT", "Net.listen")|}
+    (show (Other "ETIMEDOUT")) ;
+  equal string {|Weft.Net.Error(No_resources "EMFILE", "Net.listen")|}
+    (show (No_resources "EMFILE")) ;
+  equal string {|Weft.Net.Error(Bad_fd, "Pipe.read")|}
+    (Printexc.to_string (Pipe.Error (Bad_fd, "Pipe.read"))) ;
+  List.iter
+    (fun (e, name) -> equal string name (Private.Net.error_name e))
+    [ (Op.Would_block, "Would_block")
+    ; (Refused, "Refused")
+    ; (Reset, "Reset")
+    ; (Broken_pipe, "Broken_pipe")
+    ; (No_entry, "No_entry")
+    ; (Exists, "Exists")
+    ; (Not_dir, "Not_dir")
+    ; (Is_dir, "Is_dir")
+    ; (Not_empty, "Not_empty") ] ;
+  Sim.run (fun sim ->
+      let a = Sim.addr sim "server:7" in
+      let l = Net.listen a in
+      ( match Net.listen a with
+      | _ ->
+          failwith "no error"
+      | exception e ->
+          equal string {|Weft.Net.Error(In_use, "Net.listen")|}
+            (Printexc.to_string e) ) ;
+      Net.close l )
+
 let tests =
   [ group "net"
-      [ slow "echo: the client gets hello back, with 1000 seeds" echo_1000_seeds
+      [ test "Printexc shows the name of the constructor of an error"
+          error_printer
+      ; slow "echo: the client gets hello back, with 1000 seeds" echo_1000_seeds
       ; slow "408 after exactly 10 s, with 1000 seeds" t408_1000_seeds
       ; test "a full head gives 200" t200_full_head
       ; test "a connect before the listen gives ECONNREFUSED"

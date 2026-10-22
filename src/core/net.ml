@@ -24,6 +24,44 @@ type error = Op.error =
 
 exception Error of error * string
 
+(* The name of the constructor, as in the source text. *)
+let error_name = function
+  | Would_block ->
+      "Would_block"
+  | Bad_fd ->
+      "Bad_fd"
+  | Refused ->
+      "Refused"
+  | Reset ->
+      "Reset"
+  | Broken_pipe ->
+      "Broken_pipe"
+  | In_use ->
+      "In_use"
+  | No_entry ->
+      "No_entry"
+  | Exists ->
+      "Exists"
+  | Not_dir ->
+      "Not_dir"
+  | Is_dir ->
+      "Is_dir"
+  | Not_empty ->
+      "Not_empty"
+  | No_resources s ->
+      Printf.sprintf "No_resources %S" s
+  | Other s ->
+      Printf.sprintf "Other %S" s
+
+(* With no printer, an uncaught error shows the number of the constructor (issue
+   38). [Pipe.Error], [Process.Error], [Fs] and [Dns] use the same exception. *)
+let () =
+  Printexc.register_printer (function
+    | Error (e, name) ->
+        Some (Printf.sprintf "Weft.Net.Error(%s, %S)" (error_name e) name)
+    | _ ->
+        None )
+
 let submit name op = World.perform name (World.Submit op)
 
 (* A [submit] holds a user of the record. In [Closing] or [Closed], it gets
