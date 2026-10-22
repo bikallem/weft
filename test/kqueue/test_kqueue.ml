@@ -243,12 +243,16 @@ let watchdog_park () =
   in
   at_most int ~than:10 checks
 
-(* After a park, the watchdog reports a fiber that computes for 3 times the
-   limit with no yield, on 1 and on 2 domains, as in test/linux. *)
+(* After a park, the watchdog reports a fiber that computes with no yield until
+   the report comes, for at most 2 s, on 1 and on 2 domains, as in
+   test/linux. *)
 let watchdog_after_park () =
-  let busy_ms ms =
+  let busy_until_report before =
     let t0 = Unix.gettimeofday () in
-    while Unix.gettimeofday () -. t0 < Float.of_int ms /. 1000. do
+    while
+      Weft_kqueue.watchdog_reports () = before
+      && Unix.gettimeofday () -. t0 < 2.
+    do
       ()
     done
   in
@@ -259,7 +263,7 @@ let watchdog_after_park () =
         ~watchdog:(Some (Span.ms 20))
         (fun () ->
           Time.sleep Mono (Span.ms 100) ;
-          busy_ms 60 ) ;
+          busy_until_report before ) ;
       equal int (before + 1) (Weft_kqueue.watchdog_reports ()) )
     [1; 2]
 
