@@ -59,7 +59,11 @@ let () =
   Printexc.register_printer (function
     | Error (e, name) ->
         Some (Printf.sprintf "Weft.Net.Error(%s, %S)" (error_name e) name)
-    | _ ->
+    | (_
+       [@mutate
+         off
+           "Printexc skips a printer that raises, so a Match_failure here \
+            gives the same text as None"] ) ->
         None )
 
 let submit name op = World.perform name (World.Submit op)
