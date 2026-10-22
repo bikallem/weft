@@ -23,14 +23,6 @@ module Log = struct
   let get l = List.rev (Atomic.get l)
 end
 
-(* A failure report gives the error of a [Net.Error], not "_". *)
-let () =
-  Printexc.register_printer (function
-    | Net.Error (e, name) ->
-        Some (Format.asprintf "Net.Error (%a, %S)" Private.Op.pp_error e name)
-    | _ ->
-        None )
-
 let read_n c n =
   let buf = Bytes.create n in
   let rec loop off =
