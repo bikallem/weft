@@ -34,7 +34,7 @@ let shield_closes_after_wait () =
       is_true !slept )
 
 (* Outside a fiber, each call raises [Not_in_fiber] before it changes the lock.
-   The release of the semaphore does not change its count. *)
+   The release and the use of the semaphore do not change its count. *)
 let lock_calls_outside () =
   let t = Fiber.Semaphore.create ~max:2 1 in
   List.iter
@@ -44,7 +44,9 @@ let lock_calls_outside () =
       , fun () -> Fiber.Condition.signal (Fiber.Condition.create ()) )
     ; ( "Condition.broadcast"
       , fun () -> Fiber.Condition.broadcast (Fiber.Condition.create ()) )
-    ; ("Semaphore.release", fun () -> Fiber.Semaphore.release t) ] ;
+    ; ("Semaphore.release", fun () -> Fiber.Semaphore.release t)
+    ; ("Semaphore.use", fun () -> Fiber.Semaphore.use t ignore)
+    ; ("Fiber.check_cancel", Fiber.check_cancel) ] ;
   is_true (Fiber.Semaphore.try_acquire t) ;
   is_false (Fiber.Semaphore.try_acquire t)
 

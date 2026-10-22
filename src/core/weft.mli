@@ -175,6 +175,14 @@ module Fiber : sig
   val yield : unit -> unit
   (** Puts the fiber at the tail of the queue. It is a cancellation point. *)
 
+  val check_cancel : unit -> unit
+  (** A cancellation point with no wait. If the chain of the fiber is cancelled,
+      it raises [Cancelled e], as a [sync] does. Inside a shield, it does
+      nothing. It does not switch to another fiber, and it costs less than
+      [sync (always ())].
+
+      @raise Not_in_fiber outside a fiber. *)
+
   (** The id of a fiber (design section 2.5, The id of a fiber). Two fibers of
       one run have different ids. A fiber keeps its id when it moves to a
       different domain. *)
@@ -316,7 +324,8 @@ module Fiber : sig
 
     val use : t -> (unit -> 'a) -> 'a
     (** [use t f] acquires a permit, runs [f] and releases the permit, also if
-        [f] raises. The acquire is a cancellation point. *)
+        [f] raises. The acquire is a cancellation point, also when a permit is
+        free. A free permit needs no [sync]. *)
   end
 end
 

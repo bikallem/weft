@@ -300,13 +300,25 @@ module Semaphore = struct
     if not (try_release t) then
       invalid_arg "Fiber.Semaphore.release: the free permits are at the maximum"
 
+  (* A cancellation point, also when a permit is free, as [Mutex.lock]. A free
+     permit needs no sync (issue 37). [check_cancel] raises [Not_in_fiber]
+     outside a fiber, so the release needs no [self]. *)
   let use t f =
-    Event.sync (acquire t) ;
+    check_cancel () ;
+    if not (try_acquire t) then Event.sync (acquire t) ;
+    let release () =
+      match give t with
+      | Some resumed ->
+          enqueue resumed
+      | None ->
+          invalid_arg
+            "Fiber.Semaphore.release: the free permits are at the maximum"
+    in
     match f () with
     | v ->
-        release t ; v
+        release () ; v
     | exception e ->
         let bt = Printexc.get_raw_backtrace () in
-        release t ;
+        release () ;
         Printexc.raise_with_backtrace e bt
 end
