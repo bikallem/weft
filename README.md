@@ -1,7 +1,8 @@
 # weft
 
-Weft is a concurrency library for OCaml 5. You write direct-style code with
-fibers, and weft runs the fibers on all of the domains of the machine. The
+Weft is a structured concurrency library for OCaml 5. You write direct-style
+code with fibers, and weft runs the fibers on all of the domains of the
+machine. Each fiber is in a scope, and a scope waits for all of its fibers. The
 events of weft come from Concurrent ML, so you can combine a receive, a
 timeout and a cancel into one choice. Each call to the operating system is an
 effect. Thus the same program runs on Linux, macOS and FreeBSD, and in a

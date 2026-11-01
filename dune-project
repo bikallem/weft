@@ -15,9 +15,10 @@
 
 (package
  (name weft)
- (synopsis "Concurrency for OCaml 5 with CML events and a deterministic simulator")
+ (synopsis
+  "Structured concurrency for OCaml 5 with CML events and a deterministic simulator")
  (description
-  "Weft runs fibers on OCaml 5 domains. Its events come from Concurrent ML. All operating system calls are effects, so a simulator can run the same program with a virtual clock and network.")
+  "Weft runs fibers on OCaml 5 domains. Each fiber is in a scope, and a scope waits for all of its fibers. Its events come from Concurrent ML. All operating system calls are effects, so a simulator can run the same program with a virtual clock and network.")
  (depends
   (ocaml
    (>= 5.5))
