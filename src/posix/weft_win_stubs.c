@@ -25,6 +25,8 @@
 #include <caml/memory.h>
 #include <caml/mlvalues.h>
 
+#include "weft_posix.h"
+
 #ifndef SIO_UDP_CONNRESET
 #define SIO_UDP_CONNRESET _WSAIOW(IOC_VENDOR, 12)
 #endif
@@ -164,30 +166,13 @@ static int wsa_err(void) { return -weft_wsa_errno(WSAGetLastError()); }
 
 /* The time */
 
-static LARGE_INTEGER freq;
-static INIT_ONCE freq_once = INIT_ONCE_STATIC_INIT;
+/* The monotonic clock: QueryPerformanceCounter (weft_posix.h). */
+value weft_mono_ns(value unit) { return caml_copy_int64(weft_now_ns()); }
 
-static BOOL CALLBACK freq_fn(PINIT_ONCE o, PVOID p, PVOID *c) {
-  QueryPerformanceFrequency(&freq);
-  return TRUE;
-}
-
-/* The monotonic clock: QueryPerformanceCounter. The split of the counter
-   prevents an overflow of the product. */
-value weft_mono_ns(value unit) {
-  InitOnceExecuteOnce(&freq_once, freq_fn, NULL, NULL);
-  LARGE_INTEGER c;
-  QueryPerformanceCounter(&c);
-  int64_t f = freq.QuadPart, q = c.QuadPart / f, r = c.QuadPart % f;
-  return caml_copy_int64(q * 1000000000 + r * 1000000000 / f);
-}
-
-/* The time since 1970, from units of 100 ns since 1601. */
 value weft_posix_ns(value unit) {
   FILETIME ft;
   GetSystemTimePreciseAsFileTime(&ft);
-  int64_t t = ((int64_t)ft.dwHighDateTime << 32) | ft.dwLowDateTime;
-  return caml_copy_int64((t - 116444736000000000LL) * 100);
+  return caml_copy_int64(weft_filetime_ns(ft));
 }
 
 /* Sockets */
@@ -256,7 +241,7 @@ static SOCKET new_socket(int family, int type, int *err) {
     DWORD n;
     WSAIoctl(s, SIO_UDP_CONNRESET, &no, sizeof no, NULL, 0, &n, NULL, NULL);
   }
-  int r = weft_win_add_socket(s, type == SOCK_DGRAM);
+  int r = weft_win_add_socket(s);
   if (r < 0) {
     closesocket(s);
     *err = r;
@@ -379,7 +364,7 @@ value weft_accept(value lfd) {
     u_long one = 1;
     ioctlsocket(s, FIONBIO, &one);
     SetHandleInformation((HANDLE)s, HANDLE_FLAG_INHERIT, 0);
-    int e = weft_win_add_socket(s, 0);
+    int e = weft_win_add_socket(s);
     if (e < 0) {
       closesocket(s);
       r = e;
@@ -512,7 +497,11 @@ value weft_send(value fd, value buf, value off, value len) {
     if (e == WSAEWOULDBLOCK) weft_win_arm(s, WEFT_DIR_W);
     if (e == WSAECONNABORTED) e = WSAECONNRESET;
     if (e == WSAECONNRESET && weft_win_reset(s)) return Val_long(-EPIPE);
-    if (e == WSAENOTCONN && weft_win_is_dgram(s)) return Val_long(-EDESTADDRREQ);
+    if (e == WSAENOTCONN) {
+      int type = 0, l = sizeof type;
+      if (getsockopt(s, SOL_SOCKET, SO_TYPE, (char *)&type, &l) == 0 && type == SOCK_DGRAM)
+        return Val_long(-EDESTADDRREQ);
+    }
     return Val_long(-weft_wsa_errno(e));
   }
   return Val_long(n);
@@ -649,12 +638,14 @@ value weft_signal_numbers(value unit) {
   CAMLreturn(r);
 }
 
-/* A signal of the CRT gets its action with raise. The others have no
-   action on Windows. */
+/* The default action of an event of the console (SIGINT, SIGBREAK and
+   SIGHUP, weft_win_io.c) ends the process as the console does. Another
+   signal of the CRT gets its action with raise. The others have no action
+   on Windows. */
 value weft_resend(value sig) {
   int s = Int_val(sig);
-  if (s == SIGINT || s == SIGILL || s == SIGABRT || s == SIGFPE || s == SIGSEGV || s == SIGTERM ||
-      s == SIGBREAK)
+  if (s == SIGINT || s == SIGBREAK || s == 1) ExitProcess(0xC000013A /* STATUS_CONTROL_C_EXIT */);
+  if (s == SIGILL || s == SIGABRT || s == SIGFPE || s == SIGSEGV || s == SIGTERM)
     return Val_int(raise(s) != 0 ? -EINVAL : 0);
   return Val_int(-EINVAL);
 }

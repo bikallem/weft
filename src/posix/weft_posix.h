@@ -4,6 +4,9 @@
 #define WEFT_POSIX_H
 
 #include <pthread.h>
+#ifndef _WIN32
+#include <signal.h>
+#endif
 #include <stdint.h>
 #include <time.h>
 
@@ -66,6 +69,23 @@ static inline void weft_cond_wait_until(pthread_cond_t *c, pthread_mutex_t *m, i
 #else
   struct timespec ts = {at / 1000000000, at % 1000000000};
   pthread_cond_timedwait(c, m, &ts);
+#endif
+}
+
+/* A new thread copies the signal mask of its creator. Thus the creator
+   blocks all signals for the time of the create, and a thread of the
+   library never gets a signal of the user. Windows has no signals. */
+static inline int weft_thread_create(pthread_t *t, const pthread_attr_t *attr,
+                                     void *(*f)(void *), void *arg) {
+#ifdef _WIN32
+  return pthread_create(t, attr, f, arg);
+#else
+  sigset_t all, old;
+  sigfillset(&all);
+  pthread_sigmask(SIG_SETMASK, &all, &old);
+  int e = pthread_create(t, attr, f, arg);
+  pthread_sigmask(SIG_SETMASK, &old, NULL);
+  return e;
 #endif
 }
 

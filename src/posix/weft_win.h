@@ -23,13 +23,10 @@
 #define WEFT_DIR_R 1
 #define WEFT_DIR_W 2
 
-/* The keys of the completions on the IOCP of a domain. */
+/* The key of a wake on the IOCP of a domain: weft_win_wake, the thread
+   pools and the handler of the console. The other keys are in
+   weft_win_io.c. */
 #define WEFT_KEY_WAKE 1
-#define WEFT_KEY_EDGE 2
-#define WEFT_KEY_AFD 3
-#define WEFT_KEY_PIPE 4
-#define WEFT_KEY_PROC 5
-#define WEFT_KEY_TIMER 6
 
 /* An error of Win32 with no errno value: the base plus the code of Win32.
    weft_errname gives "WIN32_<code>" for it. */
@@ -40,6 +37,12 @@
 int weft_win_errno(DWORD e);
 int weft_wsa_errno(int e);
 
+/* The time of a FILETIME (units of 100 ns since 1601) in ns since 1970. */
+static inline int64_t weft_filetime_ns(FILETIME ft) {
+  int64_t t = ((int64_t)ft.dwHighDateTime << 32) | ft.dwLowDateTime;
+  return (t - 116444736000000000LL) * 100;
+}
+
 /* WSAStartup, one time. */
 void weft_win_init(void);
 
@@ -47,7 +50,7 @@ void weft_win_init(void);
 wchar_t *weft_wide(const char *s);
 
 /* The table of the fds: a socket of the world. */
-int weft_win_add_socket(SOCKET s, int dgram);
+int weft_win_add_socket(SOCKET s);
 
 /* After WSAEWOULDBLOCK of an operation in direction [dir]: the next edge in
    that direction goes to the domains that registered the socket. */
@@ -60,9 +63,6 @@ int weft_win_connect_error(SOCKET s);
    ECONNRESET one time, then the end of the stream to a read and EPIPE to a
    write. */
 int weft_win_reset(SOCKET s);
-
-/* 1 if the socket is a datagram socket of the table. */
-int weft_win_is_dgram(SOCKET s);
 
 /* The stubs of fds that the table knows: pipes, children and sockets. */
 int weft_win_close(intptr_t fd);

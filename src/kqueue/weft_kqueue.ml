@@ -285,31 +285,6 @@ module Poller = struct
     | None ->
         close_op t.pool fd
 
-  (* The timeout of kevent: the earliest deadline, or none. A step of the wall
-     clock does not end a wait, so a wait for a [Posix] deadline ends after 1 s
-     at most, and the scheduler examines the clock again. *)
-  let timeout_ns (w : World.Wait.t) =
-    match w.timeout with
-    | World.Wait.Poll ->
-        0L
-    | World.Wait.Sleep -> (
-        let left line d now =
-          Int64.max 0L (Int64.sub (Weft.Clock.to_ns line d) now)
-        in
-        let m = Option.map (fun d -> left Mono d (mono_ns ())) w.deadline in
-        let p =
-          Option.map
-            (fun d -> Int64.min 1_000_000_000L (left Posix d (posix_ns ())))
-            w.posix_deadline
-        in
-        match (m, p) with
-        | None, None ->
-            -1L
-        | Some x, None | None, Some x ->
-            x
-        | Some x, Some y ->
-            Int64.min x y )
-
   (* Under the lock: a close removes the child under the same lock before it
      closes [exit_w]. *)
   let exited t token =

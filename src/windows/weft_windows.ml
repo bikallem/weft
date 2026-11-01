@@ -29,7 +29,7 @@ external win_kill : int -> int = "weft_win_kill"
 
 external win_watch : nativeint -> int array -> unit = "weft_win_watch"
 
-external win_unwatch : int -> int = "weft_win_unwatch"
+external win_unwatch : int -> unit = "weft_win_unwatch"
 
 external win_unwatch_all : unit -> unit = "weft_win_unwatch_all"
 
@@ -61,7 +61,11 @@ let create ?(domains = 1) ?(signals = []) () =
     invalid_arg "Weft_windows.create: another world watches signals" ;
   match
     let w = win_create domains in
-    (w, create_pool (win_iocps w))
+    match create_pool (win_iocps w) with
+    | pool ->
+        (w, pool)
+    | exception e ->
+        win_close w ; raise e
   with
   | exception e ->
       let bt = Printexc.get_raw_backtrace () in
@@ -90,7 +94,7 @@ let close t =
 
 (* The end of a watch: the event of the console gets its default action. A count
    that domain 0 did not take stays: the scheduler sends it again. *)
-let unwatch _ s ~rest:_ = unit (win_unwatch (number_of s))
+let unwatch _ s ~rest:_ = Ok (win_unwatch (number_of s))
 
 (* The signals that came since the last take, for the wait of domain 0. *)
 let signals acc =
@@ -130,32 +134,6 @@ module Poller = struct
   let kill _ fd _ = unit (win_kill fd)
 
   let close_fd t fd = close_op t.pool fd
-
-  (* The time of the alarm, from now: the earliest deadline, or none. A step of
-     the wall clock does not end a wait, so a wait for a [Posix] deadline ends
-     after 1 s at most, and the scheduler examines the clock again, as in the
-     kqueue world. *)
-  let timeout_ns (w : World.Wait.t) =
-    match w.timeout with
-    | World.Wait.Poll ->
-        0L
-    | World.Wait.Sleep -> (
-        let left line d now =
-          Int64.max 0L (Int64.sub (Weft.Clock.to_ns line d) now)
-        in
-        let m = Option.map (fun d -> left Mono d (mono_ns ())) w.deadline in
-        let p =
-          Option.map
-            (fun d -> Int64.min 1_000_000_000L (left Posix d (posix_ns ())))
-            w.posix_deadline
-        in
-        match (m, p) with
-        | None, None ->
-            -1L
-        | Some x, None | None, Some x ->
-            x
-        | Some x, Some y ->
-            Int64.min x y )
 
   let wait t ~domain (w : World.Wait.t) =
     Array.fold_right

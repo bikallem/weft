@@ -19,7 +19,7 @@
   (language c)
   (flags
    (:standard -O2 -Wall -Wextra -Wno-unused-parameter))
-  (extra_deps weft_posix.h weft_win.h)
+  (extra_deps weft_posix.h weft_win.h weft_pool_win.h)
   (names
    weft_posix_stubs
    weft_pool

@@ -17,9 +17,6 @@
 #define _GNU_SOURCE
 #include <errno.h>
 #include <pthread.h>
-#ifndef _WIN32
-#include <signal.h>
-#endif
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -126,15 +123,7 @@ value weft_watchdog_start(value beats, value stride, value limit_ns) {
   pthread_mutex_init(&w->m, NULL);
   /* The timed wait uses the clock of the deadlines. */
   weft_cond_init(&w->c);
-#ifdef _WIN32
-  int e = pthread_create(&w->thread, NULL, watch, w);
-#else
-  sigset_t all, old;
-  sigfillset(&all);
-  pthread_sigmask(SIG_SETMASK, &all, &old);
-  int e = pthread_create(&w->thread, NULL, watch, w);
-  pthread_sigmask(SIG_SETMASK, &old, NULL);
-#endif
+  int e = weft_thread_create(&w->thread, NULL, watch, w);
   if (e != 0) {
     free(w);
     caml_failwith("weft: the watchdog thread did not start");

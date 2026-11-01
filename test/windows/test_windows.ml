@@ -98,6 +98,73 @@ let console_events () =
   (* After the run, the world takes no event. *)
   is_false (console_event 0)
 
+(* A loopback connection: the client and the accepted socket. *)
+let pair () =
+  let l = Net.listen (Net.Tcp ("127.0.0.1", 0)) in
+  let c = Net.connect (Net.local_addr l) in
+  let s, _ = Net.accept l in
+  Net.close l ; (c, s)
+
+(* The review of the Windows world: the I/O of a domain does not wait for
+   another domain. A pinned fiber computes on domain 0. A fiber on domain 1
+   reads a socket that another fiber writes, and it gets the data while domain 0
+   computes. *)
+let busy_domain_0 () =
+  Weft_windows.run ~domains:2 ~watchdog:None (fun () ->
+      let c, s = pair () in
+      let spinning = Atomic.make false and got = Atomic.make false in
+      Fiber.scope (fun sc ->
+          let during =
+            Fiber.fork_promise ~pinned:true sc (fun () ->
+                Atomic.set spinning true ;
+                let t0 = Unix.gettimeofday () in
+                while Unix.gettimeofday () -. t0 < 2. && not (Atomic.get got) do
+                  ()
+                done ;
+                Atomic.get got )
+          in
+          while not (Atomic.get spinning) do
+            Fiber.yield ()
+          done ;
+          Fiber.fork sc (fun () ->
+              Time.sleep Mono (Span.ms 20) ;
+              Net.write c "x" ) ;
+          let buf = Bytes.create 1 in
+          equal int 1 (Net.read s buf 0 1) ;
+          Atomic.set got true ;
+          is_true (Promise.await during) ) ;
+      Net.close c ;
+      Net.close s )
+
+(* The review: a second world, made and closed during a run, does not take the
+   I/O of the first world. *)
+let second_world () =
+  Weft_windows.run ~domains:1 (fun () ->
+      Weft_windows.close (Weft_windows.create ()) ;
+      let c, s = pair () in
+      Fiber.scope (fun sc ->
+          Fiber.fork sc (fun () ->
+              Time.sleep Mono (Span.ms 20) ;
+              Net.write c "x" ) ;
+          let buf = Bytes.create 1 in
+          equal int 1
+            (Fiber.with_timeout Mono (Span.s 5) (fun () -> Net.read s buf 0 1)) ) ;
+      Net.close c ;
+      Net.close s )
+
+(* The review: at the end of a run, a write to a child that does not read stops,
+   and the close of the world does not wait for it. *)
+let pending_write_at_close () =
+  let t0 = Unix.gettimeofday () in
+  Weft_windows.run ~domains:1 (fun () ->
+      let p =
+        Process.spawn ~stdin:Piped ~stdout:Null "ping" ["-n"; "5"; "127.0.0.1"]
+      in
+      let i = Option.get (Process.stdin p) in
+      Pipe.write i (String.make 100_000 'x') ;
+      Pipe.close i ) ;
+  less (float 0.001) ~than:3. (Unix.gettimeofday () -. t0)
+
 let one_signal_world () =
   Weft_windows.run ~domains:1 ~signals:[SIGINT] (fun () ->
       raises
@@ -135,4 +202,10 @@ let () =
              ; test "Process.kill ends a child with the exit code 1" child_kill
              ; test "Ctrl-C and Ctrl-Break come as signals" console_events
              ; test "only one world at a time watches signals" one_signal_world
+             ; test "a busy domain 0 does not stop the I/O of domain 1"
+                 busy_domain_0
+             ; test "a second world does not take the I/O of the first"
+                 second_world
+             ; test "the close of a world stops a write to a child"
+                 pending_write_at_close
              ; test "Weft_os is the Windows world" weft_os ] ] ) )

@@ -6,7 +6,7 @@
  (enabled_if
   (= %{os_type} Win32))
  (modules test_windows)
- (libraries weft weft.windows weft.os windtrap portable))
+ (libraries weft weft.windows weft.os windtrap portable unix))
 
 (rule
  (alias runtest)
