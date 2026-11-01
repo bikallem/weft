@@ -1086,7 +1086,7 @@ On Linux, `accept` can also give a pending network error of the new connection. 
 - **The errors of Linux.** After a reset, the first operation of a socket gets `ECONNRESET`. Then a read gets the end of the stream, and a write gets `EPIPE`, as on Linux: Windows gives `WSAECONNRESET` each time. `Connect_result` uses `SO_CONNECT_TIME`, because `getpeername` gives a peer while the connect continues. A UDP socket gets no `WSAECONNRESET` from an earlier ICMP message (`SIO_UDP_CONNRESET`). Windows tries a refused connect again for about 2 s before `CONNECT_FAIL`. An option can stop these tries, but then a connect on a real network fails at its first lost SYN, so the world keeps them.
 - **The limit.** An end of a pipe stays on the I/O port of its world. Thus a pipe of one world gives `EBADF` in a later world.
 - **Tests.** `test/windows` runs the portable tests on 1 and on 4 domains, and the tests of the timers, the children, the pipes to a child, the events of the console and the watchdog. Three tests come from the review: a busy domain 0, a second world, and a write to a child at the close of a world. Each of them fails with the first version. A test calls the handler of the console directly, because a real Ctrl-C goes to each process of the console. The `windows` job of the CI runs them on `windows-latest`.
-- **Not verified:** a real Ctrl-C, the `Posix` alarm after a step of the clock, the MSVC port of OCaml, and Windows versions before Windows Server 2025 (build 26100) other than the version of the CI.
+- **Not verified:** a real Ctrl-C, the `Posix` alarm after a step of the clock, the MSVC port of OCaml, and other Windows versions: the VM and the `windows-latest` runner of the CI both have Windows Server 2025.
 
 ### Signals (M2)
 

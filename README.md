@@ -239,8 +239,8 @@ With Nix, the flake gives weft as a package (see
 - macOS or FreeBSD: the CI tests macOS 15 and FreeBSD 15.1. OpenBSD and NetBSD
   are not tested.
 - Windows: OCaml with MinGW-w64, for example from opam 2.2 or later. The CI
-  tests `windows-latest`, and the development VM has Windows Server 2025. The
-  MSVC port of OCaml is not tested. A refused connect takes about 2 s,
+  (`windows-latest`) and the development VM have Windows Server 2025. Other
+  Windows versions and the MSVC port of OCaml are not tested. A refused connect takes about 2 s,
   because Windows tries it again. `Process.kill` ends a child with the exit
   code 1, and Ctrl-C comes as `SIGINT`.
 - The core and the simulator need no OS calls. They build on each system that
