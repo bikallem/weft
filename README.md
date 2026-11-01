@@ -1,40 +1,92 @@
 # weft
 
-Weft is a concurrency library for OCaml 5. It runs fibers on OCaml domains,
-and its events come from Concurrent ML. Each operating system call is an
-effect. Thus the same program runs on Linux or in a deterministic simulator,
-with a virtual clock and an in-memory network.
+Weft is a concurrency library for OCaml 5. You write direct-style code with
+fibers, and weft runs the fibers on all of the domains of the machine. The
+events of weft come from Concurrent ML, so you can combine a receive, a
+timeout and a cancel into one choice. Each call to the operating system is an
+effect. Thus the same program runs on Linux, macOS and FreeBSD, and in a
+deterministic simulator with a virtual clock and an in-memory network.
 
-**Status:** pre-release (version 0.0.0). The API can change. The milestones
-M0 to M3 of the design are complete on Linux and in the simulator. The kqueue
-world (macOS and FreeBSD) runs the main portable tests in CI. Some of its
-facts are not verified yet (design section 2.7).
+```ocaml
+open Weft
+
+let () =
+  Weft.run (module Weft_os) (fun () ->
+      Fiber.scope (fun s ->
+          Fiber.fork s (fun () ->
+              Time.sleep Mono (Span.ms 100) ;
+              print_endline "world" ) ;
+          print_endline "hello" ) )
+```
+
+**Status:** pre-release (version 0.0.0). The API can change. Linux is the main
+platform. The CI tests macOS and FreeBSD too.
+
+## Why weft
+
+- **Direct style.** There are no monads and no callbacks. A read is
+  `Net.read c buf 0 n`, and a fiber that waits does not block its domain.
+- **Structured concurrency.** Each fiber is in a scope. A scope waits for all
+  of its fibers. If a fiber fails, the scope cancels the other fibers and
+  gives the error to the caller. No fiber stays alive after its scope ends.
+- **Events that you can combine.** `choose`, `wrap`, `guard` and `with_nack`
+  from Concurrent ML work on channels, timers, Ivars, variables, sockets,
+  signals and child processes. You do not need a special `select` for each
+  type of source.
+- **All cores.** One call starts a scheduler on each domain. An idle domain
+  takes work from a busy domain.
+- **Deterministic tests of the real code.** The simulator runs your program,
+  not a model of it. A seed gives the same order of events each time. A test
+  with a timeout of 10 s takes no real time. When a test fails, run the same
+  seed again to get the same failure.
+- **No context value to carry.** Fiber code uses the clock, the network and
+  the files directly. You do not give an environment or a capability to each
+  function. The world (the OS or the simulator) handles the effects.
+- **A small core.** The core library has no C code and does not link `unix`.
+  The worlds of the OS have their own C stubs.
+- **Strict checks of the library.** TLA+ models check the shared protocols,
+  and `dscheck` checks the lock-free code. Mutation tests make sure that the
+  tests find each change to the code.
+
+## When weft is not a good fit
+
+- You need Windows. Weft has worlds for Linux, macOS and FreeBSD only.
+- You need a stable API now. Weft is pre-release.
+- You need a large set of protocol libraries, for example HTTP or TLS. Weft
+  gives sockets, files, DNS and processes, but not these protocols.
+- You use OCaml 4 or an OCaml 5 version older than 5.5.
 
 ## Features
 
-- **Fibers and scopes.** `Fiber.scope` waits for all of its fibers. An error
-  in a fiber cancels the other fibers of its scope. `Fiber.with_timeout`,
-  `Fiber.shield` and promises are also available. Pinned fibers stay on
-  domain 0.
-- **Events from Concurrent ML.** `sync`, `choose`, `wrap`, `guard` and
-  `with_nack` work on channels, Ivars, timers and sockets.
-- **Many domains.** A domain steals work from the others, as in the Go
-  scheduler. `run ~domains:n` selects the number of domains.
-- **Locks for fiber code.** `Fiber.Mutex`, `Fiber.Condition` and
-  `Fiber.Semaphore` suspend the fiber, not the domain.
-- **I/O.** TCP, UDP and Unix sockets, pipes, files, directories, DNS, child
-  processes and signals. A C thread pool runs the operations that can block.
-- **A watchdog.** In the Linux and kqueue worlds, `run ~watchdog` writes a
-  warning to `stderr` when a fiber runs for more than the limit with no
-  switch. The default limit is 10 ms.
-- **A simulator.** `Weft_sim.run ~seed` runs the program with a virtual clock,
-  a network with latency and faults, a file system in memory, and fake
-  processes. A seed always gives the same order of events. The simulator finds
-  a deadlock, a lost wakeup and a livelock, and tells which fiber waits.
+- **Fibers:** `Fiber.scope`, `fork`, `fork_daemon`, `fork_isolated` (a server
+  connection that fails does not stop the server), promises,
+  `Fiber.with_timeout`, `Fiber.shield` and `Fiber.cancel`. A pinned fiber
+  stays on domain 0, for example for a C library that is not thread-safe.
+- **Events:** `sync`, `choose`, `wrap`, `guard`, `with_nack`, `always` and
+  `never`, on `Chan`, `Ivar`, `Var`, `Time`, `Net`, `Signal` and `Process`.
+- **Synchronization:** channels, Ivars, variables with change events, and
+  `Fiber.Mutex`, `Fiber.Condition` and `Fiber.Semaphore`. A lock suspends the
+  fiber, not the domain.
+- **Time:** a monotonic clock and a wall clock. A wall-clock timer follows a
+  step of the system clock. Near deadlines share one alarm.
+- **Network:** TCP, UDP and Unix sockets, `Dns.resolve` and `Dns.reverse`.
+- **Files and processes:** files, directories, pipes, child processes with
+  pipes, and signals as events. A pool of C threads runs the calls that can
+  block, so they do not stop a domain.
+- **Production worlds:** epoll on Linux and kqueue on macOS and FreeBSD. Each
+  domain has its own poller.
+- **A watchdog:** it writes a warning to `stderr` when a fiber runs for more
+  than 10 ms with no switch.
+- **A simulator:** a virtual clock, virtual domains, a network with latency,
+  jitter, short reads, packet loss and resets, a file system in memory, and
+  fake processes. It finds a deadlock, a lost wakeup and a livelock, and it
+  names the fibers that wait.
 
-## An example
+## Examples
 
-This echo server uses only the API of weft
+### An echo server
+
+The server code uses only the API of weft
 ([`examples/echo/echo.ml`](examples/echo/echo.ml)):
 
 ```ocaml
@@ -56,6 +108,8 @@ let handle c =
   in
   Fun.protect ~finally:(fun () -> Net.close c) loop
 
+(* Each connection is a fiber. A connection that fails does not stop the
+   server. *)
 let serve l =
   Fiber.scope (fun s ->
       while true do
@@ -66,7 +120,7 @@ let serve l =
       done )
 ```
 
-On the OS ([`examples/echo/echo_server.ml`](examples/echo/echo_server.ml)):
+Run it on the OS ([`examples/echo/echo_server.ml`](examples/echo/echo_server.ml)):
 
 ```ocaml
 let () =
@@ -74,37 +128,118 @@ let () =
       Echo.serve (Net.listen (Net.Tcp ("127.0.0.1", 7000))) )
 ```
 
-`Weft_os` (library `weft.os`) is the world of the OS that the build runs on:
-the Linux world on Linux, and the kqueue world on macOS and FreeBSD. A
-program for one OS can give that world directly, for example
-`Weft.run (module Weft_linux) main`.
+`Weft_os` is the world of the OS that the build runs on: epoll on Linux, and
+kqueue on macOS and FreeBSD. A program for one OS can give its world directly,
+for example `Weft.run (module Weft_linux) main`. `Weft.run` uses up to 4
+domains by default. Set the number with `~domains`.
 
-In the simulator ([`examples/echo/test_echo.ml`](examples/echo/test_echo.ml)),
-the same server runs for 100 seeds on 2 virtual domains. The idle timeout of
-10 s takes no real time, because the virtual clock moves to the next deadline:
+### A test of the same server in the simulator
+
+This test ([`examples/echo/test_echo.ml`](examples/echo/test_echo.ml)) runs
+the server for 100 seeds, on 2 virtual domains, with a latency of 5 ms. The
+idle timeout of 10 s takes no real time, because the virtual clock moves to
+the next deadline:
 
 ```ocaml
-Weft_sim.run ~seed ~domains:2 (fun sim ->
-    Weft_sim.set_latency sim (Span.ms 5) ;
-    let a = Weft_sim.addr sim "server:7" in
-    let l = Net.listen a in
-    Fiber.scope (fun s ->
-        Fiber.fork_daemon s (fun () -> Echo.serve l) ;
-        assert (Echo.ask a "hello" = "hello") ) )
+let () =
+  for seed = 1 to 100 do
+    Weft_sim.run ~seed ~domains:2 (fun sim ->
+        Weft_sim.set_latency sim (Span.ms 5) ;
+        let a = Weft_sim.addr sim "server:7" in
+        let l = Net.listen a in
+        Fiber.scope (fun s ->
+            Fiber.fork_daemon s (fun () -> Echo.serve l) ;
+            assert (Echo.ask a "hello" = "hello") ;
+            (* A client that sends nothing: the server closes it after 10 s. *)
+            let c = Net.connect a in
+            let t0 = Time.now Mono in
+            assert (Net.read c (Bytes.create 1) 0 1 = 0) ;
+            let waited = Span.to_ns (Time.diff Mono (Time.now Mono) t0) in
+            assert (waited >= 10_000_000_000L && waited < 10_100_000_000L) ;
+            Net.close c ) )
+  done
 ```
+
+### Events: a request or a tick
+
+`choose` waits for the first event that is ready. `wrap` gives each event a
+result of the same type:
+
+```ocaml
+open Weft
+
+(* Do each request, and write a report each second. *)
+let rec loop requests count =
+  match
+    sync
+      (choose
+         [ wrap (Chan.recv requests) (fun r -> `Request r)
+         ; wrap (Time.after Mono (Span.s 1)) (fun () -> `Tick) ] )
+  with
+  | `Request r ->
+      print_endline r ;
+      loop requests (count + 1)
+  | `Tick ->
+      Printf.printf "%d requests\n%!" count ;
+      loop requests 0
+```
+
+### Two tasks at the same time
+
+The two functions can run on different domains. If one of them fails, the
+scope cancels the other, and `both` raises the error:
+
+```ocaml
+open Weft
+
+let both f g =
+  let x = ref None in
+  let y =
+    Fiber.scope (fun s ->
+        Fiber.fork s (fun () -> x := Some (f ())) ;
+        g () )
+  in
+  (Option.get !x, y)
+```
+
+## Get weft
+
+Weft is not in the opam repository yet. Pin it from GitHub:
+
+```sh
+opam pin add weft https://github.com/bikallem/weft.git
+```
+
+Then add the libraries to your `dune` file:
+
+```dune
+(executable
+ (name main)
+ (libraries weft weft.os))
+```
+
+| Library | Contents |
+|---|---|
+| `weft` | The core: fibers, events, I/O, and `Weft.run`. |
+| `weft.os` | `Weft_os`: the world of the OS that the build runs on. |
+| `weft.linux` | `Weft_linux`: the Linux world (epoll). |
+| `weft.kqueue` | `Weft_kqueue`: the world of macOS and FreeBSD (kqueue). |
+| `weft.sim` | `Weft_sim`: the simulator. |
+| `weft.posix` | The parts that the two worlds of the OS share. |
+
+With Nix, the flake gives weft as a package (see
+[Use weft from another flake](#use-weft-from-another-flake)).
 
 ## Requirements
 
-- OCaml 5.5 or later. The CI and the tests use only OCaml 5.5, so the package
-  does not claim an older version.
-- For the Linux world: Linux 5.4 or later (pidfd), and glibc 2.39 or later
-  (`pidfd_spawnp`).
-- For the kqueue world: macOS or FreeBSD. The CI tests macOS 15 and
-  FreeBSD 15.1. OpenBSD and NetBSD are not tested.
+- OCaml 5.5 or later. The CI tests only OCaml 5.5.
+- Linux: Linux 5.4 or later, and glibc 2.39 or later.
+- macOS or FreeBSD: the CI tests macOS 15 and FreeBSD 15.1. OpenBSD and NetBSD
+  are not tested.
 - The core and the simulator need no OS calls. They build on each system that
-  OCaml 5 supports, and they do not link `unix`.
+  OCaml 5 supports.
 
-## Build and test
+## Development
 
 The development tools come from the Nix flake:
 
@@ -113,11 +248,6 @@ nix develop -c dune build
 nix develop -c dune runtest
 nix develop -c spec/tla/check.sh     # the TLA+ models of the design
 ```
-
-The libraries are `weft` (the core), `weft.sim` (the simulator),
-`weft.linux` (the Linux world), `weft.kqueue` (the world for macOS and
-FreeBSD), `weft.os` (the world of the OS that the build runs on) and
-`weft.posix` (the parts that the two worlds share).
 
 The main test suites are in `test`:
 
@@ -128,10 +258,10 @@ The main test suites are in `test`:
   tests of many domains.
 - `test/kqueue`: the kqueue world. It runs only on macOS and FreeBSD.
 
-### Mutation testing
+### Mutation tests
 
 The tests use a fork of [windtrap](https://github.com/bikallem/windtrap), and
-the flake gives it. Mutation testing changes the code of the libraries, one
+the flake gives it. A mutation test changes the code of the libraries, one
 mutant at a time. Then it makes sure that a test gives a failure for each
 mutant:
 
@@ -174,7 +304,7 @@ The VM directory is `~/.local/share/weft-freebsd-vm` (or
 5. Run `tools/freebsd-vm.sh start`. Then, in the VM, do the steps of the
    `freebsd` job of `.github/workflows/ci.yml`, and `pkg install -y rsync`.
 
-## Use weft from another flake
+### Use weft from another flake
 
 The flake gives weft as a package. To build it with the OCaml of your own
 scope:
@@ -197,8 +327,8 @@ package. The flake also has `overlays.default`, which adds weft to
 
 ## Design
 
-[`docs/design.md`](docs/design.md) gives the design, the measurements and the
-reviews of each milestone. The TLA+ models of the shared protocols are in
+[`docs/design.md`](docs/design.md) gives the design, the decisions and the
+measurements. The TLA+ models of the shared protocols are in
 [`spec/tla`](spec/tla).
 
 ## License
