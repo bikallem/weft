@@ -86,3 +86,23 @@ jobs:
             dune build
             export WINDTRAP_VERBOSE=1 WINDTRAP_TIMEOUT=120
             dune runtest --force
+
+  # Windows, with OCaml 5.5 (MinGW-w64) from opam. The steps agree with
+  # tools/windows-vm/opam.ps1.
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ocaml/setup-ocaml@v3
+        with:
+          ocaml-compiler: "5.5.0"
+      - name: Install the test tools
+        run: |
+          opam pin add -n windtrap git+https://github.com/bikallem/windtrap.git#8054b03cb7c580b3048afde86dc819c27815c7ce
+          opam pin add -n ppx_windtrap git+https://github.com/bikallem/windtrap.git#8054b03cb7c580b3048afde86dc819c27815c7ce
+          opam install dune windtrap ppx_windtrap dscheck
+      - name: Build
+        run: opam exec -- dune build
+      - name: Test
+        run: opam exec -- dune runtest --force

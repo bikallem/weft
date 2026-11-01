@@ -2,8 +2,11 @@
 ; thread, so the process can fork after a run. The test calls Unix.fork,
 ; so it is not in test/sim, where the test code must not call Unix. The
 ; guard makes sure that weft and weft.sim do not link the threads library.
+; Windows has no fork.
 
 (test
  (name sim_fork)
  (libraries weft weft.sim unix)
+ (enabled_if
+  (<> %{os_type} Win32))
  (forbidden_libraries threads.posix))

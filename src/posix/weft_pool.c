@@ -21,25 +21,34 @@
    thread for each such job, up to [limit]. Thus the live jobs keep [max]
    threads. A close of [weft_close_async] is detached from its start, and it
    does not count in the limit. If jobs wait and the pool can start no thread
-   for more than 1 s, a monitor thread writes a warning to stderr. */
+   for more than 1 s, a monitor thread writes a warning to stderr.
+
+   On Windows (design section 2.7, Windows), the pool uses the pthreads of
+   MinGW-w64, and the wake is a completion on the IOCP of the domain. A job
+   runs the calls of Win32 on a HANDLE, with the errors of POSIX. */
 
 #define _GNU_SOURCE
+#ifdef _WIN32
+#include "weft_win.h"
+#include <io.h>
+#else
 #include <arpa/inet.h>
 #include <dirent.h>
-#include <errno.h>
 #include <fcntl.h>
 #include <netdb.h>
 #include <netinet/in.h>
-#include <pthread.h>
 #include <signal.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
+#include <errno.h>
+#include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/socket.h>
-#include <sys/stat.h>
 #include <time.h>
-#include <unistd.h>
 
 #include <caml/alloc.h>
 #include <caml/fail.h>
@@ -101,7 +110,16 @@ struct job {
   size_t len;
   int64_t res;
   int err; /* 0, an errno value, or -1 for a getaddrinfo error in buf. */
+#ifdef _WIN32
+  struct {
+    int kind; /* 0 regular, 1 directory, 2 symlink, 3 other. */
+    int64_t size;
+    int perm;
+    int64_t mtime; /* In ns since 1970. */
+  } st;
+#else
   struct stat st;
+#endif
   enum { S_QUEUED, S_RUNNING, S_DONE } state;
   int detached;
 };
@@ -167,9 +185,13 @@ static void post(struct mbx *w, int dom, int64_t id) {
        empties the box. Under the lock: the close of the world cannot close
        the fd here. */
     if (b->n == 1) {
+#ifdef _WIN32
+      PostQueuedCompletionStatus((HANDLE)(intptr_t)b->evfd, 0, WEFT_KEY_WAKE, NULL);
+#else
       uint64_t one = 1;
       ssize_t r = write(b->evfd, &one, sizeof one);
       (void)r;
+#endif
     }
   }
   pthread_mutex_unlock(&b->m);
@@ -183,8 +205,17 @@ static void free_job(struct job *j) {
 }
 
 /* The cleanup of a result that nobody gets. */
+/* The close of an fd of a job: a HANDLE on Windows. */
+static void close_fd(int64_t fd) {
+#ifdef _WIN32
+  CloseHandle((HANDLE)(intptr_t)fd);
+#else
+  close((int)fd);
+#endif
+}
+
 static void drop(struct job *j) {
-  if (j->kind == J_OPEN && j->res >= 0) close((int)j->res);
+  if (j->kind == J_OPEN && j->res >= 0) close_fd(j->res);
 }
 
 /* Add [n] bytes to the result buffer. */
@@ -202,6 +233,7 @@ static int append(struct job *j, size_t *cap, const char *s, size_t n) {
   return 0;
 }
 
+#ifndef _WIN32
 static int open_flags(int64_t f) {
   int rd = f & 1, wr = f & 2;
   int fl = O_CLOEXEC | (wr ? (rd ? O_RDWR : O_WRONLY) : O_RDONLY);
@@ -211,6 +243,7 @@ static int open_flags(int64_t f) {
   if (f & 32) fl |= O_APPEND;
   return fl;
 }
+#endif
 
 static void name_error(struct job *j, int e) {
   if (e == EAI_NONAME
@@ -221,8 +254,10 @@ static void name_error(struct job *j, int e) {
     j->err = ENOENT;
   } else if (e == EAI_MEMORY) {
     j->err = ENOMEM;
+#ifdef EAI_SYSTEM
   } else if (e == EAI_SYSTEM) {
     j->err = errno;
+#endif
   } else {
     size_t cap = 0;
     const char *m = gai_strerror(e);
@@ -292,6 +327,9 @@ static void reverse(struct job *j) {
   j->res = 0;
 }
 
+#ifdef _WIN32
+#include "weft_pool_win.h"
+#else
 static void read_dir(struct job *j) {
   DIR *d = opendir(j->s1);
   if (d == NULL) {
@@ -382,6 +420,7 @@ static void run(struct job *j) {
   j->res = r;
   j->err = r < 0 ? errno : 0;
 }
+#endif
 
 
 static int start_thread(void *(*f)(void *), struct pool *p);
@@ -489,19 +528,14 @@ static void *worker(void *arg) {
   return NULL;
 }
 
-/* A new thread copies the signal mask of its creator. Thus the creator blocks
-   all signals for the time of the create. */
+/* A detached thread that blocks all signals (weft_posix.h). */
 static int start_thread(void *(*f)(void *), struct pool *p) {
-  sigset_t all, old;
   pthread_attr_t attr;
   pthread_t t;
-  sigfillset(&all);
-  pthread_sigmask(SIG_SETMASK, &all, &old);
   pthread_attr_init(&attr);
   pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
-  int ok = pthread_create(&t, &attr, f, p) == 0;
+  int ok = weft_thread_create(&t, &attr, f, p) == 0;
   pthread_attr_destroy(&attr);
-  pthread_sigmask(SIG_SETMASK, &old, NULL);
   return ok;
 }
 
@@ -529,7 +563,7 @@ static void fail_all(struct pool *p) {
     j->err = EAGAIN;
     j->state = S_DONE;
     /* A close must not leak its fd. */
-    if (j->kind == J_CLOSE) close(j->fd);
+    if (j->kind == J_CLOSE) close_fd(j->fd);
     struct mbx *w = j->mbx;
     if (w != NULL) {
       post(w, j->dom, j->id);
@@ -542,7 +576,8 @@ static void fail_all(struct pool *p) {
 
 /* After a fork, the child has no workers: it starts new ones, and it drops
    the jobs of the parent. The pool mutexes are free in the child, because the
-   fork takes them first. */
+   fork takes them first. Windows has no fork. */
+#ifndef _WIN32
 static void prepare(void) {
   pthread_mutex_lock(&file_pool.m);
   pthread_mutex_lock(&dns_pool.m);
@@ -567,6 +602,7 @@ static void child(void) {
   reset(&file_pool);
   reset(&dns_pool);
 }
+#endif
 
 static pthread_once_t once = PTHREAD_ONCE_INIT;
 
@@ -574,7 +610,11 @@ static pthread_once_t once = PTHREAD_ONCE_INIT;
 static void init(void) {
   weft_cond_init(&file_pool.mc);
   weft_cond_init(&dns_pool.mc);
+#ifdef _WIN32
+  weft_win_init();
+#else
   pthread_atfork(prepare, parent, child);
+#endif
 }
 
 static void submit(struct job *j) {
@@ -729,14 +769,22 @@ value weft_job_read(value job, value buf, value off) {
 value weft_job_stat(value job) {
   CAMLparam1(job);
   CAMLlocal1(r);
+  r = caml_alloc_tuple(4);
+#ifdef _WIN32
+  struct job *j = Job_val(job);
+  Store_field(r, 0, Val_int(j->st.kind));
+  Store_field(r, 1, Val_long(j->st.size));
+  Store_field(r, 2, Val_int(j->st.perm));
+  Store_field(r, 3, caml_copy_int64(j->st.mtime));
+#else
   struct stat *s = &Job_val(job)->st;
   int kind = S_ISREG(s->st_mode) ? 0 : S_ISDIR(s->st_mode) ? 1 : S_ISLNK(s->st_mode) ? 2 : 3;
-  r = caml_alloc_tuple(4);
   Store_field(r, 0, Val_int(kind));
   Store_field(r, 1, Val_long(s->st_size));
   Store_field(r, 2, Val_int(s->st_mode & 07777));
   Store_field(r, 3,
               caml_copy_int64((int64_t)s->st_mtim.tv_sec * 1000000000 + s->st_mtim.tv_nsec));
+#endif
   CAMLreturn(r);
 }
 

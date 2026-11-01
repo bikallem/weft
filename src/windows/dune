@@ -1,0 +1,10 @@
+; The Windows world: IOCP, AFD_POLL and overlapped pipes (design section 2.7,
+; Windows). Its C code is in weft.posix (weft_win_io.c), so it has no stubs
+; of its own and does not link unix.
+
+(library
+ (name weft_windows)
+ (public_name weft.windows)
+ (enabled_if
+  (= %{os_type} Win32))
+ (libraries weft weft.posix))

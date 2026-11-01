@@ -1,6 +1,7 @@
 ; The world of the OS that the build runs on: Weft_os is Weft_linux on Linux,
-; and Weft_kqueue on macOS and FreeBSD. A portable program uses
-; Weft.run (module Weft_os). On another system, run raises Failure.
+; Weft_kqueue on macOS and FreeBSD, and Weft_windows on Windows. A portable
+; program uses Weft.run (module Weft_os). On another system, run raises
+; Failure.
 
 (library
  (name weft_os)
@@ -12,4 +13,5 @@
    from
    (weft.linux -> weft_os.linux.ml)
    (weft.kqueue -> weft_os.kqueue.ml)
+   (weft.windows -> weft_os.windows.ml)
    (-> weft_os.none.ml))))
