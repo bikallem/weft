@@ -1072,6 +1072,16 @@ On Linux, `accept` can also give a pending network error of the new connection. 
 
 **Poll:** a fallback for systems with neither epoll nor kqueue. It uses `poll(2)`, so it has no `FD_SETSIZE` limit, as `select` has. It uses a timeout in milliseconds and not an alarm. It cannot be edge-triggered, so it simulates the flags with a level-triggered poll. It comes only if a user needs it.
 
+**Windows (not built yet):** the plan is a world `weft.windows` with one I/O completion port (IOCP) for each domain. `poll` and `ppoll` do not exist on Windows. `WSAPoll` accepts only sockets, and it is level-triggered. A spike in the VM of `tools/windows-vm.sh` (Windows Server 2025, build 26100, OCaml 5.5 with MinGW-w64) gave these results. The programs are in `tools/windows-vm/spike`.
+
+- **Sockets: `AFD_POLL`.** The IOCTL `AFD_POLL` of the driver `afd.sys` gives the readiness of a socket as a completion on the IOCP. Microsoft does not document it, but wepoll and mio use it. A poll of a ready socket completes at once, and a poll after `WSAEWOULDBLOCK` waits for the next edge. Thus it agrees with the edge rules of the simulator. A cancel, a close of the peer, a local close, an accept, a refused connect and a UDP datagram each complete a poll with the correct event. Windows tries a refused connect again for about 2 s before `CONNECT_FAIL`.
+- **One poll for each socket.** When two polls wait on one socket, only the oldest poll gets the events. The second poll misses also the next edge, until a cancel. This is true with one AFD handle and with two AFD handles on two IOCPs. Thus the Windows world cannot register a socket in each domain, as decision 8 does. It keeps at most one poll for each socket in the process, and it sends each edge to all of the domains that registered the socket. A poll that includes `SEND` completes at once on a writable socket. Thus the world asks for an event only after an operation in that direction gave `WSAEWOULDBLOCK`. mio does the same.
+- **The alarm: a high-resolution waitable timer.** `NtAssociateWaitCompletionPacket` (ntdll, from Windows 8, used by the Go runtime) connects the timer to the IOCP, as the `timerfd` is in the epoll set on Linux. With the synthetic timers of Hyper-V (QEMU `hv_synic,hv_stimer`), a 1 ms timer was 25 µs late (median) and 541 µs late (maximum), and never early. The timeout of `GetQueuedCompletionStatusEx` has only milliseconds, and it was 15 ms late on a 1 ms wait. With `timeBeginPeriod (1)`, it was about 1 ms late, and it ended up to 527 µs early. Without the synthetic timers, the high-resolution timer was 1 to 2 ms late.
+- **Child processes.** The same call connects a process handle to the IOCP. The exit of the child is a completion, and no thread waits for it.
+- **The wake.** `PostQueuedCompletionStatus` from another thread ended the wait in 20 µs (median).
+- **Domains.** OCaml 5.5 with MinGW-w64 started 4 domains (`recommended_domain_count` is 4 in the VM).
+- **Not verified:** pipes with overlapped I/O, files in a thread pool, the `Posix` alarm with an absolute timer and a step of the clock, and Ctrl-C.
+
 ### Signals (M2)
 
 **How the worlds wait on a signal:**
