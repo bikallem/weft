@@ -4,6 +4,9 @@
    O_NONBLOCK. A stub gives a value >= 0, or -errno. They build on Linux,
    macOS and FreeBSD. */
 
+/* Windows has its own version (weft_win_stubs.c and weft_win_io.c). */
+#ifndef _WIN32
+
 #define _GNU_SOURCE
 #include <arpa/inet.h>
 #include <errno.h>
@@ -520,3 +523,5 @@ value weft_signal_numbers(value unit) {
 value weft_resend(value sig) {
   return Val_int(kill(getpid(), Int_val(sig)) < 0 ? ERR : 0);
 }
+
+#endif

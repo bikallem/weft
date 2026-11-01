@@ -8,6 +8,9 @@
    each spawn uses POSIX_SPAWN_CLOEXEC_DEFAULT: the child gets only the fds 0,
    1 and 2. */
 
+/* Windows has its own version (weft_win_stubs.c and weft_win_io.c). */
+#ifndef _WIN32
+
 #define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
@@ -137,3 +140,5 @@ value weft_spawn(value args, value defaults) {
   for (int i = 0; i < 3; i++) Store_field(r, 2 + i, Val_int(ends[i]));
   CAMLreturn(r);
 }
+
+#endif

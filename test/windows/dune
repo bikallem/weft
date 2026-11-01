@@ -1,0 +1,16 @@
+; The tests of the Windows world (design section 2.7, Windows). An
+; executable and a rule, as in test/kqueue.
+
+(executable
+ (name test_windows)
+ (enabled_if
+  (= %{os_type} Win32))
+ (modules test_windows)
+ (libraries weft weft.windows weft.os windtrap portable))
+
+(rule
+ (alias runtest)
+ (enabled_if
+  (= %{os_type} Win32))
+ (action
+  (run %{exe:test_windows.exe})))

@@ -5,8 +5,8 @@ code with fibers, and weft runs the fibers on all of the domains of the
 machine. Each fiber is in a scope, and a scope waits for all of its fibers. The
 events of weft come from Concurrent ML, so you can combine a receive, a
 timeout and a cancel into one choice. Each call to the operating system is an
-effect. Thus the same program runs on Linux, macOS and FreeBSD, and in a
-deterministic simulator with a virtual clock and an in-memory network.
+effect. Thus the same program runs on Linux, macOS, FreeBSD and Windows, and
+in a deterministic simulator with a virtual clock and an in-memory network.
 
 ```ocaml
 open Weft
@@ -21,7 +21,7 @@ let () =
 ```
 
 **Status:** pre-release (version 0.0.0). The API can change. Linux is the main
-platform. The CI tests macOS and FreeBSD too.
+platform. The CI tests macOS, FreeBSD and Windows too.
 
 ## Why weft
 
@@ -51,7 +51,6 @@ platform. The CI tests macOS and FreeBSD too.
 
 ## When weft is not a good fit
 
-- You need Windows. Weft has worlds for Linux, macOS and FreeBSD only.
 - You need a stable API now. Weft is pre-release.
 - You need a large set of protocol libraries, for example HTTP or TLS. Weft
   gives sockets, files, DNS and processes, but not these protocols.
@@ -74,8 +73,8 @@ platform. The CI tests macOS and FreeBSD too.
 - **Files and processes:** files, directories, pipes, child processes with
   pipes, and signals as events. A pool of C threads runs the calls that can
   block, so they do not stop a domain.
-- **Production worlds:** epoll on Linux and kqueue on macOS and FreeBSD. Each
-  domain has its own poller.
+- **Production worlds:** epoll on Linux, kqueue on macOS and FreeBSD, and I/O
+  completion ports on Windows. Each domain has its own poller.
 - **A watchdog:** it writes a warning to `stderr` when a fiber runs for more
   than 10 ms with no switch.
 - **A simulator:** a virtual clock, virtual domains, a network with latency,
@@ -129,10 +128,11 @@ let () =
       Echo.serve (Net.listen (Net.Tcp ("127.0.0.1", 7000))) )
 ```
 
-`Weft_os` is the world of the OS that the build runs on: epoll on Linux, and
-kqueue on macOS and FreeBSD. A program for one OS can give its world directly,
-for example `Weft.run (module Weft_linux) main`. `Weft.run` uses up to 4
-domains by default. Set the number with `~domains`.
+`Weft_os` is the world of the OS that the build runs on: epoll on Linux,
+kqueue on macOS and FreeBSD, and I/O completion ports on Windows. A program
+for one OS can give its world directly, for example
+`Weft.run (module Weft_linux) main`. `Weft.run` uses up to 4 domains by
+default. Set the number with `~domains`.
 
 ### A test of the same server in the simulator
 
@@ -225,8 +225,9 @@ Then add the libraries to your `dune` file:
 | `weft.os` | `Weft_os`: the world of the OS that the build runs on. |
 | `weft.linux` | `Weft_linux`: the Linux world (epoll). |
 | `weft.kqueue` | `Weft_kqueue`: the world of macOS and FreeBSD (kqueue). |
+| `weft.windows` | `Weft_windows`: the Windows world (I/O completion ports). |
 | `weft.sim` | `Weft_sim`: the simulator. |
-| `weft.posix` | The parts that the two worlds of the OS share. |
+| `weft.posix` | The parts that the worlds of the OS share. |
 
 With Nix, the flake gives weft as a package (see
 [Use weft from another flake](#use-weft-from-another-flake)).
@@ -237,6 +238,11 @@ With Nix, the flake gives weft as a package (see
 - Linux: Linux 5.4 or later, and glibc 2.39 or later.
 - macOS or FreeBSD: the CI tests macOS 15 and FreeBSD 15.1. OpenBSD and NetBSD
   are not tested.
+- Windows: OCaml with MinGW-w64, for example from opam 2.2 or later. The CI
+  tests `windows-latest`, and the development VM has Windows Server 2025. The
+  MSVC port of OCaml is not tested. A refused connect takes about 2 s,
+  because Windows tries it again. `Process.kill` ends a child with the exit
+  code 1, and Ctrl-C comes as `SIGINT`.
 - The core and the simulator need no OS calls. They build on each system that
   OCaml 5 supports.
 
@@ -253,11 +259,12 @@ nix develop -c spec/tla/check.sh     # the TLA+ models of the design
 The main test suites are in `test`:
 
 - `test/core` and `test/sim`: the core and the simulator.
-- `test/portable`: the tests that run on each world (the simulator, Linux and
-  kqueue).
+- `test/portable`: the tests that run on each world (the simulator, Linux,
+  kqueue and Windows).
 - `test/linux` and `test/linux_md`: the Linux world. `test/linux_md` has the
   tests of many domains.
 - `test/kqueue`: the kqueue world. It runs only on macOS and FreeBSD.
+- `test/windows`: the Windows world. It runs only on Windows.
 
 ### Mutation tests
 
@@ -305,13 +312,12 @@ The VM directory is `~/.local/share/weft-freebsd-vm` (or
 5. Run `tools/freebsd-vm.sh start`. Then, in the VM, do the steps of the
    `freebsd` job of `.github/workflows/ci.yml`, and `pkg install -y rsync`.
 
-### Windows in a Windows Server VM
+### The Windows world in a Windows Server VM
 
 On a Linux host with KVM, `tools/windows-vm.sh` runs a Windows Server 2025
 VM (Server Core, with no desktop) in QEMU, with 4 CPUs and 6 GB of memory.
-Weft has no Windows world yet. The VM is for that task. At this time, the VM
-builds weft with OCaml 5.5 (MinGW-w64), and it runs the tests of the core,
-the simulator and dscheck.
+The VM builds weft with OCaml 5.5 (MinGW-w64), and it runs all of the tests
+that build on Windows, also `test/windows`.
 
 ```sh
 tools/windows-vm.sh start              # start the VM and wait for SSH

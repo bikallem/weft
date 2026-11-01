@@ -111,8 +111,8 @@ let tmp =
               b
           | None ->
               let b = Filename.temp_dir "weft-test" "" in
-              at_exit (fun () ->
-                  ignore (Sys.command ("rm -rf " ^ Filename.quote b)) ) ;
+              let rm = if Sys.win32 then "rmdir /s /q " else "rm -rf " in
+              at_exit (fun () -> ignore (Sys.command (rm ^ Filename.quote b))) ;
               base := Some b ;
               b
         in
