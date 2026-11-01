@@ -430,7 +430,7 @@ end
 let error_stops_others () =
   (* A mutation run in fork mode forks a child for each mutant, and OCaml
      refuses a fork after a domain started. The Makefile also runs this suite in
-     exec mode for the mutants of weft_core.ml. *)
+     exec mode for the mutants of weft.ml. *)
   if
     Option.is_some (Sys.getenv_opt "WINDTRAP_MUTATE")
     && Sys.getenv_opt "WINDTRAP_MUTATE_CHILDREN" <> Some "exec"
@@ -482,6 +482,28 @@ let error_of_domain_1 () =
   is_true (Atomic.get w.sleeps) ;
   is_false (Atomic.get w.stuck)
 
+(* Weft.run gives each argument to the run of the world, and gives its value.
+   The world here records the arguments and runs [main] directly. *)
+let run_gives_arguments () =
+  let seen = ref None in
+  let module Record = struct
+    let run ?slack ?domains ?signals ?watchdog main =
+      seen := Some (slack, domains, signals, watchdog) ;
+      main ()
+  end in
+  let v =
+    Weft.run ~slack:(Span.us 7) ~domains:3 ~signals:[Signal.SIGUSR1]
+      ~watchdog:None
+      (module Record)
+      (fun () -> 42)
+  in
+  equal int 42 v ;
+  match !seen with
+  | Some (Some slack, Some 3, Some [Signal.SIGUSR1], Some None) ->
+      equal int64 7_000L (Span.to_ns slack)
+  | _ ->
+      fail "Weft.run did not give the arguments"
+
 let world =
   group "Weft.run_world"
     [ test "run gives the value of main" run_gives_value
@@ -528,6 +550,7 @@ let world =
     ; test "an error of the world on domain 0 goes to the caller"
         world_error_of_domain_0
     ; test "an error of the world on domain 0 stops domain 1" error_stops_others
+    ; test "Weft.run gives the arguments to the world" run_gives_arguments
     ; test "an error of the world on domain 1 goes to the caller"
         error_of_domain_1 ]
 

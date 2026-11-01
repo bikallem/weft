@@ -53,7 +53,7 @@ LINUX_LIBS := src/linux,src/posix
 # in test/core start a domain, so the fork run of SUITES skips them. A second
 # run of test/core in exec mode tests the mutants of this file again, with
 # these tests.
-CORE_DOMAIN_FILES := src/core/weft_core.ml
+CORE_DOMAIN_FILES := src/core/weft.ml
 
 # The report of `windtrap mutants`. $(1) is the revision of the changed lines,
 # or empty for all the lines.

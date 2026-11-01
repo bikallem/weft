@@ -34,7 +34,7 @@
  (enabled_if
   (= %{system} linux))
  (modules test_linux)
- (libraries weft weft.linux windtrap portable unix))
+ (libraries weft weft.linux weft.os windtrap portable unix))
 
 (rule
  (alias runtest)

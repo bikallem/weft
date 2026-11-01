@@ -70,11 +70,14 @@ On the OS ([`examples/echo/echo_server.ml`](examples/echo/echo_server.ml)):
 
 ```ocaml
 let () =
-  Weft.run (fun () -> Echo.serve (Net.listen (Net.Tcp ("127.0.0.1", 7000))))
+  Weft.run (module Weft_os) (fun () ->
+      Echo.serve (Net.listen (Net.Tcp ("127.0.0.1", 7000))) )
 ```
 
-`Weft.run` uses the world of the OS. The build selects it: the Linux world on
-Linux, and the kqueue world on macOS and FreeBSD.
+`Weft_os` (library `weft.os`) is the world of the OS that the build runs on:
+the Linux world on Linux, and the kqueue world on macOS and FreeBSD. A
+program for one OS can give that world directly, for example
+`Weft.run (module Weft_linux) main`.
 
 In the simulator ([`examples/echo/test_echo.ml`](examples/echo/test_echo.ml)),
 the same server runs for 100 seeds on 2 virtual domains. The idle timeout of
@@ -98,9 +101,8 @@ Weft_sim.run ~seed ~domains:2 (fun sim ->
   (`pidfd_spawnp`).
 - For the kqueue world: macOS or FreeBSD. The CI tests macOS 15 and
   FreeBSD 15.1. OpenBSD and NetBSD are not tested.
-- The core (`weft.core`) and the simulator need no OS calls. They build on each
-  system that OCaml 5 supports, and they do not link `unix`. On a system with
-  no world of the OS, `weft` builds, but `Weft.run` raises `Failure`.
+- The core and the simulator need no OS calls. They build on each system that
+  OCaml 5 supports, and they do not link `unix`.
 
 ## Build and test
 
@@ -112,10 +114,10 @@ nix develop -c dune runtest
 nix develop -c spec/tla/check.sh     # the TLA+ models of the design
 ```
 
-The libraries are `weft` (the core and `Weft.run`), `weft.core` (the core
-only), `weft.sim` (the simulator), `weft.linux` (the Linux world),
-`weft.kqueue` (the world for macOS and FreeBSD) and `weft.posix` (the parts
-that the two worlds share).
+The libraries are `weft` (the core), `weft.sim` (the simulator),
+`weft.linux` (the Linux world), `weft.kqueue` (the world for macOS and
+FreeBSD), `weft.os` (the world of the OS that the build runs on) and
+`weft.posix` (the parts that the two worlds share).
 
 The main test suites are in `test`:
 

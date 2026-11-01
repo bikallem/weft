@@ -7,7 +7,9 @@ let () =
   let port =
     if Array.length Sys.argv > 1 then int_of_string Sys.argv.(1) else 7000
   in
-  Weft.run (fun () ->
+  Weft.run
+    (module Weft_os)
+    (fun () ->
       let l = Net.listen (Net.Tcp ("127.0.0.1", port)) in
       Printf.printf "echo: on 127.0.0.1:%d\n%!" port ;
       Echo.serve l )

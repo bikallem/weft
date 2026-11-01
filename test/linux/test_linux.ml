@@ -976,12 +976,14 @@ let alarm_sets () =
   equal int 1 (sets (fun () -> Time.sleep Mono (Span.ms 20))) ;
   equal int 1 (sets (fun () -> Time.sleep Posix (Span.ms 20)))
 
-(* Weft.run uses the Linux world: a sleep in it sets the alarm of the Linux
-   world. *)
-let weft_run () =
+(* Weft_os is the Linux world: a sleep in Weft.run (module Weft_os) sets the
+   alarm of the Linux world. *)
+let weft_os () =
   let n = Weft_linux.alarm_sets () in
   let v =
-    Weft.run ~domains:1 ~watchdog:None (fun () ->
+    Weft.run ~domains:1 ~watchdog:None
+      (module Weft_os)
+      (fun () ->
         Time.sleep Mono (Span.ms 1) ;
         42 )
   in
@@ -1382,7 +1384,7 @@ let linux =
     ; test "after a park, the watchdog reports a stall" watchdog_after_park
     ; test "a Posix sleep ends after its deadline" posix_sleep
     ; test "a sleep sets the alarm of its clock one time" alarm_sets
-    ; test "Weft.run uses the Linux world" weft_run
+    ; test "Weft_os is the Linux world" weft_os
     ; test "the world reads its eventfd and its timerfds after an event" drained
     ; test "a reader that never waits yields after 64 KiB" busy_reader
     ; test ~timeout:30. "A: a pinned fiber with many short sleeps ends"

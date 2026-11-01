@@ -9,7 +9,7 @@ val run :
      ?seed:int
   -> ?domains:int
   -> ?auto:bool
-  -> ?signals:Weft_core.Signal.t list
+  -> ?signals:Weft.Signal.t list
   -> ?outside_fills:bool
   -> ?livelock:int
   -> (t -> 'a)
@@ -63,23 +63,23 @@ val run :
 val settle : t -> unit
 (** [settle t] waits until the program is quiescent. *)
 
-val advance_until : t -> Weft_core.Clock.mono -> unit
+val advance_until : t -> Weft.Clock.mono -> unit
 (** [advance_until t at] moves the time one deadline at a time up to [at], and
     settles at each one. Only in manual mode.
 
     @raise Invalid_argument in auto mode, or if an advance is active. *)
 
-val addr : t -> string -> Weft_core.Net.addr
+val addr : t -> string -> Weft.Net.addr
 (** [addr t "server:80"] is the address of a name and a port in the in-memory
     network. [addr t "unix:/run/s"] is a Unix socket. As on Linux, a listen or a
     connect with a Unix path of 108 bytes or more gives
     [Weft.Net.Error (Other "ENAMETOOLONG", _)]. The limit is 104 bytes on macOS
     and FreeBSD. *)
 
-val set_latency : t -> Weft_core.Span.t -> unit
+val set_latency : t -> Weft.Span.t -> unit
 (** The latency of each packet. It is 0 by default. *)
 
-val set_posix : t -> Weft_core.Clock.posix -> unit
+val set_posix : t -> Weft.Clock.posix -> unit
 (** [set_posix t p] makes the wall clock jump to [p]. Only [Now Posix] changes.
     A [Posix] timer follows the step: it ends when the new time reaches its
     deadline, as with [TFD_TIMER_CANCEL_ON_SET] on Linux. A [Mono] timer does
@@ -91,7 +91,7 @@ val set_posix : t -> Weft_core.Clock.posix -> unit
     ends a stream before its end. A UDP datagram can come in a different order
     ([jitter]) or not at all ([udp_loss]). *)
 type net_faults =
-  { jitter: Weft_core.Span.t
+  { jitter: Weft.Span.t
         (** Each delivery takes a random delay more, from 0 to [jitter]. The
             data of a stream keeps its order. *)
   ; short_io: bool
@@ -130,7 +130,7 @@ val set_fd_limit : t -> int option -> unit
 
     @raise Invalid_argument if [n] is negative. *)
 
-val socket_pair : t -> Weft_core.Net.t * Weft_core.Net.t
+val socket_pair : t -> Weft.Net.t * Weft.Net.t
 (** [socket_pair t] gives the two sides of a TCP connection, as a connect and an
     accept give them, but with no listener. The connection is established at
     once. It has the latency and the faults of each TCP connection. [Net.reset]
@@ -145,7 +145,7 @@ val socket_pair : t -> Weft_core.Net.t * Weft_core.Net.t
       {!set_fd_limit}, or with [Other "EADDRNOTAVAIL"] if each port of the
       counter has an open client. *)
 
-val fault : t -> Weft_core.Net.t -> Weft_core.Net.error -> unit
+val fault : t -> Weft.Net.t -> Weft.Net.error -> unit
 (** [fault t s e] breaks the connection of [s] at the side of [s]. The next
     operation of [s] raises [Weft.Net.Error (e, _)] one time: the next write, or
     the next read after the data that [s] already has. This is the order of the
@@ -174,7 +174,7 @@ val fault : t -> Weft_core.Net.t -> Weft_core.Net.error -> unit
       [Other _], or if [s] is not a socket of a TCP or Unix stream connection.
     @raise Weft.Net.Error with [Bad_fd] if [s] is closed. *)
 
-val set_blocking_cost : t -> Weft_core.Span.t -> unit
+val set_blocking_cost : t -> Weft.Span.t -> unit
 (** [set_blocking_cost t limit]: each [Blocking] operation (a [File], [Dir] or
     [Dns] operation) takes a time cost from the seed, in the range 0 to [limit].
     The operation occurs at the end of its cost. With a limit of 0 (the
@@ -196,10 +196,10 @@ val set_dns : t -> string -> dns_answer -> unit
 type program
 
 val program :
-     ?runs:Weft_core.Span.t
+     ?runs:Weft.Span.t
   -> ?code:int
   -> ?output:string
-  -> ?ignores:Weft_core.Signal.t list
+  -> ?ignores:Weft.Signal.t list
   -> unit
   -> program
 (** [program ~runs ~code ~output ()] writes [output] on its stdout, and it exits
@@ -212,7 +212,7 @@ val add_program : t -> string -> (string list -> program) -> unit
 (** [add_program t name f]: [Process.spawn name args] starts [f args]. A name
     that is not in the table gives [No_entry]. *)
 
-val signal : t -> Weft_core.Signal.t -> unit
+val signal : t -> Weft.Signal.t -> unit
 (** [signal t s] sends [s] to the program. If the program watches [s], domain 0
     gets it at its next switch point. If not, for example after
     [Signal.unwatch s], [s] gets its default action at once. The action ends the
@@ -240,9 +240,9 @@ exception Unawaited of string list
 (** The program got a signal with an action that ends the process, for example
     [SIGINT] after [Signal.unwatch SIGINT]. [run] raises it at once, as the OS
     ends the process. *)
-exception Killed of Weft_core.Signal.t
+exception Killed of Weft.Signal.t
 
 (**/**)
 
 (* For the tests of the checks. *)
-val sched : t -> Weft_core.Private.Sched.t
+val sched : t -> Weft.Private.Sched.t

@@ -9,7 +9,7 @@
 (executable
  (name echo_server)
  (modules echo_server)
- (libraries echo weft))
+ (libraries echo weft weft.os))
 
 (test
  (name test_echo)

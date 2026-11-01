@@ -74,7 +74,7 @@ let handle (type w) (module W : WORLD with type t = w) (w : w) f =
 
 (* Domain 0 runs on the calling thread, and each other domain on an OCaml domain
    of its own. If a loop fails, the others stop. *)
-let run_hooked (type w) ?slack ?(domains = 1) ?on_create
+let run_world (type w) ?slack ?(domains = 1) ?on_create
     (module W : WORLD with type t = w) (w : w) main =
   let t = Sched.create ?slack ~domains () in
   Option.iter (fun f -> f t) on_create ;
@@ -134,10 +134,21 @@ let run_hooked (type w) ?slack ?(domains = 1) ?on_create
   | _ ->
       result ()
 
-let run_world ?slack ?domains m w main = run_hooked ?slack ?domains m w main
+module type OS = sig
+  val run :
+       ?slack:Span.t
+    -> ?domains:int
+    -> ?signals:Signal.t list
+    -> ?watchdog:Span.t option
+    -> (unit -> 'a)
+    -> 'a
+end
+
+let run ?slack ?domains ?signals ?watchdog (module O : OS) main =
+  O.run ?slack ?domains ?signals ?watchdog main
 
 module Private = struct
-  let run_world = run_hooked
+  let run_world = run_world
 
   let scope_ctx (s : Fiber.scope) : Sched.ctx = s
 
@@ -157,3 +168,6 @@ module Private = struct
   module Job = Job
   module Process = Process
 end
+
+(* The public run_world has no [on_create]: the scheduler is private. *)
+let run_world ?slack ?domains m w main = run_world ?slack ?domains m w main
