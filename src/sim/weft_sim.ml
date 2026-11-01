@@ -1,4 +1,4 @@
-open Weft.Private
+open Weft_core.Private
 
 (* SplitMix64: a fixed PRNG, so that a seed gives the same run with each version
    of OCaml (design section 2.8). *)
@@ -1491,8 +1491,8 @@ let start_dom d =
           | _ ->
               None ) }
 
-let now_of (type time) t (line : time Weft.Clock.line) : time =
-  Weft.Clock.of_ns line
+let now_of (type time) t (line : time Weft_core.Clock.line) : time =
+  Weft_core.Clock.of_ns line
     (match line with Mono -> t.now | Posix -> Int64.add t.posix0 t.now)
 
 (* What a [Wait] of domain [d] gets now: a wake, and the edges, alarms and
@@ -1625,8 +1625,8 @@ let quiescent t st =
   let s = sched t in
   ( match
       Sched_debug.lost s
-        ~now:(Weft.Clock.of_ns Mono t.now)
-        ~posix:(Weft.Clock.of_ns Posix (Int64.add t.posix0 t.now))
+        ~now:(Weft_core.Clock.of_ns Mono t.now)
+        ~posix:(Weft_core.Clock.of_ns Posix (Int64.add t.posix0 t.now))
       @ fd_problems t
     with
   | [] ->
@@ -1642,13 +1642,13 @@ let quiescent t st =
         | Sleeping (w, _) ->
             Option.to_list
               (Option.map
-                 (fun m -> (d, Weft.Clock.to_ns Mono m, World.Ready.Alarm))
+                 (fun m -> (d, Weft_core.Clock.to_ns Mono m, World.Ready.Alarm))
                  w.deadline )
             @ Option.to_list
                 (Option.map
                    (fun p ->
                      ( d
-                     , Int64.sub (Weft.Clock.to_ns Posix p) t.posix0
+                     , Int64.sub (Weft_core.Clock.to_ns Posix p) t.posix0
                      , World.Ready.Posix_alarm ) )
                    w.posix_deadline )
         | _ ->
@@ -1771,7 +1771,7 @@ let run ?(seed = 0) ?(domains = 1) ?(auto = true) ?(signals = [])
     ; no_progress= 0
     ; next_pid= 1000 }
   in
-  let s = Sched.create ~slack:Weft.Span.zero ~simulated:true ~domains () in
+  let s = Sched.create ~slack:Weft_core.Span.zero ~simulated:true ~domains () in
   t.sched <- Some s ;
   (* A fill from outside a fiber waits for the quiescence. The GC selects when a
      finaliser runs, so a seed gives the same run only in the same binary with
@@ -1786,8 +1786,8 @@ let run ?(seed = 0) ?(domains = 1) ?(auto = true) ?(signals = [])
   Atomic.set Sched.outside slot ;
   (* The promises of this run that failed and that no fiber awaited. *)
   let unawaited = Atomic.make [] in
-  let old_report = Atomic.get Weft.Private.promise_report in
-  Atomic.set Weft.Private.promise_report (fun run e ->
+  let old_report = Atomic.get Weft_core.Private.promise_report in
+  Atomic.set Weft_core.Private.promise_report (fun run e ->
       match run with
       | Some r when r = s.run_id ->
           Sched.push_list unawaited
@@ -1800,7 +1800,7 @@ let run ?(seed = 0) ?(domains = 1) ?(auto = true) ?(signals = [])
      never resumes a fiber of this run. *)
   let restore () =
     ignore (Atomic.compare_and_set Sched.outside slot None) ;
-    Atomic.set Weft.Private.promise_report old_report ;
+    Atomic.set Weft_core.Private.promise_report old_report ;
     Sched.Spin.with_lock s.fibers_lock (fun () ->
         Hashtbl.iter
           (fun _ (f : Sched.fiber) ->
@@ -1857,7 +1857,7 @@ let advance_until t target =
   if Option.is_some t.advance then
     invalid_arg "Sim.advance_until: an advance is already active" ;
   let id = fresh t in
-  t.advance <- Some (Weft.Clock.to_ns Mono target, id) ;
+  t.advance <- Some (Weft_core.Clock.to_ns Mono target, id) ;
   (* A cancel ends the advance. *)
   match Job.wait id with
   | () ->
@@ -1871,35 +1871,35 @@ let advance_until t target =
           () ) ;
       Printexc.raise_with_backtrace e bt
 
-let set_latency t span = t.net.latency <- Weft.Span.to_ns span
+let set_latency t span = t.net.latency <- Weft_core.Span.to_ns span
 
 (* A step of the wall clock. As TFD_TIMER_CANCEL_ON_SET does on Linux, the step
    ends the wait of each domain for its [Posix] alarm. The [Mono] line does not
    change. *)
 let set_posix t p =
-  t.posix0 <- Int64.sub (Weft.Clock.to_ns Posix p) t.now ;
+  t.posix0 <- Int64.sub (Weft_core.Clock.to_ns Posix p) t.now ;
   Array.iteri
     (fun d _ -> t.net.edges <- (d, World.Ready.Posix_alarm) :: t.net.edges)
     (sched t).doms
 
 type net_faults =
-  { jitter: Weft.Span.t
+  { jitter: Weft_core.Span.t
   ; short_io: bool
   ; extra_edges: bool
   ; udp_loss: bool
   ; resets: bool }
 
 let no_faults =
-  { jitter= Weft.Span.zero
+  { jitter= Weft_core.Span.zero
   ; short_io= false
   ; extra_edges= false
   ; udp_loss= false
   ; resets= false }
 
 let net_faults t (f : net_faults) =
-  if Int64.compare (Weft.Span.to_ns f.jitter) 0L < 0 then
+  if Int64.compare (Weft_core.Span.to_ns f.jitter) 0L < 0 then
     invalid_arg "Sim.net_faults: the jitter is negative" ;
-  t.net.jitter <- Weft.Span.to_ns f.jitter ;
+  t.net.jitter <- Weft_core.Span.to_ns f.jitter ;
   t.net.short_io <- f.short_io ;
   t.net.extra_edges <- f.extra_edges ;
   t.net.udp_loss <- f.udp_loss ;
@@ -1989,14 +1989,14 @@ let fault t (fd : Net.t) e =
           invalid_arg "Sim.fault: the fd is not a connected socket" )
 
 let set_blocking_cost t span =
-  if Int64.compare (Weft.Span.to_ns span) 0L < 0 then
+  if Int64.compare (Weft_core.Span.to_ns span) 0L < 0 then
     invalid_arg "Sim.set_blocking_cost: the span is negative" ;
-  t.blocking_cost <- Weft.Span.to_ns span
+  t.blocking_cost <- Weft_core.Span.to_ns span
 
 let set_dns t name answer = Hashtbl.replace t.dns name answer
 
 let program ?runs ?(code = 0) ?(output = "") ?(ignores = []) () =
-  { runs= Option.map Weft.Span.to_ns runs
+  { runs= Option.map Weft_core.Span.to_ns runs
   ; code
   ; output
   ; ignores= List.map normal ignores }

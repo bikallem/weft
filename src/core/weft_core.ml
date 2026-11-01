@@ -74,7 +74,7 @@ let handle (type w) (module W : WORLD with type t = w) (w : w) f =
 
 (* Domain 0 runs on the calling thread, and each other domain on an OCaml domain
    of its own. If a loop fails, the others stop. *)
-let run_world (type w) ?slack ?(domains = 1) ?on_create
+let run_hooked (type w) ?slack ?(domains = 1) ?on_create
     (module W : WORLD with type t = w) (w : w) main =
   let t = Sched.create ?slack ~domains () in
   Option.iter (fun f -> f t) on_create ;
@@ -134,10 +134,10 @@ let run_world (type w) ?slack ?(domains = 1) ?on_create
   | _ ->
       result ()
 
-let run ?slack ?domains m w main = run_world ?slack ?domains m w main
+let run_world ?slack ?domains m w main = run_hooked ?slack ?domains m w main
 
 module Private = struct
-  let run_world = run_world
+  let run_world = run_hooked
 
   let scope_ctx (s : Fiber.scope) : Sched.ctx = s
 

@@ -2,7 +2,7 @@
    wake, a signalfd and pidfds. The parts that the POSIX worlds share are in
    Weft_posix. *)
 
-open Weft.Private
+open Weft_core.Private
 open Weft_posix
 
 external epoll_create : unit -> int = "weft_epoll_create"
@@ -275,12 +275,12 @@ module Poller = struct
   let target to_ns = function None -> 0L | Some x -> Int64.max 1L (to_ns x)
 
   let arm d (w : World.Wait.t) =
-    let t = target (Weft.Clock.to_ns Mono) w.deadline in
+    let t = target (Weft_core.Clock.to_ns Mono) w.deadline in
     if not (Int64.equal t d.armed) then (
       Atomic.incr alarm_sets ;
       ignore (timerfd_set d.tfd false t) ;
       d.armed <- t ) ;
-    let p = target (Weft.Clock.to_ns Posix) w.posix_deadline in
+    let p = target (Weft_core.Clock.to_ns Posix) w.posix_deadline in
     if not (Int64.equal p d.parmed) then (
       Atomic.incr alarm_sets ;
       ignore (timerfd_set d.ptfd true p) ;

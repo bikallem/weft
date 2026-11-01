@@ -5,9 +5,9 @@
 (** The state of the world: the poller of each domain. *)
 type t
 
-module World : Weft.WORLD with type t = t
+module World : Weft_core.WORLD with type t = t
 
-val create : ?domains:int -> ?signals:Weft.Signal.t list -> unit -> t
+val create : ?domains:int -> ?signals:Weft_core.Signal.t list -> unit -> t
 (** [create ~domains ()] makes the poller of each domain, 1 by default.
 
     [~signals] (none by default) are the signals that [Signal.received] can wait
@@ -29,10 +29,10 @@ val close : t -> unit
     close does nothing. *)
 
 val run :
-     ?slack:Weft.Span.t
+     ?slack:Weft_core.Span.t
   -> ?domains:int
-  -> ?signals:Weft.Signal.t list
-  -> ?watchdog:Weft.Span.t option
+  -> ?signals:Weft_core.Signal.t list
+  -> ?watchdog:Weft_core.Span.t option
   -> (unit -> 'a)
   -> 'a
 (** [run main] runs [main] with a new kqueue world, and closes the world at the

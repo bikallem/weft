@@ -117,6 +117,8 @@ This order solves lesson 6. The scheduler runs inside the world handler. Thus a 
 
 A world is everything outside the program: the clock, the I/O, the waits, the randomness and the order in which the domains run. In production, the world is the OS (`Weft_linux`, `Weft_kqueue`). In tests, the world is the simulator (`Weft_sim`). The simulator models the OS, and it also controls the order of the domains and the randomness.
 
+A program calls `Weft.run main`. The build selects the world of the OS: `Weft_linux` on Linux, and `Weft_kqueue` on macOS and FreeBSD (decision 33, section 2.7). `Weft.run_world (module W) w main` runs a program with another world, for example a test world.
+
 In the code, the interface of a world is a module type, `WORLD`. A function makes a handler from it. You get a typed contract from the module type, and you get a plug that needs no argument in the program code from the effect.
 
 ```ocaml
@@ -150,24 +152,24 @@ module type WORLD = sig
       Production uses [getrandom] or [arc4random_buf]. *)
 end
 
-val run :
+val run_world :
   ?domains:int -> ?slack:Span.t ->
   (module WORLD with type t = 'w) -> 'w -> (unit -> 'a) -> 'a
-(** [run (module W) w main] installs the world handler and the scheduler,
+(** [run_world (module W) w main] installs the world handler and the scheduler,
     then runs [main] as the first fiber. [~domains] is in milestone M1. *)
 ```
 
 No part of the library performs `Random_bytes` at this time. The effect waits for a later user, for example the keys and TLS of decision 18, and the tests of the core and of the simulator cover it.
 
-The signals are an argument of the world, for example `Weft_linux.run ~signals` (M2). The world must block them before it starts a thread, and only the world starts the threads. `Signal.unwatch` stops the watch of one signal while the world runs, and the signal gets its action again (section 2.7, The end of a watch).
+The signals are an argument of the world, for example `Weft.run ~signals` (M2). The world must block them before it starts a thread, and only the world starts the threads. `Signal.unwatch` stops the watch of one signal while the world runs, and the signal gets its action again (section 2.7, The end of a watch).
 
-The effect constructors (`Now`, `Submit`, `Wait`, `Wake`, `Random`, `Switch`) are private. The `.mli` does not export them. Thus only `run` and `Sim.run` can handle them, and fiber code cannot catch them by accident. Fiber code calls functions such as `Time.now Mono` or `Net.read fd buf`.
+The effect constructors (`Now`, `Submit`, `Wait`, `Wake`, `Random`, `Switch`) are private. The `.mli` does not export them. Thus only `run_world` and `Sim.run` can handle them, and fiber code cannot catch them by accident. Fiber code calls functions such as `Time.now Mono` or `Net.read fd buf`.
 
 **The fd records.** The scheduler keeps one record for each open fd, and all domains share the table of records. A record holds a use count, a closed bit, a generation number and the set of domains that registered the fd (section 2.7). The first time that a fiber blocks on an fd on domain `d`, the scheduler of `d` submits `Register (d, fd, token)`. `Deregister (d, fd)` removes it. The token is an OCaml `int`: the index of the record shifted left by 32 bits, with the generation in the low bits. The world puts the token in `epoll_data` or in `udata` of kqueue. `Ready.t` gives the token back.
 
 The scheduler gives the domain index to `wait` and `wake`. A world never uses `Domain.self` or domain-local storage (DLS) to find a domain. In the simulator, all of the virtual domains run on one real domain, so DLS gives one value for all of them.
 
-The production worlds implement `WORLD`, and `run` makes the handler from the module. The simulator is not a module of type `WORLD`. It handles the same effects with its own handler, because it must keep the continuation of a virtual domain at each switch point (section 2.8). `Sim.run` installs this handler. The two give the same contract to the scheduler.
+The production worlds implement `WORLD`, and `run_world` makes the handler from the module. The simulator is not a module of type `WORLD`. It handles the same effects with its own handler, because it must keep the continuation of a virtual domain at each switch point (section 2.8). `Sim.run` installs this handler. The two give the same contract to the scheduler.
 
 A blocking OS call that has no readiness model goes through `Submit` as a `Blocking` operation. Examples are `getaddrinfo` and a read from a regular file. epoll does not accept a regular file (`epoll_ctl` gives `EPERM`). The production worlds run these operations on thread pools, or later on `io_uring`. The simulator answers them directly.
 
@@ -1064,6 +1066,8 @@ On Linux, `accept` can also give a pending network error of the new connection. 
 - Signals use a handler of the world, which counts each signal and writes the wake pipe of domain 0 (section Signals, below). Before issue 6, they used `EVFILT_SIGNAL` on domain 0, with the action `SIG_IGN`. A test of macOS and FreeBSD in CI verifies that a `SIGTERM` to the process comes as an event.
 - A child has no pidfd. Its fd is a pipe, and domain 0 watches the child with `EVFILT_PROC` (`NOTE_EXIT`). At the exit, the world writes one byte to the pipe, so the fiber that waits gets a normal read edge. If `EVFILT_PROC` refuses the child because it already exited, the world writes the pipe at once. The kernel can tell of the exit before the child is a zombie. Then a reap with `WNOHANG` finds nothing, and no second edge comes. Thus after the exit, the reap first waits for the zombie with `waitid (WNOWAIT)`, in a blocking section. The reap and a `kill` are under one lock, so a `kill` never goes to a pid that the system gave again. A test spawns 50 children that exit at once, on 2 domains. It does not show which of the two ways occurs.
 - The parts that the two POSIX worlds share are in `src/posix` (`weft.posix`): the sockets, pipes, thread pools, errors and the watchdog, with portable C. The functor `Weft_posix.Make` gives the `World` module and `run` of a world from its poller, its signals and its child processes. Its `submit` takes each operation, and `run` checks the limit of the watchdog before it makes the world. On macOS, a timed wait uses `pthread_cond_timedwait_relative_np`, because macOS has no `pthread_condattr_setclock`.
+
+**The library `weft` (decision 33).** The core is the library `weft.core` (module `Weft_core`). It has no C stubs, and the worlds depend on it. The library `weft` (module `Weft`) includes `Weft_core` and adds `run`, the `run` of the world of the OS. A `select` of dune selects the world when it builds `weft`: `weft.linux` if it is available, then `weft.kqueue`. On another system, `weft` builds, and `Weft.run` raises `Failure`. The selection occurs at compile time, because the stubs of epoll compile only on Linux and the stubs of kqueue only on macOS and FreeBSD. Thus one binary never contains the two worlds. `Weft.run` has the defaults of the worlds of the OS: `min 4 (Domain.recommended_domain_count ())` domains and a watchdog of 10 ms. `Weft.run_world` has 1 domain by default. A program of the simulator also links the stubs of the world of the OS, but it does not start them, because the worlds have no top-level effects. A program that must not link C stubs uses `weft.core` and `weft.sim` only.
 - **Not verified:** a system sleep on macOS, the combination of near timeouts by macOS, and OpenBSD and NetBSD.
 
 **Poll:** a fallback for systems with neither epoll nor kqueue. It uses `poll(2)`, so it has no `FD_SETSIZE` limit, as `select` has. It uses a timeout in milliseconds and not an alarm. It cannot be edge-triggered, so it simulates the flags with a level-triggered poll. It comes only if a user needs it.
@@ -1427,6 +1431,7 @@ Decisions 1 to 6 were made on 2026-10-09, decisions 7 to 9 on 2026-10-10, decisi
 | 30 | A check for a fiber that waits for its own end | `Fiber.self` and `Fiber.Id`, with `equal`, `compare`, `hash` and `to_int` (section 2.5, The id of a fiber). The scheduler cannot find the wait of caravan: it waits for an `Ivar`, and any fiber can fill an `Ivar`. A handler of the scope with an effect of caravan needs no new API. But each effect of the producer then goes through that handler, and a call from another fiber gets an exception. |
 | 31 | The numbers of the ids | One counter for each run, which all nodes of the run share. Thus a seed gives the same ids in the simulator, also after other runs. The id is an `int`, not the fiber record, so a kept id does not keep the scopes of the fiber alive. The ids of two runs can be equal. |
 | 32 | Fiber-local storage | Not at this time. caravan needs only the id. A request id for logs can go in an argument or in a handler of the scope. A fork that copies the values costs time at each fork, and no user needs it at this time. A later `Fiber.Local` can be a field of the fiber record, next to the id, so the id does not block it. |
+| 33 | The run of the world of the OS | `Weft.run main`, from a library `weft` that includes the core (`weft.core`) and selects the world at compile time with a `select` of dune (section 2.7, The library `weft`). The run with a world module is `Weft.run_world`. `Weft_linux.run` and `Weft_kqueue.run` stay for the functions of one world. |
 
 Also on 2026-10-10, the user accepted the milestone plan of section 2.14. Decisions 4, 7 and 8 stay, and they come in milestone M1. Milestone M0 has one domain.
 
@@ -1714,7 +1719,7 @@ The tests use windtrap from the fork `bikallem/windtrap` (decision 9). The fork 
 - `dune runtest`: all suites.
 - `dune runtest --force --instrument-with ppx_windtrap.coverage`, then `dune exec windtrap -- coverage`.
 - `WINDTRAP_MUTATE=1 dune runtest --force --instrument-with ppx_windtrap.mutate`, then `dune exec windtrap -- mutants`.
-- The Makefile has the recipes. `make mutate` tests the mutants on the lines that changed since the merge base with `origin/main` (`--mutate-since`), with one child for each CPU (`--mutate-jobs auto`). Then it runs `test/linux` and `test/linux_md` one at a time, on Linux only, and merges the verdicts of the four suites. The two Linux suites start domains, so windtrap starts each of their children as a new process (exec mode). They test only the mutants of `weft.linux` and `weft.posix`, because `test/core` and `test/sim` kill each mutant of the core that they kill. A run of `test/linux_md` on `sched.ml` took 297 s and gave no other kill. `make help` gives all the targets and variables.
+- The Makefile has the recipes. `make mutate` tests the mutants on the lines that changed since the merge base with `origin/main` (`--mutate-since`), with one child for each CPU (`--mutate-jobs auto`). Then it runs `test/core` again in exec mode, only for the mutants of `weft_core.ml` (`CORE_DOMAIN_FILES`). In this run, the tests of `run_world` on two domains do not skip, so they kill the mutants of the stop of the domains. Then it runs `test/linux` and `test/linux_md` one at a time, on Linux only, and merges the verdicts of the four suites. The two Linux suites start domains, so windtrap starts each of their children as a new process (exec mode). They test only the mutants of `weft.linux` and `weft.posix`, because `test/core` and `test/sim` kill each mutant of the core that they kill. A run of `test/linux_md` on `sched.ml` took 297 s and gave no other kill. `make help` gives all the targets and variables.
 
 **Survivors of a mutation run.** A survivor is a mutant that no test kills. These rules apply to each survivor and to each mutant that no test reaches:
 
@@ -1732,7 +1737,6 @@ The known survivors of `make mutate-all`:
 | Site | Why it survives | The test that covers it |
 |---|---|---|
 | `sched.ml`, the `flush_wake` at the start of `wait` | In the simulator, the `Mono` time moves only in a wait. `Sim.set_posix` can move the `Posix` line between two expires, but it also gives each domain an edge. Thus the next wait ends at once, and its flush wakes domain 0. I think that the simulator cannot see the mutant, but no test confirms this for `Posix`. A real clock on more than one real domain can make a pinned deadline pass here. | None at this time. |
-| `weft.ml`, `run`: the set of `finished` and the wake of the domains after an error of the world | Only more than one real domain sees the stop of the other domains. | "Weft.run › an error of the world on domain 0 stops domain 1". A mutation run skips it, because it starts a domain. |
 | `net.ml`, `reset`: the check that the caller is in a fiber | Only a close on another thread at the same time changes the state. | None. A test of this race is not deterministic. |
 | `pipe.ml`, `read` and `write`: the check of the direction of the end | Linux and the simulator give `EBADF` for the wrong end. Only the pipes of FreeBSD and macOS have two directions. | "pipes › each end has one direction" of the portable suite, in `test/kqueue`. |
 | `process.ml`, `kill`: `reaping` or a full status, as the condition that the error of the send is not an error | Only the reaper fills the status. It sets `reaping` before, and `reaping` stays set after a reap. Thus the mutant (`and`) differs only while a fiber reaps and the status is empty. In the simulator, the domain of the reaper continues from the reap of the world to the fill with no switch point. If other code reaped the child, the result of the kill depends on the schedule also without the mutant. Thus only a kill on another real domain between the reap and the fill can show the mutant. | None. A test of this race on Linux is not deterministic. |
@@ -1749,8 +1753,7 @@ The mutants that no test of `test/core` and `test/sim` reaches at this time:
 | `chan.ml`, `meet`: `Self_done`. `locks.ml`, the `Error` of `self_commit` of a semaphore. `sched.ml`, the `Error` of `self_commit` in `signal_leaf` | Only a commit on another real domain between the check of the scan and the commit can reach it. No world effect comes between them. |
 | `sched.ml`, `push_ready`: an empty pop of a full ring. `ensure_reg`: the undo after a close | Only a thief or a close on another real domain at the same time can reach it. |
 | `process.ml`, `kill`: `Bad_fd` after a reap | Only a close of the pidfd on another real domain between the peek and the attempt can reach it. |
-| `weft.ml`, `run`: the stop and the undo of the domains that started | Only a failure of `Domain.spawn` reaches it. |
-| `weft.ml`, `run`: the list of the domains that started (`dom :: started`) | Only a run on more than one real domain reaches it. The test "Weft.run › an error of the world on domain 0 stops domain 1" covers it outside a mutation run. |
+| `weft_core.ml`, `run_world`: the stop and the undo of the domains that started | Only a failure of `Domain.spawn` reaches it. |
 | `sched.ml`: `Iv.get` of an empty Ivar, the asserts of `resume`, `state_of`, `reason` and `start`, `Rc.release` of a closed fd, `on_chain` at the root, the path `arrived` of a job. `promise.ml`: the fallback text of the report, `start` of a promise that runs. `chan.ml`: the `None` result of a `recv`. `weft_sim.ml`: `readable` of a file, the lookup of a name with no listener in `Connect`, `step` of a domain that ended, the assert of `step` for an effect that is not of the world, the fallback text of the report | Defensive checks of a contract, or dead code. A correct program and a correct world cannot reach them. |
 
 The report also lists 2 sites under "evaluated outside tests". No test runs them, but module initialization runs them: `mask` of `ring.ml` and the list `linux_numbers` of `weft_sim.ml`. Windtrap tests no mutant of these sites, and the score does not include them. Each test depends on the values of these sites.

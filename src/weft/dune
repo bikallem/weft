@@ -1,0 +1,16 @@
+; The library weft: the core (weft.core) and the run of the world of the OS.
+; The build selects the world: weft.linux on Linux, weft.kqueue on macOS and
+; FreeBSD. On another system, run raises Failure, but the core and the
+; simulator still build.
+
+(library
+ (name weft)
+ (public_name weft)
+ (libraries
+  weft.core
+  (select
+   weft_os.ml
+   from
+   (weft.linux -> weft_os.linux.ml)
+   (weft.kqueue -> weft_os.kqueue.ml)
+   (-> weft_os.none.ml))))

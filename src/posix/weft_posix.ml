@@ -3,7 +3,7 @@
    pools and the watchdog. A world adds its poller, its alarm, its wake, its
    signals and its child processes. *)
 
-open Weft.Private
+open Weft_core.Private
 
 external mono_ns : unit -> int64 = "weft_mono_ns"
 
@@ -543,8 +543,8 @@ let close_op p fd =
   then Ok (close_async fd)
   else unit (close_fd fd)
 
-let now (type time) (line : time Weft.Clock.line) : time =
-  Weft.Clock.of_ns line
+let now (type time) (line : time Weft_core.Clock.line) : time =
+  Weft_core.Clock.of_ns line
     (match line with Mono -> mono_ns () | Posix -> posix_ns ())
 
 let default_domains () = Int.min 4 (Domain.recommended_domain_count ())
@@ -743,9 +743,10 @@ module Make (P : POLLER) = struct
      end. The check of the limit comes before [create], so a bad limit makes no
      world. The watchdog reads the beats of the scheduler. The pair keeps the
      Bigarray alive until the stop. *)
-  let run ?slack ?domains ?signals ?(watchdog = Some (Weft.Span.ms 10)) main =
+  let run ?slack ?domains ?signals ?(watchdog = Some (Weft_core.Span.ms 10))
+      main =
     ( match watchdog with
-    | Some l when Int64.compare (Weft.Span.to_ns l) 0L <= 0 ->
+    | Some l when Int64.compare (Weft_core.Span.to_ns l) 0L <= 0 ->
         invalid_arg (P.name ^ ".run: the limit of the watchdog is not positive")
     | _ ->
         () ) ;
@@ -758,7 +759,8 @@ module Make (P : POLLER) = struct
       Option.iter
         (fun limit ->
           let d =
-            watchdog_start s.beats Sched.beat_stride (Weft.Span.to_ns limit)
+            watchdog_start s.beats Sched.beat_stride
+              (Weft_core.Span.to_ns limit)
           in
           dog := Some (d, s.beats) ;
           Atomic.set (P.watchdog w) d )
@@ -769,7 +771,7 @@ module Make (P : POLLER) = struct
         Option.iter (fun (d, _) -> watchdog_stop d) !dog ;
         P.close w )
       (fun () ->
-        Weft.Private.run_world ?slack ~domains ~on_create:start
+        Weft_core.Private.run_world ?slack ~domains ~on_create:start
           (module World)
           w main )
 end

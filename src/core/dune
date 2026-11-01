@@ -1,10 +1,11 @@
-; The core library. It has no dependency on unix (design section 2.3), and
+; The core library. The library weft includes it and adds the run of the OS
+; world (src/weft). It has no dependency on unix (design section 2.3), and
 ; it does not use ppx_windtrap, because its runtime libraries link unix.
 ; test/nounix makes sure of it.
 
 (library
- (name weft)
- (public_name weft)
+ (name weft_core)
+ (public_name weft.core)
  (instrumentation
   (backend ppx_windtrap.coverage))
  (instrumentation

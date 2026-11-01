@@ -1,4 +1,6 @@
-(** Weft: fibers, CML events and pluggable worlds. *)
+(** Weft_core: fibers, CML events and pluggable worlds. Programs use the library
+    [weft]: its module [Weft] includes this module, and adds [run] with the
+    world of the OS. *)
 
 val version : string
 (** The version of the library. *)
@@ -428,18 +430,19 @@ end
 
 module type WORLD = World.WORLD
 
-val run :
+val run_world :
      ?slack:Span.t
   -> ?domains:int
   -> (module WORLD with type t = 'w)
   -> 'w
   -> (unit -> 'a)
   -> 'a
-(** [run (module W) w main] runs [main] as the first fiber, with the world [W].
-    When [main] returns, the root scope cancels the other fibers and waits for
-    them. [~domains] (1 by default) is the number of domains: domain 0 runs on
-    the calling thread, and each other domain on an OCaml domain of its own. The
-    world must have a poller for each domain.
+(** [run_world (module W) w main] runs [main] as the first fiber, with the world
+    [W]. [Weft.run] runs [main] with the world of the OS. When [main] returns,
+    the root scope cancels the other fibers and waits for them. [~domains] (1 by
+    default) is the number of domains: domain 0 runs on the calling thread, and
+    each other domain on an OCaml domain of its own. The world must have a
+    poller for each domain.
 
     [~slack] (100 us by default) rounds the alarm of a domain up to a multiple
     of the slack. Thus near deadlines share one alarm. A timer never fires

@@ -9,7 +9,7 @@
    (= %{system} linux)
    (= %{system} macosx)
    (= %{system} freebsd)))
- (libraries weft)
+ (libraries weft.core)
  (foreign_stubs
   (language c)
   (flags

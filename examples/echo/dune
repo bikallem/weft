@@ -1,4 +1,4 @@
-; An echo server. The same code runs on Linux (echo_server.exe) and in the
+; An echo server. The same code runs on the OS (echo_server.exe) and in the
 ; simulator (test_echo.ml).
 
 (library
@@ -9,9 +9,7 @@
 (executable
  (name echo_server)
  (modules echo_server)
- (enabled_if
-  (= %{system} linux))
- (libraries echo weft weft.linux))
+ (libraries echo weft))
 
 (test
  (name test_echo)

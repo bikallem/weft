@@ -2159,6 +2159,6 @@ let run_domain dom =
     Atomic.set dom.sched.finished true
     [@mutate
       off
-        "Weft.run sets finished again and wakes each domain after the \
+        "Weft.run_world sets finished again and wakes each domain after the \
          exception, and the simulator stops each domain at the exception"] ;
     raise (Internal_error (e, bt))

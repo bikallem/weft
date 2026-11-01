@@ -4,7 +4,7 @@
    children (EVFILT_PROC). The parts that the POSIX worlds share are in
    Weft_posix. *)
 
-open Weft.Private
+open Weft_core.Private
 open Weft_posix
 
 external kq_create : unit -> int = "weft_kq_create"
@@ -294,7 +294,7 @@ module Poller = struct
         0L
     | World.Wait.Sleep -> (
         let left line d now =
-          Int64.max 0L (Int64.sub (Weft.Clock.to_ns line d) now)
+          Int64.max 0L (Int64.sub (Weft_core.Clock.to_ns line d) now)
         in
         let m = Option.map (fun d -> left Mono d (mono_ns ())) w.deadline in
         let p =

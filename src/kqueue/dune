@@ -8,7 +8,7 @@
   (or
    (= %{system} macosx)
    (= %{system} freebsd)))
- (libraries weft weft.posix)
+ (libraries weft.core weft.posix)
  (foreign_stubs
   (language c)
   (flags

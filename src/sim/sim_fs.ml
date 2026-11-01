@@ -2,7 +2,7 @@
    the errors that the API documents: ENOENT, EEXIST, ENOTDIR, EISDIR, ENOTEMPTY
    and EBADF (open question 1). It has no effects. *)
 
-open Weft.Private
+open Weft_core.Private
 
 type node = File of file | Dir of dir
 

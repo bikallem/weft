@@ -3,7 +3,7 @@
 (library
  (name weft_sim)
  (public_name weft.sim)
- (libraries weft)
+ (libraries weft.core)
  (instrumentation
   (backend ppx_windtrap.coverage))
  (instrumentation
