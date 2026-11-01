@@ -305,6 +305,43 @@ The VM directory is `~/.local/share/weft-freebsd-vm` (or
 5. Run `tools/freebsd-vm.sh start`. Then, in the VM, do the steps of the
    `freebsd` job of `.github/workflows/ci.yml`, and `pkg install -y rsync`.
 
+### Windows in a Windows Server VM
+
+On a Linux host with KVM, `tools/windows-vm.sh` runs a Windows Server 2025
+VM (Server Core, with no desktop) in QEMU, with 4 CPUs and 6 GB of memory.
+Weft has no Windows world yet. The VM is for that task. At this time, the VM
+builds weft with OCaml 5.5 (MinGW-w64), and it runs the tests of the core,
+the simulator and dscheck.
+
+```sh
+tools/windows-vm.sh start              # start the VM and wait for SSH
+tools/windows-vm.sh test .             # dune build and dune runtest
+tools/windows-vm.sh test . runtest     # or other dune arguments
+tools/windows-vm.sh ssh                # a cmd shell in the VM
+tools/windows-vm.sh screen             # a screenshot of the console
+tools/windows-vm.sh stop               # shut down the VM
+```
+
+The `test` command copies the worktree to the VM with tar and scp (without
+`_build` and `.git`). Then it builds the worktree with the opam switch of the
+VM.
+
+The VM directory is `~/.local/share/weft-windows-vm` (or
+`$WEFT_WINDOWS_VM`). Make it one time:
+
+1. Get the ISO of Windows Server 2025 from the
+   [Evaluation Center](https://www.microsoft.com/evalcenter/download-windows-server-2025)
+   (64-bit, English). Save it as `server2025-eval.iso` in the VM directory.
+2. Run `tools/windows-vm.sh install`. It makes an SSH key and a password,
+   installs Windows with no user input (about 5 minutes), and enables SSH.
+3. Run `tools/windows-vm.sh start`, then `tools/windows-vm.sh opam`. The
+   `opam` command runs `tools/windows-vm/opam.ps1` in the VM. The script
+   installs MinGit, opam, OCaml 5.5 and the tools of the CI (about 10
+   minutes).
+
+The license of the evaluation ends 180 days after the install. Then delete
+`disk.qcow2` and do steps 2 and 3 again.
+
 ### Use weft from another flake
 
 The flake gives weft as a package. To build it with the OCaml of your own

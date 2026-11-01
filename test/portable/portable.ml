@@ -94,6 +94,10 @@ let host_port s =
   | Net.Unix _ ->
       invalid_arg "host_port"
 
+(* The tests make paths with "/". The simulator knows only "/", and Windows
+   accepts it too. [Filename.concat] gives "\\" on Windows. *)
+let concat a b = a ^ "/" ^ b
+
 (* A new directory for each call. The first call makes the base directory, so a
    suite that does not call [tmp] makes no directory. The directories go at the
    exit. A lock serializes the calls of many domains. *)
@@ -113,7 +117,7 @@ let tmp =
               b
         in
         incr n ;
-        let d = Filename.concat b (string_of_int !n) in
+        let d = concat b (string_of_int !n) in
         Sys.mkdir d 0o755 ; d )
 
 type runner = {call: 'a. (unit -> 'a) -> 'a}
@@ -746,7 +750,7 @@ let now_and_reset w =
 (* A Unix connection. The client writes data that the server does not read, then
    the server runs [close] on its socket. Then the client runs [client]. *)
 let unix_unread w close client =
-  let a = Net.Unix (Filename.concat (w.tmp ()) "u") in
+  let a = Net.Unix (concat (w.tmp ()) "u") in
   let l = Net.listen a in
   let sent = Ivar.create () and closed = Ivar.create () in
   Fiber.scope (fun s ->
@@ -770,7 +774,7 @@ let unix_unread w close client =
 let unwatch_helper () =
   match Sys.getenv_opt "WEFT_UNWATCH" with
   | Some c ->
-      if Filename.is_relative c then Filename.concat (Sys.getcwd ()) c else c
+      if Filename.is_relative c then concat (Sys.getcwd ()) c else c
   | None ->
       skip ~reason:"WEFT_UNWATCH is not set" ()
 
@@ -912,7 +916,7 @@ let zero_writes w =
               List.iter Net.close [c; s] ) )
     ; test "Unix after a close of the peer gives EPIPE" (fun () ->
           w.run (fun () ->
-              let a = Net.Unix (Filename.concat (w.tmp ()) "z") in
+              let a = Net.Unix (concat (w.tmp ()) "z") in
               let c, s = conn (Net.listen a, a) in
               Net.close s ;
               pause () ;
@@ -966,7 +970,7 @@ let reset_details w =
                   equal string "" (read_all c) ) ) )
     ; test "a reset of a Unix socket gives the end of the stream" (fun () ->
           w.run (fun () ->
-              let a = Net.Unix (Filename.concat (w.tmp ()) "s") in
+              let a = Net.Unix (concat (w.tmp ()) "s") in
               let l = Net.listen a in
               Fiber.scope (fun s ->
                   Fiber.fork s (fun () ->
@@ -1012,7 +1016,7 @@ let reset_details w =
               let dir = w.tmp () in
               List.iteri
                 (fun i client ->
-                  let a = Net.Unix (Filename.concat dir (string_of_int i)) in
+                  let a = Net.Unix (concat dir (string_of_int i)) in
                   let l = Net.listen a in
                   let c = Net.connect a in
                   Net.close l ; pause () ; client c ; Net.close c )
@@ -1105,7 +1109,7 @@ let local_addr w =
     ; test "a Unix listener has its path, and a Unix client has no path"
         (fun () ->
           w.run (fun () ->
-              let a = Net.Unix (Filename.concat (w.tmp ()) "s") in
+              let a = Net.Unix (concat (w.tmp ()) "s") in
               let l = Net.listen a in
               let c = Net.connect a in
               let s, peer = Net.accept l in
@@ -1151,7 +1155,7 @@ let local_addr w =
               einval (fun () -> Net.connect (Net.Tcp (host, big + p))) ;
               nul (fun () -> Net.listen (Net.Tcp (host ^ "\000x", 0))) ;
               nul (fun () -> Net.connect (Net.Tcp (host ^ "\000x", p))) ;
-              let path = Filename.concat (w.tmp ()) "s" in
+              let path = concat (w.tmp ()) "s" in
               nul (fun () -> Net.listen (Net.Unix (path ^ "\000x"))) ;
               nul (fun () -> Net.connect (Net.Unix (path ^ "\000x"))) ;
               nul (fun () -> Net.udp (host ^ "\000x", 0)) ;
@@ -1171,9 +1175,7 @@ let local_addr w =
           w.run (fun () ->
               (* The limit is 108 bytes on Linux and 104 on macOS and
                  FreeBSD. *)
-              let a =
-                Net.Unix (Filename.concat (w.tmp ()) (String.make 200 'a'))
-              in
+              let a = Net.Unix (concat (w.tmp ()) (String.make 200 'a')) in
               let too_long f = equal string "ENAMETOOLONG" (error_of f) in
               too_long (fun () -> Net.listen a) ;
               too_long (fun () -> Net.connect a) ) )
@@ -2304,7 +2306,7 @@ let files w =
   group "files"
     [ test "a file gives back its data" (fun () ->
           w.run (fun () ->
-              let path = Filename.concat (w.tmp ()) "a" in
+              let path = concat (w.tmp ()) "a" in
               write_file path "hello world" ;
               equal string "hello world" (read_file path) ;
               let f = File.openfile [Read] path in
@@ -2321,7 +2323,7 @@ let files w =
               is_true ((File.stat path).kind = File.Regular) ) )
     ; test "pwrite, truncate and append" (fun () ->
           w.run (fun () ->
-              let path = Filename.concat (w.tmp ()) "b" in
+              let path = concat (w.tmp ()) "b" in
               write_file path "abcdef" ;
               let f = File.openfile [Read; Write] path in
               equal int 1
@@ -2338,7 +2340,7 @@ let files w =
     ; test "the directory operations" (fun () ->
           w.run (fun () ->
               let d = w.tmp () in
-              let p = Filename.concat d in
+              let p = concat d in
               Dir.mkdir (p "sub") ;
               write_file (p "x") "1" ;
               write_file (p "y") "2" ;
@@ -2356,7 +2358,7 @@ let files w =
     ; test "the errors of open question 1" (fun () ->
           w.run (fun () ->
               let d = w.tmp () in
-              let p = Filename.concat d in
+              let p = concat d in
               write_file (p "f") "data" ;
               Dir.mkdir (p "dir") ;
               write_file (p "dir/g") "" ;
@@ -2397,7 +2399,7 @@ let files w =
                 (err (fun () -> File.read f (Bytes.create 1) 0 1)) ) )
     ; test "C5 and C12: more errors agree with Linux" (fun () ->
           w.run (fun () ->
-              let p = Filename.concat (w.tmp ()) in
+              let p = concat (w.tmp ()) in
               write_file (p "f") "data" ;
               Dir.mkdir (p "dir") ;
               (* The text of [Other] is not the same in each world. *)
@@ -2437,7 +2439,7 @@ let files w =
               is_true ((File.stat (p "empty")).kind = File.Directory) ) )
     ; test "a NUL byte in a path, a name or an argument gives EINVAL" (fun () ->
           w.run (fun () ->
-              let p = Filename.concat (w.tmp ()) in
+              let p = concat (w.tmp ()) in
               let bad = p "a\000b" in
               Dir.mkdir (p "a") ;
               let nul f =
@@ -2461,7 +2463,7 @@ let files w =
               equal (list string) [] (Dir.readdir (p "a")) ) )
     ; test "pread and pwrite at offset 0 do not move the offset" (fun () ->
           w.run (fun () ->
-              let path = Filename.concat (w.tmp ()) "o" in
+              let path = concat (w.tmp ()) "o" in
               write_file path "abcdefgh" ;
               let f = File.openfile [Read; Write] path in
               let buf = Bytes.create 4 in
@@ -2486,7 +2488,7 @@ let files w =
               Fiber.scope (fun s ->
                   for i = 1 to 20 do
                     Fiber.fork s (fun () ->
-                        let path = Filename.concat d (string_of_int i) in
+                        let path = concat d (string_of_int i) in
                         write_file path (String.make i 'x') ;
                         equal int i (String.length (read_file path)) )
                   done ) ;
@@ -2516,21 +2518,26 @@ let pipes w =
           (* The world ignores SIGPIPE. An earlier world of the process can
              ignore it already, so the test sets a handler first. The world
              replaces it. The simulator sends no real signal, so there the
-             handler cannot get SIGPIPE. *)
+             handler cannot get SIGPIPE. Windows has no SIGPIPE, thus there the
+             test sets no handler. *)
           let got = Atomic.make false in
-          let old =
-            Sys.signal Sys.sigpipe
-              (Sys.Signal_handle (fun _ -> Atomic.set got true))
+          let write () =
+            w.run (fun () ->
+                let r, wr = Pipe.create () in
+                Pipe.close r ;
+                equal string "EPIPE" (pipe_error (fun () -> Pipe.write wr "x")) ;
+                Pipe.close wr ) ;
+            is_false (Atomic.get got)
           in
-          Fun.protect
-            ~finally:(fun () -> Sys.set_signal Sys.sigpipe old)
-            (fun () ->
-              w.run (fun () ->
-                  let r, wr = Pipe.create () in
-                  Pipe.close r ;
-                  equal string "EPIPE" (pipe_error (fun () -> Pipe.write wr "x")) ;
-                  Pipe.close wr ) ;
-              is_false (Atomic.get got) ) )
+          if Sys.win32 then write ()
+          else
+            let old =
+              Sys.signal Sys.sigpipe
+                (Sys.Signal_handle (fun _ -> Atomic.set got true))
+            in
+            Fun.protect
+              ~finally:(fun () -> Sys.set_signal Sys.sigpipe old)
+              write )
     ; test "each end has one direction" (fun () ->
           w.run (fun () ->
               let r, wr = Pipe.create () in
