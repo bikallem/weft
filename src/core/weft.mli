@@ -428,14 +428,15 @@ end
 
 module type WORLD = World.WORLD
 
-val run :
+val run_world :
      ?slack:Span.t
   -> ?domains:int
   -> (module WORLD with type t = 'w)
   -> 'w
   -> (unit -> 'a)
   -> 'a
-(** [run (module W) w main] runs [main] as the first fiber, with the world [W].
+(** [run_world (module W) w main] runs [main] as the first fiber, with the world
+    [W]. A test world uses it. A program uses {!run} with a world of the OS.
     When [main] returns, the root scope cancels the other fibers and waits for
     them. [~domains] (1 by default) is the number of domains: domain 0 runs on
     the calling thread, and each other domain on an OCaml domain of its own. The
@@ -446,6 +447,35 @@ val run :
     before its deadline (open question 7).
 
     @raise Invalid_argument if [domains] is not in the range 1 to 62. *)
+
+(** A world of the OS: [Weft_linux] (library [weft.linux]), [Weft_kqueue]
+    (library [weft.kqueue]), or [Weft_os] (library [weft.os]), which is the
+    world of the OS that the build runs on. *)
+module type OS = sig
+  val run :
+       ?slack:Span.t
+    -> ?domains:int
+    -> ?signals:Signal.t list
+    -> ?watchdog:Span.t option
+    -> (unit -> 'a)
+    -> 'a
+  (** [run main] makes a new world, runs [main] with it, and closes the world at
+      the end. *)
+end
+
+val run :
+     ?slack:Span.t
+  -> ?domains:int
+  -> ?signals:Signal.t list
+  -> ?watchdog:Span.t option
+  -> (module OS)
+  -> (unit -> 'a)
+  -> 'a
+(** [run (module O) main] is [O.run main]. For example,
+    [Weft.run (module Weft_linux) main] runs [main] on Linux, and
+    [Weft.run (module Weft_os) main] runs it on each OS that has a world. The
+    world gives the defaults: for [Weft_linux] and [Weft_kqueue], up to 4
+    domains, a slack of 100 us, no signals and a watchdog of 10 ms. *)
 
 (** The parts inside the library. They are for the tests and for the worlds of
     the library, not for programs. They can change in each version. *)

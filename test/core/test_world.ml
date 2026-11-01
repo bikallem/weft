@@ -1,5 +1,5 @@
-(* The tests of [Weft.run] with a test world, and of [Span] and [Time] (design
-   sections 2.3, 2.5 and 2.6). *)
+(* The tests of [Weft.run_world] with a test world, and of [Span] and [Time]
+   (design sections 2.3, 2.5 and 2.6). *)
 
 open Windtrap
 open Weft
@@ -67,7 +67,7 @@ module Manual = struct
   let random_bytes _ b = Bytes.fill b 0 (Bytes.length b) 'x'
 end
 
-let run ?slack w f = Weft.run ?slack (module Manual) w f
+let run ?slack w f = Weft.run_world ?slack (module Manual) w f
 
 let ms n = Int64.mul (Int64.of_int n) 1_000_000L
 
@@ -428,10 +428,13 @@ end
 (* An error of the world on domain 0 stops the run: domain 1 gets a wake and
    sees the end, and the error goes to the caller. *)
 let error_stops_others () =
-  (* Mutation testing forks a child for each mutant, and OCaml refuses a fork
-     after a domain started. *)
-  if Option.is_some (Sys.getenv_opt "WINDTRAP_MUTATE") then
-    skip ~reason:"a mutation run cannot start a domain" () ;
+  (* A mutation run in fork mode forks a child for each mutant, and OCaml
+     refuses a fork after a domain started. The Makefile also runs this suite in
+     exec mode for the mutants of weft.ml. *)
+  if
+    Option.is_some (Sys.getenv_opt "WINDTRAP_MUTATE")
+    && Sys.getenv_opt "WINDTRAP_MUTATE_CHILDREN" <> Some "exec"
+  then skip ~reason:"a mutation run in fork mode cannot start a domain" () ;
   let w =
     { Stop.woken= Atomic.make false
     ; sleeps= Atomic.make false
@@ -440,15 +443,69 @@ let error_stops_others () =
   raises_match
     (function Failure m -> m = "boom" | _ -> false)
     (fun () ->
-      Weft.run ~domains:2
+      Weft.run_world ~domains:2
         (module Stop)
         w
         (fun () -> sync (Ivar.read (Ivar.create ()))) ) ;
   is_true (Atomic.get w.sleeps) ;
   is_false (Atomic.get w.stuck)
 
+(* The world of [Stop], with the two domains in the other order: when domain 0
+   sleeps, the wait of domain 1 raises "boom". *)
+module Stop_1 = struct
+  include Stop
+
+  let wait t ~domain w = Stop.wait t ~domain:(1 - domain) w
+
+  let wake t ~domain = Stop.wake t ~domain:(1 - domain)
+end
+
+(* An error of the world on domain 1 goes to the caller: run joins domain 1 and
+   raises its error. *)
+let error_of_domain_1 () =
+  if
+    Option.is_some (Sys.getenv_opt "WINDTRAP_MUTATE")
+    && Sys.getenv_opt "WINDTRAP_MUTATE_CHILDREN" <> Some "exec"
+  then skip ~reason:"a mutation run in fork mode cannot start a domain" () ;
+  let w =
+    { Stop.woken= Atomic.make false
+    ; sleeps= Atomic.make false
+    ; stuck= Atomic.make false }
+  in
+  raises_match
+    (function Failure m -> m = "boom" | _ -> false)
+    (fun () ->
+      Weft.run_world ~domains:2
+        (module Stop_1)
+        w
+        (fun () -> sync (Ivar.read (Ivar.create ()))) ) ;
+  is_true (Atomic.get w.sleeps) ;
+  is_false (Atomic.get w.stuck)
+
+(* Weft.run gives each argument to the run of the world, and gives its value.
+   The world here records the arguments and runs [main] directly. *)
+let run_gives_arguments () =
+  let seen = ref None in
+  let module Record = struct
+    let run ?slack ?domains ?signals ?watchdog main =
+      seen := Some (slack, domains, signals, watchdog) ;
+      main ()
+  end in
+  let v =
+    Weft.run ~slack:(Span.us 7) ~domains:3 ~signals:[Signal.SIGUSR1]
+      ~watchdog:None
+      (module Record)
+      (fun () -> 42)
+  in
+  equal int 42 v ;
+  match !seen with
+  | Some (Some slack, Some 3, Some [Signal.SIGUSR1], Some None) ->
+      equal int64 7_000L (Span.to_ns slack)
+  | _ ->
+      fail "Weft.run did not give the arguments"
+
 let world =
-  group "Weft.run"
+  group "Weft.run_world"
     [ test "run gives the value of main" run_gives_value
     ; test "run raises the exception of main" run_raises
     ; test "the alarm rounds up to the slack" alarm_rounds_up
@@ -493,7 +550,9 @@ let world =
     ; test "an error of the world on domain 0 goes to the caller"
         world_error_of_domain_0
     ; test "an error of the world on domain 0 stops domain 1" error_stops_others
-    ]
+    ; test "Weft.run gives the arguments to the world" run_gives_arguments
+    ; test "an error of the world on domain 1 goes to the caller"
+        error_of_domain_1 ]
 
 (* A handler of the user sees each effect that the fibers of its scope perform.
    A fill with no waiter performs only [Self]: it resumes no fiber, so it
@@ -867,7 +926,7 @@ let signal_count_zero () =
     ; resent= [] }
   in
   let n =
-    Weft.run
+    Weft.run_world
       (module Signals)
       w
       (fun () ->
@@ -881,7 +940,7 @@ let signal_count_zero () =
    the world continues to watch the signal. *)
 let unwatch_error () =
   let w = {Signals.batches= []; resent= []} in
-  Weft.run
+  Weft.run_world
     (module Signals)
     w
     (fun () ->

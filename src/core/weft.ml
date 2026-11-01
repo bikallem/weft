@@ -134,7 +134,18 @@ let run_world (type w) ?slack ?(domains = 1) ?on_create
   | _ ->
       result ()
 
-let run ?slack ?domains m w main = run_world ?slack ?domains m w main
+module type OS = sig
+  val run :
+       ?slack:Span.t
+    -> ?domains:int
+    -> ?signals:Signal.t list
+    -> ?watchdog:Span.t option
+    -> (unit -> 'a)
+    -> 'a
+end
+
+let run ?slack ?domains ?signals ?watchdog (module O : OS) main =
+  O.run ?slack ?domains ?signals ?watchdog main
 
 module Private = struct
   let run_world = run_world
@@ -157,3 +168,6 @@ module Private = struct
   module Job = Job
   module Process = Process
 end
+
+(* The public run_world has no [on_create]: the scheduler is private. *)
+let run_world ?slack ?domains m w main = run_world ?slack ?domains m w main

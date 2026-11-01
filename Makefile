@@ -49,6 +49,12 @@ SUITES := test/core test/sim
 LINUX_SUITES := $(if $(filter Linux,$(shell uname -s)),test/linux test/linux_md)
 LINUX_LIBS := src/linux,src/posix
 
+# The run of a world with more than one domain (CORE_DOMAIN_FILES). Its tests
+# in test/core start a domain, so the fork run of SUITES skips them. A second
+# run of test/core in exec mode tests the mutants of this file again, with
+# these tests.
+CORE_DOMAIN_FILES := src/core/weft.ml
+
 # The report of `windtrap mutants`. $(1) is the revision of the changed lines,
 # or empty for all the lines.
 report = $(DUNE) exec $(MUTATE) windtrap -- mutants \
@@ -74,6 +80,8 @@ check-windtrap:
 define run_suites
 -WINDTRAP_MUTATE=1 $(if $(1),WINDTRAP_MUTATE_SINCE=$(1)) WINDTRAP_MUTATE_JOBS=$(JOBS) \
   $(DUNE) runtest --force $(MUTATE) $(SUITES)
+-WINDTRAP_MUTATE=$(CORE_DOMAIN_FILES) $(if $(1),WINDTRAP_MUTATE_SINCE=$(1)) WINDTRAP_MUTATE_JOBS=$(JOBS) \
+  WINDTRAP_MUTATE_CHILDREN=exec $(DUNE) runtest --force $(MUTATE) test/core
 -for s in $(LINUX_SUITES); do \
   WINDTRAP_MUTATE=$(LINUX_LIBS) $(if $(1),WINDTRAP_MUTATE_SINCE=$(1)) WINDTRAP_MUTATE_JOBS=$(JOBS) \
     $(DUNE) runtest --force $(MUTATE) $$s; \

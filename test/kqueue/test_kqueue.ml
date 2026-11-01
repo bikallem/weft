@@ -267,6 +267,23 @@ let watchdog_after_park () =
       equal int (before + 1) (Weft_kqueue.watchdog_reports ()) )
     [1; 2]
 
+(* Weft_os is the kqueue world: the watchdog of the kqueue world reports a fiber
+   that computes with no yield, for at most 2 s. *)
+let weft_os () =
+  let before = Weft_kqueue.watchdog_reports () in
+  let t0 = Unix.gettimeofday () in
+  Weft.run ~domains:1
+    ~watchdog:(Some (Span.ms 20))
+    (module Weft_os)
+    (fun () ->
+      while
+        Weft_kqueue.watchdog_reports () = before
+        && Unix.gettimeofday () -. t0 < 2.
+      do
+        ()
+      done ) ;
+  equal int (before + 1) (Weft_kqueue.watchdog_reports ())
+
 let () =
   exit
     (Windtrap.run "kqueue"
@@ -277,6 +294,7 @@ let () =
                  (Portable.sleep_10ms ~median:20_000_000 (world 1))
              ; test "the pipes and the exit status of a child" child_output
              ; test "a child that exits at once" child_fast_exit
+             ; test "Weft_os is the kqueue world" weft_os
              ; test "a child stops at SIGINT" child_kill
              ; test
                  "a child keeps an ignored signal, and gets the default action \

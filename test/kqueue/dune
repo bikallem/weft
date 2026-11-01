@@ -8,7 +8,7 @@
    (= %{system} macosx)
    (= %{system} freebsd)))
  (modules test_kqueue)
- (libraries weft weft.kqueue windtrap portable unix))
+ (libraries weft weft.kqueue weft.os windtrap portable unix))
 
 (executable
  (name unwatch)
