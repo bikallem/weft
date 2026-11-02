@@ -25,6 +25,11 @@
 # script. The slowest Wake case took 5736 s on a CI runner, so the limit is
 # 2.5 times that time. In CI, each group of models has its own job
 # and its own LIMIT (.github/workflows/tla.yml).
+# STALL (default 300) is the maximum time, in seconds, before the first
+# progress line of TLC. TLC writes this line about 3 s after its start. On a
+# CI runner, TLC once hung before this line, and the case stopped only at
+# LIMIT. Thus the script stops a case that has no progress line at STALL, and
+# starts it again.
 # Each result goes to stderr when its case ends, and the list of all results
 # goes to stdout at the end.
 set -u
@@ -39,6 +44,7 @@ JOBS=${JOBS:-4}
 WORKERS=${WORKERS:-$(( $(nproc) / JOBS > 0 ? $(nproc) / JOBS : 1 ))}
 export JAVA_TOOL_OPTIONS="-Xmx${HEAP:-2g}"
 LIMIT=${LIMIT:-14400}
+STALL=${STALL:-300}
 MODELS=${MODELS:-"Commit Scope Ivar Wake Fd Semaphore Signal Watchdog"}
 want() { case " $MODELS " in *" $1 "*) return 0 ;; *) return 1 ;; esac; }
 
@@ -67,18 +73,31 @@ runone() {
   local i=$1 module expect scen bugs
   { read -r module; read -r expect; read -r scen; read -r bugs; } < "$work/case$i.meta"
   local out="$work/out$i.txt"
-  local t0=$SECONDS try rc=0
+  local t0=$SECONDS try rc=0 pid start stalled=0
   # TLC copies the standard modules (Integers.tla and the others) from its jar
   # to java.io.tmpdir, /tmp by default, and deletes them at its exit. With one
   # directory for all cases, a case truncates or deletes the file that another
   # case parses. Thus each case has its own directory.
   mkdir -p "$work/tmp$i"
-  for try in 1 2; do
+  for try in 1 2 3; do
     rm -rf "$work/states$i"
     JAVA_TOOL_OPTIONS="$JAVA_TOOL_OPTIONS -Djava.io.tmpdir=$work/tmp$i" \
       timeout -k 30 "$LIMIT" tlc -workers "$WORKERS" -lncheck final -metadir "$work/states$i" \
-      -config "$work/case$i.cfg" "$module.tla" > "$out" 2>&1
+      -config "$work/case$i.cfg" "$module.tla" > "$out" 2>&1 &
+    pid=$!
+    start=$SECONDS stalled=0
+    while kill -0 "$pid" 2>/dev/null && [ $((SECONDS - start)) -lt "$STALL" ]; do sleep 2; done
+    # A hang at the start: no progress line and no result at STALL. timeout
+    # sends the TERM to the process group of TLC, and a KILL 30 s later.
+    if kill -0 "$pid" 2>/dev/null &&
+      ! grep -qE "^Progress\(|No error has been found|^Error:" "$out"; then
+      stalled=1
+      kill -TERM "$pid"
+    fi
+    # The redirection removes the "Killed" message of bash for a stopped try.
+    wait "$pid" 2>/dev/null
     rc=$?
+    [ "$stalled" = 1 ] && continue
     # A timeout is not a race of the start, so do not try again.
     [ "$rc" = 124 ] || [ "$rc" = 137 ] && break
     # TLC gave a result: a pass, a violation or a deadlock.
@@ -88,6 +107,7 @@ runone() {
   why=$(grep -m1 -E "^Error: (Invariant [A-Za-z]+ is violated|Deadlock reached|Temporal properties were violated)" "$out" | sed 's/^Error: //')
   if grep -q "No error has been found" "$out"; then result=pass
   elif [ -n "$why" ]; then result=fail
+  elif [ "$stalled" = 1 ]; then why="no progress line in $STALL s, $try tries"
   elif [ "$rc" = 124 ] || [ "$rc" = 137 ]; then why="no result in $LIMIT s"; fi
   states=$(grep -oE "[0-9,]+ distinct states found" "$out" | tail -1)
   printf '%-6s %-6s %-6s %-20s -> %s %s (%s, %ss)\n' "$module" "$expect" "$scen" "$bugs" \
@@ -273,7 +293,7 @@ dog fail   2       FALSE   TRUE
 
 # Run the cases. The slow cases come first, so that they start early.
 export -f runone
-export work WORKERS LIMIT
+export work WORKERS LIMIT STALL
 t0=$SECONDS
 for i in $(seq 1 "$n"); do
   # Wake cases have the largest state space.
