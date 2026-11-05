@@ -52,9 +52,15 @@ static int trailing(const wchar_t *p) {
 
 static int last_err(const wchar_t *p) { return fix_enoent(p, weft_win_errno(GetLastError())); }
 
+/* The stat of a handle. Each open of this file has no
+   FILE_FLAG_OPEN_REPARSE_POINT, thus the open follows a symbolic link and a
+   junction, as stat(2) and fstat(2) do on POSIX. A reparse point that stays on
+   the handle is not a link: for example a OneDrive placeholder or a
+   deduplicated file. Thus the kind is Directory or Regular, never Symlink
+   (issue 51). */
 static void stat_of(struct job *j, BY_HANDLE_FILE_INFORMATION *fi) {
   DWORD a = fi->dwFileAttributes;
-  j->st.kind = (a & FILE_ATTRIBUTE_DIRECTORY) ? 1 : (a & FILE_ATTRIBUTE_REPARSE_POINT) ? 2 : 0;
+  j->st.kind = (a & FILE_ATTRIBUTE_DIRECTORY) ? 1 : 0;
   j->st.size = ((int64_t)fi->nFileSizeHigh << 32) | fi->nFileSizeLow;
   j->st.perm = (a & FILE_ATTRIBUTE_DIRECTORY) ? 0755 : (a & FILE_ATTRIBUTE_READONLY) ? 0444 : 0644;
   j->st.mtime = weft_filetime_ns(fi->ftLastWriteTime);
