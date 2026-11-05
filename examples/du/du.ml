@@ -18,6 +18,12 @@ type stats =
 
    [File.stat] follows a symbolic link. The OS stops a loop of links with an
    error (ELOOP), and [du] counts it in [errors]. *)
+(* A path in the directory [dir]. [Filename.concat] puts a "\\" on Windows, but
+   the file system of the simulator knows only "/". Windows also accepts "/",
+   thus [concat] uses "/" on each system. *)
+let concat dir name =
+  if String.ends_with ~suffix:"/" dir then dir ^ name else dir ^ "/" ^ name
+
 let du ?(limit = 16) root =
   let ops = Fiber.Semaphore.create limit in
   let files = Atomic.make 0
@@ -49,8 +55,7 @@ let du ?(limit = 16) root =
             (* The scope ends when the walk of each entry ends. *)
             Fiber.scope (fun s ->
                 List.iter
-                  (fun name ->
-                    Fiber.fork s (fun () -> walk (Filename.concat path name)) )
+                  (fun name -> Fiber.fork s (fun () -> walk (concat path name)))
                   names ) )
     | {kind= Regular; size; _} ->
         Atomic.incr files ;
