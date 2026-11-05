@@ -742,6 +742,10 @@ module File : sig
   (** [Read] and [Write] together open the file for read and write. *)
   type flag = Read | Write | Create | Exclusive | Truncate | Append
 
+  (** The kind of a file. [stat] and [fstat] follow a symbolic link, thus they
+      give the kind of the target and never [Symlink]. On Windows, they give
+      [Regular] or [Directory]. A file with a reparse point that is not a link,
+      for example a OneDrive placeholder, is [Regular]. *)
   type kind = Private.Op.kind = Regular | Directory | Symlink | Special
 
   type stat = {kind: kind; size: int; perm: int; mtime: Clock.posix}
