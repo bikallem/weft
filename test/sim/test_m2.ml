@@ -266,6 +266,34 @@ let jobs =
               in
               Helpers.ok (Helpers.submit (Op.Detach id)) ;
               equal int n0 (Sim.open_fds sim) ) )
+    ; test "a detach after the completion of an open_stat closes its fd"
+        (fun () ->
+          Sim.run (fun sim ->
+              let n0 = Sim.open_fds sim in
+              let id =
+                Helpers.ok
+                  (Helpers.submit
+                     (Op.Start (0, Op.Open_stat ("/f", [O_read; O_create], 0))) )
+              in
+              Helpers.ok (Helpers.submit (Op.Detach id)) ;
+              equal int n0 (Sim.open_fds sim) ) )
+    ; test "a cancel of openfile_stat leaves no fd, with 100 seeds" (fun () ->
+          Helpers.seeds 100 (fun seed ->
+              Sim.run ~seed ~domains:2 (fun sim ->
+                  Sim.set_blocking_cost sim (Span.ms 10) ;
+                  let n0 = Sim.open_fds sim in
+                  ( match
+                      Fiber.with_timeout Mono (Span.ms 5) (fun () ->
+                          File.openfile_stat [Read; Write; Create] "/g" )
+                    with
+                  | f, _ ->
+                      File.close f
+                  | exception Fiber.Timeout ->
+                      () ) ;
+                  (* The job completes after its cost, and the world closes its
+                     fd. *)
+                  Time.sleep Mono (Span.ms 20) ;
+                  equal int n0 (Sim.open_fds sim) ) ) )
     ; test "a Finish after a detach gives Model_error" (fun () ->
           contains ~sub:"Finish of job"
             (Helpers.model_error (fun _ ->

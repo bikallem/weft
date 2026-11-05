@@ -199,7 +199,7 @@ Each operation is a constructor of the GADT `'a Op.t`, for example `Read : fd * 
 |---|---|---|---|
 | `Net` | Sockets: TCP, UDP, Unix domain. `listen`, `accept`, `connect`, `local_addr`, `read`, `write`, `read_now`, `write_now`, `sendto`, `recvfrom`, `shutdown`, `reset`, socket options | Non-blocking fds in the poller | The in-memory network |
 | `Pipe` | `pipe`, `read`, `write` | Non-blocking fds in the poller | In-memory buffers |
-| `File` | `open`, `read`, `write`, `pread`, `pwrite`, `fsync`, `stat`, `truncate` | `Blocking` operations on the thread pool | An in-memory file system |
+| `File` | `open`, `openfile_stat`, `read`, `write`, `pread`, `pwrite`, `fsync`, `stat`, `truncate` | `Blocking` operations on the thread pool | An in-memory file system |
 | `Dir` | `mkdir`, `readdir`, `rename`, `unlink`, `rmdir` | `Blocking` operations on the thread pool | The in-memory file system |
 | `Process` | `spawn`, `wait`, `kill`, the exit event | `pidfd_spawn` and a `pidfd` on Linux, `EVFILT_PROC` on kqueue | A table of fake processes that the test scripts |
 | `Signal` | The signal event, `unwatch` | `signalfd` on Linux, a handler of the world on kqueue | The test sends the signal |
@@ -211,6 +211,8 @@ Each operation is a constructor of the GADT `'a Op.t`, for example `Read : fd * 
 - The calls that only block, for example `Unix.sleep` and `Unix.select`. `Time.sleep` and `choose` take their place.
 
 **The checks of the strings and the ports (issue 2).** The C side reads a string only up to its first NUL byte, and `Int_val` cuts a large port to an `int` of C. Thus without a check, the OS can use a different path or address. The core does the checks one time, before the submit, and each world gives the same errors. A NUL byte in a path, a host, a name of `Dns` or an argument of `Process.spawn` gives `EINVAL: a NUL byte in a string`. A port out of the range 0 to 65535 gives `EINVAL`. The check comes before the use of the fd. Thus a `sendto` on a closed socket with a bad address gives `EINVAL`, not `EBADF`. The core does not check the length of a Unix path, because the limit of `sun_path` is not the same on all OSes. The POSIX worlds give `Other "ENAMETOOLONG"` for a path that does not fit with its NUL byte. On Linux, this is a path of 108 bytes or more, and on macOS and FreeBSD, 104 bytes or more. The check comes before the socket is made, thus before `EMFILE`.
+
+**One job for an open and an fstat (issue 50).** A server that sends a file opens it, then calls `File.fstat` on the fd. The fstat on the fd prevents a race between a check of the path and its use. But the two calls are two jobs of the pool, and each job is a round trip. caravan.static measured these costs with `Weft_linux` on 1 domain, with a warm page cache: one pool job takes approximately 9 µs for the round trip, and an inline `Unix.stat` takes 0.68 µs. A `304 Not Modified` took 17.9 µs, and 9 µs of it was the fstat job. Thus `File.openfile_stat` does open(2) and then fstat(2) on the same pool thread, in the job `Open_stat`. If the fstat fails, the job closes the fd and gives the error of the fstat. A detached `Open_stat` follows the rule of `Open`: the pool closes its fd (section 2.5, Blocking operations). On Windows, the job does `CreateFileW` and then `GetFileInformationByHandle`. In the simulator, the fstat of an open file cannot fail.
 
 **Direct calls to `Unix`.** A wrapper does not stop a library that calls `Unix` directly. This call goes past the world with no warning, as in caravan. Thus:
 

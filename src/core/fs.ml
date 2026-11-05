@@ -33,6 +33,14 @@ module File = struct
     Sched.Fdtab.alloc
       (Job.run "File.openfile" (Op.Open (path, List.map op_flag flags, perm)))
 
+  (* One job for the open and the fstat (issue 50). *)
+  let openfile_stat ?(perm = 0o644) flags path =
+    let fd, st =
+      Job.run "File.openfile_stat"
+        (Op.Open_stat (path, List.map op_flag flags, perm))
+    in
+    (Sched.Fdtab.alloc fd, stat_of st)
+
   let read fd buf off len =
     Net.check_range ~read:true "File.read" buf off len ;
     Job.run ~fd "File.read" (Op.Pread (fd.Sched.os, buf, off, len, -1))

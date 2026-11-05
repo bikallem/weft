@@ -77,7 +77,8 @@ enum {
   J_RMDIR,
   J_RESOLVE,
   J_REVERSE,
-  J_CLOSE
+  J_CLOSE,
+  J_OPEN_STAT /* open(2), then fstat(2) of the new fd (issue 50). */
 };
 
 /* The mailbox of one domain: the ids of the completed jobs. */
@@ -215,7 +216,7 @@ static void close_fd(int64_t fd) {
 }
 
 static void drop(struct job *j) {
-  if (j->kind == J_OPEN && j->res >= 0) close_fd(j->res);
+  if ((j->kind == J_OPEN || j->kind == J_OPEN_STAT) && j->res >= 0) close_fd(j->res);
 }
 
 /* Add [n] bytes to the result buffer. */
@@ -376,6 +377,17 @@ static void run(struct job *j) {
     break;
   case J_FSTAT:
     r = fstat(j->fd, &j->st);
+    break;
+  case J_OPEN_STAT:
+    /* If the fstat fails, the job closes the fd and gives the error of the
+       fstat. */
+    r = open(j->s1, open_flags(j->a), (mode_t)j->b);
+    if (r >= 0 && fstat((int)r, &j->st) < 0) {
+      int e = errno;
+      close((int)r);
+      errno = e;
+      r = -1;
+    }
     break;
   case J_STAT:
     r = stat(j->s1, &j->st);

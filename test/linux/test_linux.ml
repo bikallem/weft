@@ -399,14 +399,15 @@ let fd_of_int : int -> Unix.file_descr = Obj.magic
 (* The pool closes a file, because the close of a file can block (design section
    2.7). The world closes another fd at once, also if the fd has the number of a
    file that closed before. The fibers hold all threads of the pool, so a close
-   in the pool waits in the queue. *)
-let pool_closes_files () =
+   in the pool waits in the queue. [open_] opens the file: [File.openfile] or
+   [File.openfile_stat]. *)
+let pool_closes_files open_ () =
   let fifo = new_fifo () in
   let name = "pool-closes-this-file" in
   let path = Filename.concat (Filename.dirname fifo) name in
   let before = open_fds () in
   Weft_linux.run ~domains:1 (fun () ->
-      let f = File.openfile [Write; Create] path in
+      let f = open_ [File.Write; Create] path in
       let n =
         match
           List.find_opt
@@ -1347,7 +1348,11 @@ let linux =
     ; test "each detached job that runs gives one more thread, up to the limit"
         detached_threads
     ; test "a pool that is full for more than 1 s writes a warning" full_warning
-    ; test "the pool closes a file, and only a file" pool_closes_files
+    ; test "the pool closes a file, and only a file"
+        (pool_closes_files (fun flags path -> File.openfile flags path))
+    ; test "the pool closes a file of openfile_stat"
+        (pool_closes_files (fun flags path ->
+             fst (File.openfile_stat flags path) ) )
     ; test "a job that ends after the close of the world writes no fd"
         detached_after_close
     ; test "a child stops at SIGINT" child_sigint

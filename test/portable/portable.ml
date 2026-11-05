@@ -2321,6 +2321,43 @@ let files w =
               is_true (st.kind = File.Regular) ;
               File.close f ;
               is_true ((File.stat path).kind = File.Regular) ) )
+    ; test "openfile_stat gives the file and its stat" (fun () ->
+          w.run (fun () ->
+              let d = w.tmp () in
+              let p = concat d in
+              write_file (p "a") "hello" ;
+              let f, st = File.openfile_stat [Read] (p "a") in
+              equal int 5 st.size ;
+              is_true (st.kind = File.Regular) ;
+              is_true (st = File.fstat f) ;
+              let buf = Bytes.create 8 in
+              equal int 5 (File.read f buf 0 8) ;
+              equal string "hello" (Bytes.sub_string buf 0 5) ;
+              File.close f ;
+              (* A new file. *)
+              let f, st =
+                File.openfile_stat ~perm:0o600 [Write; Create] (p "new")
+              in
+              equal int 0 st.size ;
+              File.write f "abc" ;
+              equal int 3 (File.fstat f).size ;
+              File.close f ;
+              equal int 3 (File.stat (p "new")).size ;
+              (* A directory opens for a read. *)
+              let f, st = File.openfile_stat [Read] d in
+              is_true (st.kind = File.Directory) ;
+              File.close f ;
+              (* The errors of openfile. *)
+              let err = fs_error in
+              equal string "ENOENT"
+                (err (fun () -> File.openfile_stat [Read] (p "no"))) ;
+              equal string "EEXIST"
+                (err (fun () ->
+                     File.openfile_stat [Write; Create; Exclusive] (p "a") ) ) ;
+              equal string "EISDIR"
+                (err (fun () -> File.openfile_stat [Write] d)) ;
+              equal string "ENOTDIR"
+                (err (fun () -> File.openfile_stat [Read] (p "a/x"))) ) )
     ; test "pwrite, truncate and append" (fun () ->
           w.run (fun () ->
               let path = concat (w.tmp ()) "b" in
@@ -2446,6 +2483,7 @@ let files w =
                 equal string "EINVAL: a NUL byte in a string" (fs_error f)
               in
               nul (fun () -> File.openfile [Write; Create] bad) ;
+              nul (fun () -> File.openfile_stat [Read] bad) ;
               nul (fun () -> File.stat bad) ;
               nul (fun () -> Dir.mkdir bad) ;
               nul (fun () -> Dir.readdir bad) ;

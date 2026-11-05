@@ -182,6 +182,7 @@ type raw =
   | R_int of int
   | R_read of string
   | R_stat of Op.stat
+  | R_open_stat of int * Op.stat  (** The fd and the stat of [Open_stat]. *)
   | R_names of string list
   | R_name of string
 
@@ -442,6 +443,14 @@ let perform : type a. t -> a Op.blocking -> (raw, Op.error) result option =
          let fd = new_fd n in
          Hashtbl.replace n.fds fd (Fil h) ;
          Ok (R_int fd) )
+  | Op.Open_stat (path, flags, perm) ->
+      (* The fstat of a file that is open cannot fail in memory. *)
+      Some
+        (let* () = room n 1 in
+         let* h = Sim_fs.open_ fs path flags perm ~now in
+         let fd = new_fd n in
+         Hashtbl.replace n.fds fd (Fil h) ;
+         Ok (R_open_stat (fd, Sim_fs.stat_of h.Sim_fs.node)) )
   | Op.Pread (fd, _, _, len, at) ->
       Some
         (let* h = handle_of n fd in
@@ -513,6 +522,8 @@ let finish : type a. a Op.blocking -> raw -> a =
   match (op, raw) with
   | Op.Open _, R_int fd ->
       fd
+  | Op.Open_stat _, R_open_stat (fd, s) ->
+      (fd, s)
   | Op.Pread (_, buf, off, _, _), R_read s ->
       Bytes.blit_string s 0 buf off (String.length s) ;
       String.length s
@@ -552,6 +563,8 @@ let start_job : type a. t -> int -> a Op.blocking -> int =
   let on_drop = function
     | R_int fd -> (
       match op with Op.Open _ -> Hashtbl.remove t.net.fds fd | _ -> () )
+    | R_open_stat (fd, _) ->
+        Hashtbl.remove t.net.fds fd
     | _ ->
         ()
   in

@@ -220,8 +220,8 @@ static void run(struct job *j) {
   int64_t r = 0;
   HANDLE h = (HANDLE)(intptr_t)j->fd;
   wchar_t *p = NULL, *p2 = NULL;
-  if (j->kind == J_OPEN || j->kind == J_STAT || j->kind == J_MKDIR || j->kind == J_READDIR ||
-      j->kind == J_RENAME || j->kind == J_UNLINK || j->kind == J_RMDIR) {
+  if (j->kind == J_OPEN || j->kind == J_OPEN_STAT || j->kind == J_STAT || j->kind == J_MKDIR ||
+      j->kind == J_READDIR || j->kind == J_RENAME || j->kind == J_UNLINK || j->kind == J_RMDIR) {
     p = weft_wide(j->s1);
     if (p == NULL) {
       fail(j, EINVAL);
@@ -258,6 +258,21 @@ static void run(struct job *j) {
     BY_HANDLE_FILE_INFORMATION fi;
     if (GetFileInformationByHandle(h, &fi)) stat_of(j, &fi);
     else r = -weft_win_errno(GetLastError());
+    break;
+  }
+  case J_OPEN_STAT: {
+    /* If the stat fails, the job closes the handle and gives the error of the
+       stat. */
+    BY_HANDLE_FILE_INFORMATION fi;
+    r = w_open(j, p);
+    if (r < 0) break;
+    if (GetFileInformationByHandle((HANDLE)(intptr_t)r, &fi)) {
+      stat_of(j, &fi);
+    } else {
+      int e = weft_win_errno(GetLastError());
+      CloseHandle((HANDLE)(intptr_t)r);
+      r = -e;
+    }
     break;
   }
   case J_STAT:

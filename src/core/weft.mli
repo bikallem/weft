@@ -753,6 +753,15 @@ module File : sig
         with [No_entry], [Exists] (with [Create] and [Exclusive]), [Not_dir] or
         [Is_dir] (with [Write]). *)
 
+  val openfile_stat : ?perm:int -> flag list -> string -> t * stat
+  (** [openfile_stat flags path] is [openfile flags path] and [fstat] of the
+      file, in one job of the pool. Thus it costs one round trip to the pool,
+      not two. The stat is of the open file, not of the path: a rename of the
+      path after the open does not change the result. If the stat fails, the
+      file is closed, and the call raises the error.
+
+      @raise Error as [openfile] and [fstat]. *)
+
   val read : t -> bytes -> int -> int -> int
   (** [read t buf off len] reads at the offset of [t], and moves the offset. It
       gives 0 at the end of the file.
