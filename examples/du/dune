@@ -1,0 +1,17 @@
+; A concurrent walk of a directory: Dir, File, nested scopes and a semaphore
+; that limits the operations.
+
+(library
+ (name du)
+ (modules du)
+ (libraries weft))
+
+(executable
+ (name du_main)
+ (modules du_main)
+ (libraries du weft weft.os))
+
+(test
+ (name test_du)
+ (modules test_du)
+ (libraries du weft weft.sim))

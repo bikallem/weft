@@ -84,6 +84,27 @@ platform. The CI tests macOS, FreeBSD and Windows too.
 
 ## Examples
 
+The [`examples`](examples) directory has an example for each major function.
+Each example has its code in a library that uses only the API of weft, a
+program for the OS, and a test of the same code in the simulator.
+`dune runtest` runs the tests.
+
+| Example | What it shows | Program |
+|---|---|---|
+| [`echo`](examples/echo) | A TCP server, `fork_isolated`, `Fiber.with_timeout` | `echo_server.exe [port]` |
+| [`parallel`](examples/parallel) | A parallel map on all domains, a race of promises, a cancel that stops the siblings, a cleanup in `Fiber.shield` | `parallel_main.exe [n]` |
+| [`pool`](examples/pool) | Workers on a `Chan`, an RPC event with `guard` and `with_nack`, a rate limit with `Fiber.Semaphore` | `pool_main.exe` |
+| [`happy`](examples/happy) | `Dns.resolve`, a race of connects (RFC 8305) with `choose`, `Time.after` and `Promise.cancel` | `happy_main.exe [host] [port]` |
+| [`chat`](examples/chat) | A chat server, a mailbox with `Fiber.Mutex` and `Fiber.Condition`, a graceful stop at `SIGINT` | `chat_main.exe [port]` |
+| [`reload`](examples/reload) | A configuration in a `Var`, a reload from a `File` at `SIGHUP`, a worker that waits on `Var.changed` | `reload_main.exe [file]` |
+| [`du`](examples/du) | A concurrent walk with `Dir` and `File`, a scope for each directory, a limit of the operations | `du_main.exe [dir] [limit]` |
+| [`supervisor`](examples/supervisor) | `Process.spawn` with a pipe, a restart with a backoff, a stop at `SIGTERM` | `supervisor_main.exe prog [args]` |
+| [`cron`](examples/cron) | A daily job on the wall clock with `Time.at Posix`, `Time.to_utc`, the steps of the clock | `cron_main.exe HH:MM` |
+| [`sim_tour`](examples/sim_tour) | The simulator: a deadlock report, network faults over 100 seeds, the replay of a seed, the manual clock, UDP with loss | test only |
+
+Run a program with `dune exec`, for example
+`dune exec examples/du/du_main.exe -- src`.
+
 ### An echo server
 
 The server code uses only the API of weft

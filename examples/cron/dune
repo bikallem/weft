@@ -1,0 +1,17 @@
+; A daily job on the wall clock: Time.at on the Posix line, Time.to_utc and
+; Time.of_utc, and the steps of the wall clock.
+
+(library
+ (name cron)
+ (modules cron)
+ (libraries weft))
+
+(executable
+ (name cron_main)
+ (modules cron_main)
+ (libraries cron weft weft.os))
+
+(test
+ (name test_cron)
+ (modules test_cron)
+ (libraries cron weft weft.sim))

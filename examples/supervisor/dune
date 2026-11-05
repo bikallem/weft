@@ -1,0 +1,17 @@
+; A supervisor of a child process: Process.spawn with a pipe, a restart with a
+; backoff, and a stop at SIGTERM.
+
+(library
+ (name supervisor)
+ (modules supervisor)
+ (libraries weft))
+
+(executable
+ (name supervisor_main)
+ (modules supervisor_main)
+ (libraries supervisor weft weft.os))
+
+(test
+ (name test_supervisor)
+ (modules test_supervisor)
+ (libraries supervisor weft weft.sim))

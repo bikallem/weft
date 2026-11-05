@@ -1,0 +1,17 @@
+; A configuration in a Var: a reload from a file at SIGHUP, and a worker that
+; waits on Var.changed.
+
+(library
+ (name reload)
+ (modules reload)
+ (libraries weft))
+
+(executable
+ (name reload_main)
+ (modules reload_main)
+ (libraries reload weft weft.os))
+
+(test
+ (name test_reload)
+ (modules test_reload)
+ (libraries reload weft weft.sim))

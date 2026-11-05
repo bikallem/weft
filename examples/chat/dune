@@ -1,0 +1,17 @@
+; A chat server: TCP, a mailbox with Fiber.Mutex and Fiber.Condition,
+; fork_isolated, and a graceful stop at SIGINT.
+
+(library
+ (name chat)
+ (modules chat)
+ (libraries weft))
+
+(executable
+ (name chat_main)
+ (modules chat_main)
+ (libraries chat weft weft.os))
+
+(test
+ (name test_chat)
+ (modules test_chat)
+ (libraries chat weft weft.sim))
