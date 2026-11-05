@@ -73,6 +73,7 @@ type status = Exited of int | Signaled of signal
 
 type _ blocking =
   | Open : string * open_flag list * int -> fd blocking
+  | Open_stat : string * open_flag list * int -> (fd * stat) blocking
   | Pread : fd * bytes * int * int * int -> int blocking
   | Pwrite : fd * bytes * int * int * int -> int blocking
   | Fsync : fd -> unit blocking

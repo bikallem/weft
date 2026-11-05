@@ -236,7 +236,8 @@ type pool =
   ; jobs: (int, nativeint) Hashtbl.t  (** The jobs that are not finished. *)
   ; next_job: int Atomic.t
   ; files: (int, unit) Hashtbl.t
-        (** The fds of [Open]: the pool does their close(2). *) }
+        (** The fds of [Open] and [Open_stat]: the pool does their close(2). *)
+  }
 
 (* [wake_fds] has the fd of each domain that a worker writes after it puts a
    completion in the mailbox of that domain. *)
@@ -289,6 +290,8 @@ let kind_of : type a. a Op.blocking -> int = function
       12
   | Op.Reverse _ ->
       13
+  | Op.Open_stat _ ->
+      15
 
 let flag_bits flags =
   List.fold_left
@@ -325,7 +328,7 @@ let args_of : type a. int -> int -> a Op.blocking -> job_args =
     ; off= 0 }
   in
   match op with
-  | Op.Open (path, flags, perm) ->
+  | Op.Open (path, flags, perm) | Op.Open_stat (path, flags, perm) ->
       {base with s1= path; a= flag_bits flags; b= perm}
   | Op.Pread (fd, _, _, len, at) ->
       {base with fd; a= len; b= at}
@@ -381,6 +384,8 @@ let finish : type a. nativeint -> a Op.blocking -> (a, Op.error) result =
       match op with
       | Op.Open _ ->
           Ok res
+      | Op.Open_stat _ ->
+          Ok (res, stat_of j)
       | Op.Pread (_, buf, off, _, _) ->
           Ok (job_read j buf off)
       | Op.Pwrite _ ->
@@ -514,12 +519,17 @@ let start_job p dom op =
 
 let finish_job : type a. pool -> int -> a Op.blocking -> (a, Op.error) result =
  fun p id op ->
+  let add_file fd =
+    Mutex.protect p.lock (fun () -> Hashtbl.replace p.files fd ())
+  in
   match take_job p id with
   | Some j ->
       let r = finish j op in
       ( match (op, r) with
       | Op.Open _, Ok fd ->
-          Mutex.protect p.lock (fun () -> Hashtbl.replace p.files fd ())
+          add_file fd
+      | Op.Open_stat _, Ok (fd, _) ->
+          add_file fd
       | _ ->
           () ) ;
       r

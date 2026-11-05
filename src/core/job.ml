@@ -10,7 +10,7 @@ let wait id =
 
 (* The paths and the names that go to the OS. *)
 let strings : type a. a Op.blocking -> string list = function
-  | Op.Open (path, _, _) ->
+  | Op.Open (path, _, _) | Op.Open_stat (path, _, _) ->
       [path]
   | Op.Stat path ->
       [path]
