@@ -1,0 +1,17 @@
+; Structured concurrency on all domains: a parallel map, a race of promises,
+; and a cleanup that a cancel does not stop.
+
+(library
+ (name parallel)
+ (modules parallel)
+ (libraries weft))
+
+(executable
+ (name parallel_main)
+ (modules parallel_main)
+ (libraries parallel weft weft.os))
+
+(test
+ (name test_parallel)
+ (modules test_parallel)
+ (libraries parallel weft weft.sim))

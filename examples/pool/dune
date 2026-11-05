@@ -1,0 +1,17 @@
+; A pool of workers: channels, a CML call with with_nack, and a rate limit with
+; a semaphore.
+
+(library
+ (name pool)
+ (modules pool)
+ (libraries weft))
+
+(executable
+ (name pool_main)
+ (modules pool_main)
+ (libraries pool weft weft.os))
+
+(test
+ (name test_pool)
+ (modules test_pool)
+ (libraries pool weft weft.sim))

@@ -1,0 +1,17 @@
+; DNS and a race of connects ("happy eyeballs", RFC 8305): promises, choose and
+; timers.
+
+(library
+ (name happy)
+ (modules happy)
+ (libraries weft))
+
+(executable
+ (name happy_main)
+ (modules happy_main)
+ (libraries happy weft weft.os))
+
+(test
+ (name test_happy)
+ (modules test_happy)
+ (libraries happy weft weft.sim))

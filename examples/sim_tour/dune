@@ -1,0 +1,7 @@
+; A tour of the simulator: a deadlock report, network faults over many seeds,
+; the replay of a seed, the manual clock, and UDP with packet loss. It has
+; only a test.
+
+(test
+ (name test_sim_tour)
+ (libraries weft weft.sim))
