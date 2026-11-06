@@ -398,4 +398,7 @@ measurements. The TLA+ models of the shared protocols are in
 
 ## License
 
-ISC.
+ISC, except the files of `weft.flow` that came from caravan. These files are
+under the Mozilla Public License 2.0 ([`LICENSE.MPL-2.0`](LICENSE.MPL-2.0)),
+and each one starts with the header of this license. Thus the license of the
+package is `ISC AND MPL-2.0`.

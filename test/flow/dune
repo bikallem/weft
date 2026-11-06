@@ -1,0 +1,12 @@
+; The suite of weft.flow on the simulator world (design section 2.18). As
+; test/sim, it links windtrap and thus unix. The test code must not call
+; Unix. It starts no domain, so a mutation run can fork it.
+
+(test
+ (name test_flow)
+ (libraries weft weft.sim weft.flow windtrap)
+ (action
+  (progn
+   (run %{test} --corrected)
+   (diff? test_flow.ml test_flow.ml.corrected)
+   (diff? test_tcp.ml test_tcp.ml.corrected))))

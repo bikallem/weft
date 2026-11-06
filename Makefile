@@ -35,15 +35,16 @@ MUTANT ?=
 DUNE := $(if $(IN_NIX_SHELL),dune,nix develop -c dune)
 MUTATE := --instrument-with ppx_windtrap.mutate
 
-# The suites of all the libraries.
-SUITES := test/core test/sim
+# The suites of all the libraries. test/flow is the suite of weft.flow.
+SUITES := test/core test/sim test/flow
 
 # The suites of the Linux world. They test only the mutants of weft.linux and
 # weft.posix (LINUX_LIBS), because test/core and test/sim kill each mutant of
-# the core and the simulator that these suites kill. A run of test/linux_md on
-# src/core/sched.ml took 297 s and gave no other kill. These suites start
-# domains, so windtrap starts each child as a new process (exec mode). They
-# run after SUITES, one at a time, because their tests use ports and files.
+# the core and the simulator that these suites kill, and test/flow kills the
+# mutants of weft.flow. A run of test/linux_md on src/core/sched.ml took 297 s
+# and gave no other kill. These suites start domains, so windtrap starts each
+# child as a new process (exec mode). They run after SUITES, one at a time,
+# because their tests use ports and files.
 # Each mutant that only test/linux/few_fds.exe tests survives: few_fds is a
 # program that a dune rule runs, not a suite, so it reaches no mutant.
 LINUX_SUITES := $(if $(filter Linux,$(shell uname -s)),test/linux test/linux_md)

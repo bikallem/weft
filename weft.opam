@@ -6,7 +6,7 @@ description:
   "Weft runs fibers on OCaml 5 domains. Each fiber is in a scope, and a scope waits for all of its fibers. Its events come from Concurrent ML. All operating system calls are effects, so a simulator can run the same program with a virtual clock and network."
 maintainer: ["Bikal Gurung <gbikal@gmail.com>"]
 authors: ["Bikal Gurung <gbikal@gmail.com>"]
-license: "ISC"
+license: "ISC AND MPL-2.0"
 homepage: "https://github.com/bikallem/weft"
 bug-reports: "https://github.com/bikallem/weft/issues"
 depends: [

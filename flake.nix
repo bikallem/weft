@@ -40,8 +40,9 @@
       forAllSystems = f: nixpkgs.lib.genAttrs systems (system: f nixpkgs.legacyPackages.${system});
 
       # The libraries weft, weft.posix, weft.linux (on Linux), weft.kqueue (on
-      # macOS and FreeBSD) and weft.sim. The tests need windtrap, so the
-      # package does not run them. The source has only the files of the build.
+      # macOS and FreeBSD), weft.sim and weft.flow. The tests need windtrap, so
+      # the package does not run them. The source has only the files of the
+      # build.
       package =
         { lib, buildDunePackage }:
         buildDunePackage {
@@ -55,6 +56,7 @@
               ./weft.opam
               ./src
               ./LICENSE
+              ./LICENSE.MPL-2.0
               ./README.md
             ];
           };
@@ -62,7 +64,11 @@
           meta = {
             description = "Concurrency for OCaml 5 with CML events and a deterministic simulator";
             homepage = "https://github.com/bikallem/weft";
-            license = lib.licenses.isc;
+            # The files of weft.flow that came from caravan are MPL-2.0.
+            license = [
+              lib.licenses.isc
+              lib.licenses.mpl20
+            ];
           };
         };
     in
