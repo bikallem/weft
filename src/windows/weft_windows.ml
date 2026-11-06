@@ -138,10 +138,10 @@ module Poller = struct
   let wait t ~domain (w : World.Wait.t) =
     Array.fold_right
       (fun (token, read, write) acc ->
-        if token = timer_token then World.Ready.Alarm :: acc
+        if token = timer_token then acc
         else if token = wake_token then
           let acc = if domain = 0 && t.signals then signals acc else acc in
-          World.Ready.Woken :: completions t.pool domain acc
+          completions t.pool domain acc
         else World.Ready.Fd {token; read; write} :: acc )
       (win_wait t.w domain (timeout_ns w))
       []

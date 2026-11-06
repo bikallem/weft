@@ -1474,9 +1474,8 @@ let now_of (type time) t (line : time Weft.Clock.line) : time =
 (* What a [Wait] of domain [d] gets now: a wake, and the edges, alarms and
    completions of [d]. *)
 let take_ready t d =
-  let woken = if t.woken.(d) then [World.Ready.Woken] else [] in
   t.woken.(d) <- false ;
-  woken @ take_edges t d
+  take_edges t d
 
 let has_edges t d = List.exists (fun (d', _) -> d' = d) t.net.edges
 
@@ -1583,13 +1582,9 @@ let step t st d =
       | World.Wait (_, w) -> (
           if t.net.extra_edges then extra_edge t d ;
           (* A domain waits only on its own poller. *)
-          match (take_ready t d, w.timeout) with
-          | (_ :: _ as ready), _ ->
-              go ready
-          | [], World.Wait.Poll ->
-              go []
-          | [], World.Wait.Sleep ->
-              st.(d) <- Sleeping (w, k) )
+          if has_ready t d || w.timeout = World.Wait.Poll then
+            go (take_ready t d)
+          else st.(d) <- Sleeping (w, k) )
       | _ ->
           assert false (* The handler stops only at world effects. *) )
 
@@ -1621,21 +1616,18 @@ let quiescent t st =
         | Sleeping (w, _) ->
             Option.to_list
               (Option.map
-                 (fun m -> (d, Weft.Clock.to_ns Mono m, World.Ready.Alarm))
+                 (fun m -> (d, Weft.Clock.to_ns Mono m))
                  w.deadline )
             @ Option.to_list
                 (Option.map
-                   (fun p ->
-                     ( d
-                     , Int64.sub (Weft.Clock.to_ns Posix p) t.posix0
-                     , World.Ready.Posix_alarm ) )
+                   (fun p -> (d, Int64.sub (Weft.Clock.to_ns Posix p) t.posix0))
                    w.posix_deadline )
         | _ ->
             [] )
       (List.init (Array.length st) Fun.id)
   in
   let deadline =
-    List.fold_left (fun acc (_, at, _) -> earliest acc (Some at)) None deadlines
+    List.fold_left (fun acc (_, at) -> earliest acc (Some at)) None deadlines
   in
   let next_agenda = Agenda.next t.agenda
   in
@@ -1662,7 +1654,7 @@ let quiescent t st =
     t.now <- Int64.max t.now at ;
     run_agenda t ;
     List.iter
-      (fun (d, dl, alarm) -> if Int64.compare dl t.now <= 0 then give d alarm)
+      (fun (d, dl) -> if Int64.compare dl t.now <= 0 then t.woken.(d) <- true)
       deadlines
   in
   if Atomic.get t.refused_fill then
@@ -1672,7 +1664,7 @@ let quiescent t st =
   | (_ :: _ as fills), _ ->
       (* The fills go to the injection queue, and a domain wakes. *)
       List.iter (Sched.inject s) (List.rev fills) ;
-      give first World.Ready.Woken
+      t.woken.(first) <- true
   | [], _ :: _ ->
       List.iter
         (fun id -> give first (World.Ready.External id))
@@ -1856,9 +1848,7 @@ let set_latency t span = t.net.latency <- Weft.Span.to_ns span
    change. *)
 let set_posix t p =
   t.posix0 <- Int64.sub (Weft.Clock.to_ns Posix p) t.now ;
-  Array.iteri
-    (fun d _ -> t.net.edges <- (d, World.Ready.Posix_alarm) :: t.net.edges)
-    (sched t).doms
+  Array.fill t.woken 0 (Array.length t.woken) true
 
 type net_faults =
   { jitter: Weft.Span.t

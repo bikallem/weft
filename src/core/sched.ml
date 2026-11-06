@@ -1144,8 +1144,6 @@ let on_ready dom = function
               () )
       | None ->
           () )
-  | World.Ready.Alarm | World.Ready.Posix_alarm | World.Ready.Woken ->
-      ()
 
 (* The cancel contexts (design section 2.5, How a cancel reaches a fiber, and
    spec/tla/Scope.tla). *)

@@ -137,8 +137,10 @@ module type WORLD = sig
   val wait : t -> domain:int -> Wait.t -> Ready.t list
   (** The only blocking call. The domain waits on its own poller.
       [Wait.t] holds the timeout (zero or none) and the earliest
-      deadline of the domain. The result tells which fds are ready, if
-      the alarm went off, and if [wake] occurred. *)
+      deadline of the domain. The result gives the ready fds, the
+      completed jobs and the signals. It can be empty: after the alarm,
+      after a [wake], or with no event. The scheduler then reads its
+      queues and its heap again. *)
 
   val wake : t -> domain:int -> unit
   (** Ends the [wait] of domain [domain]. Any domain or thread can call

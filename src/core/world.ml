@@ -9,9 +9,6 @@ end
 
 module Ready = struct
   type t =
-    | Alarm
-    | Posix_alarm
-    | Woken
     | Fd of {token: int; read: bool; write: bool}
     | External of int
     | Signal of Op.signal * int
