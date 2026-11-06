@@ -24,6 +24,10 @@
   #
   # - As weft.packages.${system}.weft, with
   #   inputs.weft.inputs.nixpkgs.follows = "nixpkgs".
+  #
+  # The package weft-tls (library weft-tls) has the same three ways:
+  # weft.lib.tlsPackage in a scope that also has weft, the overlay, and
+  # weft.packages.${system}.weft-tls.
   outputs =
     {
       self,
@@ -71,22 +75,73 @@
             ];
           };
         };
+
+      # The library weft-tls: the TLS flow of caravan (design section 2.19).
+      # The scope of the caller gives weft, tls and mirage-crypto-rng. The
+      # source has only the files of the build, and dune builds only the
+      # package weft-tls.
+      tlsPackage =
+        {
+          lib,
+          buildDunePackage,
+          weft,
+          tls,
+          mirage-crypto-rng,
+        }:
+        buildDunePackage {
+          pname = "weft-tls";
+          version = "0.1.0-dev";
+          minimalOCamlVersion = "5.5";
+          src = lib.fileset.toSource {
+            root = ./.;
+            fileset = lib.fileset.unions [
+              ./dune-project
+              ./weft-tls.opam
+              ./src/tls
+              ./LICENSE
+              ./LICENSE.MPL-2.0
+              ./README.md
+            ];
+          };
+          propagatedBuildInputs = [
+            weft
+            tls
+            mirage-crypto-rng
+          ];
+          doCheck = false;
+          meta = {
+            description = "TLS flows for weft, with ocaml-tls";
+            homepage = "https://github.com/bikallem/weft";
+            # The library is a changed copy of a file of caravan.
+            license = lib.licenses.mpl20;
+          };
+        };
     in
     {
-      lib = { inherit package; };
+      lib = { inherit package tlsPackage; };
 
       overlays.default = final: prev: {
         ocaml-ng = prev.ocaml-ng // {
           ocamlPackages_5_5 = prev.ocaml-ng.ocamlPackages_5_5.overrideScope (
-            ofinal: _: { weft = ofinal.callPackage package { }; }
+            ofinal: _: {
+              weft = ofinal.callPackage package { };
+              weft-tls = ofinal.callPackage tlsPackage { };
+            }
           );
         };
       };
 
-      packages = forAllSystems (pkgs: rec {
-        weft = pkgs.ocaml-ng.ocamlPackages_5_5.callPackage package { };
-        default = weft;
-      });
+      packages = forAllSystems (
+        pkgs:
+        let
+          ocamlPackages = pkgs.ocaml-ng.ocamlPackages_5_5;
+        in
+        rec {
+          weft = ocamlPackages.callPackage package { };
+          weft-tls = ocamlPackages.callPackage tlsPackage { inherit weft; };
+          default = weft;
+        }
+      );
 
       devShells = forAllSystems (
         pkgs:
@@ -107,6 +162,15 @@
               ocamlPackages.windtrap
               ocamlPackages.ppx_windtrap
               ocamlPackages.dscheck
+              # weft-tls and its tests. mirage-crypto-ec makes the keys of the
+              # test certificates.
+              ocamlPackages.tls
+              ocamlPackages.x509
+              ocamlPackages.domain-name
+              ocamlPackages.ipaddr
+              ocamlPackages.mirage-crypto-rng
+              ocamlPackages.mirage-crypto-ec
+              ocamlPackages.ptime
               ocamlPackages.ocaml
               ocamlPackages.dune_3
               ocamlPackages.findlib

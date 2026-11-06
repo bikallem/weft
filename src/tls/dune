@@ -1,0 +1,15 @@
+; The TLS flow of weft (design section 2.19), with ocaml-tls. The files came
+; from caravan (tls/caravan_tls.ml) and are MPL-2.0. Optional: dune builds the
+; library only if tls and mirage-crypto-rng are installed. It uses only the
+; core and weft.flow, thus each world and the simulator run it. test/nounix
+; makes sure that it links no unix.
+
+(library
+ (name weft_tls)
+ (public_name weft-tls)
+ (optional)
+ (libraries weft weft.flow tls mirage-crypto-rng)
+ (instrumentation
+  (backend ppx_windtrap.coverage))
+ (instrumentation
+  (backend ppx_windtrap.mutate)))

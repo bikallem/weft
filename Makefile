@@ -35,8 +35,9 @@ MUTANT ?=
 DUNE := $(if $(IN_NIX_SHELL),dune,nix develop -c dune)
 MUTATE := --instrument-with ppx_windtrap.mutate
 
-# The suites of all the libraries. test/flow is the suite of weft.flow.
-SUITES := test/core test/sim test/flow
+# The suites of all the libraries. test/flow is the suite of weft.flow, and
+# test/tls the suite of weft-tls.
+SUITES := test/core test/sim test/flow test/tls
 
 # The suites of the Linux world. They test only the mutants of weft.linux and
 # weft.posix (LINUX_LIBS), because test/core and test/sim kill each mutant of
