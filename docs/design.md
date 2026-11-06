@@ -724,7 +724,7 @@ The stealing is full, as in affect (decision 7). A thief can take any ready fibe
 | Poller | The epoll set or the kqueue of this domain, with its fd registrations, its alarm and its `wake` fd. On domain 0, also the signal source. | Only the owner. `wake` can come from any thread. |
 | Fd registrations | For each fd in the poller: a read flag, a write flag and the waiters | Only the owner |
 | Deadline heap | The `Mono` deadlines of the fibers that blocked on this domain (section 2.6) | Only the owner adds and pops entries. Other domains change only the sync word of an entry. |
-| Mailbox (M2) | A C queue for the completed `Blocking` operations and the close notices of this domain | Pool threads and other domains push. Only the owner takes. |
+| Mailboxes (M2) | Two: a C queue of the ids of the completed `Blocking` operations, and the atomic list `mailbox` of the close notices of this domain | Pool threads push to the C queue, and other domains push to the list. Only the owner takes. |
 | PRNG | Selects the domain to steal from, and the order of the branches of a `sync` | Only the owner. Its seed comes from `World.random` when the domain starts. |
 | Sync id counter | The ids of section 2.4 | Only the owner |
 
@@ -806,13 +806,13 @@ A lost wake-up is the typical bug here: domain A goes to sleep, and at the same 
 **A domain that finds no work (step 4 of the loop found nothing):**
 
 1. It adds itself to `idle`.
-2. It checks again: its next slot, its local queue, its mailbox, the global injection queue, the queues and next slots of the other domains, and on domain 0, the pinned queue.
+2. It checks again: the end of `main`, the global injection queue, on domain 0 the pinned queue, the local queues and next slots of all domains, and the overflow queue. It does not read the mailboxes (What the second check protects in M1, below).
 3. If it finds work, it removes itself from `idle` and goes to step 1 of the loop. If not, it performs `Wait`.
 
 **A domain or thread that pushes work:**
 
 1. It pushes the fiber.
-2. It reads `idle`. If `idle` is not empty, it takes one domain out of `idle` and wakes it with `wake`.
+2. It reads `idle` and `searching`. If `idle` is not empty and no domain searches, it wakes one idle domain with `wake` and the token (The Go rules, below). In M1, each push woke an idle domain.
 3. A push to the pinned queue wakes domain 0 directly. A different idle domain cannot run a pinned fiber.
 
 OCaml `Atomic` operations are sequentially consistent. Thus one of the two sides always sees the other: the sleeper sees the work in its second check, or the pusher sees the sleeper in `idle`. This is the Dekker pattern. It needs a model check with `dscheck`, because the simulator does not try the other orders of the atomic operations between two switch points.
@@ -821,9 +821,9 @@ OCaml `Atomic` operations are sequentially consistent. Thus one of the two sides
 
 A `wake` that comes before the domain is in `Wait` is not lost. The `eventfd` keeps its count, and the next `Wait` returns at once. The wake pipe of the kqueue world keeps its bytes in the same way.
 
-**The cost: more wakes.** A push wakes an idle domain each time that one exists, also when another domain already looks for work. Thus there can be more wakes than necessary, a small "thundering herd". Go and Tokio prevent this with a count of the domains that search for work ("spinning" threads in Go, "searching" workers in Tokio). Open question 8 asks for a measurement of this cost.
+**The cost of M1: more wakes.** In M1, a push woke an idle domain each time that one existed, also when another domain already looked for work. Thus there can be more wakes than necessary, a small "thundering herd". Go and Tokio prevent this with a count of the domains that search for work ("spinning" threads in Go, "searching" workers in Tokio). Open question 8 asked for a measurement of this cost, and M3 added the Go rules that follow.
 
-**The Go rules (M3, only if a measurement shows that they are necessary).** These rules lower the number of wakes, but the TLA+ model of `Wake.tla` showed that correctness does not need them:
+**The Go rules (M3).** These rules lower the number of wakes, but the TLA+ model of `Wake.tla` showed that correctness does not need them:
 
 - A `searching` count. A domain increases it when it starts step 4, and a push wakes nobody if it is not 0.
 - At most half of the domains search at one time.
@@ -1074,7 +1074,7 @@ On Linux, `accept` can also give a pending network error of the new connection. 
 - `wake` writes a pipe of the domain, and not `EVFILT_USER`: a worker of a thread pool must write an fd after it posts a completion, and the pipe serves the two.
 - Signals use a handler of the world, which counts each signal and writes the wake pipe of domain 0 (section Signals, below). Before issue 6, they used `EVFILT_SIGNAL` on domain 0, with the action `SIG_IGN`. A test of macOS and FreeBSD in CI verifies that a `SIGTERM` to the process comes as an event.
 - A child has no pidfd. Its fd is a pipe, and domain 0 watches the child with `EVFILT_PROC` (`NOTE_EXIT`). At the exit, the world writes one byte to the pipe, so the fiber that waits gets a normal read edge. If `EVFILT_PROC` refuses the child because it already exited, the world writes the pipe at once. The kernel can tell of the exit before the child is a zombie. Then a reap with `WNOHANG` finds nothing, and no second edge comes. Thus after the exit, the reap first waits for the zombie with `waitid (WNOWAIT)`, in a blocking section. The reap and a `kill` are under one lock, so a `kill` never goes to a pid that the system gave again. A test spawns 50 children that exit at once, on 2 domains. It does not show which of the two ways occurs.
-- The parts that the two POSIX worlds share are in `src/posix` (`weft.posix`): the sockets, pipes, thread pools, errors and the watchdog, with portable C. The functor `Weft_posix.Make` gives the `World` module and `run` of a world from its poller, its signals and its child processes. Its `submit` takes each operation, and `run` checks the limit of the watchdog before it makes the world. On macOS, a timed wait uses `pthread_cond_timedwait_relative_np`, because macOS has no `pthread_condattr_setclock`.
+- The parts that the three production worlds (Linux, kqueue and Windows) share are in `src/posix` (`weft.posix`): the sockets, pipes, thread pools, errors and the watchdog, with portable C. The functor `Weft_posix.Make` gives the `World` module and `run` of a world from its poller, its signals and its child processes. Its `submit` takes each operation, and `run` checks the limit of the watchdog before it makes the world. On macOS, a timed wait uses `pthread_cond_timedwait_relative_np`, because macOS has no `pthread_condattr_setclock`.
 
 **The world at the call site (decision 33).** The core defines `module type OS`, with the `run` of a world of the OS. `Weft_linux`, `Weft_kqueue` and `Weft_windows` match it. A program gives the world to `Weft.run`, for example `Weft.run (module Weft_linux) main`. A portable program uses `Weft.run (module Weft_os) main`. The library `weft.os` (module `Weft_os`) selects the world with a `select` of dune: `weft.linux` if it is available, then `weft.kqueue`, then `weft.windows`. On another system, `weft.os` builds, and its `run` raises `Failure`. The selection occurs at compile time, because the stubs of epoll compile only on Linux, the stubs of kqueue only on macOS and FreeBSD, and the stubs of IOCP only on Windows. Thus the core keeps no C stubs, and a program that names a world that its OS does not have gives an error at build time. The world gives the defaults: for the worlds of the OS, `min 4 (Domain.recommended_domain_count ())` domains and a watchdog of 10 ms. `Weft.run_world (module W) w main` runs a program with a `WORLD` value, for example a test world. It has 1 domain by default.
 - **Not verified:** a system sleep on macOS, the combination of near timeouts by macOS, and OpenBSD and NetBSD.
@@ -1328,7 +1328,7 @@ The check of step 1 reads the scheduler through `Sched_debug` (section 2.2). The
 
 Without this check, the simulator takes a lost wakeup as quiescence and moves the time. A test then gives an incorrect timeout and not a clear error.
 
-A `Blocking` operation (milestone M2) does not complete at once. The simulator puts its completion in the agenda, with a time cost and a later switch point from the seed. The completion goes through the mailbox of the domain, as in production. Thus the race of a cancel and a completion, and the detach path, run in simulator tests.
+A `Blocking` operation (milestone M2) does not complete at once. The simulator puts its completion in the agenda, with a time cost and a later switch point from the seed. The completion goes to the domain as an `External` edge, as a completion of the pool does in production. Thus the race of a cancel and a completion, and the detach path, run in simulator tests.
 
 **Livelock (M3).** A loop such as `while Time.now Mono < t do Fiber.yield () done` ends in production. In the simulator, the program is never quiescent, so the time never moves, and the loop never ends. Go's `synctest` has the same property. Thus the simulator counts the switch points since the last quiescence in which the only world effects are `Now`, `Switch` and yields. If the count is more than 10^7, the simulator raises `Livelock` with the fibers that run. A test that streams much data with no timer is thus not a livelock. A test can change the limit, and 10^7 is a start value.
 
