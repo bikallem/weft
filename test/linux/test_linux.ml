@@ -1561,4 +1561,5 @@ let () =
                  ; domains= 4
                  ; run= (fun f -> Weft_linux.run ~domains:4 f) } ]
          ; linux
-         ; review_2026 ] ) )
+         ; review_2026
+         ; Flow_linux.tests ] ) )

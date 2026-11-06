@@ -29,12 +29,14 @@
 ; An executable and a rule, not a test stanza: on another system, dune
 ; builds the executable of a test stanza also if its enabled_if is false.
 
+; flow_linux has the tests of weft.flow that need real sockets.
+
 (executable
  (name test_linux)
  (enabled_if
   (= %{system} linux))
- (modules test_linux)
- (libraries weft weft.linux weft.os windtrap portable unix))
+ (modules test_linux flow_linux)
+ (libraries weft weft.linux weft.os weft.flow windtrap portable unix))
 
 (rule
  (alias runtest)
