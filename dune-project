@@ -34,3 +34,33 @@
    (and
     :with-test
     (>= 0.6.0)))))
+
+(package
+ (name weft-tls)
+ (allow_empty)
+ (license MPL-2.0)
+ (synopsis "TLS flows for weft, with ocaml-tls")
+ (description
+  "Weft_tls makes a TLS flow of weft.flow from another flow, as a server or as a client, with ocaml-tls. A read and a write can run at the same time in two fibers. A client can start TLS in the middle of a protocol, after bytes in clear text.")
+ (depends
+  (weft
+   (= :version))
+  (tls
+   (>= 2.1.3))
+  mirage-crypto-rng
+  (windtrap
+   (and
+    :with-test
+    (>= 0.2.0)))
+  (ppx_windtrap
+   (and
+    :with-test
+    (>= 0.2.0)))
+  (x509 :with-test)
+  (domain-name :with-test)
+  (ipaddr :with-test)
+  (ptime :with-test)
+  (dscheck
+   (and
+    :with-test
+    (>= 0.6.0)))))
