@@ -1412,11 +1412,13 @@ The cost of an effect is a perform and a handler call for each world operation. 
 | `fork_isolated ~on_error`, the poisoned mutex, `use_rw ~protect` and `use_ro` | Eio `run_server`, Eio `Mutex` |
 | The handler of a scope, `Promise.ready`, `Promise.cancel` | affect `Call_handler`, `get'`, `cancel` |
 | `Flow`, `Tcp` and the deadlines of a flow (`weft.flow`) | caravan |
+| The `read_into` rule of `Reader`: the held bytes first, and a large part with no copy | caravan `Buf_reader` |
+| The large-write rule of `Writer`: the start fills the buffer, and a large rest goes with no copy | caravan `Buf_writer` |
 | A simulator with a network and a seed | Shadow (from the session). FoundationDB, TigerBeetle, madsim and turmoil use the same idea. We did not examine them in the session. |
 
 ## 2.12 Decisions
 
-Decisions 1 to 6 were made on 2026-10-09, decisions 7 to 9 on 2026-10-10, decisions 10 and 11 on 2026-10-12 (issue 1), decision 12 on 2026-10-12 (issue 2), decisions 13 and 14 on 2026-10-12 (issue 3), decisions 15 to 17 on 2026-10-12 (issue 4), decisions 18 to 20 on 2026-10-12 (issue 5), decisions 21 to 25 on 2026-10-13 (issue 6), decision 26 on 2026-10-13 (issue 7), decisions 27 to 29 on 2026-10-13 (issue 8), and decisions 30 to 32 on 2026-10-13 (issue 9). Decision 35 was made on 2026-11-06.
+Decisions 1 to 6 were made on 2026-10-09, decisions 7 to 9 on 2026-10-10, decisions 10 and 11 on 2026-10-12 (issue 1), decision 12 on 2026-10-12 (issue 2), decisions 13 and 14 on 2026-10-12 (issue 3), decisions 15 to 17 on 2026-10-12 (issue 4), decisions 18 to 20 on 2026-10-12 (issue 5), decisions 21 to 25 on 2026-10-13 (issue 6), decision 26 on 2026-10-13 (issue 7), decisions 27 to 29 on 2026-10-13 (issue 8), and decisions 30 to 32 on 2026-10-13 (issue 9). Decisions 35 and 36 were made on 2026-11-06.
 
 | No. | Question | Decision |
 |---|---|---|
@@ -1455,6 +1457,7 @@ Decisions 1 to 6 were made on 2026-10-09, decisions 7 to 9 on 2026-10-10, decisi
 | 33 | The run of the world of the OS | `Weft.run (module O) main`, with the world `O` of type `OS` at the call site: `Weft_linux`, `Weft_kqueue`, or `Weft_os` of the library `weft.os`, which selects the world at compile time with a `select` of dune (section 2.7, The world at the call site). The run with a `WORLD` value is `Weft.run_world`. A library that includes the core and the world of the OS adds a library name and links C stubs into the core, so it was not kept. |
 | 34 | The Windows world | `weft.windows`: one IOCP for each domain and an I/O thread for each world, `AFD_POLL` for the sockets with one poll for each socket in the process, overlapped named pipes with a buffer of the world, a high-resolution timer and the exits of the children on the IOCP with `NtAssociateWaitCompletionPacket`, and the events of the console as signals (section 2.7, Windows). `weft.posix` gets a Windows version of its stubs, so `Weft_posix.Make` makes the world. `WSAPoll` is level-triggered and accepts only sockets. A poll in each domain, as decision 8, misses edges: AFD gives the events of a socket only to its oldest poll. The timeout of `GetQueuedCompletionStatusEx` was 15 ms late on a 1 ms wait. |
 | 35 | Byte streams in weft | The library `weft.flow` (`Weft_flow`) with `Flow` and `Tcp` from caravan, and an internal `Deadline` (section 2.18). `Flow.linger` is a procedure of HTTP, thus it stays in caravan. The files from caravan keep MPL-2.0, thus the license of the package is `ISC AND MPL-2.0`. A package of its own adds release work for two modules. A dependency of a database client on caravan puts an HTTP server in its link. |
+| 36 | Binary reads and writes in `weft.flow` | `Reader` and `Writer` (section 2.18), new code with the license ISC. Their users, the MySQL packet codec of Cistern and the WebSocket frames of caravan, are outside weft. Thus property tests with a model of each framing test them, and the pull request merges after the Cistern packet codec runs on it. The reader reads at offsets and does not move a cursor, because a MySQL decoder reads the fields of a packet in the buffer and then consumes the packet: two cursors give two states that can disagree. The header of a frame comes after its body, with the same write functions, because a MySQL header has a length and a sequence id. A form with a function for the header allocates a closure for each packet and gives the raw buffer to the caller. caravan keeps its HTTP `Buf_reader` and `Buf_writer`, which read lines. |
 
 Also on 2026-10-10, the user accepted the milestone plan of section 2.14. Decisions 4, 7 and 8 stay, and they come in milestone M1. Milestone M0 has one domain.
 
@@ -1798,7 +1801,7 @@ On a machine with 16 CPUs, `make mutate` took 45 s for a change to a comment, 10
 
 ## 2.18 Byte streams (`weft.flow`)
 
-The library `weft.flow` (`Weft_flow`) gives byte streams on `Net`, with deadlines and timeouts. Protocols on weft can share it. caravan and Cistern are the planned users. Its code came from caravan (`src/flow.ml`, `src/tcp.ml` and `src/deadline.ml`), and these files keep the license of caravan, MPL-2.0. The library needs only the core, thus each world and the simulator run the same code. The guard `test/nounix` links it (section 2.3).
+The library `weft.flow` (`Weft_flow`) gives byte streams on `Net`, with deadlines and timeouts. Protocols on weft can share it. caravan and Cistern are the planned users. `Flow`, `Tcp` and `Deadline` came from caravan (`src/flow.ml`, `src/tcp.ml` and `src/deadline.ml`), and these files keep the license of caravan, MPL-2.0. `Reader` and `Writer` are new code, with the license of weft, ISC. The library needs only the core, thus each world and the simulator run the same code. The guard `test/nounix` links it (section 2.3).
 
 **The wait of `Tcp`.** A read or a write that cannot continue waits for the socket, for a change of the deadline of the flow (a `Var`, decision 18), or for the deadline. A deadline that passed wins over the other events, also over a close at the same time.
 
@@ -1808,9 +1811,19 @@ The library `weft.flow` (`Weft_flow`) gives byte streams on `Net`, with deadline
 
 **Keep-alive.** `Tcp.connect ~keep_alive:true` sets `SO_KEEPALIVE` on a TCP connection, so that a connection to a peer that is gone ends. weft has no option for the times of the probes, thus the OS gives them. After failed probes, the first read or write raises `Net.Error` (`ETIMEDOUT` on Linux). Later ones give the end of the stream or `Flow.Closed`. I read this in the source of Linux, but I did not do a test of it.
 
+**Binary reads (`Reader`).** `src/flow/reader.mli` gives the contract. The users are the MySQL packet codec of Cistern and the WebSocket frames of caravan. Two reasons are not in the interface:
+
+- The buffer grows only when it is full. It allocates at most two times its size, or it takes the spare buffer (below), which can be larger. Thus a peer that declares a large length and sends a few bytes makes the reader allocate at most about two times the bytes that came, not the length.
+- The reader keeps its last larger buffer for the next growth, if it has at most the larger of `16 * size` and 64 KiB. Without it, a stream of rows a little larger than `size` allocated and copied a new buffer for each row (5020-byte rows: 629 words of the major heap and about 2 us for each row). The limit keeps the memory of an idle connection small.
+
+**Binary writes (`Writer`).** `src/flow/writer.mli` gives the contract. Two reasons are not in the interface:
+
+- A write of the flow can send a part of its bytes before an exception, also before a cancel. Thus the writer is broken after it. A new packet after a cut packet makes the peer read incorrect data: for example, a MySQL server can read the start of the next statement as the end of the cut statement.
+- The writer keeps its last larger buffer for the next frame that grows, with the limit of the reader. Without it, a frame of 5000 bytes with a `size` of 4096 allocated a new buffer for each frame (1026 words of the major heap and about 0.7 us for each frame).
+
 **No TLA+ model.** The library adds no shared protocol. It is a composition of `Var`, `Atomic` and `choose`, as `Var` is (section 2.16). The race tests of `test/flow` do a close and a deadline from another fiber during a wait, on 4 virtual domains and 100 seeds.
 
-**The tests.** `test/flow` runs on the simulator only, and it is in `SUITES` of the Makefile. It starts no domain, thus a mutation run can fork it. The group "weft.flow" of `test/linux` (`test/linux/flow_linux.ml`) runs a test of caravan with real sockets, on 1 and on 4 domains: on Linux, a shutdown after a reset of the peer gives `ENOTCONN`, and `Flow.shutdown_send` ignores it.
+**The tests.** `test/flow` runs on the simulator only, and it is in `SUITES` of the Makefile. It starts no domain, thus a mutation run can fork it. The tests of `Reader` and `Writer` use a fake flow that logs each read and write (`fake.ml`), models of the MySQL and WebSocket framings (`framing.ml`) with a codec for each (`codec.ml`), and the TCP flows of the simulator (`test_framing.ml`). The group "weft.flow" of `test/linux` (`test/linux/flow_linux.ml`) runs a test of caravan with real sockets, on 1 and on 4 domains: on Linux, a shutdown after a reset of the peer gives `ENOTCONN`, and `Flow.shutdown_send` ignores it.
 
 ---
 

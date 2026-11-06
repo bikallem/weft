@@ -15,6 +15,10 @@ exception Failed of string
 
 let failf fmt = Printf.ksprintf (fun m -> raise (Failed m)) fmt
 
+(* [is_invalid_arg e] tells if [e] is an [Invalid_argument], for
+   [Windtrap.raises_match]. *)
+let is_invalid_arg = function Invalid_argument _ -> true | _ -> false
+
 (* The text of a span in the largest unit that gives a whole number, for example
    "2 s" or "1 ns". *)
 let span_text d =

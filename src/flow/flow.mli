@@ -41,7 +41,9 @@ val make :
      ~set_read_deadline ~set_write_deadline ~set_read_timeout ~set_write_timeout
      ()] is a flow with these functions:
     - [read buf off len] reads at most [len > 0] bytes into [buf] from [off] and
-      gives the count, [0] at the end of the stream. It can wait.
+      gives the count, [0] at the end of the stream. It can wait. If it raises,
+      it took no byte of the stream: a later read gives these bytes. {!Reader}
+      needs this rule.
     - [read_now buf off len] is as [read], but it never waits: it is [None] when
       [read] would wait.
     - [write buf off len] writes all [len] bytes of [buf] from [off], or raises.
@@ -67,7 +69,8 @@ val make :
 
 val read : t -> bytes -> int -> int -> int
 (** [read flow buf off len] reads at most [len] bytes into [buf] from [off], and
-    gives the count. It gives [0] only at the end of the stream.
+    gives the count. It gives [0] only at the end of the stream. A read that
+    raises took no byte of the stream (see {!make}).
 
     @raise Invalid_argument
       if [len <= 0], or if [off] and [len] are not a valid range of [buf].

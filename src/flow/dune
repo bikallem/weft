@@ -1,6 +1,8 @@
 ; The byte streams on weft (design section 2.18): Flow and Tcp, with the
-; internal module Deadline. The library uses only the core, thus each world
-; and the simulator run it. test/nounix makes sure that it links no unix.
+; internal module Deadline, and the binary buffered reads and writes of Reader
+; and Writer. Flow, Tcp and Deadline came from caravan and are MPL-2.0. Reader
+; and Writer are ISC. The library uses only the core, thus each world and the
+; simulator run it. test/nounix makes sure that it links no unix.
 
 (library
  (name weft_flow)

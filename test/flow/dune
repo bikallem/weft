@@ -9,4 +9,7 @@
   (progn
    (run %{test} --corrected)
    (diff? test_flow.ml test_flow.ml.corrected)
-   (diff? test_tcp.ml test_tcp.ml.corrected))))
+   (diff? test_tcp.ml test_tcp.ml.corrected)
+   (diff? test_reader.ml test_reader.ml.corrected)
+   (diff? test_writer.ml test_writer.ml.corrected)
+   (diff? test_framing.ml test_framing.ml.corrected))))
