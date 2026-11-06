@@ -1,0 +1,23 @@
+; The suite of weft-tls on the simulator world (design section 2.19). As
+; test/flow, it links windtrap and thus unix. The test code must not call
+; Unix. It starts no OS domain, so a mutation run can fork it. FreeBSD and
+; Windows in CI have no tls, thus weft-tls is not available there, and the
+; build_if skips the suite. An enabled_if with %{lib-available:...} does not
+; skip a test stanza (dune 3.23).
+
+(test
+ (name test_tls)
+ (package weft-tls)
+ (build_if %{lib-available:weft-tls})
+ (libraries
+  weft
+  weft.sim
+  weft.flow
+  weft-tls
+  windtrap
+  tls
+  x509
+  domain-name
+  ipaddr
+  mirage-crypto-rng
+  ptime))

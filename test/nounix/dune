@@ -1,8 +1,19 @@
-; The guard: the build gives an error if weft, weft.sim or weft.flow links
-; unix (design section 2.3). The windtrap suites link unix, so the guard is a
-; separate executable with no test library.
+; The guards: the build gives an error if weft, weft.sim, weft.flow or
+; weft-tls links unix (design section 2.3). The windtrap suites link unix, so
+; each guard is a separate executable with no test library. weft-tls is
+; optional (FreeBSD and Windows in CI have no tls), thus it has a guard of its
+; own, and the guard of weft builds also where tls is absent.
 
 (test
  (name nounix)
+ (modules nounix)
  (libraries weft weft.sim weft.flow)
+ (forbidden_libraries unix))
+
+(test
+ (name nounix_tls)
+ (package weft-tls)
+ (modules nounix_tls)
+ (build_if %{lib-available:weft-tls})
+ (libraries weft-tls)
  (forbidden_libraries unix))
