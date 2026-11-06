@@ -120,7 +120,10 @@ module Fiber : sig
 
   (** A handler of the user, for example of a user effect (design section 2.5,
       Effect handlers of a scope). It must be safe for parallel use, and its
-      [effc] must give [None] for each effect that it does not know. *)
+      [effc] must give [None] for each effect that it does not know. It must
+      resume or discontinue each continuation that it takes. A continuation that
+      it drops skips the end of the scopes inside it: their fibers are not
+      joined. Then the scope of the handler raises [Invalid_argument]. *)
   type handler = {handle: 'a. (unit -> 'a) -> 'a}
 
   val scope : ?handler:handler -> (scope -> 'a) -> 'a

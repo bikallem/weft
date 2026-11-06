@@ -73,6 +73,40 @@ let condition_of_two_runs () =
           Time.sleep Mono (Span.ms 1) ;
           Fiber.Mutex.use_ro m (fun () -> Fiber.Condition.signal c) ) )
 
+type _ Effect.t += Drop : unit Effect.t
+
+(* A handler that drops the continuation of [Drop]: it raises with no
+   discontinue. The end of the nested scope never runs. The scope of the handler
+   raises [Invalid_argument], and the contexts of the fiber get their old value
+   (the review of 2026-11-06). *)
+let dropped_continuation () =
+  let drop =
+    { Fiber.handle=
+        (fun f ->
+          Effect.Deep.match_with f ()
+            { retc= Fun.id
+            ; exnc= raise
+            ; effc=
+                (fun (type a) (e : a Effect.t) ->
+                  match e with
+                  | Drop ->
+                      Some
+                        (fun (_ : (a, _) Effect.Deep.continuation) -> raise Exit)
+                  | _ ->
+                      None ) } ) }
+  in
+  Helpers.run (fun () ->
+      raises_match
+        (function Invalid_argument _ -> true | _ -> false)
+        (fun () ->
+          Fiber.scope ~handler:drop (fun _ ->
+              Fiber.scope (fun inner ->
+                  Fiber.fork inner (fun () -> Time.sleep Mono (Span.ms 1)) ;
+                  Effect.perform Drop ) ) ) ;
+      (* The fiber runs in its own scope again: a cancel check works. *)
+      Fiber.check_cancel () ;
+      Time.sleep Mono (Span.ms 5) )
+
 (* Outside a fiber, each call raises [Not_in_fiber] before it changes the lock.
    The release and the use of the semaphore do not change its count. *)
 let lock_calls_outside () =
@@ -198,6 +232,8 @@ let tests =
           timeout_of_wait_no_poison
       ; test "a timeout outside a wait in use_rw poisons"
           timeout_outside_wait_poisons
+      ; test "a handler that drops a continuation fails its scope"
+          dropped_continuation
       ; test "a signal skips the dead waiter of an earlier run"
           condition_of_two_runs
       ; test "each lock call outside a fiber raises Not_in_fiber"

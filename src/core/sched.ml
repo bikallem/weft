@@ -1939,10 +1939,14 @@ let finish_scope m node result =
       raise (Multiple l)
 
 (* The body runs inside [handler] only: the fiber already runs inside the chain
-   of its outer scopes. *)
+   of its outer scopes. A handler that does not resume a continuation skips the
+   end of each scope and shield inside it: their nodes stay at the head of
+   [ctxs]. Then the scope fails with [Invalid_argument], and [ctxs] gets its old
+   value (the review of 2026-11-06). *)
 let scope ?handler f =
   let fiber = self () in
-  let parent = List.hd fiber.ctxs in
+  let ctxs = fiber.ctxs in
+  let parent = List.hd ctxs in
   let node = new_node ~parent ?handler (Scope_node (new_scope_state ())) in
   let m = add_member_to node fiber in
   Spin.with_lock parent.lock (fun () ->
@@ -1961,7 +1965,18 @@ let scope ?handler f =
     | exception e ->
         Error (e, Printexc.get_raw_backtrace ())
   in
-  fiber.ctxs <- List.tl fiber.ctxs ;
+  let result =
+    match fiber.ctxs with
+    | n :: _ when n == node ->
+        result
+    | _ ->
+        Error
+          ( Invalid_argument
+              "Fiber.scope: a handler did not resume or discontinue a \
+               continuation"
+          , Printexc.get_callstack 0 )
+  in
+  fiber.ctxs <- ctxs ;
   finish_scope m node result
 
 (* [f] gets the shield node. *)

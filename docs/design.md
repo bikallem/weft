@@ -693,6 +693,7 @@ A user can have their own effects, for example a counter or a logger. A handler 
 - `Fiber.scope ~handler f` stores `handler` in the scope. The body `f` runs inside `handler.handle`.
 - Each fiber of the scope runs inside the handler of its scope. A nested scope composes its handler inside the handler of the outer scope. Thus a fiber of a nested scope runs as `outer.handle (fun () -> inner.handle g)`, as in affect.
 - The handler must be safe for parallel use. It can run on many domains at the same time, and a fiber can move to a different domain while it is suspended.
+- The handler must resume or discontinue each continuation that it takes. A dropped continuation skips the end of each scope and shield inside it, so their fibers are not joined. The scope of the handler then finds a node of an inner scope at the head of the contexts of the fiber. It restores the contexts and fails with `Invalid_argument` (the review of 2026-11-06).
 - A user handler cannot match the world effects or the program effects by name, because their constructors are private (section 2.3). These effects go through the user handler to the scheduler and to the world handler. But a user handler with a wildcard case in its `effc` catches all effects, also the private ones. Thus a user handler must give `None` for each effect that it does not know.
 
 ### Compared with affect's asynchronous functions
