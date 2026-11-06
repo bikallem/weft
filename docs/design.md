@@ -1823,7 +1823,7 @@ The library `weft.flow` (`Weft_flow`) gives byte streams on `Net`, with deadline
 
 **No TLA+ model.** The library adds no shared protocol. It is a composition of `Var`, `Atomic` and `choose`, as `Var` is (section 2.16). The race tests of `test/flow` do a close and a deadline from another fiber during a wait, on 4 virtual domains and 100 seeds.
 
-**The tests.** `test/flow` runs on the simulator only, and it is in `SUITES` of the Makefile. It starts no domain, thus a mutation run can fork it. The group "weft.flow" of `test/linux` (`test/linux/flow_linux.ml`) runs a test of caravan with real sockets, on 1 and on 4 domains: on Linux, a shutdown after a reset of the peer gives `ENOTCONN`, and `Flow.shutdown_send` ignores it.
+**The tests.** `test/flow` runs on the simulator only, and it is in `SUITES` of the Makefile. It starts no domain, thus a mutation run can fork it. The tests of `Reader` and `Writer` use a fake flow that logs each read and write (`fake.ml`), models of the MySQL and WebSocket framings (`framing.ml`) with a codec for each (`codec.ml`), and the TCP flows of the simulator (`test_framing.ml`). The group "weft.flow" of `test/linux` (`test/linux/flow_linux.ml`) runs a test of caravan with real sockets, on 1 and on 4 domains: on Linux, a shutdown after a reset of the peer gives `ENOTCONN`, and `Flow.shutdown_send` ignores it.
 
 ---
 
