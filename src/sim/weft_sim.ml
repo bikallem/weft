@@ -205,9 +205,9 @@ type t =
   ; woken: bool array  (** A [wake] of each domain that it did not take. *)
   ; mutable sched: Sched.t option
   ; net: net
-  ; mutable agenda: (int64 * (unit -> unit)) list
-        (** The timed events of the simulator, in order. An event comes after
-            the events with the same time that came before it. *)
+  ; agenda: Agenda.t
+        (** The timed events of the simulator. An event comes after the events
+            with the same time that came before it. *)
   ; mutable next_id: int
   ; mutable settles: int list
   ; mutable advance: (int64 * int) option
@@ -287,26 +287,15 @@ let edge n fd ~read ~write =
       n.edges <- (d, World.Ready.Fd {token; read; write}) :: n.edges )
     (Option.value ~default:[] (Hashtbl.find_opt n.regs fd))
 
-let schedule t delay f =
-  let at = Int64.add t.now delay in
-  let e = (at, f) in
-  let rec insert = function
-    | [] ->
-        [e]
-    | ((a, _) as x) :: rest ->
-        if Int64.compare at a < 0 then e :: x :: rest else x :: insert rest
-  in
-  t.agenda <- insert t.agenda
+let schedule t delay f = Agenda.add t.agenda (Int64.add t.now delay) f
 
 (* Run the events of the agenda that are due. *)
 let run_agenda t =
   let rec loop () =
-    match t.agenda with
-    | (at, f) :: rest when Int64.compare at t.now <= 0 ->
-        t.agenda <- rest ;
-        f () ;
-        loop ()
-    | _ ->
+    match Agenda.take_due t.agenda t.now with
+    | Some f ->
+        f () ; loop ()
+    | None ->
         ()
   in
   loop ()
@@ -1675,8 +1664,7 @@ let quiescent t st =
   let deadline =
     List.fold_left (fun acc (_, at, _) -> earliest acc (Some at)) None deadlines
   in
-  let next_agenda =
-    match t.agenda with (at, _) :: _ -> Some at | [] -> None
+  let next_agenda = Agenda.next t.agenda
   in
   (* The first domain that did not end gets the completions. *)
   let first =
@@ -1770,7 +1758,7 @@ let run ?(seed = 0) ?(domains = 1) ?(auto = true) ?(signals = [])
         ; resets= false
         ; next_port= first_port
         ; fd_limit= None }
-    ; agenda= []
+    ; agenda= Agenda.create ()
     ; next_id= 0
     ; settles= []
     ; advance= None
