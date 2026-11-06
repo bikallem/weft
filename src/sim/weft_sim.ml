@@ -1428,26 +1428,17 @@ let take_edges t d =
 (* The check of the waiters of the fds: a live waiter on a ready fd is a lost
    wakeup (design section 2.8, The wait steps). *)
 let fd_problems t =
+  let ready fd ~write = if write then writable t.net fd else readable t.net fd in
   List.concat_map
     (fun (fd, readers, writers) ->
-      let r =
-        if readable t.net fd then
-          List.map
-            (fun w ->
-              Printf.sprintf "%s waits to read fd %d, which is ready" w fd )
-            readers
-        else []
-      in
-      let w =
-        if writable t.net fd then
-          List.map
-            (fun w ->
-              Printf.sprintf "%s waits to write fd %d, which is ready" w fd )
-            writers
-        else []
-      in
-      r @ w )
-    (Sched_debug.fd_waiters (sched t))
+      List.map
+        (fun w -> Printf.sprintf "%s waits to read fd %d, which is ready" w fd)
+        readers
+      @ List.map
+          (fun w ->
+            Printf.sprintf "%s waits to write fd %d, which is ready" w fd )
+          writers )
+    (Sched_debug.fd_waiters (sched t) ~ready)
 
 let earliest a b =
   match (a, b) with
