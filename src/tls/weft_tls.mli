@@ -64,6 +64,23 @@
     - [Weft_flow.Flow.shutdown_send] sends [close_notify], then the end of the
       stream of the base flow. [Weft_flow.Flow.close] sends nothing: it never
       waits.
+    - [shutdown_send] is a cancellation point, because the write of
+      [close_notify] can wait, as each write. In a cancelled fiber, it sends
+      the end of the stream with no [close_notify] and raises [Cancelled]. The
+      peer then sees a truncation. A plain TCP flow has no such write. To send
+      [close_notify] in a cleanup, call [shutdown_send] in [Weft.Fiber.shield],
+      with a [Weft.Fiber.with_timeout] in the shield, because a peer that does
+      not read can keep the write waiting:
+      {[
+        Fun.protect
+          ~finally:(fun () ->
+            Fiber.shield (fun () ->
+                try
+                  Fiber.with_timeout Mono (Span.s 1) (fun () ->
+                      Flow.shutdown_send flow )
+                with Fiber.Timeout -> () ) )
+          (fun () -> handle flow)
+      ]}
     - A write sends one record for each 16383 bytes. A write that raises can
       send a part of its bytes: a cancel between two records leaves the records
       before it sent, and the flow open. A write of the base flow that raises,
