@@ -129,8 +129,12 @@ module Mutex = struct
     | exception e ->
         let bt = Printexc.get_raw_backtrace () in
         m.shield <- None ;
+        (* The cancel of a wait, or its reason: [with_timeout] around the wait
+           raises [Timeout], the reason of the [Cancelled] of the wait. *)
         ( match m.wait_exn with
         | Some e' when e' == e ->
+            unlock m
+        | Some (Cancelled r) when r == e ->
             unlock m
         | _ ->
             poison m ) ;

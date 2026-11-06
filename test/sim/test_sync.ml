@@ -33,6 +33,28 @@ let shield_closes_after_wait () =
                   Fiber.cancel s (Failure "stop") ) ) ) ;
       is_true !slept )
 
+(* A [with_timeout] around [Condition.wait] in [use_rw ~protect:true] raises
+   [Timeout], the reason of the cancel of the wait. The data is correct at the
+   wait, so the mutex stays usable (the review of 2026-11-06). *)
+let timeout_of_wait_no_poison () =
+  Helpers.run (fun () ->
+      let m = Fiber.Mutex.create () and c = Fiber.Condition.create () in
+      raises Fiber.Timeout (fun () ->
+          Fiber.Mutex.use_rw ~protect:true m (fun () ->
+              Fiber.with_timeout Mono (Span.ms 5) (fun () ->
+                  Fiber.Condition.wait c m ) ) ) ;
+      equal string "free" (Fiber.Mutex.use_ro m (fun () -> "free")) )
+
+(* A [Timeout] that does not come from a wait poisons the mutex. *)
+let timeout_outside_wait_poisons () =
+  Helpers.run (fun () ->
+      let m = Fiber.Mutex.create () in
+      raises Fiber.Timeout (fun () ->
+          Fiber.Mutex.use_rw ~protect:true m (fun () ->
+              Fiber.with_timeout Mono (Span.ms 5) (fun () ->
+                  Time.sleep Mono (Span.ms 10) ) ) ) ;
+      raises Fiber.Mutex.Poisoned (fun () -> Fiber.Mutex.use_ro m ignore) )
+
 (* Outside a fiber, each call raises [Not_in_fiber] before it changes the lock.
    The release and the use of the semaphore do not change its count. *)
 let lock_calls_outside () =
@@ -154,6 +176,10 @@ let tests =
       [ test "use_ro unlocks the mutex when f gives a value" use_ro_unlocks
       ; test "the shield of use_rw closes again after Condition.wait"
           shield_closes_after_wait
+      ; test "a timeout of Condition.wait in use_rw does not poison"
+          timeout_of_wait_no_poison
+      ; test "a timeout outside a wait in use_rw poisons"
+          timeout_outside_wait_poisons
       ; test "each lock call outside a fiber raises Not_in_fiber"
           lock_calls_outside
       ; test "a cancelled waiter that got the mutex releases it"
