@@ -508,6 +508,40 @@ let cancel_and_sync () =
         | None ->
             true )
 
+(* The link of a nested scope (the review of 2026-11-06): a fork into a nested
+   scope S that is not linked, while a cancel walks its parent P. The fork links
+   S, then reads the flags. The new fiber then starts a sync in S. The fork
+   fails, or the sync ends: it is not parked with the flag of P set. *)
+let fork_into_unlinked_and_cancel () =
+  trace (fun () ->
+      let t = S.create ~domains:2 () in
+      let w = world () in
+      let p = scope_node () in
+      let s = scope_node ~parent:p () in
+      let g = Atomic.make None in
+      spawn_in w (fun () ->
+          S.link s ;
+          match S.add_member s ~daemon:false with
+          | () ->
+              let f = S.new_fiber [s] in
+              ignore (S.add_member_to s f) ;
+              Atomic.set g (Some f) ;
+              S.sync t.S.doms.(0) f {S.leaves= [||]; nocancel= false} (cont ())
+          | exception S.Scope_closed ->
+              () ) ;
+      spawn_in w (fun () ->
+          List.iter (S.resume t.S.doms.(1)) (S.cancel_node p Exit) ) ;
+      fun () ->
+        match Atomic.get g with
+        | Some f -> (
+          match Atomic.get f.S.current with
+          | Some s ->
+              C.state s.S.word <> C.Parked
+          | None ->
+              true )
+        | None ->
+            true )
+
 (* Two cancels of one scope while a fiber starts a sync. Only the cancel that
    sets the flag walks (Scope.tla). The other cancel ends at once, also while
    the walk of the first one runs. The sync does not stay parked. *)
@@ -1152,6 +1186,8 @@ let () =
   case "cancel: a walk while a fiber starts a sync" cancel_and_sync ;
   case "cancel: a walk while the fiber leaves the scope" cancel_and_leave ;
   case "cancel: two cancels while a fiber starts a sync" two_cancels_and_sync ;
+  case "cancel: a fork into a scope that is not linked, and a walk"
+    fork_into_unlinked_and_cancel ;
   case "scope: a fork while the last member ends" fork_and_end ;
   case "fd: a submit and a close at the same time" submit_and_close ;
   case "fd: a Register and a close at the same time" register_and_close ;

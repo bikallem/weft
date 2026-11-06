@@ -139,7 +139,8 @@ scope() { want Scope || return 0 # expect scenario joinCancellable shieldNotNode
     BugNoChainCheck="$6" BugExnAfterEnd="$7" BugNoFlagCheck="$8" \
     SimpNoChildFlags="${9:-FALSE}" BugCondOuterCtx="${10:-FALSE}" \
     BugAnyCancelled="${11:-FALSE}" SimpWalkAgain="${12:-FALSE}" \
-    BugSkipOnChain="${13:-FALSE}" defaultInitValue=defaultInitValue
+    BugSkipOnChain="${13:-FALSE}" BugNoLinkAtFork="${14:-FALSE}" \
+    defaultInitValue=defaultInitValue
 }
 #     expect scenario join  shield recheck chain exn   flag
 scope pass   error    FALSE FALSE  FALSE   FALSE FALSE FALSE
@@ -174,6 +175,9 @@ scope fail   error    FALSE FALSE  FALSE   FALSE FALSE FALSE FALSE FALSE TRUE
 # The form before the review, a walk at each cancel, also passes.
 scope pass   error    FALSE FALSE  FALSE   FALSE FALSE FALSE FALSE FALSE FALSE TRUE
 scope pass   condwait FALSE FALSE  FALSE   FALSE FALSE FALSE FALSE FALSE FALSE TRUE
+# The review of 2026-11-06: a scope links under its parent only at the first
+# fork into it. The bug forks into S with no link, so a walk of R misses G3.
+scope fail   fork     FALSE FALSE  FALSE   FALSE FALSE FALSE FALSE FALSE FALSE FALSE FALSE TRUE
 # A cancel that does not walk if a flag on the chain of x is set: the timer
 # of with_timeout can end before the cancel of S reaches the condition wait.
 scope fail   condwait FALSE FALSE  FALSE   FALSE FALSE FALSE FALSE FALSE FALSE FALSE TRUE

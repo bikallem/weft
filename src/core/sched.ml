@@ -81,6 +81,10 @@ and ctx =
   ; members: members  (** Under [lock]. *)
   ; children: (int, ctx) Hashtbl.t
         (** The nested nodes that are not shields, by node id, under [lock]. *)
+  ; link: int Atomic.t
+        (** [unlinked], [linked] or [removed]: the state of this node in the
+            [children] of its parent (design section 2.5, The link of a nested
+            scope). *)
   ; chain: handler
         (** The handlers of the user on the chain of scopes, the outermost
             first. Each fiber of the node runs inside it. *)
@@ -371,6 +375,7 @@ module Heap = struct
       ; lock= Spin.make ()
       ; members= {head= None}
       ; children= Hashtbl.create 1
+      ; link= Atomic.make 1
       ; chain= {handle= (fun f -> f ())}
       ; fids= Atomic.make 0 }
     in
@@ -1155,6 +1160,16 @@ let next_nid = Atomic.make 0
 
 let no_handler = {handle= (fun f -> f ())}
 
+(* The states of the link of a node in the [children] of its parent. A nested
+   scope starts [unlinked]: its first fork links it, and its end removes it. The
+   other nodes start [linked]: the root has no parent, a daemon node links at
+   its fork, and a shield is never in [children]. *)
+let unlinked = 0
+
+let linked = 1
+
+let removed = 2
+
 (* A nested scope composes its handler inside the chain of its parent. *)
 let new_node ?parent ?handler kind =
   let outer = match parent with Some p -> p.chain | None -> no_handler in
@@ -1172,6 +1187,13 @@ let new_node ?parent ?handler kind =
   ; lock= Spin.make ()
   ; members= {head= None}
   ; children= Hashtbl.create ~random:false 4
+  ; link=
+      Atomic.make
+        ( match (kind, parent) with
+        | Scope_node _, Some _ ->
+            unlinked
+        | _ ->
+            linked )
   ; chain
   ; fids= (match parent with Some p -> p.fids | None -> Atomic.make 0) }
 
@@ -1849,6 +1871,34 @@ let member_end node ~daemon =
       (by_id ds)
   else []
 
+(* Link [n] in the [children] of its parent, and first each parent that is not
+   linked: from the top down, so that a linked node always has a linked chain up
+   to the root or a shield. A fork links its scope before [add_member] reads the
+   flags of the chain, and a cancel sets its flag before its walk reads the
+   [children]: the Dekker pair (design section 2.5, The link of a nested scope,
+   and spec/tla/Scope.tla). A scope that ended is [removed], and it does not
+   link: its [add_member] then raises [Scope_closed]. *)
+let rec link n =
+  if Atomic.get n.link = unlinked then
+    match n.parent with
+    | None ->
+        ()
+    | Some p ->
+        link p ;
+        Spin.with_lock p.lock (fun () ->
+            if Atomic.compare_and_set n.link unlinked linked then
+              Hashtbl.replace p.children n.nid n )
+
+(* The end of a scope: a scope that no fiber forked into is not linked, and its
+   end takes no lock of its parent. *)
+let unlink n =
+  if not (Atomic.compare_and_set n.link unlinked removed) then
+    match n.parent with
+    | Some p ->
+        Spin.with_lock p.lock (fun () -> Hashtbl.remove p.children n.nid)
+    | None ->
+        ()
+
 (* Add a member with a CAS that succeeds only if the closed bit is clear. A fork
    also reads the flags of the chain (design section 2.5, Fork into a scope that
    ends). *)
@@ -1878,6 +1928,7 @@ let run_body ~ctx scope body =
    the scope. *)
 let fork ?name ?pinned scope body =
   ignore (self ()) ;
+  link scope ;
   add_member scope ~daemon:false ;
   let f = new_fiber ?name ?pinned [scope] in
   let m = add_member_to scope f in
@@ -1898,6 +1949,7 @@ let fork_daemon ?name scope body =
   let d = new_node ~parent:scope Daemon_node in
   let f = new_fiber ?name [d] in
   ignore (add_member_to d f) ;
+  link scope ;
   Spin.with_lock scope.lock (fun () ->
       add_member scope ~daemon:true ;
       Hashtbl.replace scope.children d.nid d ) ;
@@ -1933,11 +1985,7 @@ let finish_scope m node result =
   enqueue (member_end node ~daemon:false) ;
   let st = state_of node in
   ignore (sync_req ~nocancel:true [|Iv.leaf st.join|]) ;
-  ( match node.parent with
-  | Some p ->
-      Spin.with_lock p.lock (fun () -> Hashtbl.remove p.children node.nid)
-  | None ->
-      () ) ;
+  unlink node ;
   match List.rev (Atomic.get st.failures) with
   | [] -> (
     match result with Ok v -> v | Error e -> reraise e )
@@ -1957,8 +2005,6 @@ let scope ?handler f =
   let parent = List.hd ctxs in
   let node = new_node ~parent ?handler (Scope_node (new_scope_state ())) in
   let m = add_member_to node fiber in
-  Spin.with_lock parent.lock (fun () ->
-      Hashtbl.replace parent.children node.nid node ) ;
   fiber.ctxs <- node :: fiber.ctxs ;
   let result =
     match
