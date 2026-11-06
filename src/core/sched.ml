@@ -1816,7 +1816,13 @@ let fail ~ctx node e bt =
 
 (* The end of a member: one CAS on the counts. The end of the last member sets
    the closed bit and fills the join. When the last member that is not a daemon
-   ends, the scope cancels its daemons. It gives the syncs to resume. *)
+   ends, the scope cancels its daemons. It gives the syncs to resume.
+
+   A daemon can fork a member that is not a daemon between the CAS and the lock,
+   and that member can fork a new daemon. Thus the end reads the count again
+   under the lock, where [fork_daemon] adds its node: if a member that is not a
+   daemon is alive, no daemon is cancelled. Its end does the cancel later (the
+   review of 2026-11-06). *)
 let member_end node ~daemon =
   let st = state_of node in
   let rec dec () =
@@ -1829,7 +1835,9 @@ let member_end node ~daemon =
   if all_count c = 0 then Option.value ~default:[] (Iv.fill st.join ())
   else if (not daemon) && nd_count c = 0 then
     let ds =
-      by_id (Spin.with_lock node.lock (fun () -> entries node.children))
+      Spin.with_lock node.lock (fun () ->
+          if nd_count (Atomic.get st.counts) = 0 then entries node.children
+          else [] )
     in
     List.concat_map
       (fun d ->
@@ -1838,7 +1846,7 @@ let member_end node ~daemon =
             cancel_node d Daemons_end
         | Scope_node _ | Shield_node _ ->
             [] )
-      ds
+      (by_id ds)
   else []
 
 (* Add a member with a CAS that succeeds only if the closed bit is clear. A fork

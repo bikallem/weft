@@ -633,6 +633,17 @@ let notify_while_put_back () =
         one_resume [x; p] ()
         && match C.state p.sync with C.Done _ -> true | _ -> false )
 
+(* Run [f] as a fiber up to its first request that is not [Self]. [Self] gets a
+   new fiber. Thus a [fork_daemon] adds its node, and stops at its [Fork]. *)
+let until_fork f =
+  let rec go : S.step -> unit = function
+    | S.Suspended (S.Self, k) ->
+        go (Effect.Deep.continue k (S.new_fiber [scope_node ()]))
+    | S.Suspended _ | S.Finished ->
+        ()
+  in
+  go (S.start_fiber f ())
+
 (* The scope: a fork_daemon while the last member that is not a daemon ends. The
    daemon is not added, or its node gets the cancel. *)
 let daemon_and_end () =
@@ -640,8 +651,8 @@ let daemon_and_end () =
       let w = world () in
       let node = scope_node () in
       spawn_in w (fun () ->
-          match S.start_fiber (fun () -> S.fork_daemon node ignore) () with
-          | _ ->
+          match until_fork (fun () -> S.fork_daemon node ignore) with
+          | () ->
               ()
           | exception S.Scope_closed ->
               () ) ;
@@ -650,6 +661,39 @@ let daemon_and_end () =
         List.for_all
           (fun d -> Option.is_some (Atomic.get d.S.flag))
           (S.by_id (S.entries node.S.children)) )
+
+(* The scope: a daemon D1 forks a member N2 that is not a daemon, and then a
+   daemon D2, while the last member that is not a daemon ends (the review of
+   2026-11-06). If the fork of N2 is accepted, the scope does not cancel D2
+   while N2 is alive. *)
+let fork_from_daemon_and_end () =
+  trace (fun () ->
+      let w = world () in
+      let node = scope_node () in
+      let st = S.state_of node in
+      (* D1, a daemon of the scope. *)
+      S.add_member node ~daemon:true ;
+      let d1 = S.new_node ~parent:node S.Daemon_node in
+      Hashtbl.replace node.S.children d1.S.nid d1 ;
+      let n2 = Atomic.make false in
+      spawn_in w (fun () ->
+          match S.add_member node ~daemon:false with
+          | () -> (
+              Atomic.set n2 true ;
+              match until_fork (fun () -> S.fork_daemon node ignore) with
+              | () ->
+                  ()
+              | exception S.Scope_closed ->
+                  () )
+          | exception S.Scope_closed ->
+              () ) ;
+      spawn_in w (fun () -> ignore (S.member_end node ~daemon:false)) ;
+      fun () ->
+        (not (Atomic.get n2))
+        || S.nd_count (Atomic.get st.S.counts) = 0
+        || List.for_all
+             (fun d -> d == d1 || Option.is_none (Atomic.get d.S.flag))
+             (S.by_id (S.entries node.S.children)) )
 
 (* The completions of the jobs (design section 2.14, the state of M2). Domain 0
    runs the fiber: its leaf, its park, and then the completion of the job, in
@@ -1103,6 +1147,8 @@ let () =
   case "commit: a cancel while a claim of its sync is put back"
     notify_while_put_back ;
   case "scope: a fork_daemon while the last member ends" daemon_and_end ;
+  case "scope: a daemon forks while the last member ends"
+    fork_from_daemon_and_end ;
   case "cancel: a walk while a fiber starts a sync" cancel_and_sync ;
   case "cancel: a walk while the fiber leaves the scope" cancel_and_leave ;
   case "cancel: two cancels while a fiber starts a sync" two_cancels_and_sync ;
