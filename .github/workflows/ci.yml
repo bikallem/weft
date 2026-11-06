@@ -36,8 +36,8 @@ jobs:
         run: nix develop -c dune runtest --force
 
   # The mutation gate of a pull request (design section 2.17). make mutate
-  # tests the mutants that test/core, test/sim and test/flow reach on the
-  # lines that the pull request changes. It gives a failure if one of these
+  # tests the mutants that test/core, test/sim, test/flow and test/tls reach on
+  # the lines that the pull request changes. It gives a failure if one of these
   # mutants survives. A mutant that no test reaches gives no failure. The two
   # Linux suites test the lines of weft.posix and weft.linux, and the gate does
   # not test the lines of weft.kqueue.
@@ -59,7 +59,9 @@ jobs:
       - name: Test the mutants of the changed lines
         run: nix develop -c make mutate BASE=HEAD^1
 
-  # FreeBSD in a VM. OCaml 5.5 and the test tools come from opam.
+  # FreeBSD in a VM. OCaml 5.5 and the test tools come from opam. This job and
+  # the Windows job install no tls, thus dune skips weft-tls, test/tls,
+  # test/dscheck_tls and the guard nounix_tls.
   freebsd:
     runs-on: ubuntu-24.04
     timeout-minutes: 60

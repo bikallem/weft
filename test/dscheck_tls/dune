@@ -1,0 +1,23 @@
+; The dscheck tests of the TLS session (design section 2.19). The test copies
+; src/tls/weft_tls.ml with no interface, and the traced Atomic and the Domain
+; with a spin limit of test/dscheck. Its own modules Weft and Weft_flow are
+; models of the parts of weft that the session uses: Fiber.Mutex is a spin
+; lock on traced atomics, with the cancellation points of the real mutex, and
+; a flow reads and writes strings. Thus dscheck examines the real code of the
+; session in each order of its locks and of its atomic status. FreeBSD and
+; Windows in CI have no tls: the build_if skips the test there.
+
+(copy_files#
+ (files ../../src/tls/weft_tls.ml))
+
+(copy_files#
+ (files ../dscheck/{atomic,domain}.ml))
+
+(copy_files#
+ (files ../tls/tls_support.{ml,mli}))
+
+(test
+ (name test_dscheck_tls)
+ (package weft-tls)
+ (build_if %{lib-available:weft-tls})
+ (libraries dscheck tls x509 domain-name ipaddr mirage-crypto-rng ptime))
