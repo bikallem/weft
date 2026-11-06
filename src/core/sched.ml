@@ -112,8 +112,7 @@ and scope_state =
         *)
   ; failures: (exn * Printexc.raw_backtrace) list Atomic.t
         (** The newest first. *)
-  ; join: unit ivar
-  ; daemons: (int, ctx) Hashtbl.t  (** Under the lock of the scope node. *) }
+  ; join: unit ivar }
 
 and 'a ivar = 'a ivar_state Atomic.t
 
@@ -1842,8 +1841,15 @@ let member_end node ~daemon =
   let c = dec () in
   if all_count c = 0 then Option.value ~default:[] (Iv.fill st.join ())
   else if (not daemon) && nd_count c = 0 then
-    let ds = by_id (Spin.with_lock node.lock (fun () -> entries st.daemons)) in
-    List.concat_map (fun d -> cancel_node d Daemons_end) ds
+    let ds = by_id (Spin.with_lock node.lock (fun () -> entries node.children)) in
+    List.concat_map
+      (fun d ->
+        match d.kind with
+        | Daemon_node ->
+            cancel_node d Daemons_end
+        | Scope_node _ | Shield_node _ ->
+            [] )
+      ds
   else []
 
 (* Add a member with a CAS that succeeds only if the closed bit is clear. A fork
@@ -1892,22 +1898,19 @@ let fork ?name ?pinned scope body =
    daemon removes its node when it ends. [Self] first, as in [fork]. *)
 let fork_daemon ?name scope body =
   ignore (self ()) ;
-  let st = state_of scope in
   let d = new_node ~parent:scope Daemon_node in
   let f = new_fiber ?name [d] in
   ignore (add_member_to d f) ;
   Spin.with_lock scope.lock (fun () ->
       add_member scope ~daemon:true ;
-      Hashtbl.replace scope.children d.nid d ;
-      Hashtbl.replace st.daemons d.nid d ) ;
+      Hashtbl.replace scope.children d.nid d ) ;
   prog "Fiber.fork_daemon"
     (Fork
        ( f
        , fun () ->
            run_body ~ctx:d scope body ;
            Spin.with_lock scope.lock (fun () ->
-               Hashtbl.remove scope.children d.nid ;
-               Hashtbl.remove st.daemons d.nid ) ;
+               Hashtbl.remove scope.children d.nid ) ;
            enqueue (member_end scope ~daemon:true) ) )
 
 let sync_req ~nocancel leaves = prog "sync" (Sync {leaves; nocancel})
@@ -1915,8 +1918,7 @@ let sync_req ~nocancel leaves = prog "sync" (Sync {leaves; nocancel})
 let new_scope_state () =
   { counts= Atomic.make (all_one + nd_one)
   ; failures= Atomic.make []
-  ; join= Iv.make ()
-  ; daemons= Hashtbl.create ~random:false 4 }
+  ; join= Iv.make () }
 
 let reraise (e, bt) = Printexc.raise_with_backtrace e bt
 

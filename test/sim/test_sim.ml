@@ -550,12 +550,7 @@ let daemon_nodes_removed () =
           done ;
           Fiber.yield () ;
           let ctx = Private.scope_ctx s in
-          equal int 0 (Hashtbl.length ctx.Private.Sched.children) ;
-          match ctx.Private.Sched.kind with
-          | Private.Sched.Scope_node st ->
-              equal int 0 (Hashtbl.length st.Private.Sched.daemons)
-          | _ ->
-              failwith "not a scope" ) )
+          equal int 0 (Hashtbl.length ctx.Private.Sched.children) ) )
 
 let yield_in_cancelled_scope () =
   run (fun () ->

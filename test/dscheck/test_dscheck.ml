@@ -639,7 +639,6 @@ let daemon_and_end () =
   trace (fun () ->
       let w = world () in
       let node = scope_node () in
-      let st = S.state_of node in
       spawn_in w (fun () ->
           match S.start_fiber (fun () -> S.fork_daemon node ignore) () with
           | _ ->
@@ -650,7 +649,7 @@ let daemon_and_end () =
       fun () ->
         List.for_all
           (fun d -> Option.is_some (Atomic.get d.S.flag))
-          (S.by_id (S.entries st.S.daemons)) )
+          (S.by_id (S.entries node.S.children)) )
 
 (* The completions of the jobs (design section 2.14, the state of M2). Domain 0
    runs the fiber: its leaf, its park, and then the completion of the job, in
