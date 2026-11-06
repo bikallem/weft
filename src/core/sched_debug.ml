@@ -130,9 +130,9 @@ let live_timers t =
     0 t.doms
 
 (* The live waiters of each registered fd that [ready] gives: the fd of the
-   world, and the names of the fibers that wait to read and to write.
-   [ready fd ~write] tells if the fd is ready for that direction. The check runs
-   at each quiescence, so it makes the names only for a ready fd. *)
+   world, and the names of the fibers that wait to read and to write. [ready fd
+   ~write] tells if the fd is ready for that direction. The check runs at each
+   quiescence, so it makes the names only for a ready fd. *)
 let fd_waiters t ~ready =
   let live w = List.exists (fun (s, _) -> not (is_done s)) w.ws in
   let names w =

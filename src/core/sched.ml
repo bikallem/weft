@@ -300,9 +300,9 @@ and ext =
         (** For a job that holds the user of an fd: the release, at the
             completion, also when the waiter left. *) }
 
-(* [Started]: no waiter and no completion. [Waiting]: the waiter. [Arrived]:
-   the completion came before the waiter. [Dropped]: the fiber does not wait
-   any more, for example after a cancel. *)
+(* [Started]: no waiter and no completion. [Waiting]: the waiter. [Arrived]: the
+   completion came before the waiter. [Dropped]: the fiber does not wait any
+   more, for example after a cancel. *)
 and ext_state = Started | Waiting of sync * int | Arrived | Dropped
 
 (* The heap of deadlines of one domain. Only its owner uses it. *)
@@ -971,8 +971,7 @@ let start_job dom job on_done =
       if Option.is_some on_done then dom.held <- dom.held + 1 ;
       let t = dom.sched in
       Spin.with_lock t.externals_lock (fun () ->
-          Hashtbl.replace t.externals id
-            {est= Started; on_done} )
+          Hashtbl.replace t.externals id {est= Started; on_done} )
   | Error _ ->
       () ) ;
   r
@@ -1824,7 +1823,9 @@ let member_end node ~daemon =
   let c = dec () in
   if all_count c = 0 then Option.value ~default:[] (Iv.fill st.join ())
   else if (not daemon) && nd_count c = 0 then
-    let ds = by_id (Spin.with_lock node.lock (fun () -> entries node.children)) in
+    let ds =
+      by_id (Spin.with_lock node.lock (fun () -> entries node.children))
+    in
     List.concat_map
       (fun d ->
         match d.kind with

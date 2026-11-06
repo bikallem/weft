@@ -19,9 +19,9 @@ let peer server =
   | exception Flow.Closed ->
       "truncation"
 
-(* [cleanup shutdown] runs a fiber that sleeps, cancels it, and calls
-   [shutdown] in the cleanup of the fiber. It gives the text of the result of
-   the shutdown. *)
+(* [cleanup shutdown] runs a fiber that sleeps, cancels it, and calls [shutdown]
+   in the cleanup of the fiber. It gives the text of the result of the
+   shutdown. *)
 let cleanup shutdown =
   let r = ref "no cleanup" in
   ( try

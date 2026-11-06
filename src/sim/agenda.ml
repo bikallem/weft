@@ -1,8 +1,8 @@
-(* The timed events of the simulator: a binary min-heap on the time and then
-   the sequence number. Thus an event comes after the events with the same time
-   that came before it, as in the sorted list that the heap replaced (the
-   review of 2026-11-06). An insert into that list was linear, so a test with
-   many packets in flight was quadratic. *)
+(* The timed events of the simulator: a binary min-heap on the time and then the
+   sequence number. Thus an event comes after the events with the same time that
+   came before it, as in the sorted list that the heap replaced (the review of
+   2026-11-06). An insert into that list was linear, so a test with many packets
+   in flight was quadratic. *)
 
 type event = {at: int64; seq: int; f: unit -> unit}
 
@@ -46,8 +46,8 @@ let add h at f =
 (* The time of the first event. *)
 let next h = if h.size = 0 then None else Some h.entries.(0).at
 
-(* The first event, if its time is not after [now]. Its slot holds [dummy]
-   after the take, so the heap does not keep the closure. *)
+(* The first event, if its time is not after [now]. Its slot holds [dummy] after
+   the take, so the heap does not keep the closure. *)
 let take_due h now =
   if h.size = 0 || Int64.compare h.entries.(0).at now > 0 then None
   else

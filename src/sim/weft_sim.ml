@@ -1414,7 +1414,9 @@ let take_edges t d =
 (* The check of the waiters of the fds: a live waiter on a ready fd is a lost
    wakeup (design section 2.8, The wait steps). *)
 let fd_problems t =
-  let ready fd ~write = if write then writable t.net fd else readable t.net fd in
+  let ready fd ~write =
+    if write then writable t.net fd else readable t.net fd
+  in
   List.concat_map
     (fun (fd, readers, writers) ->
       List.map
@@ -1521,8 +1523,8 @@ let extra_edge t d =
         t.net.edges <-
           (d, World.Ready.Fd {token; read= true; write= true}) :: t.net.edges
 
-(* A switch point with no progress: only [Now], [Switch], [Random], [Wake], or
-   a wait that gets no edge. A loop that yields until a time comes makes no
+(* A switch point with no progress: only [Now], [Switch], [Random], [Wake], or a
+   wait that gets no edge. A loop that yields until a time comes makes no
    progress, because the time moves only at a quiescence (design section 2.8,
    Livelock). The scheduler makes a [Wake] and a woken flag itself, for example
    for a push of a yield. Thus they are not progress, and a yield loop on many
@@ -1579,12 +1581,12 @@ let step t st d =
       | World.Wake d' ->
           t.woken.(d') <- true ;
           go ()
-      | World.Wait (_, w) -> (
+      | World.Wait (_, w) ->
           if t.net.extra_edges then extra_edge t d ;
           (* A domain waits only on its own poller. *)
           if has_ready t d || w.timeout = World.Wait.Poll then
             go (take_ready t d)
-          else st.(d) <- Sleeping (w, k) )
+          else st.(d) <- Sleeping (w, k)
       | _ ->
           assert false (* The handler stops only at world effects. *) )
 
@@ -1615,9 +1617,7 @@ let quiescent t st =
         match st.(d) with
         | Sleeping (w, _) ->
             Option.to_list
-              (Option.map
-                 (fun m -> (d, Weft.Clock.to_ns Mono m))
-                 w.deadline )
+              (Option.map (fun m -> (d, Weft.Clock.to_ns Mono m)) w.deadline)
             @ Option.to_list
                 (Option.map
                    (fun p -> (d, Int64.sub (Weft.Clock.to_ns Posix p) t.posix0))
@@ -1629,8 +1629,7 @@ let quiescent t st =
   let deadline =
     List.fold_left (fun acc (_, at) -> earliest acc (Some at)) None deadlines
   in
-  let next_agenda = Agenda.next t.agenda
-  in
+  let next_agenda = Agenda.next t.agenda in
   (* The first domain that did not end gets the completions. *)
   let first =
     let rec find d =

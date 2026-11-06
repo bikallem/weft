@@ -253,9 +253,8 @@ module Fiber : sig
         raises, the protected data can be incorrect, so [m] becomes poisoned. A
         [Cancelled] from [Condition.wait] does not poison. Its reason also does
         not poison, for example the [Timeout] of a [with_timeout] around the
-        wait. With [~protect:true],
-        [f] runs in a shield, but [Condition.wait] in [f] sees the cancels from
-        outside.
+        wait. With [~protect:true], [f] runs in a shield, but [Condition.wait]
+        in [f] sees the cancels from outside.
 
         @raise Poisoned if [m] is poisoned. *)
 
