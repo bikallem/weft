@@ -47,8 +47,11 @@ let clear r h =
   r.clean <- h
 
 (* The owner only. A thief can take the head at the same time, so the take is a
-   CAS on the head. A slot keeps its item until the ring is empty: a clear on
-   each pop costs a store in the fast path (the review of M3). *)
+   CAS on the head. After the CAS, the pop clears its slot: on a busy domain the
+   ring is never empty, and without the clear the GC promotes each ended fiber
+   that a slot holds (the review of 2026-11-06). A thief with an old head can
+   read the cleared slot, but then its CAS on the head fails, as for [clear].
+   The slots of a steal stay until the ring is empty. *)
 let rec pop r =
   let h = Atomic.get r.head in
   if Atomic.get r.tail = h then (
@@ -59,7 +62,10 @@ let rec pop r =
     None )
   else
     let x = Atomic.get r.buf.(h land mask) in
-    if Atomic.compare_and_set r.head h (h + 1) then x else pop r
+    if Atomic.compare_and_set r.head h (h + 1) then (
+      Atomic.set r.buf.(h land mask) None ;
+      x )
+    else pop r
 
 let is_empty r = Atomic.get r.tail - Atomic.get r.head <= 0
 
