@@ -8,24 +8,32 @@ open Sched
 exception Poisoned
 
 (* A fiber that waits. [gone] tells that it left after a cancel, and an Ivar
-   that is full tells that it got the lock or the signal. *)
-type waiter = {wiv: unit ivar; mutable gone: bool}
+   that is full tells that it got the lock or the signal. [run] is the run of
+   the waiter of a condition, or [no_run]. *)
+type waiter = {wiv: unit ivar; mutable gone: bool; run: int}
 
-let new_waiter () = {wiv= Iv.make (); gone= false}
+let new_waiter ?(run = no_run) () = {wiv= Iv.make (); gone= false; run}
 
 let is_full w = match Atomic.get w.wiv with Full _ -> true | Empty _ -> false
 
 (* Fill the Ivar of [w] and give the syncs to resume. *)
 let give w = Option.value ~default:[] (Iv.fill w.wiv ())
 
-(* The first waiter that did not leave. *)
-let rec first q =
-  match Queue.take_opt q with Some w when w.gone -> first q | x -> x
+(* The first waiter of [run] that did not leave. A waiter of another run is
+   dead: its run ended while it waited, and the end of the run made its sync
+   [Done] (the review of 2026-11-06). A condition can outlive a run, for example
+   as a global of a test that runs many seeds. *)
+let rec first ~run q =
+  match Queue.take_opt q with
+  | Some w when w.gone || w.run <> run ->
+      first ~run q
+  | x ->
+      x
 
-(* Give to each waiter that did not leave. *)
-let give_all q =
+(* Give to each waiter of [run] that did not leave. *)
+let give_all ~run q =
   let rec all acc =
-    match first q with Some w -> all (give w @ acc) | None -> acc
+    match first ~run q with Some w -> all (give w @ acc) | None -> acc
   in
   all []
 
@@ -67,7 +75,7 @@ module Mutex = struct
           else if not m.held then
             invalid_arg "Fiber.Mutex.unlock: the mutex is not locked"
           else
-            match first m.waiters with
+            match first ~run:no_run m.waiters with
             | Some w ->
                 give w
             | None ->
@@ -82,7 +90,7 @@ module Mutex = struct
       (Spin.with_lock m.lock (fun () ->
            m.poisoned <- true ;
            m.held <- false ;
-           give_all m.waiters ) )
+           give_all ~run:no_run m.waiters ) )
 
   (* A cancellation point, also when the mutex is free. *)
   let lock m =
@@ -157,14 +165,14 @@ module Condition = struct
   let create () = {clock= Spin.make (); cwaiters= Queue.create ()}
 
   let signal c =
-    ignore (self ()) ;
+    let run = run_id () in
     enqueue
       (Spin.with_lock c.clock (fun () ->
-           match first c.cwaiters with Some w -> give w | None -> [] ) )
+           match first ~run c.cwaiters with Some w -> give w | None -> [] ) )
 
   let broadcast c =
-    ignore (self ()) ;
-    enqueue (Spin.with_lock c.clock (fun () -> give_all c.cwaiters))
+    let run = run_id () in
+    enqueue (Spin.with_lock c.clock (fun () -> give_all ~run c.cwaiters))
 
   let set_open node o =
     match node with Some {kind= Shield_node a; _} -> Atomic.set a o | _ -> ()
@@ -176,8 +184,7 @@ module Condition = struct
      holds [m] when [wait] returns or raises. [Self] first: outside a fiber,
      [wait] raises [Not_in_fiber] before it adds its waiter. *)
   let wait c (m : Mutex.t) =
-    ignore (self ()) ;
-    let w = new_waiter () in
+    let w = new_waiter ~run:(run_id ()) () in
     Spin.with_lock c.clock (fun () -> Queue.push w c.cwaiters) ;
     let node = m.shield in
     m.shield <- None ;

@@ -870,6 +870,8 @@ Fiber code must not hold a stdlib `Mutex` across a `sync` or a world effect, for
 
 `Fiber.Condition.wait` must lock the mutex again before it returns, also when the fiber is cancelled. That lock is a `sync`, so `Condition.wait` does it in a shield. Without the shield, the lock raises `Cancelled`, and the caller continues without the mutex. This shield has no time limit. It is an exception to the rule of the shield: the lock waits only for the other holders of the mutex, and each of them must unlock it.
 
+**A condition that outlives a run.** A waiter of `Fiber.Condition` keeps the id of its run, and `signal` and `broadcast` skip the waiters of another run. A run that ends while a fiber waits makes the sync of that fiber `Done` (section 3.11, finding 1), but the waiter stays in the queue of the condition. Without the id, a signal of a later run went to that dead waiter, and the real waiter slept forever (the review of 2026-11-06). A `Mutex` has waiters only while a fiber holds it, and a run that ends while a fiber holds a mutex leaves it held. Thus its waiters need no id.
+
 For the same reason as the stdlib `Mutex`, fiber code must not use a spin loop that waits for another domain. In the simulator, no other virtual domain runs between two switch points, so the loop never ends.
 
 **A semaphore (issue 4).** `Fiber.Semaphore` is a counting semaphore:

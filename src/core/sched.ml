@@ -171,6 +171,7 @@ and _ req =
   | Fork : fiber * (unit -> unit) -> unit req
   | Self : fiber req
   | Dom_index : int req  (** The domain that runs the fiber, for the tests. *)
+  | Run_id : int req  (** The id of the run of the fiber. *)
   | Enqueue : sync list -> unit req
   | Close_notices : fdrec -> unit req
       (** Send a close notice to each domain with a registration. *)
@@ -1310,6 +1311,8 @@ let rec run_fiber : dom -> fiber -> step -> unit =
       run_fiber dom fiber (Effect.Deep.continue k fiber)
   | Suspended (Dom_index, k) ->
       run_fiber dom fiber (Effect.Deep.continue k dom.index)
+  | Suspended (Run_id, k) ->
+      run_fiber dom fiber (Effect.Deep.continue k dom.sched.run_id)
   | Suspended (Fork (f, body), k) ->
       register dom.sched f ;
       push dom f (start_fiber body) ;
@@ -1776,6 +1779,10 @@ let nd_count c = (c lsr 1) land 0x7fff_ffff
 let all_count c = c lsr 32
 
 let self () = prog "Fiber.self" Self
+
+(* The id of the run of the fiber. Outside a fiber, it raises [Not_in_fiber], as
+   [self]. *)
+let run_id () = prog "Fiber.self" Run_id
 
 let enqueue = function [] -> () | l -> prog "Fiber" (Enqueue l)
 

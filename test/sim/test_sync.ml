@@ -55,6 +55,24 @@ let timeout_outside_wait_poisons () =
                   Time.sleep Mono (Span.ms 10) ) ) ) ;
       raises Fiber.Mutex.Poisoned (fun () -> Fiber.Mutex.use_ro m ignore) )
 
+(* A condition and a mutex that two runs share, for example as globals of a test
+   that runs many seeds. The first run ends while a fiber waits on the
+   condition. The signal of the second run goes to the waiter of the second run,
+   not to the dead waiter (the review of 2026-11-06). *)
+let condition_of_two_runs () =
+  let m = Fiber.Mutex.create () and c = Fiber.Condition.create () in
+  let wait () =
+    Fiber.Mutex.lock m ; Fiber.Condition.wait c m ; Fiber.Mutex.unlock m
+  in
+  raises_match
+    (function Weft_sim.Deadlock _ -> true | _ -> false)
+    (fun () -> Weft_sim.run (fun _ -> wait ())) ;
+  Weft_sim.run (fun _ ->
+      Fiber.scope (fun s ->
+          Fiber.fork s wait ;
+          Time.sleep Mono (Span.ms 1) ;
+          Fiber.Mutex.use_ro m (fun () -> Fiber.Condition.signal c) ) )
+
 (* Outside a fiber, each call raises [Not_in_fiber] before it changes the lock.
    The release and the use of the semaphore do not change its count. *)
 let lock_calls_outside () =
@@ -180,6 +198,8 @@ let tests =
           timeout_of_wait_no_poison
       ; test "a timeout outside a wait in use_rw poisons"
           timeout_outside_wait_poisons
+      ; test "a signal skips the dead waiter of an earlier run"
+          condition_of_two_runs
       ; test "each lock call outside a fiber raises Not_in_fiber"
           lock_calls_outside
       ; test "a cancelled waiter that got the mutex releases it"
