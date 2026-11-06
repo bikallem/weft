@@ -107,6 +107,62 @@ let dropped_continuation () =
       Fiber.check_cancel () ;
       Time.sleep Mono (Span.ms 5) )
 
+(* The link of a nested scope (the review of 2026-11-06, design section 2.5). A
+   scope links in the children of its parent at its first fork, and its end
+   removes it. *)
+let link_removed_at_end () =
+  Helpers.run (fun () ->
+      Fiber.scope (fun outer ->
+          let children () =
+            Hashtbl.length (Private.scope_ctx outer).Private.Sched.children
+          in
+          Fiber.scope (fun _ -> ()) ;
+          equal int 0 (children ()) ;
+          Fiber.scope (fun inner ->
+              Fiber.fork inner ignore ;
+              equal int 1 (children ()) ) ;
+          equal int 0 (children ()) ) )
+
+(* A fork into a scope S whose parent P is also not linked links P first. Thus a
+   cancel of the scope A above P reaches the fiber that the fork added. *)
+let link_parents_first () =
+  Helpers.run (fun () ->
+      let reached = ref false in
+      ( try
+          Fiber.scope (fun a ->
+              Fiber.fork a (fun () ->
+                  Time.sleep Mono (Span.ms 1) ;
+                  Fiber.cancel a Exit ) ;
+              Fiber.scope (fun _p ->
+                  Fiber.scope (fun s ->
+                      Fiber.fork s (fun () ->
+                          try sync (Ivar.read (Ivar.create ()))
+                          with Fiber.Cancelled _ as e ->
+                            reached := true ;
+                            raise e ) ;
+                      Fiber.shield (fun () -> Time.sleep Mono (Span.ms 5)) ) ) )
+        with Fiber.Cancelled _ -> () ) ;
+      is_true !reached )
+
+(* fork_daemon links its scope. Thus a cancel of the outer scope reaches the
+   daemon at once, before the body of its scope ends. *)
+let daemon_links_scope () =
+  let add, get = Helpers.log () in
+  Helpers.run (fun () ->
+      try
+        Fiber.scope (fun a ->
+            Fiber.fork a (fun () ->
+                Time.sleep Mono (Span.ms 1) ;
+                Fiber.cancel a Exit ) ;
+            Fiber.scope (fun s ->
+                Fiber.fork_daemon s (fun () ->
+                    try sync (Ivar.read (Ivar.create ()))
+                    with Fiber.Cancelled _ as e -> add "daemon" ; raise e ) ;
+                Fiber.shield (fun () -> Time.sleep Mono (Span.ms 5)) ;
+                add "body" ) )
+      with Fiber.Cancelled _ -> () ) ;
+  equal (list string) ["daemon"; "body"] (get ())
+
 (* Outside a fiber, each call raises [Not_in_fiber] before it changes the lock.
    The release and the use of the semaphore do not change its count. *)
 let lock_calls_outside () =
@@ -232,6 +288,10 @@ let tests =
           timeout_of_wait_no_poison
       ; test "a timeout outside a wait in use_rw poisons"
           timeout_outside_wait_poisons
+      ; test "the end of a linked scope removes its link" link_removed_at_end
+      ; test "a fork links the parents that are not linked first"
+          link_parents_first
+      ; test "fork_daemon links its scope" daemon_links_scope
       ; test "a handler that drops a continuation fails its scope"
           dropped_continuation
       ; test "a signal skips the dead waiter of an earlier run"
