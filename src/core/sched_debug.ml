@@ -88,7 +88,10 @@ let lost ?posix t ~now =
     if
       heap.size = 0
       || (not (is_done heap.entries.(0).esync))
-         && Int64.compare heap.entries.(0).deadline now > 0
+         && ( Int64.compare heap.entries.(0).deadline now
+            > 0 )
+            [@mutate
+              off "an entry at now is a bug in expire, not in this check"]
     then []
     else List.filter due (List.init heap.size (fun i -> heap.entries.(i)))
   in
@@ -149,7 +152,7 @@ let fd_waiters t ~ready =
           match
             (side reg.rwait fd ~write:false, side reg.wwait fd ~write:true)
           with
-          | [], [] ->
+          | (([], []) [@mutate off "an fd with no names gives no message"]) ->
               acc
           | r, w ->
               (fd, r, w) :: acc )

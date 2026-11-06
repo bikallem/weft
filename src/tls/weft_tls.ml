@@ -288,10 +288,11 @@ let write t buf off len =
 
 (* [notify t] sends close_notify, one time. The flag changes under the state
    lock, when the session makes the record. A cancel at the write lock comes
-   before that, so a later call sends close_notify. *)
+   before that, so a later call sends close_notify. After close_notify, [send]
+   raises [Flow.Closed], and [shutdown_send] then ends the TCP stream. *)
 let notify t =
   send t (fun tls ->
-      if t.notified then Some (tls, "")
+      if t.notified then None
       else (
         t.notified <- true ;
         Some (Tls.Engine.send_close_notify tls) ) )

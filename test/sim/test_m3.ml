@@ -364,6 +364,21 @@ let lost_queues () =
     (Private.Sched_debug.lost t ~now:(Clock.of_ns Mono 0L)) ;
   S.Fdtab.release fdr
 
+(* The check of the timers at quiescence sees a live entry that is due at the
+   top of a heap. It scans a heap only when its top is stale or due. *)
+let lost_timer () =
+  let t = S.create ~domains:1 () in
+  let node = S.new_node (S.Scope_node (S.new_scope_state ())) in
+  let f = S.new_fiber ~name:"late" [node] in
+  let s =
+    {S.word= S.C.make 0; owner= f; sctx= node; cancellable= true; k= None}
+  in
+  S.Heap.push t.S.doms.(0).S.heap ~deadline:5L s 0 ;
+  equal (list string) [] (Private.Sched_debug.lost t ~now:(Clock.of_ns Mono 4L)) ;
+  equal (list string)
+    ["late has an expired timer"]
+    (Private.Sched_debug.lost t ~now:(Clock.of_ns Mono 6L))
+
 (* One fiber that a fiber wakes goes to the next slot: it runs before the fiber
    that is at the head of the local queue. *)
 let woken_goes_next () =
@@ -460,6 +475,7 @@ let tests =
       ; test "the check of the queues sees a next slot" lost_next
       ; test "the check of the queues sees each shared queue and the mailbox"
           lost_queues
+      ; test "the check of the timers sees a due entry at the top" lost_timer
       ; test "a fill from outside gives at once while the word is Claimed"
           fill_while_claimed
       ; test "the deadline form of with_timeout has no fiber" deadline_form

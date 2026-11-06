@@ -21,7 +21,7 @@ let swap h i j =
   h.entries.(j) <- x
 
 let rec up h i =
-  if i > 0 then
+  if (i > 0) [@mutate off "at 0, the parent is 0 itself, and lt is false"] then
     let p = (i - 1) / 2 in
     if lt h.entries.(i) h.entries.(p) then (swap h i p ; up h p)
 
@@ -29,8 +29,24 @@ let rec up h i =
 let rec down h i =
   let l = (2 * i) + 1 in
   let r = l + 1 in
-  let m = if l < h.size && lt h.entries.(l) h.entries.(i) then l else i in
-  let m = if r < h.size && lt h.entries.(r) h.entries.(m) then r else m in
+  let m =
+    if
+      ( l < h.size )
+      [@mutate
+        off "at l = size, the slot holds dummy, and lt of dummy is false"]
+      && lt h.entries.(l) h.entries.(i)
+    then l
+    else i
+  in
+  let m =
+    if
+      ( r < h.size )
+      [@mutate
+        off "at r = size, the slot holds dummy, and lt of dummy is false"]
+      && lt h.entries.(r) h.entries.(m)
+    then r
+    else m
+  in
   if m <> i then (swap h i m ; down h m)
 
 let add h at f =
@@ -54,6 +70,7 @@ let take_due h now =
     let e = h.entries.(0) in
     h.size <- h.size - 1 ;
     h.entries.(0) <- h.entries.(h.size) ;
-    h.entries.(h.size) <- dummy ;
+    (h.entries.(h.size) <- dummy )
+    [@mutate off "only the GC sees the closure that the slot keeps"] ;
     down h 0 ;
     Some e.f
