@@ -205,6 +205,8 @@ Each operation is a constructor of the GADT `'a Op.t`, for example `Read : fd * 
 | `Signal` | The signal event, `unwatch` | `signalfd` on Linux, a handler of the world on kqueue | The test sends the signal |
 | `Dns` | `getaddrinfo`, `getnameinfo` | `Blocking` operations on the thread pool | A name table that the test gives |
 
+The library `weft.flow` gives byte streams with deadlines on `Net` (section 2.18).
+
 "The full Unix I/O API" does not include these calls:
 
 - `fork`. In OCaml 5, `Unix.fork` raises `Failure` if the program ever spawned a domain. `Process.spawn` takes its place.
@@ -1409,11 +1411,12 @@ The cost of an effect is a perform and a handler call for each world operation. 
 | The state machine of an fd record, and the one `close(2)` | Eio `Rcfd` |
 | `fork_isolated ~on_error`, the poisoned mutex, `use_rw ~protect` and `use_ro` | Eio `run_server`, Eio `Mutex` |
 | The handler of a scope, `Promise.ready`, `Promise.cancel` | affect `Call_handler`, `get'`, `cancel` |
+| `Flow`, `Tcp` and the deadlines of a flow (`weft.flow`) | caravan |
 | A simulator with a network and a seed | Shadow (from the session). FoundationDB, TigerBeetle, madsim and turmoil use the same idea. We did not examine them in the session. |
 
 ## 2.12 Decisions
 
-Decisions 1 to 6 were made on 2026-10-09, decisions 7 to 9 on 2026-10-10, decisions 10 and 11 on 2026-10-12 (issue 1), decision 12 on 2026-10-12 (issue 2), decisions 13 and 14 on 2026-10-12 (issue 3), decisions 15 to 17 on 2026-10-12 (issue 4), decisions 18 to 20 on 2026-10-12 (issue 5), decisions 21 to 25 on 2026-10-13 (issue 6), decision 26 on 2026-10-13 (issue 7), decisions 27 to 29 on 2026-10-13 (issue 8), and decisions 30 to 32 on 2026-10-13 (issue 9).
+Decisions 1 to 6 were made on 2026-10-09, decisions 7 to 9 on 2026-10-10, decisions 10 and 11 on 2026-10-12 (issue 1), decision 12 on 2026-10-12 (issue 2), decisions 13 and 14 on 2026-10-12 (issue 3), decisions 15 to 17 on 2026-10-12 (issue 4), decisions 18 to 20 on 2026-10-12 (issue 5), decisions 21 to 25 on 2026-10-13 (issue 6), decision 26 on 2026-10-13 (issue 7), decisions 27 to 29 on 2026-10-13 (issue 8), and decisions 30 to 32 on 2026-10-13 (issue 9). Decision 35 was made on 2026-11-06.
 
 | No. | Question | Decision |
 |---|---|---|
@@ -1451,6 +1454,7 @@ Decisions 1 to 6 were made on 2026-10-09, decisions 7 to 9 on 2026-10-10, decisi
 | 32 | Fiber-local storage | Not at this time. caravan needs only the id. A request id for logs can go in an argument or in a handler of the scope. A fork that copies the values costs time at each fork, and no user needs it at this time. A later `Fiber.Local` can be a field of the fiber record, next to the id, so the id does not block it. |
 | 33 | The run of the world of the OS | `Weft.run (module O) main`, with the world `O` of type `OS` at the call site: `Weft_linux`, `Weft_kqueue`, or `Weft_os` of the library `weft.os`, which selects the world at compile time with a `select` of dune (section 2.7, The world at the call site). The run with a `WORLD` value is `Weft.run_world`. A library that includes the core and the world of the OS adds a library name and links C stubs into the core, so it was not kept. |
 | 34 | The Windows world | `weft.windows`: one IOCP for each domain and an I/O thread for each world, `AFD_POLL` for the sockets with one poll for each socket in the process, overlapped named pipes with a buffer of the world, a high-resolution timer and the exits of the children on the IOCP with `NtAssociateWaitCompletionPacket`, and the events of the console as signals (section 2.7, Windows). `weft.posix` gets a Windows version of its stubs, so `Weft_posix.Make` makes the world. `WSAPoll` is level-triggered and accepts only sockets. A poll in each domain, as decision 8, misses edges: AFD gives the events of a socket only to its oldest poll. The timeout of `GetQueuedCompletionStatusEx` was 15 ms late on a 1 ms wait. |
+| 35 | Byte streams in weft | The library `weft.flow` (`Weft_flow`) with `Flow` and `Tcp` from caravan, and an internal `Deadline` (section 2.18). `Flow.linger` is a procedure of HTTP, thus it stays in caravan. The files from caravan keep MPL-2.0, thus the license of the package is `ISC AND MPL-2.0`. A package of its own adds release work for two modules. A dependency of a database client on caravan puts an HTTP server in its link. |
 
 Also on 2026-10-10, the user accepted the milestone plan of section 2.14. Decisions 4, 7 and 8 stay, and they come in milestone M1. Milestone M0 has one domain.
 

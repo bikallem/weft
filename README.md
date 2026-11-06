@@ -249,6 +249,7 @@ Then add the libraries to your `dune` file:
 | `weft.windows` | `Weft_windows`: the Windows world (I/O completion ports). |
 | `weft.sim` | `Weft_sim`: the simulator. |
 | `weft.posix` | The parts that the worlds of the OS share. |
+| `weft.flow` | `Weft_flow`: byte streams with deadlines (`Flow`), and TCP and Unix connections and listeners (`Tcp`). |
 
 With Nix, the flake gives weft as a package (see
 [Use weft from another flake](#use-weft-from-another-flake)).
@@ -280,6 +281,7 @@ nix develop -c spec/tla/check.sh     # the TLA+ models of the design
 The main test suites are in `test`:
 
 - `test/core` and `test/sim`: the core and the simulator.
+- `test/flow`: the byte streams of `weft.flow`, on the simulator.
 - `test/portable`: the tests that run on each world (the simulator, Linux,
   kqueue and Windows).
 - `test/linux` and `test/linux_md`: the Linux world. `test/linux_md` has the
