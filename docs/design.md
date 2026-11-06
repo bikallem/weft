@@ -1412,6 +1412,7 @@ The cost of an effect is a perform and a handler call for each world operation. 
 | `fork_isolated ~on_error`, the poisoned mutex, `use_rw ~protect` and `use_ro` | Eio `run_server`, Eio `Mutex` |
 | The handler of a scope, `Promise.ready`, `Promise.cancel` | affect `Call_handler`, `get'`, `cancel` |
 | `Flow`, `Tcp` and the deadlines of a flow (`weft.flow`) | caravan |
+| The `read_into` rule of `Reader`: the held bytes first, and a large part with no copy | caravan `Buf_reader` |
 | A simulator with a network and a seed | Shadow (from the session). FoundationDB, TigerBeetle, madsim and turmoil use the same idea. We did not examine them in the session. |
 
 ## 2.12 Decisions
@@ -1798,7 +1799,7 @@ On a machine with 16 CPUs, `make mutate` took 45 s for a change to a comment, 10
 
 ## 2.18 Byte streams (`weft.flow`)
 
-The library `weft.flow` (`Weft_flow`) gives byte streams on `Net`, with deadlines and timeouts. Protocols on weft can share it. caravan and Cistern are the planned users. Its code came from caravan (`src/flow.ml`, `src/tcp.ml` and `src/deadline.ml`), and these files keep the license of caravan, MPL-2.0. The library needs only the core, thus each world and the simulator run the same code. The guard `test/nounix` links it (section 2.3).
+The library `weft.flow` (`Weft_flow`) gives byte streams on `Net`, with deadlines and timeouts. Protocols on weft can share it. caravan and Cistern are the planned users. `Flow`, `Tcp` and `Deadline` came from caravan (`src/flow.ml`, `src/tcp.ml` and `src/deadline.ml`), and these files keep the license of caravan, MPL-2.0. `Reader` is new code, with the license of weft, ISC. The library needs only the core, thus each world and the simulator run the same code. The guard `test/nounix` links it (section 2.3).
 
 **The wait of `Tcp`.** A read or a write that cannot continue waits for the socket, for a change of the deadline of the flow (a `Var`, decision 18), or for the deadline. A deadline that passed wins over the other events, also over a close at the same time.
 
@@ -1807,6 +1808,11 @@ The library `weft.flow` (`Weft_flow`) gives byte streams on `Net`, with deadline
 **Changes from caravan.** `Deadline` is internal. `Tcp.Listener.listen` has the default backlog of `Net.listen`. `Flow.linger` stays in caravan, because it is a procedure of HTTP (RFC 9112, section 9.6).
 
 **Keep-alive.** `Tcp.connect ~keep_alive:true` sets `SO_KEEPALIVE` on a TCP connection, so that a connection to a peer that is gone ends. weft has no option for the times of the probes, thus the OS gives them. After failed probes, the first read or write raises `Net.Error` (`ETIMEDOUT` on Linux). Later ones give the end of the stream or `Flow.Closed`. I read this in the source of Linux, but I did not do a test of it.
+
+**Binary reads (`Reader`).** `src/flow/reader.mli` gives the contract. The users are the MySQL packet codec of Cistern and the WebSocket frames of caravan. Two reasons are not in the interface:
+
+- The buffer grows only when it is full. It allocates at most two times its size, or it takes the spare buffer (below), which can be larger. Thus a peer that declares a large length and sends a few bytes makes the reader allocate at most about two times the bytes that came, not the length.
+- The reader keeps its last larger buffer for the next growth, if it has at most the larger of `16 * size` and 64 KiB. Without it, a stream of rows a little larger than `size` allocated and copied a new buffer for each row (5020-byte rows: 629 words of the major heap and about 2 us for each row). The limit keeps the memory of an idle connection small.
 
 **No TLA+ model.** The library adds no shared protocol. It is a composition of `Var`, `Atomic` and `choose`, as `Var` is (section 2.16). The race tests of `test/flow` do a close and a deadline from another fiber during a wait, on 4 virtual domains and 100 seeds.
 

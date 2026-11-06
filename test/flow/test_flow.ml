@@ -4,12 +4,12 @@
 
 (* The suite of weft.flow on the simulator (design section 2.18): the group
    "Flow" of test/test_core.ml of caravan, and the runner. The tests of Tcp are
-   in test_tcp.ml. *)
+   in test_tcp.ml, and the tests of Reader in test_reader.ml. *)
 
 open Windtrap
 open Weft_flow
 
-let is_invalid_arg = function Invalid_argument _ -> true | _ -> false
+let is_invalid_arg = Helpers.is_invalid_arg
 
 (* Flow *)
 
@@ -243,4 +243,6 @@ let flow_tests =
           in
           equal string input (read_all ~size flow) ) ]
 
-let () = exit (Windtrap.run "flow" (flow_tests :: Test_tcp.tests))
+let () =
+  exit
+    (Windtrap.run "flow" ((flow_tests :: Test_tcp.tests) @ Test_reader.tests))
