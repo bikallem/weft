@@ -793,12 +793,7 @@ let default_opts tcp =
   ; rcvbuf= (if tcp then 131072 else udp_rcvbuf)
   ; sndbuf= (if tcp then 16384 else udp_rcvbuf) }
 
-let copy_opts o =
-  { no_delay= o.no_delay
-  ; keep_alive= o.keep_alive
-  ; broadcast= o.broadcast
-  ; rcvbuf= o.rcvbuf
-  ; sndbuf= o.sndbuf }
+let copy_opts o = {o with no_delay= o.no_delay}
 
 (* The smallest size: 2304 bytes for a receive buffer, 4608 for a send buffer,
    as on Linux. *)
@@ -868,35 +863,8 @@ let with_opts : type a b.
   | None ->
       Error Op.Bad_fd
 
-let new_pipe n =
-  let mk role =
-    { role
-    ; inbox= Buffer.create 64
-    ; rpos= 0
-    ; inflight= 0
-    ; last_at= 0L
-    ; peer= None
-    ; eof= false
-    ; fin= false
-    ; shut= false
-    ; abort= false
-    ; err= None
-    ; lost= false
-    ; established= true
-    ; refused= false
-    ; cfd= new_fd n
-    ; remote= Op.Unix ""
-    ; local= Op.Unix ""
-    ; tcp= false }
-  in
-  let r = mk Rd_end and w = mk Wr_end in
-  r.peer <- Some w ;
-  w.peer <- Some r ;
-  (r, w)
-
-(* One side of a connection, before the connect completes. *)
-let new_sock ~tcp ~local remote =
-  { role= Sock
+let new_conn ~role ~tcp ~established ~local remote =
+  { role
   ; inbox= Buffer.create 64
   ; rpos= 0
   ; inflight= 0
@@ -908,12 +876,30 @@ let new_sock ~tcp ~local remote =
   ; abort= false
   ; err= None
   ; lost= false
-  ; established= false
+  ; established
   ; refused= false
   ; cfd= -1
   ; remote
   ; local
   ; tcp }
+
+let new_pipe n =
+  let mk role =
+    let c =
+      new_conn ~role ~tcp:false ~established:true ~local:(Op.Unix "")
+        (Op.Unix "")
+    in
+    c.cfd <- new_fd n ;
+    c
+  in
+  let r = mk Rd_end and w = mk Wr_end in
+  r.peer <- Some w ;
+  w.peer <- Some r ;
+  (r, w)
+
+(* One side of a connection, before the connect completes. *)
+let new_sock ~tcp ~local remote =
+  new_conn ~role:Sock ~tcp ~established:false ~local remote
 
 (* The exit of a fake process: it closes the ends of its pipes, and its pidfd
    becomes readable. *)
@@ -1452,20 +1438,16 @@ let earliest a b =
    is a switch point. One top-level loop keeps the continuation of each domain,
    and the PRNG selects the domain that continues. *)
 
-type dstep =
-  | Ended
-  | Paused : 'a Effect.t * ('a, dstep) Effect.Deep.continuation -> dstep
-
 type vstate =
   | Start of Sched.dom
-  | Pending : 'a Effect.t * ('a, dstep) Effect.Deep.continuation -> vstate
+  | Pending : 'a Effect.t * ('a, vstate) Effect.Deep.continuation -> vstate
   | Sleeping of
-      World.Wait.t * (World.Ready.t list, dstep) Effect.Deep.continuation
+      World.Wait.t * (World.Ready.t list, vstate) Effect.Deep.continuation
   | Ended_dom
 
 let start_dom d =
   Effect.Deep.match_with Sched.run_domain d
-    { retc= (fun () -> Ended)
+    { retc= (fun () -> Ended_dom)
     ; exnc=
         (fun e ->
           Printexc.raise_with_backtrace e (Printexc.get_raw_backtrace ()) )
@@ -1480,7 +1462,8 @@ let start_dom d =
           | World.Random_bytes _
           | World.Switch ->
               Some
-                (fun (k : (a, dstep) Effect.Deep.continuation) -> Paused (e, k))
+                (fun (k : (a, vstate) Effect.Deep.continuation) ->
+                  Pending (e, k) )
           | _ ->
               None ) }
 
@@ -1568,16 +1551,15 @@ let step t st d =
           no_progress t
       | _ ->
           progress t ) ;
-  let next = function Ended -> Ended_dom | Paused (e, k) -> Pending (e, k) in
   match st.(d) with
   | Start dom ->
-      st.(d) <- next (start_dom dom)
+      st.(d) <- start_dom dom
   | Sleeping (_, k) ->
-      st.(d) <- next (Effect.Deep.continue k (take_ready t d))
+      st.(d) <- Effect.Deep.continue k (take_ready t d)
   | Ended_dom ->
       ()
   | Pending (e, k) -> (
-      let go v = st.(d) <- next (Effect.Deep.continue k v) in
+      let go v = st.(d) <- Effect.Deep.continue k v in
       match e with
       | World.Now line ->
           go (now_of t line)
