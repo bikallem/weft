@@ -295,14 +295,15 @@ and sigstate =
 (* A completion that the world gives with [Ready.External]: the end of a job of
    the pool, or of [Sim.settle]. *)
 and ext =
-  { mutable ewait: (sync * int) option  (** The waiter, if one. *)
-  ; mutable arrived: bool  (** The completion came before the waiter. *)
-  ; mutable dropped: bool
-        (** The fiber left before its wait started, for example after a cancel.
-        *)
+  { mutable est: ext_state
   ; on_done: (unit -> unit) option
         (** For a job that holds the user of an fd: the release, at the
             completion, also when the waiter left. *) }
+
+(* [Started]: no waiter and no completion. [Waiting]: the waiter. [Arrived]:
+   the completion came before the waiter. [Dropped]: the fiber does not wait
+   any more, for example after a cancel. *)
+and ext_state = Started | Waiting of sync * int | Arrived | Dropped
 
 (* The heap of deadlines of one domain. Only its owner uses it. *)
 and heap =
@@ -942,33 +943,22 @@ let external_leaf id : leaf =
   let t = dom.sched in
   Spin.with_lock t.externals_lock (fun () ->
       match Hashtbl.find_opt t.externals id with
-      | ((Some e)
-         [@mutate
-           off
-             "only the domain of the job takes its completion, and it does not \
-              poll between the start of the job and the wait or the detach"] )
-        when e.arrived ->
+      | Some {est= Arrived; _} ->
           Hashtbl.remove t.externals id ;
           ignore (C.self_commit s.word i)
       | Some e ->
-          e.ewait <- Some (s, i)
+          e.est <- Waiting (s, i)
       | None ->
-          Hashtbl.replace t.externals id
-            {ewait= Some (s, i); arrived= false; dropped= false; on_done= None} )
+          Hashtbl.replace t.externals id {est= Waiting (s, i); on_done= None} )
 
 (* The fiber does not wait for the completion of [id] any more. *)
 let drop_external t id =
   Spin.with_lock t.externals_lock (fun () ->
       match Hashtbl.find_opt t.externals id with
-      | ((Some e)
-         [@mutate
-           off
-             "only the domain of the job takes its completion, and it does not \
-              poll between the start of the job and the wait or the detach"] )
-        when e.arrived ->
+      | Some {est= Arrived; _} ->
           Hashtbl.remove t.externals id
       | Some e ->
-          e.dropped <- true
+          e.est <- Dropped
       | None ->
           () )
 
@@ -982,7 +972,7 @@ let start_job dom job on_done =
       let t = dom.sched in
       Spin.with_lock t.externals_lock (fun () ->
           Hashtbl.replace t.externals id
-            {ewait= None; arrived= false; dropped= false; on_done} )
+            {est= Started; on_done} )
   | Error _ ->
       () ) ;
   r
@@ -1131,16 +1121,11 @@ let on_ready dom = function
       let e =
         Spin.with_lock t.externals_lock (fun () ->
             match Hashtbl.find_opt t.externals id with
-            | Some e
-              when ( Option.is_some e.ewait || e.dropped )
-                   [@mutate
-                     off
-                       "the dscheck test of the jobs kills this mutant, and \
-                        dscheck is not in the mutation run"] ->
+            | Some ({est= Waiting _ | Dropped; _} as e) ->
                 Hashtbl.remove t.externals id ;
                 Some e
             | Some e ->
-                e.arrived <- true ;
+                e.est <- Arrived ;
                 Some e
             | None ->
                 None )
@@ -1152,10 +1137,10 @@ let on_ready dom = function
               dom.held <- dom.held - 1 ;
               f () )
             e.on_done ;
-          match e.ewait with
-          | Some (s, i) -> (
+          match e.est with
+          | Waiting (s, i) -> (
             match C.notify s.word i with C.Resume -> resume dom s | _ -> () )
-          | None ->
+          | Started | Arrived | Dropped ->
               () )
       | None ->
           () )

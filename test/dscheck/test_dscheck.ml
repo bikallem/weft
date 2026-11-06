@@ -664,10 +664,7 @@ let job_completion () =
       let d0 = t.S.doms.(0) and d1 = t.S.doms.(1) in
       let id = 5 and released = Atomic.make 0 and continued = Atomic.make 0 in
       Hashtbl.replace t.S.externals id
-        { S.ewait= None
-        ; arrived= false
-        ; dropped= false
-        ; on_done= Some (fun () -> Atomic.incr released) } ;
+        {S.est= S.Started; on_done= Some (fun () -> Atomic.incr released)} ;
       d0.S.held <- 1 ;
       let s = new_sync (scope_node ()) in
       spawn_in w (fun () ->
