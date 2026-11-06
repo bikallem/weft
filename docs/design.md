@@ -612,7 +612,7 @@ TLC checks these properties in each scenario:
 
 All three scenarios pass. Five planted bugs each give a failure: a join that a cancel can end, a scope in a shield that links under the outer scope, a walk with no check of the chain, a member that ends before it stores its exception, and a `sync` that parks with no read of the flags. In **error**, G1 can also raise a `Cancelled`. A scope that ignores each `Cancelled`, also when the chain of S is not cancelled, violates `ExnSeen` (the review of 2026-10-16, C1). Section 2.16 lists all of the TLA+ models. The model makes each commit one atomic step, and `Commit.tla` examines the commit itself. The model does not cover promises, `fork_isolated`, `Fiber.Mutex`, more than one nested scope in each scenario, or the deadline form of `with_timeout`.
 
-**In the simulator.** The scope cancels its members in the fork order, so the seed sets the full result. After a scope ends, the simulator examines its state. It must find no fibers of that scope, and no live offers or heap entries. An offer or an entry is live if its sync word is not `Done`. Stale entries can stay until their owner drops them.
+**In the simulator.** The scope cancels its members in the fork order, so the seed sets the full result. The simulator does not examine the state of a scope when it ends. The review of 2026-11-06 found that this text described such a check, but no code did it. The check at each quiescence (section 2.8) finds a fiber, a timer or an fd waiter that the scheduler did not run, and `Scope.tla` examines the orphan fibers (section 2.16).
 
 ### The id of a fiber (issue 9)
 
@@ -664,7 +664,7 @@ caravan needs only the id. The other use is a request id in logs and traces. In 
 **Code that catches `Cancelled`.** A handler such as `try ... with _ -> ()` also catches `Cancelled`, and the fiber continues. The sticky cancel makes the next `sync` raise again. But a loop that catches all exceptions around each `sync` never ends. Thus:
 
 - Code that catches all exceptions must raise `Cancelled` again, for example with `| Fiber.Cancelled _ as e -> raise e`.
-- The simulator reports a fiber that catches `Cancelled` more than 100 times. The value 100 is a start value.
+- The simulator does not count the caught cancels. The review of 2026-11-06 found that this text described a report after 100 caught cancels, but no code did it.
 
 **Asynchronous exceptions are not permitted.** OCaml can raise an exception from a `Sys.signal` handler, from a finaliser, or as `Sys.Break` after `Sys.catch_break`. These exceptions come at a poll point. OCaml 5 polls at allocations, at function entries and at loop back edges. Thus this point can be inside the scheduler's own code, for example in a push to the local queue. The scheduler state is then half changed, and OCaml has no way to block these exceptions. Thus:
 
