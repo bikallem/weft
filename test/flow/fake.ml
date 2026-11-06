@@ -1,6 +1,6 @@
-(* A flow in memory that logs its calls, for the tests of Reader. Thus a test
-   sees the size of each read and write, and the bytes that the flow got, with
-   no function of the API for the tests. It needs no fiber. *)
+(* A flow in memory that logs its calls, for the tests of Reader and Writer.
+   Thus a test sees the size of each read and write, and the bytes that the flow
+   got, with no function of the API for the tests. It needs no fiber. *)
 
 open Weft_flow
 

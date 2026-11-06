@@ -26,9 +26,9 @@
     ]}
 
     A reader has one user. Two calls at the same time on one reader are not
-    supported. A call of the reader and a write of the same flow can run at the
-    same time in two fibers. A function needs a weft fiber only when the read of
-    the flow needs one.
+    supported. A reader and a {!Writer} on the same flow can run at the same
+    time in two fibers. A function needs a weft fiber only when the read of the
+    flow needs one.
 
     The reader sets no deadline and no timeout. They are those of the flow. A
     read timeout of the flow ({!Flow.set_read_timeout}) applies to each read of
