@@ -327,6 +327,11 @@ type _ Effect.t += Prog : 'a req -> 'a Effect.t
 
 let prog name r = World.perform name (Prog r)
 
+(* A push to an atomic list with a CAS: no lock. A finaliser can do it. *)
+let rec push_list l x =
+  let old = Atomic.get l in
+  if not (Atomic.compare_and_set l old (x :: old)) then push_list l x
+
 let is_done s = match C.state s.word with C.Done _ -> true | _ -> false
 
 module Waiters = struct
@@ -916,9 +921,7 @@ let remove_reg dom reg =
 (* A close notice on [dom] acts only on a live registration. *)
 let close_notice dom fdr = Option.iter (remove_reg dom) (live_reg dom fdr)
 
-let rec post dom fdr =
-  let l = Atomic.get dom.mailbox in
-  if not (Atomic.compare_and_set dom.mailbox l (fdr :: l)) then post dom fdr
+let post dom fdr = push_list dom.mailbox fdr
 
 (* Take the close notices of [dom], the oldest first. *)
 let take_mail dom =
@@ -1801,13 +1804,8 @@ let fail ~ctx node e bt =
   | Cancelled _ when Option.is_some (first_flag ctx) ->
       []
   | _ ->
-      let st = state_of node in
-      let rec store () =
-        let l = Atomic.get st.failures in
-        if not (Atomic.compare_and_set st.failures l ((e, bt) :: l)) then
-          store ()
-      in
-      store () ; cancel_node node e
+      push_list (state_of node).failures (e, bt) ;
+      cancel_node node e
 
 (* The end of a member: one CAS on the counts. The end of the last member sets
    the closed bit and fills the join. When the last member that is not a daemon
@@ -2102,11 +2100,6 @@ let start t main =
   push t.doms.(0) fiber (start_fiber body) ;
   (* The value of [main], or its exception. *)
   fun () -> match !result with Some r -> r () | None -> assert false
-
-(* A push to an atomic list with a CAS: no lock. A finaliser can do it. *)
-let rec push_list l x =
-  let old = Atomic.get l in
-  if not (Atomic.compare_and_set l old (x :: old)) then push_list l x
 
 (* Push a request to the injection queue: no lock, no sync word. *)
 let inject t req = push_list t.inject req

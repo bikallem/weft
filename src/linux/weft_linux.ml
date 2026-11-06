@@ -226,12 +226,7 @@ let unwatch t s ~rest =
   if r < 0 then Error (error_of (-r))
   else (
     sigmask_unblock [|number_of s|] ;
-    let rec add () =
-      let l = Atomic.get t.unblock0 in
-      if not (Atomic.compare_and_set t.unblock0 l (number_of s :: l)) then
-        add ()
-    in
-    add () ;
+    Sched.push_list t.unblock0 (number_of s) ;
     ignore (eventfd_signal t.doms.(0).evfd) ;
     Ok () )
 
