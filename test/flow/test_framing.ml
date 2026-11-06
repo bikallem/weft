@@ -1,6 +1,7 @@
 (* The tests of Reader and Writer with the models of framing.ml: the codecs of
    codec.ml give the bytes and the values of the models, for each split of the
-   input and each size of buffer. They need no fiber. *)
+   input and each size of buffer. The group "Reader and Writer on sockets" runs
+   the codecs on the TCP flows of the simulator. *)
 
 open Windtrap
 open Weft_flow
@@ -165,4 +166,134 @@ let model_tests =
           let r = reader ~chunk ~size (Ws_model.encode fs) in
           equal frames fs (Ws.read_frames r) ) ]
 
-let tests = [model_tests]
+(* The simulator tests: the codecs on the TCP flows of the simulator, with short
+   reads and writes, deadlines, cancels and faults. *)
+
+open Weft
+open Helpers
+
+let payload i n = String.init n (fun k -> Char.chr ((i + k) land 0xff))
+
+(* [echo sim ~size ~flush_every ps] sends the packets [ps] from the client, with
+   a flush after each [flush_every] packets. The server sends each packet back.
+   The client gets the same packets. The readers and the writers have [size]
+   bytes. *)
+let echo sim ~size ~flush_every ps =
+  with_flows sim
+  @@ fun ~server ~client ->
+  Fiber.scope
+  @@ fun s ->
+  let back =
+    call s (fun () ->
+        let r = Reader.create ~size server and w = Writer.create ~size server in
+        List.iter
+          (fun _ ->
+            Mysql.write_packet w (Mysql.read_packet r) ;
+            Writer.flush w )
+          ps )
+  in
+  let send =
+    call s (fun () ->
+        let w = Writer.create ~size client in
+        List.iteri
+          (fun i p ->
+            Mysql.write_packet w p ;
+            if (i + 1) mod flush_every = 0 then Writer.flush w )
+          ps ;
+        Writer.flush w )
+  in
+  let r = Reader.create ~size client in
+  equal packets ps (List.map (fun _ -> Mysql.read_packet r) ps) ;
+  await send ;
+  await back
+
+let sim_tests =
+  group "Reader and Writer on sockets"
+    [ test "MySQL packets each way with short reads and writes" (fun () ->
+          run
+          @@ fun sim ->
+          Weft_sim.net_faults sim {Weft_sim.no_faults with short_io= true} ;
+          echo sim ~size:4096 ~flush_every:10
+            (List.init 100 (fun i ->
+                 { Mysql_model.seq= i land 0xff
+                 ; payload= payload i (i * 7919 mod 70_001) } ) ) )
+    ; test "race: a reader and a writer on one flow in two fibers" (fun () ->
+          race
+          @@ fun sim ->
+          echo sim ~size:16 ~flush_every:1
+            (List.init 20 (fun i ->
+                 {Mysql_model.seq= i; payload= payload i (i * 37)} ) ) )
+    ; test "an exception in ensure keeps the bytes that came" (fun () ->
+          (* Each case: the action on the flows while ensure waits, the
+             exception of ensure, and the check after it. *)
+          let continues r ~server ~client =
+            Flow.set_read_deadline server None ;
+            Flow.write_string client "\003\004" ;
+            Reader.ensure r 4 ;
+            equal int32 0x04030201l (Reader.get_int32_le r 0)
+          in
+          let cases =
+            [ ( "a cancel"
+              , (fun c ~server:_ ~client:_ -> cancel c)
+              , Promise.Cancelled
+              , continues )
+            ; ( "a passed read deadline"
+              , (fun _ ~server ~client:_ ->
+                  Flow.set_read_deadline server (Some (Time.now Mono)) )
+              , Flow.Timeout
+              , continues )
+            ; ( "a close"
+              , (fun _ ~server ~client:_ -> Flow.close server)
+              , Flow.Closed
+              , fun r ~server:_ ~client:_ ->
+                  raises Flow.Closed (fun () -> Reader.ensure r 4) )
+            ; ( "a reset of the peer"
+              , (fun _ ~server:_ ~client -> Flow.reset client)
+              , Flow.Closed
+              , fun _ ~server:_ ~client:_ -> () )
+            ; ( "the end of the stream"
+              , (fun _ ~server:_ ~client -> Flow.shutdown_send client)
+              , End_of_file
+              , fun r ~server:_ ~client:_ ->
+                  raises End_of_file (fun () -> Reader.ensure r 3) ) ]
+          in
+          List.iter
+            (fun (name, act, exn, after) ->
+              run
+              @@ fun sim ->
+              with_flows sim
+              @@ fun ~server ~client ->
+              Fiber.scope
+              @@ fun s ->
+              Flow.write_string client "\001\002" ;
+              let r = Reader.create server in
+              let c = call s (fun () -> Reader.ensure r 4) in
+              Weft_sim.settle sim ;
+              is_true ~msg:(name ^ ": ensure waits") (not (ended sim c)) ;
+              act c ~server ~client ;
+              raises ~msg:name exn (fun () -> await c) ;
+              equal int ~msg:(name ^ ": the bytes stay") 2 (Reader.buffered r) ;
+              equal int ~msg:(name ^ ": nothing consumed") 0 (Reader.consumed r) ;
+              after r ~server ~client )
+            cases )
+    ; test "a cancel of a flush that waits breaks the writer, and leaves no fd"
+        (fun () ->
+          run
+          @@ fun sim ->
+          no_fd_leak sim
+          @@ fun () ->
+          with_flows sim
+          @@ fun ~server ~client:_ ->
+          Fiber.scope
+          @@ fun s ->
+          let w = Writer.create ~size:(big + 1) server in
+          Writer.write_string w (String.make big 'x') ;
+          let c = call s (fun () -> Writer.flush w) in
+          Weft_sim.settle sim ;
+          is_true ~msg:"the flush waits" (not (ended sim c)) ;
+          cancel c ;
+          raises Promise.Cancelled (fun () -> await c) ;
+          raises_match is_invalid_arg (fun () -> Writer.write_uint8 w 1) ;
+          Flow.close server ) ]
+
+let tests = [model_tests; sim_tests]
