@@ -250,6 +250,30 @@ Then add the libraries to your `dune` file:
 | `weft.sim` | `Weft_sim`: the simulator. |
 | `weft.posix` | The parts that the worlds of the OS share. |
 | `weft.flow` | `Weft_flow`: byte streams with deadlines (`Flow`), TCP and Unix connections and listeners (`Tcp`), and binary buffered reads and writes (`Reader`, `Writer`). |
+| `weft-tls` | `Weft_tls`: TLS flows as a server or a client, with ocaml-tls. A separate opam package, which needs `tls` and `mirage-crypto-rng`. |
+
+A TLS client on a TCP connection:
+
+```ocaml
+let () = Mirage_crypto_rng_unix.use_default ()
+
+let ok = function Ok v -> v | Error (`Msg m) -> failwith m
+
+let config =
+  ok
+    (Tls.Config.client ~authenticator:(ok (Ca_certs.authenticator ()))
+       ~peer_name:Domain_name.(host_exn (of_string_exn "example.com"))
+       ())
+
+let main () =
+  let tcp = Weft_flow.Tcp.connect (Weft.Net.Tcp ("example.com", 443)) in
+  let flow, _ = Weft_tls.client config tcp in
+  Weft_flow.Flow.write_string flow "hello"
+```
+
+`Weft_tls.client` can also start on a connection that carried bytes in clear
+text, for example after the SSL request of MySQL. The interface
+(`src/tls/weft_tls.mli`) tells the rules for this upgrade.
 
 With Nix, the flake gives weft as a package (see
 [Use weft from another flake](#use-weft-from-another-flake)).
@@ -282,6 +306,9 @@ The main test suites are in `test`:
 
 - `test/core` and `test/sim`: the core and the simulator.
 - `test/flow`: the byte streams of `weft.flow`, on the simulator.
+- `test/tls`: the TLS flows of `weft-tls`, on the simulator.
+  `test/dscheck_tls` examines the locks of a TLS session with `dscheck`. The
+  two need `tls`: dune skips them where it is absent.
 - `test/portable`: the tests that run on each world (the simulator, Linux,
   kqueue and Windows).
 - `test/linux` and `test/linux_md`: the Linux world. `test/linux_md` has the
@@ -392,6 +419,10 @@ Then add `ocamlPackages.weft` to your packages. Inside
 package. The flake also has `overlays.default`, which adds weft to
 `ocaml-ng.ocamlPackages_5_5`, and `packages.<system>.weft`.
 
+The package `weft-tls` has the same three forms: `weft.lib.tlsPackage` in a
+scope that also has weft (`weft-tls = final.callPackage weft.lib.tlsPackage
+{ };`), the overlay, and `packages.<system>.weft-tls`.
+
 ## Design
 
 [`docs/design.md`](docs/design.md) gives the design, the decisions and the
@@ -400,7 +431,9 @@ measurements. The TLA+ models of the shared protocols are in
 
 ## License
 
-ISC, except the files of `weft.flow` that came from caravan. These files are
-under the Mozilla Public License 2.0 ([`LICENSE.MPL-2.0`](LICENSE.MPL-2.0)),
-and each one starts with the header of this license. Thus the license of the
-package is `ISC AND MPL-2.0`.
+ISC, except the files that came from caravan: files of `weft.flow`, the library
+`weft-tls`, and parts of its tests. These files are under the Mozilla Public
+License 2.0 ([`LICENSE.MPL-2.0`](LICENSE.MPL-2.0)), and each one starts with
+the header of this license. Thus the license of the package `weft` is
+`ISC AND MPL-2.0`. The library `weft-tls` is a changed copy of a file of
+caravan, thus the license of the package `weft-tls` is `MPL-2.0`.
