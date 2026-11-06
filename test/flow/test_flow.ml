@@ -4,8 +4,9 @@
 
 (* The suite of weft.flow on the simulator (design section 2.18): the group
    "Flow" of test/test_core.ml of caravan, and the runner. The tests of Tcp are
-   in test_tcp.ml, the tests of Reader in test_reader.ml, and the tests of
-   Writer in test_writer.ml. *)
+   in test_tcp.ml, the tests of Reader in test_reader.ml, the tests of Writer in
+   test_writer.ml, and the tests with the models of framing.ml in
+   test_framing.ml. *)
 
 open Windtrap
 open Weft_flow
@@ -247,4 +248,5 @@ let flow_tests =
 let () =
   exit
     (Windtrap.run "flow"
-       ((flow_tests :: Test_tcp.tests) @ Test_reader.tests @ Test_writer.tests) )
+       ( (flow_tests :: Test_tcp.tests)
+       @ Test_reader.tests @ Test_writer.tests @ Test_framing.tests ) )
