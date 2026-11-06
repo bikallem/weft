@@ -39,19 +39,50 @@ let cost r =
    KiB. *)
 let max_record = 16384 + 2048
 
-(* [split s] is the complete records at the start of [s], and the rest: a part
-   of a record. Each record goes to handle_tls alone: ocaml-tls copies the rest
-   of its input for each record of the input. *)
-let split s =
-  let n = String.length s in
+(* The ciphertext that the session did not take: [buf] from 0, [len] bytes. A
+   TCP read puts its bytes at the end of [buf] directly. After [take_records],
+   [len] is less than [5 + max_record], thus [buf] has space for [read_size]
+   bytes or more. Without this buffer, a record that comes in k TCP reads gives
+   k copies of the part that came before each read: a peer that sends small TCP
+   segments then costs time quadratic in the size of the record. *)
+type carry = {buf: bytes; mutable len: int}
+
+let new_carry () = {buf= Bytes.create (5 + max_record + read_size); len= 0}
+
+(* [read_into read c] reads into the space of [c] with [read], and gives the
+   count. *)
+let read_into read c = read c.buf c.len (Bytes.length c.buf - c.len)
+
+(* [record_end c i] is the end of the record at the offset [i] of [c], if [c]
+   has all of it. For a record that is too long, it is the end of [c]: the
+   session refuses the record at once, thus [c] does not wait for 64 KiB. *)
+let record_end c i =
+  if c.len - i < 5 then None
+  else
+    let len =
+      (Bytes.get_uint8 c.buf (i + 3) lsl 8) lor Bytes.get_uint8 c.buf (i + 4)
+    in
+    if (len > max_record) [@mutate off "the exact bound of a limit"] then
+      Some c.len
+    else if c.len - i < 5 + len then None
+    else Some (i + 5 + len)
+
+(* [complete c] tells that [c] starts with a record that can go to the
+   session. *)
+let complete c = Option.is_some (record_end c 0)
+
+(* [take_records c] removes the complete records at the start of [c] and gives
+   them. Each record goes to handle_tls alone: ocaml-tls copies the rest of its
+   input for each record of the input. *)
+let take_records c =
   let rec go i acc =
-    if n - i < 5 then (List.rev acc, String.sub s i (n - i))
-    else
-      let len = (Char.code s.[i + 3] lsl 8) lor Char.code s.[i + 4] in
-      if (len > max_record) [@mutate off "the exact bound of a limit"] then
-        (List.rev (String.sub s i (n - i) :: acc), "")
-      else if n - i < 5 + len then (List.rev acc, String.sub s i (n - i))
-      else go (i + 5 + len) (String.sub s i (5 + len) :: acc)
+    match record_end c i with
+    | Some j ->
+        go j (Bytes.sub_string c.buf i (j - i) :: acc)
+    | None ->
+        Bytes.blit c.buf i c.buf 0 (c.len - i) ;
+        c.len <- c.len - i ;
+        List.rev acc
   in
   go 0 []
 
@@ -65,13 +96,17 @@ let split s =
    waits for a TCP write, and [read_now] never waits for input. But [read_now]
    can wait for the state lock while a writer encrypts one record, thus a cancel
    can come in it. Only the reader uses [carry], [plain], [pos], [plain_total]
-   and [empty]. [status] is atomic: a failure stays. *)
+   and [empty]. [status] is atomic: a failure stays.
+
+   A read that raises takes no byte (the rule of Flow.make). The bytes of a TCP
+   read go to [carry] before the reader takes the state lock. Thus a cancel at
+   the lock keeps them, and the next read gives them to the session before it
+   reads the TCP flow. *)
 type t =
   { tcp: Flow.t
-  ; cbuf: bytes  (** The buffer of the TCP reads. *)
   ; mutable tls: Tls.Engine.state
   ; mutable pending: string list  (** The responses, the last one first. *)
-  ; mutable carry: string  (** A part of a record. *)
+  ; carry: carry
   ; mutable plain: string  (** Plaintext that the application did not read. *)
   ; mutable pos: int  (** The first byte of [plain] for the application. *)
   ; mutable plain_total: int
@@ -103,39 +138,40 @@ let reraise_failed t f =
       fail t ;
       Printexc.raise_with_backtrace e bt
 
-(* [feed t s] gives the ciphertext [s] to the session, one record at a time.
-   After the handshake, a failure only marks the flow: the reader never writes,
-   thus no alert goes out. *)
-let feed t s =
-  let records, rest = split (t.carry ^ s) in
-  t.carry <- rest ;
+(* [feed t] gives the complete records of [carry] to the session, one record at
+   a time. After the handshake, a failure only marks the flow: the reader never
+   writes, thus no alert goes out. A cancel at the lock raises before the split:
+   [carry] and [unfed] keep the bytes for the next read. *)
+let feed t =
+  with_lock t.state_lock
+  @@ fun () ->
+  let records = take_records t.carry in
   let data =
     reraise_failed t (fun () ->
-        with_lock t.state_lock (fun () ->
-            List.fold_left
-              (fun data r ->
-                (* After close_notify or a failure, no more records. *)
-                if Atomic.get t.status <> `Open then data
-                else
-                  match Tls.Engine.handle_tls t.tls r with
-                  | Ok (tls, eof, `Response resp, `Data d) -> (
-                      t.tls <- tls ;
-                      Option.iter (fun r -> t.pending <- r :: t.pending) resp ;
-                      if Option.is_some eof then
-                        ignore (Atomic.compare_and_set t.status `Open `End) ;
-                      match d with
-                      | Some d ->
-                          (* The plaintext of this read is in the budget of the
-                             records that follow it. *)
-                          t.plain_total <- t.plain_total + String.length d ;
-                          d :: data
-                      | None ->
-                          t.empty <- t.empty + cost r ;
-                          if t.empty > empty_budget t.plain_total then fail t ;
-                          data )
-                  | Error _ ->
-                      fail t ; data )
-              [] records ) )
+        List.fold_left
+          (fun data r ->
+            (* After close_notify or a failure, no more records. *)
+            if Atomic.get t.status <> `Open then data
+            else
+              match Tls.Engine.handle_tls t.tls r with
+              | Ok (tls, eof, `Response resp, `Data d) -> (
+                  t.tls <- tls ;
+                  Option.iter (fun r -> t.pending <- r :: t.pending) resp ;
+                  if Option.is_some eof then
+                    ignore (Atomic.compare_and_set t.status `Open `End) ;
+                  match d with
+                  | Some d ->
+                      (* The plaintext of this read is in the budget of the
+                         records that follow it. *)
+                      t.plain_total <- t.plain_total + String.length d ;
+                      d :: data
+                  | None ->
+                      t.empty <- t.empty + cost r ;
+                      if t.empty > empty_budget t.plain_total then fail t ;
+                      data )
+              | Error _ ->
+                  fail t ; data )
+          [] records )
   in
   (* The reader feeds only when it took all of [plain]. *)
   t.plain <- String.concat "" (List.rev data) ;
@@ -173,17 +209,20 @@ let take t buf off len =
 let truncated () = raise Flow.Closed
 
 (* [read] loops until plaintext comes. The budget of records with no plaintext
-   ends the loop. *)
+   ends the loop. A complete record in [carry], also one that a cancel left
+   there, goes to the session before the next TCP read. *)
 let rec read t buf off len =
   match take t buf off len with
   | Some n ->
       n
+  | None when complete t.carry ->
+      feed t ; read t buf off len
   | None -> (
-    match Flow.read t.tcp t.cbuf 0 read_size with
+    match read_into (Flow.read t.tcp) t.carry with
     | 0 ->
         truncated ()
     | n ->
-        feed t (Bytes.sub_string t.cbuf 0 n) ;
+        t.carry.len <- t.carry.len + n ;
         read t buf off len )
 
 (* [read_now] reads the TCP flow one time: input with no plaintext gives [None],
@@ -192,20 +231,24 @@ let read_now t buf off len =
   match take t buf off len with
   | Some n ->
       Some n
-  | None -> (
-    match Flow.read_now t.tcp t.cbuf 0 read_size with
-    | None ->
-        None
-    | Some 0 ->
-        truncated ()
-    | Some n ->
-        feed t (Bytes.sub_string t.cbuf 0 n) ;
-        take t buf off len )
+  | None ->
+      ( if not (complete t.carry) then
+          match read_into (Flow.read_now t.tcp) t.carry with
+          | None ->
+              ()
+          | Some 0 ->
+              truncated ()
+          | Some n ->
+              t.carry.len <- t.carry.len + n ) ;
+      if complete t.carry then (feed t ; take t buf off len) else None
 
 let readable t =
   guard (fun () ->
-      if String.length t.plain > t.pos || Atomic.get t.status <> `Open then
-        always ()
+      if
+        String.length t.plain > t.pos
+        || complete t.carry
+        || Atomic.get t.status <> `Open
+      then always ()
       else Flow.readable t.tcp )
 
 (* [send t make] takes the records of [make tls] and the pending responses, and
@@ -272,25 +315,27 @@ let flow_of t =
     ~set_write_timeout:(Flow.set_write_timeout t.tcp)
     ()
 
-(* [establish ~read tcp tls] reads with [read] until the handshake of [tls]
-   ends, and gives the flow of the session and its data. One fiber does the
-   handshake, thus it writes each response, and the alert of a failure. The
-   records that come after the end of the handshake go to the session: their
-   plaintext is in the buffer of the flow. *)
-let establish ~read tcp tls =
-  let cbuf = Bytes.create read_size in
-  let rec loop tls carry plain eof total empty =
+(* [establish tcp tls] reads [tcp] until the handshake of [tls] ends, and gives
+   the flow of the session and its data. The reads have the deadlines and the
+   timeouts of [tcp]. One fiber does the handshake, thus it writes each
+   response, and the alert of a failure. The records that come after the end of
+   the handshake go to the session: their plaintext is in the buffer of the
+   flow. *)
+let establish tcp tls =
+  let carry = new_carry () in
+  let rec loop tls plain eof total empty =
     if (not (Tls.Engine.handshake_in_progress tls)) || eof then
-      (tls, carry, plain, eof, empty)
+      (tls, plain, eof, empty)
     else
-      match read cbuf with
+      match read_into (Flow.read tcp) carry with
       | 0 ->
           raise (Handshake_error "the peer closed the connection")
       | n ->
           let total = total + n in
           if total > max_handshake then
             raise (Handshake_error "the handshake is too large") ;
-          let records, carry = split (carry ^ Bytes.sub_string cbuf 0 n) in
+          carry.len <- carry.len + n ;
+          let records = take_records carry in
           let tls, plain, eof, empty =
             List.fold_left
               (fun (tls, plain, eof, empty) r ->
@@ -339,9 +384,9 @@ let establish ~read tcp tls =
                         (Handshake_error (Tls.Engine.string_of_failure failure)) )
               (tls, plain, eof, empty) records
           in
-          loop tls carry plain eof total empty
+          loop tls plain eof total empty
   in
-  let tls, carry, plain, eof, empty = loop tls "" [] false 0 0 in
+  let tls, plain, eof, empty = loop tls [] false 0 0 in
   let epoch =
     match Tls.Engine.epoch tls with
     | Ok e ->
@@ -351,7 +396,6 @@ let establish ~read tcp tls =
   in
   let plain = String.concat "" (List.rev plain) in
   ( { tcp
-    ; cbuf
     ; tls
     ; pending= []
     ; carry
@@ -365,18 +409,27 @@ let establish ~read tcp tls =
     ; write_lock= Fiber.Mutex.create () }
   , epoch )
 
-(* The public handshakes read with the deadlines of the flow. The engine has a
-   read of its own, with the stop of the server. *)
-let read_with_deadlines tcp b = Flow.read tcp b 0 (Bytes.length b)
+(* [check_rng name] raises [Invalid_argument] for the function [name] if no
+   default generator is set. Without the check, the first handshake raises
+   No_default_generator from the depth of ocaml-tls. *)
+let check_rng name =
+  match Mirage_crypto_rng.default_generator () with
+  | _ ->
+      ()
+  | exception Mirage_crypto_rng.No_default_generator ->
+      invalid_arg
+        ( "Weft_tls." ^ name
+        ^ ": no default generator: call Mirage_crypto_rng_unix.use_default () \
+           first" )
 
 let server config tcp =
-  let t, epoch =
-    establish ~read:(read_with_deadlines tcp) tcp (Tls.Engine.server config)
-  in
+  check_rng "server" ;
+  let t, epoch = establish tcp (Tls.Engine.server config) in
   (flow_of t, epoch)
 
 let client config tcp =
+  check_rng "client" ;
   let tls, hello = Tls.Engine.client config in
   Flow.write_string tcp hello ;
-  let t, epoch = establish ~read:(read_with_deadlines tcp) tcp tls in
+  let t, epoch = establish tcp tls in
   (flow_of t, epoch)
