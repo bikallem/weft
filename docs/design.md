@@ -1802,6 +1802,8 @@ The library `weft.flow` (`Weft_flow`) gives byte streams on `Net`, with deadline
 
 **Changes from caravan.** `Deadline` is internal. `Tcp.Listener.listen` has the default backlog of `Net.listen`. `Flow.linger` stays in caravan, because it is a procedure of HTTP (RFC 9112, section 9.6).
 
+**Keep-alive.** `Tcp.connect ~keep_alive:true` sets `SO_KEEPALIVE` on a TCP connection, so that a connection to a peer that is gone ends. weft has no option for the times of the probes, thus the OS gives them. After failed probes, the first read or write raises `Net.Error` (`ETIMEDOUT` on Linux). Later ones give the end of the stream or `Flow.Closed`. I read this in the source of Linux, but I did not do a test of it.
+
 **No TLA+ model.** The library adds no shared protocol. It is a composition of `Var`, `Atomic` and `choose`, as `Var` is (section 2.16). The race tests of `test/flow` do a close and a deadline from another fiber during a wait, on 4 virtual domains and 100 seeds.
 
 **The tests.** `test/flow` runs on the simulator only, and it is in `SUITES` of the Makefile. It starts no domain, thus a mutation run can fork it.

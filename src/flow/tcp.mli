@@ -31,14 +31,24 @@ val flow : Weft.Net.t -> Flow.t
 
     The functions of the flow need a weft fiber. *)
 
-val connect : Weft.Net.addr -> Flow.t
-(** [connect addr] connects to [addr] and gives the flow of the connection. A
-    TCP connection has [TCP_NODELAY]. The connect has no deadline: put
-    [Weft.Fiber.with_timeout] around it. On each exception, also a cancel, no
-    socket stays open.
+val connect : ?keep_alive:bool -> Weft.Net.addr -> Flow.t
+(** [connect ~keep_alive addr] connects to [addr] and gives the flow of the
+    connection. A TCP connection has [TCP_NODELAY]. With [~keep_alive:true]
+    (default [false]), a TCP connection also has [SO_KEEPALIVE]: the OS sends
+    probes on an idle connection. When the peer does not answer, the first read
+    or write after the failure raises [Weft.Net.Error]. Later ones give the end
+    of the stream or {!Flow.Closed}. The OS sets the times of the probes. On
+    Linux, the first probe comes after 2 hours of idle time by default. A Unix
+    connection ignores [~keep_alive]. If the connection ended before the set of
+    the option, [connect] gives the flow, and its next operation raises
+    {!Flow.Closed}.
 
-    @raise Weft.Net.Error if the connect gives an error, for example [Refused].
-*)
+    The connect has no deadline: put [Weft.Fiber.with_timeout] around it. On
+    each exception, also a cancel, no socket stays open.
+
+    @raise Weft.Net.Error
+      if the connect gives an error, for example [Refused], or if the OS refuses
+      [SO_KEEPALIVE] for a reason other than the end of the connection. *)
 
 (** Listening sockets. *)
 module Listener : sig

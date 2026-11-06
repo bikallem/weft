@@ -118,11 +118,39 @@ let flow s =
    next read of a broken connection gives the error. *)
 let set_no_delay s = try Net.set_option s No_delay true with Net.Error _ -> ()
 
+(* [ended e] is [true] if the error [e] of a set of an option tells that the
+   connection ended. Windows gives WSAENOTCONN, thus ENOTCONN. I think that
+   macOS gives EINVAL for a set on a connection that ended (design section 2.7,
+   Net.reset), but I did not verify it. EINVAL counts on all worlds: with
+   constant arguments, no other world gives it. *)
+let ended = function Net.Other "EINVAL" -> true | e -> is_closed e
+
+(* SO_KEEPALIVE has an effect only on TCP, and an OS can refuse it on a Unix
+   socket. If the connection ended before the set, [connect] gives the flow, as
+   for [set_no_delay], and the next operation gives Flow.Closed. Each other
+   exception closes the socket, so that no socket stays open. *)
+let set_keep_alive s = function
+  | Net.Tcp _ -> (
+    match Net.set_option s Keep_alive true with
+    | () ->
+        ()
+    | exception Net.Error (e, _) when ended e ->
+        ()
+    | exception e ->
+        let bt = Printexc.get_raw_backtrace () in
+        Net.close s ;
+        Printexc.raise_with_backtrace e bt )
+  | Net.Unix _ ->
+      ()
+
 (* [Net.connect] closes the socket on an error and on a cancel. No sync occurs
-   after it. *)
-let connect addr =
+   after it: [set_no_delay] and [set_keep_alive] are world operations, not
+   cancellation points. *)
+let connect ?(keep_alive = false) addr =
   let s = Net.connect addr in
-  set_no_delay s ; flow s
+  set_no_delay s ;
+  if keep_alive then set_keep_alive s addr ;
+  flow s
 
 module Listener = struct
   type t = {sock: Net.t; addr: Net.addr}

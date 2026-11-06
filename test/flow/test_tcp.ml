@@ -604,6 +604,80 @@ let option_tests =
           with_connection sim "unix:/run/s" Tcp.connect
             (fun ~accepted:_ ~peer:_ -> () ) ) ]
 
+(* [refuse_keep_alive ~refused e f] runs [f]. The world refuses each set of
+   SO_KEEPALIVE in [f] with the error [e], and adds 1 to [refused]. The other
+   operations go to the world. *)
+let refuse_keep_alive ~refused e f =
+  let open Weft.Private in
+  Effect.Deep.try_with f ()
+    { effc=
+        (fun (type a) (eff : a Effect.t) ->
+          match eff with
+          | World.Submit (Op.Set_option (_, Op.Keep_alive, _)) ->
+              Some
+                (fun (k : (a, _) Effect.Deep.continuation) ->
+                  incr refused ;
+                  Effect.Deep.continue k (Error e) )
+          | _ ->
+              None ) }
+
+(* [keep_alive_of sim name connect] connects with [connect] to a new listener on
+   [name]. It gives the option SO_KEEPALIVE of the socket of the client. *)
+let keep_alive_of sim name connect =
+  with_connection sim name connect (fun ~accepted:_ ~peer ->
+      option_of ~peer Net.Keep_alive )
+
+let keep_alive_tests =
+  group "Tcp keep-alive"
+    [ test "connect sets SO_KEEPALIVE only with ~keep_alive:true" (fun () ->
+          run
+          @@ fun sim ->
+          equal (list bool) [true; false]
+            [ keep_alive_of sim "server:80" (fun a ->
+                  Tcp.connect ~keep_alive:true a )
+            ; keep_alive_of sim "server:81" (fun a -> Tcp.connect a) ] )
+    ; (* The simulator accepts the option on a Unix socket. Thus a connect that
+         set it on each socket gives true. *)
+      test "a Unix connect ignores ~keep_alive" (fun () ->
+          run
+          @@ fun sim ->
+          is_false
+            (keep_alive_of sim "unix:/run/k" (fun a ->
+                 Tcp.connect ~keep_alive:true a ) ) )
+    ; (* A reset of the peer before the set: Windows gives ENOTCONN, and macOS
+         gives EINVAL. *)
+      test
+        "a refused SO_KEEPALIVE after the end of the connection gives the flow"
+        (fun () ->
+          run
+          @@ fun sim ->
+          List.iter
+            (fun e ->
+              let refused = ref 0 in
+              with_connection sim "server:80"
+                (fun a ->
+                  refuse_keep_alive ~refused e (fun () ->
+                      Tcp.connect ~keep_alive:true a ) )
+                (fun ~accepted:_ ~peer ->
+                  equal int ~msg:"the refused sets" 1 !refused ;
+                  (* The read of an option of the socket of the client finds the
+                     socket only if it is open. *)
+                  is_false ~msg:"the socket is open, with no keep-alive"
+                    (option_of ~peer Net.Keep_alive) ) )
+            [Net.Other "ENOTCONN"; Other "EINVAL"; Reset] )
+    ; test "another refusal of SO_KEEPALIVE closes the socket and raises"
+        (fun () ->
+          run
+          @@ fun sim ->
+          let l = Tcp.Listener.listen (Weft_sim.addr sim "server:80") in
+          let refused = ref 0 in
+          no_fd_leak sim (fun () ->
+              raises_match (is_error (Other "EPERM")) (fun () ->
+                  refuse_keep_alive ~refused (Other "EPERM") (fun () ->
+                      Tcp.connect ~keep_alive:true (Tcp.Listener.addr l) ) ) ) ;
+          equal int ~msg:"the refused sets" 1 !refused ;
+          Tcp.Listener.close l ) ]
+
 (* [read_after_fault sim e] gives the result of a read of a Tcp flow whose
    socket got the error [e]. *)
 let read_after_fault sim e =
@@ -628,13 +702,20 @@ let error_tests =
           run
           @@ fun sim ->
           equal (list string)
-            ["Closed"; "Closed"; "Closed"; "Closed"; "Net.Error EIO"]
+            [ "Closed"
+            ; "Closed"
+            ; "Closed"
+            ; "Closed"
+            ; "Net.Error EIO"
+            ; "Net.Error ETIMEDOUT" ]
             (List.map (read_after_fault sim)
                [ Net.Reset
                ; Broken_pipe
                ; Other "ENOTCONN"
                ; Other "ECONNABORTED"
-               ; Other "EIO" ] ) )
+               ; Other "EIO"
+                 (* The error of failed keep-alive probes on Linux. *)
+               ; Other "ETIMEDOUT" ] ) )
     ; (* A different fiber can close the socket after the check of Flow. *)
       test "shutdown_send on a closed socket does nothing" (fun () ->
           run
@@ -651,4 +732,5 @@ let tests =
   ; timeout_tests
   ; listener_tests
   ; option_tests
+  ; keep_alive_tests
   ; error_tests ]
