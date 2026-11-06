@@ -11,7 +11,7 @@
 
 (maintainers "Bikal Gurung <gbikal@gmail.com>")
 
-(license ISC)
+(license "ISC AND MPL-2.0")
 
 (package
  (name weft)

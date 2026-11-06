@@ -205,6 +205,8 @@ Each operation is a constructor of the GADT `'a Op.t`, for example `Read : fd * 
 | `Signal` | The signal event, `unwatch` | `signalfd` on Linux, a handler of the world on kqueue | The test sends the signal |
 | `Dns` | `getaddrinfo`, `getnameinfo` | `Blocking` operations on the thread pool | A name table that the test gives |
 
+The library `weft.flow` gives byte streams with deadlines on `Net` (section 2.18).
+
 "The full Unix I/O API" does not include these calls:
 
 - `fork`. In OCaml 5, `Unix.fork` raises `Failure` if the program ever spawned a domain. `Process.spawn` takes its place.
@@ -217,7 +219,7 @@ Each operation is a constructor of the GADT `'a Op.t`, for example `Read : fd * 
 **Direct calls to `Unix`.** A wrapper does not stop a library that calls `Unix` directly. This call goes past the world with no warning, as in caravan. Thus:
 
 - The core library and the simulator do not depend on the `unix` library. `Op.error` is a type of the library, not `Unix.error`.
-- The guard executable `test/nounix` links `weft` and `weft.sim` and has `(forbidden_libraries unix)` in its dune stanza. The build then gives an error if one of these libraries links `unix`. This field applies to executables and tests, not to libraries. Eio uses it in `tests/nounix/dune`. Each library of a layer that must stay on the seam (milestone M2) goes into the guard too. The `threads` library needs `unix`, so these libraries cannot link `threads`.
+- The guard executable `test/nounix` links `weft`, `weft.sim` and `weft.flow` and has `(forbidden_libraries unix)` in its dune stanza. The build then gives an error if one of these libraries links `unix`. This field applies to executables and tests, not to libraries. Eio uses it in `tests/nounix/dune`. Each library of a layer that must stay on the seam (milestone M2) goes into the guard too. The `threads` library needs `unix`, so these libraries cannot link `threads`.
 - The test suites use windtrap (section 2.17), and windtrap links `unix`. Thus a suite cannot have `(forbidden_libraries unix)`, and the guard is a separate executable with no test library. The code of a simulator test must not call `Unix`. The build does not find such a call.
 - The production executable links `unix` through the Linux or kqueue world. The program code does not link it.
 - The check finds only the `unix` library. It does not find a library with its own C stubs for the time or for random numbers. I think that the clock packages of `mtime` and `ptime` and the entropy of `mirage-crypto-rng` work in this way, but I did not verify it. A test can add them to `forbidden_libraries`.
@@ -1409,11 +1411,12 @@ The cost of an effect is a perform and a handler call for each world operation. 
 | The state machine of an fd record, and the one `close(2)` | Eio `Rcfd` |
 | `fork_isolated ~on_error`, the poisoned mutex, `use_rw ~protect` and `use_ro` | Eio `run_server`, Eio `Mutex` |
 | The handler of a scope, `Promise.ready`, `Promise.cancel` | affect `Call_handler`, `get'`, `cancel` |
+| `Flow`, `Tcp` and the deadlines of a flow (`weft.flow`) | caravan |
 | A simulator with a network and a seed | Shadow (from the session). FoundationDB, TigerBeetle, madsim and turmoil use the same idea. We did not examine them in the session. |
 
 ## 2.12 Decisions
 
-Decisions 1 to 6 were made on 2026-10-09, decisions 7 to 9 on 2026-10-10, decisions 10 and 11 on 2026-10-12 (issue 1), decision 12 on 2026-10-12 (issue 2), decisions 13 and 14 on 2026-10-12 (issue 3), decisions 15 to 17 on 2026-10-12 (issue 4), decisions 18 to 20 on 2026-10-12 (issue 5), decisions 21 to 25 on 2026-10-13 (issue 6), decision 26 on 2026-10-13 (issue 7), decisions 27 to 29 on 2026-10-13 (issue 8), and decisions 30 to 32 on 2026-10-13 (issue 9).
+Decisions 1 to 6 were made on 2026-10-09, decisions 7 to 9 on 2026-10-10, decisions 10 and 11 on 2026-10-12 (issue 1), decision 12 on 2026-10-12 (issue 2), decisions 13 and 14 on 2026-10-12 (issue 3), decisions 15 to 17 on 2026-10-12 (issue 4), decisions 18 to 20 on 2026-10-12 (issue 5), decisions 21 to 25 on 2026-10-13 (issue 6), decision 26 on 2026-10-13 (issue 7), decisions 27 to 29 on 2026-10-13 (issue 8), and decisions 30 to 32 on 2026-10-13 (issue 9). Decision 35 was made on 2026-11-06.
 
 | No. | Question | Decision |
 |---|---|---|
@@ -1451,6 +1454,7 @@ Decisions 1 to 6 were made on 2026-10-09, decisions 7 to 9 on 2026-10-10, decisi
 | 32 | Fiber-local storage | Not at this time. caravan needs only the id. A request id for logs can go in an argument or in a handler of the scope. A fork that copies the values costs time at each fork, and no user needs it at this time. A later `Fiber.Local` can be a field of the fiber record, next to the id, so the id does not block it. |
 | 33 | The run of the world of the OS | `Weft.run (module O) main`, with the world `O` of type `OS` at the call site: `Weft_linux`, `Weft_kqueue`, or `Weft_os` of the library `weft.os`, which selects the world at compile time with a `select` of dune (section 2.7, The world at the call site). The run with a `WORLD` value is `Weft.run_world`. A library that includes the core and the world of the OS adds a library name and links C stubs into the core, so it was not kept. |
 | 34 | The Windows world | `weft.windows`: one IOCP for each domain and an I/O thread for each world, `AFD_POLL` for the sockets with one poll for each socket in the process, overlapped named pipes with a buffer of the world, a high-resolution timer and the exits of the children on the IOCP with `NtAssociateWaitCompletionPacket`, and the events of the console as signals (section 2.7, Windows). `weft.posix` gets a Windows version of its stubs, so `Weft_posix.Make` makes the world. `WSAPoll` is level-triggered and accepts only sockets. A poll in each domain, as decision 8, misses edges: AFD gives the events of a socket only to its oldest poll. The timeout of `GetQueuedCompletionStatusEx` was 15 ms late on a 1 ms wait. |
+| 35 | Byte streams in weft | The library `weft.flow` (`Weft_flow`) with `Flow` and `Tcp` from caravan, and an internal `Deadline` (section 2.18). `Flow.linger` is a procedure of HTTP, thus it stays in caravan. The files from caravan keep MPL-2.0, thus the license of the package is `ISC AND MPL-2.0`. A package of its own adds release work for two modules. A dependency of a database client on caravan puts an HTTP server in its link. |
 
 Also on 2026-10-10, the user accepted the milestone plan of section 2.14. Decisions 4, 7 and 8 stay, and they come in milestone M1. Milestone M0 has one domain.
 
@@ -1717,7 +1721,7 @@ The tests use windtrap from the fork `bikallem/windtrap` (decision 9). The fork 
 
 **The layout:**
 
-- `test/core`, `test/sim` and `test/linux` are windtrap suites. Each suite runs with `--corrected`, so `dune promote` accepts a new baseline. The tests that use only the public API run on each world.
+- `test/core`, `test/sim`, `test/flow` and `test/linux` are windtrap suites. `test/flow` is the suite of `weft.flow` (section 2.18). Each suite runs with `--corrected`, so `dune promote` accepts a new baseline. The tests that use only the public API run on each world.
 - `test/nounix` is the guard of section 2.3. It has no test library.
 - The libraries have the backends `ppx_windtrap.coverage` and `ppx_windtrap.mutate`. A backend does nothing until a build asks for it. Its runtime library, `windtrap.runtime`, uses only the stdlib, so the guard stays correct also with the instrumented libraries.
 - The libraries do not use `ppx_windtrap` itself. Its runtime libraries include `windtrap`, which links `unix`. Thus there are no inline tests in `weft` or `weft.sim`, and a test of an inside part goes through a module that the library exports for tests, as `Sched_debug` (section 2.2).
@@ -1738,7 +1742,7 @@ The tests use windtrap from the fork `bikallem/windtrap` (decision 9). The fork 
 - `dune runtest`: all suites.
 - `dune runtest --force --instrument-with ppx_windtrap.coverage`, then `dune exec windtrap -- coverage`.
 - `WINDTRAP_MUTATE=1 dune runtest --force --instrument-with ppx_windtrap.mutate`, then `dune exec windtrap -- mutants`.
-- The Makefile has the recipes. `make mutate` tests the mutants on the lines that changed since the merge base with `origin/main` (`--mutate-since`), with one child for each CPU (`--mutate-jobs auto`). Then it runs `test/core` again in exec mode, only for the mutants of `weft.ml` (`CORE_DOMAIN_FILES`). In this run, the tests of `run_world` on two domains do not skip, so they kill the mutants of the stop of the domains. Then it runs `test/linux` and `test/linux_md` one at a time, on Linux only, and merges the verdicts of the four suites. The two Linux suites start domains, so windtrap starts each of their children as a new process (exec mode). They test only the mutants of `weft.linux` and `weft.posix`, because `test/core` and `test/sim` kill each mutant of the core that they kill. A run of `test/linux_md` on `sched.ml` took 297 s and gave no other kill. `make help` gives all the targets and variables.
+- The Makefile has the recipes. `make mutate` tests the mutants of `test/core`, `test/sim` and `test/flow` on the lines that changed since the merge base with `origin/main` (`--mutate-since`), with one child for each CPU (`--mutate-jobs auto`). Then it runs `test/core` again in exec mode, only for the mutants of `weft.ml` (`CORE_DOMAIN_FILES`). In this run, the tests of `run_world` on two domains do not skip, so they kill the mutants of the stop of the domains. Then it runs `test/linux` and `test/linux_md` one at a time, on Linux only, and merges the verdicts of the five suites. The two Linux suites start domains, so windtrap starts each of their children as a new process (exec mode). They test only the mutants of `weft.linux` and `weft.posix`, because `test/core` and `test/sim` kill each mutant of the core that they kill, and `test/flow` kills the mutants of `weft.flow`. A run of `test/linux_md` on `sched.ml` took 297 s and gave no other kill. `make help` gives all the targets and variables.
 
 **Survivors of a mutation run.** A survivor is a mutant that no test kills. These rules apply to each survivor and to each mutant that no test reaches:
 
@@ -1780,7 +1784,7 @@ The report also lists 2 sites under "evaluated outside tests". No test runs them
 **The mutation gate of a pull request.** The CI job `mutation (changed lines)` runs `make mutate BASE=HEAD^1` on each pull request. The checkout is the merge commit of the pull request into its base branch, and its first parent is the base at the time of the event. Thus the diff from `HEAD^1` has only the lines of the pull request. This is also true in a stack of pull requests, and when the base branch moves later. These rules apply to the gate:
 
 - The gate is strict. It gives a failure if a mutant on a changed line survives. It has no `MIN_SCORE`.
-- The gate tests the mutants that `test/core` and `test/sim` reach, and the mutants of `weft.posix` and `weft.linux` that `test/linux` and `test/linux_md` reach. A mutant that no test reaches gives no failure, for example in a new function with no test. No suite of the gate tests the lines of `weft.kqueue` and `weft.windows`.
+- The gate tests the mutants that `test/core`, `test/sim` and `test/flow` reach, and the mutants of `weft.posix` and `weft.linux` that `test/linux` and `test/linux_md` reach. A mutant that no test reaches gives no failure, for example in a new function with no test. No suite of the gate tests the lines of `weft.kqueue` and `weft.windows`.
 - A pull request that changes no line with a mutant passes, for example a change to a comment, a test or this document.
 - A change to the line of a known survivor puts that survivor in scope again, and the gate gives a failure. The author must examine the survivor with the rules of this section.
 - A mutant is on the line where its expression starts. A change to a later line of a long expression does not put the mutant in scope. `make mutate-all` finds such a survivor.
@@ -1791,6 +1795,22 @@ On a machine with 16 CPUs, `make mutate` took 45 s for a change to a comment, 10
 
 - The runner of windtrap can run tests on worker domains (`Domain.spawn` in `lib/workers.ml`). A test that calls `run ~domains:n` then has more domains than `n` in the process.
 - Mutation testing forks a child for each mutant. OCaml 5 refuses `Unix.fork` in a process that started a domain, and windtrap tells this in its message (`lib/mutate_loop.ml`). Thus a mutation run of a test with many domains can give an error.
+
+## 2.18 Byte streams (`weft.flow`)
+
+The library `weft.flow` (`Weft_flow`) gives byte streams on `Net`, with deadlines and timeouts. Protocols on weft can share it. caravan and Cistern are the planned users. Its code came from caravan (`src/flow.ml`, `src/tcp.ml` and `src/deadline.ml`), and these files keep the license of caravan, MPL-2.0. The library needs only the core, thus each world and the simulator run the same code. The guard `test/nounix` links it (section 2.3).
+
+**The wait of `Tcp`.** A read or a write that cannot continue waits for the socket, for a change of the deadline of the flow (a `Var`, decision 18), or for the deadline. A deadline that passed wins over the other events, also over a close at the same time.
+
+**Cancellation.** A read of a socket with data does no `sync`, thus each read and write of `Tcp` starts with `Fiber.check_cancel`. caravan used `sync (always ())`. The two forms read the same cancel flags on the chain of the fiber, up to a shield, and neither does a world effect. Thus the schedules of the simulator are the same, and weft.flow has no module for cancellation.
+
+**Changes from caravan.** `Deadline` is internal. `Tcp.Listener.listen` has the default backlog of `Net.listen`. `Flow.linger` stays in caravan, because it is a procedure of HTTP (RFC 9112, section 9.6).
+
+**Keep-alive.** `Tcp.connect ~keep_alive:true` sets `SO_KEEPALIVE` on a TCP connection, so that a connection to a peer that is gone ends. weft has no option for the times of the probes, thus the OS gives them. After failed probes, the first read or write raises `Net.Error` (`ETIMEDOUT` on Linux). Later ones give the end of the stream or `Flow.Closed`. I read this in the source of Linux, but I did not do a test of it.
+
+**No TLA+ model.** The library adds no shared protocol. It is a composition of `Var`, `Atomic` and `choose`, as `Var` is (section 2.16). The race tests of `test/flow` do a close and a deadline from another fiber during a wait, on 4 virtual domains and 100 seeds.
+
+**The tests.** `test/flow` runs on the simulator only, and it is in `SUITES` of the Makefile. It starts no domain, thus a mutation run can fork it. The group "weft.flow" of `test/linux` (`test/linux/flow_linux.ml`) runs a test of caravan with real sockets, on 1 and on 4 domains: on Linux, a shutdown after a reset of the peer gives `ENOTCONN`, and `Flow.shutdown_send` ignores it.
 
 ---
 

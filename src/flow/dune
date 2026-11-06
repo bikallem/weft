@@ -1,0 +1,12 @@
+; The byte streams on weft (design section 2.18): Flow and Tcp, with the
+; internal module Deadline. The library uses only the core, thus each world
+; and the simulator run it. test/nounix makes sure that it links no unix.
+
+(library
+ (name weft_flow)
+ (public_name weft.flow)
+ (libraries weft)
+ (instrumentation
+  (backend ppx_windtrap.coverage))
+ (instrumentation
+  (backend ppx_windtrap.mutate)))
