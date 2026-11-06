@@ -171,10 +171,11 @@ let deadline_form () =
               Time.sleep Mono (Span.s 1) ) ) ;
       equal int64 7_000_000L (Span.to_ns (Time.diff Mono (Time.now Mono) t0)) )
 
-(* A loop that yields until a time comes is a livelock in the simulator. *)
-let livelock () =
+(* A loop that yields until a time comes is a livelock in the simulator, also on
+   many domains: the wakes of the scheduler for the yields are not progress. *)
+let livelock domains () =
   match
-    Sim.run ~livelock:100_000 (fun _ ->
+    Sim.run ~domains ~livelock:100_000 (fun _ ->
         let t0 = Time.now Mono in
         Fiber.scope (fun s ->
             Fiber.fork_daemon ~name:"parked" s (fun () ->
@@ -462,7 +463,9 @@ let tests =
       ; test "a fill from outside gives at once while the word is Claimed"
           fill_while_claimed
       ; test "the deadline form of with_timeout has no fiber" deadline_form
-      ; test "a yield loop that waits for the time gives Livelock" livelock
+      ; test "a yield loop that waits for the time gives Livelock" (livelock 1)
+      ; test "a yield loop on 2 domains gives Livelock" (livelock 2)
+      ; test "a yield loop on 4 domains gives Livelock" (livelock 4)
       ; test "a stream of 4 MiB is not a livelock" stream
       ; test "a long exchange on a channel is not a livelock" channel_progress
       ; test "a run that raises restores the report of promises" restore_report

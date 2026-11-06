@@ -1515,8 +1515,9 @@ let take_ready t d =
   t.woken.(d) <- false ;
   woken @ take_edges t d
 
-let has_ready t d =
-  t.woken.(d) || List.exists (fun (d', _) -> d' = d) t.net.edges
+let has_edges t d = List.exists (fun (d', _) -> d' = d) t.net.edges
+
+let has_ready t d = t.woken.(d) || has_edges t d
 
 let runnable t st d =
   match st.(d) with
@@ -1558,10 +1559,12 @@ let extra_edge t d =
         t.net.edges <-
           (d, World.Ready.Fd {token; read= true; write= true}) :: t.net.edges
 
-(* A switch point with no progress: only [Now], [Switch], [Random], or a [Wait]
-   that gives nothing. A loop that yields until a time comes makes no progress,
-   because the time moves only at a quiescence (design section 2.8,
-   Livelock). *)
+(* A switch point with no progress: only [Now], [Switch], [Random], [Wake], or
+   a wait that gets no edge. A loop that yields until a time comes makes no
+   progress, because the time moves only at a quiescence (design section 2.8,
+   Livelock). The scheduler makes a [Wake] and a woken flag itself, for example
+   for a push of a yield. Thus they are not progress, and a yield loop on many
+   domains gives [Livelock] as on one domain. *)
 let no_progress t =
   t.no_progress <- t.no_progress + 1 ;
   if (t.no_progress > t.livelock) [@mutate off "the limit or one step less"]
@@ -1578,9 +1581,10 @@ let step t st d =
       progress t )
     else
       match st.(d) with
-      | Pending ((World.Now _ | World.Switch | World.Random _), _) ->
+      | Pending ((World.Now _ | World.Switch | World.Random _ | World.Wake _), _)
+        ->
           no_progress t
-      | Pending (World.Wait _, _) when not (has_ready t d) ->
+      | (Pending (World.Wait _, _) | Sleeping _) when not (has_edges t d) ->
           no_progress t
       | _ ->
           progress t ) ;
