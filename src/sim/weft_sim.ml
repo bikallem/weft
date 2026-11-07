@@ -205,9 +205,9 @@ type t =
   ; woken: bool array  (** A [wake] of each domain that it did not take. *)
   ; mutable sched: Sched.t option
   ; net: net
-  ; mutable agenda: (int64 * (unit -> unit)) list
-        (** The timed events of the simulator, in order. An event comes after
-            the events with the same time that came before it. *)
+  ; agenda: Agenda.t
+        (** The timed events of the simulator. An event comes after the events
+            with the same time that came before it. *)
   ; mutable next_id: int
   ; mutable settles: int list
   ; mutable advance: (int64 * int) option
@@ -287,26 +287,15 @@ let edge n fd ~read ~write =
       n.edges <- (d, World.Ready.Fd {token; read; write}) :: n.edges )
     (Option.value ~default:[] (Hashtbl.find_opt n.regs fd))
 
-let schedule t delay f =
-  let at = Int64.add t.now delay in
-  let e = (at, f) in
-  let rec insert = function
-    | [] ->
-        [e]
-    | ((a, _) as x) :: rest ->
-        if Int64.compare at a < 0 then e :: x :: rest else x :: insert rest
-  in
-  t.agenda <- insert t.agenda
+let schedule t delay f = Agenda.add t.agenda (Int64.add t.now delay) f
 
 (* Run the events of the agenda that are due. *)
 let run_agenda t =
   let rec loop () =
-    match t.agenda with
-    | (at, f) :: rest when Int64.compare at t.now <= 0 ->
-        t.agenda <- rest ;
-        f () ;
-        loop ()
-    | _ ->
+    match Agenda.take_due t.agenda t.now with
+    | Some f ->
+        f () ; loop ()
+    | None ->
         ()
   in
   loop ()
@@ -804,12 +793,7 @@ let default_opts tcp =
   ; rcvbuf= (if tcp then 131072 else udp_rcvbuf)
   ; sndbuf= (if tcp then 16384 else udp_rcvbuf) }
 
-let copy_opts o =
-  { no_delay= o.no_delay
-  ; keep_alive= o.keep_alive
-  ; broadcast= o.broadcast
-  ; rcvbuf= o.rcvbuf
-  ; sndbuf= o.sndbuf }
+let copy_opts o = {o with no_delay= o.no_delay}
 
 (* The smallest size: 2304 bytes for a receive buffer, 4608 for a send buffer,
    as on Linux. *)
@@ -879,35 +863,8 @@ let with_opts : type a b.
   | None ->
       Error Op.Bad_fd
 
-let new_pipe n =
-  let mk role =
-    { role
-    ; inbox= Buffer.create 64
-    ; rpos= 0
-    ; inflight= 0
-    ; last_at= 0L
-    ; peer= None
-    ; eof= false
-    ; fin= false
-    ; shut= false
-    ; abort= false
-    ; err= None
-    ; lost= false
-    ; established= true
-    ; refused= false
-    ; cfd= new_fd n
-    ; remote= Op.Unix ""
-    ; local= Op.Unix ""
-    ; tcp= false }
-  in
-  let r = mk Rd_end and w = mk Wr_end in
-  r.peer <- Some w ;
-  w.peer <- Some r ;
-  (r, w)
-
-(* One side of a connection, before the connect completes. *)
-let new_sock ~tcp ~local remote =
-  { role= Sock
+let new_conn ~role ~tcp ~established ~local remote =
+  { role
   ; inbox= Buffer.create 64
   ; rpos= 0
   ; inflight= 0
@@ -919,12 +876,30 @@ let new_sock ~tcp ~local remote =
   ; abort= false
   ; err= None
   ; lost= false
-  ; established= false
+  ; established
   ; refused= false
   ; cfd= -1
   ; remote
   ; local
   ; tcp }
+
+let new_pipe n =
+  let mk role =
+    let c =
+      new_conn ~role ~tcp:false ~established:true ~local:(Op.Unix "")
+        (Op.Unix "")
+    in
+    c.cfd <- new_fd n ;
+    c
+  in
+  let r = mk Rd_end and w = mk Wr_end in
+  r.peer <- Some w ;
+  w.peer <- Some r ;
+  (r, w)
+
+(* One side of a connection, before the connect completes. *)
+let new_sock ~tcp ~local remote =
+  new_conn ~role:Sock ~tcp ~established:false ~local remote
 
 (* The exit of a fake process: it closes the ends of its pipes, and its pidfd
    becomes readable. *)
@@ -1439,26 +1414,19 @@ let take_edges t d =
 (* The check of the waiters of the fds: a live waiter on a ready fd is a lost
    wakeup (design section 2.8, The wait steps). *)
 let fd_problems t =
+  let ready fd ~write =
+    if write then writable t.net fd else readable t.net fd
+  in
   List.concat_map
     (fun (fd, readers, writers) ->
-      let r =
-        if readable t.net fd then
-          List.map
-            (fun w ->
-              Printf.sprintf "%s waits to read fd %d, which is ready" w fd )
-            readers
-        else []
-      in
-      let w =
-        if writable t.net fd then
-          List.map
-            (fun w ->
-              Printf.sprintf "%s waits to write fd %d, which is ready" w fd )
-            writers
-        else []
-      in
-      r @ w )
-    (Sched_debug.fd_waiters (sched t))
+      List.map
+        (fun w -> Printf.sprintf "%s waits to read fd %d, which is ready" w fd)
+        readers
+      @ List.map
+          (fun w ->
+            Printf.sprintf "%s waits to write fd %d, which is ready" w fd )
+          writers )
+    (Sched_debug.fd_waiters (sched t) ~ready)
 
 let earliest a b =
   match (a, b) with
@@ -1472,20 +1440,16 @@ let earliest a b =
    is a switch point. One top-level loop keeps the continuation of each domain,
    and the PRNG selects the domain that continues. *)
 
-type dstep =
-  | Ended
-  | Paused : 'a Effect.t * ('a, dstep) Effect.Deep.continuation -> dstep
-
 type vstate =
   | Start of Sched.dom
-  | Pending : 'a Effect.t * ('a, dstep) Effect.Deep.continuation -> vstate
+  | Pending : 'a Effect.t * ('a, vstate) Effect.Deep.continuation -> vstate
   | Sleeping of
-      World.Wait.t * (World.Ready.t list, dstep) Effect.Deep.continuation
+      World.Wait.t * (World.Ready.t list, vstate) Effect.Deep.continuation
   | Ended_dom
 
 let start_dom d =
   Effect.Deep.match_with Sched.run_domain d
-    { retc= (fun () -> Ended)
+    { retc= (fun () -> Ended_dom)
     ; exnc=
         (fun e ->
           Printexc.raise_with_backtrace e (Printexc.get_raw_backtrace ()) )
@@ -1500,7 +1464,8 @@ let start_dom d =
           | World.Random_bytes _
           | World.Switch ->
               Some
-                (fun (k : (a, dstep) Effect.Deep.continuation) -> Paused (e, k))
+                (fun (k : (a, vstate) Effect.Deep.continuation) ->
+                  Pending (e, k) )
           | _ ->
               None ) }
 
@@ -1511,12 +1476,12 @@ let now_of (type time) t (line : time Weft.Clock.line) : time =
 (* What a [Wait] of domain [d] gets now: a wake, and the edges, alarms and
    completions of [d]. *)
 let take_ready t d =
-  let woken = if t.woken.(d) then [World.Ready.Woken] else [] in
   t.woken.(d) <- false ;
-  woken @ take_edges t d
+  take_edges t d
 
-let has_ready t d =
-  t.woken.(d) || List.exists (fun (d', _) -> d' = d) t.net.edges
+let has_edges t d = List.exists (fun (d', _) -> d' = d) t.net.edges
+
+let has_ready t d = t.woken.(d) || has_edges t d
 
 let runnable t st d =
   match st.(d) with
@@ -1558,10 +1523,12 @@ let extra_edge t d =
         t.net.edges <-
           (d, World.Ready.Fd {token; read= true; write= true}) :: t.net.edges
 
-(* A switch point with no progress: only [Now], [Switch], [Random], or a [Wait]
-   that gives nothing. A loop that yields until a time comes makes no progress,
-   because the time moves only at a quiescence (design section 2.8,
-   Livelock). *)
+(* A switch point with no progress: only [Now], [Switch], [Random], [Wake], or a
+   wait that gets no edge. A loop that yields until a time comes makes no
+   progress, because the time moves only at a quiescence (design section 2.8,
+   Livelock). The scheduler makes a [Wake] and a woken flag itself, for example
+   for a push of a yield. Thus they are not progress, and a yield loop on many
+   domains gives [Livelock] as on one domain. *)
 let no_progress t =
   t.no_progress <- t.no_progress + 1 ;
   if (t.no_progress > t.livelock) [@mutate off "the limit or one step less"]
@@ -1578,22 +1545,22 @@ let step t st d =
       progress t )
     else
       match st.(d) with
-      | Pending ((World.Now _ | World.Switch | World.Random _), _) ->
+      | Pending ((World.Now _ | World.Switch | World.Random _ | World.Wake _), _)
+        ->
           no_progress t
-      | Pending (World.Wait _, _) when not (has_ready t d) ->
+      | (Pending (World.Wait _, _) | Sleeping _) when not (has_edges t d) ->
           no_progress t
       | _ ->
           progress t ) ;
-  let next = function Ended -> Ended_dom | Paused (e, k) -> Pending (e, k) in
   match st.(d) with
   | Start dom ->
-      st.(d) <- next (start_dom dom)
+      st.(d) <- start_dom dom
   | Sleeping (_, k) ->
-      st.(d) <- next (Effect.Deep.continue k (take_ready t d))
+      st.(d) <- Effect.Deep.continue k (take_ready t d)
   | Ended_dom ->
       ()
   | Pending (e, k) -> (
-      let go v = st.(d) <- next (Effect.Deep.continue k v) in
+      let go v = st.(d) <- Effect.Deep.continue k v in
       match e with
       | World.Now line ->
           go (now_of t line)
@@ -1614,16 +1581,12 @@ let step t st d =
       | World.Wake d' ->
           t.woken.(d') <- true ;
           go ()
-      | World.Wait (_, w) -> (
+      | World.Wait (_, w) ->
           if t.net.extra_edges then extra_edge t d ;
           (* A domain waits only on its own poller. *)
-          match (take_ready t d, w.timeout) with
-          | (_ :: _ as ready), _ ->
-              go ready
-          | [], World.Wait.Poll ->
-              go []
-          | [], World.Wait.Sleep ->
-              st.(d) <- Sleeping (w, k) )
+          if has_ready t d || w.timeout = World.Wait.Poll then
+            go (take_ready t d)
+          else st.(d) <- Sleeping (w, k)
       | _ ->
           assert false (* The handler stops only at world effects. *) )
 
@@ -1654,26 +1617,19 @@ let quiescent t st =
         match st.(d) with
         | Sleeping (w, _) ->
             Option.to_list
-              (Option.map
-                 (fun m -> (d, Weft.Clock.to_ns Mono m, World.Ready.Alarm))
-                 w.deadline )
+              (Option.map (fun m -> (d, Weft.Clock.to_ns Mono m)) w.deadline)
             @ Option.to_list
                 (Option.map
-                   (fun p ->
-                     ( d
-                     , Int64.sub (Weft.Clock.to_ns Posix p) t.posix0
-                     , World.Ready.Posix_alarm ) )
+                   (fun p -> (d, Int64.sub (Weft.Clock.to_ns Posix p) t.posix0))
                    w.posix_deadline )
         | _ ->
             [] )
       (List.init (Array.length st) Fun.id)
   in
   let deadline =
-    List.fold_left (fun acc (_, at, _) -> earliest acc (Some at)) None deadlines
+    List.fold_left (fun acc (_, at) -> earliest acc (Some at)) None deadlines
   in
-  let next_agenda =
-    match t.agenda with (at, _) :: _ -> Some at | [] -> None
-  in
+  let next_agenda = Agenda.next t.agenda in
   (* The first domain that did not end gets the completions. *)
   let first =
     let rec find d =
@@ -1697,7 +1653,7 @@ let quiescent t st =
     t.now <- Int64.max t.now at ;
     run_agenda t ;
     List.iter
-      (fun (d, dl, alarm) -> if Int64.compare dl t.now <= 0 then give d alarm)
+      (fun (d, dl) -> if Int64.compare dl t.now <= 0 then t.woken.(d) <- true)
       deadlines
   in
   if Atomic.get t.refused_fill then
@@ -1707,7 +1663,7 @@ let quiescent t st =
   | (_ :: _ as fills), _ ->
       (* The fills go to the injection queue, and a domain wakes. *)
       List.iter (Sched.inject s) (List.rev fills) ;
-      give first World.Ready.Woken
+      t.woken.(first) <- true
   | [], _ :: _ ->
       List.iter
         (fun id -> give first (World.Ready.External id))
@@ -1766,7 +1722,7 @@ let run ?(seed = 0) ?(domains = 1) ?(auto = true) ?(signals = [])
         ; resets= false
         ; next_port= first_port
         ; fd_limit= None }
-    ; agenda= []
+    ; agenda= Agenda.create ()
     ; next_id= 0
     ; settles= []
     ; advance= None
@@ -1891,9 +1847,7 @@ let set_latency t span = t.net.latency <- Weft.Span.to_ns span
    change. *)
 let set_posix t p =
   t.posix0 <- Int64.sub (Weft.Clock.to_ns Posix p) t.now ;
-  Array.iteri
-    (fun d _ -> t.net.edges <- (d, World.Ready.Posix_alarm) :: t.net.edges)
-    (sched t).doms
+  Array.fill t.woken 0 (Array.length t.woken) true
 
 type net_faults =
   { jitter: Weft.Span.t

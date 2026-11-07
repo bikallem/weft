@@ -226,12 +226,7 @@ let unwatch t s ~rest =
   if r < 0 then Error (error_of (-r))
   else (
     sigmask_unblock [|number_of s|] ;
-    let rec add () =
-      let l = Atomic.get t.unblock0 in
-      if not (Atomic.compare_and_set t.unblock0 l (number_of s :: l)) then
-        add ()
-    in
-    add () ;
+    Sched.push_list t.unblock0 (number_of s) ;
     ignore (eventfd_signal t.doms.(0).evfd) ;
     Ok () )
 
@@ -305,17 +300,13 @@ module Poller = struct
           ignore (drain d.tfd) ;
           (* A timerfd that fired is not armed. *)
           d.armed <- 0L ;
-          World.Ready.Alarm :: acc
-          [@mutate off "the scheduler does nothing for Alarm (Sched.on_ready)"]
-          )
+          acc )
         else if token = posix_token then (
           (* After a step of the clock, the read gives ECANCELED, and the alarm
              must be set again. *)
           ignore (drain d.ptfd) ;
           d.parmed <- 0L ;
-          World.Ready.Posix_alarm :: acc
-          [@mutate
-            off "the scheduler does nothing for Posix_alarm (Sched.on_ready)"] )
+          acc )
         else if token = signal_token then (
           let counts = signalfd_read t.sigfd in
           let acc = ref acc in
@@ -330,10 +321,7 @@ module Poller = struct
           !acc )
         else if token = wake_token then (
           ignore (drain d.evfd) ;
-          let acc = completions t.pool domain acc in
-          (World.Ready.Woken :: acc)
-          [@mutate off "the scheduler does nothing for Woken (Sched.on_ready)"]
-          )
+          completions t.pool domain acc )
         else World.Ready.Fd {token; read; write} :: acc )
       events []
 

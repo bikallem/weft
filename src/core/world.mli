@@ -21,10 +21,6 @@ end
 (** The result of [Wait]. *)
 module Ready : sig
   type t =
-    | Alarm  (** The alarm of the domain went off. *)
-    | Posix_alarm
-        (** The [Posix] alarm went off, or the clock made a step (M3). *)
-    | Woken  (** A [wake] occurred. *)
     | Fd of {token: int; read: bool; write: bool}
         (** An edge of a registered fd. [token] is the token of [Register]. *)
     | External of int

@@ -137,8 +137,10 @@ module type WORLD = sig
   val wait : t -> domain:int -> Wait.t -> Ready.t list
   (** The only blocking call. The domain waits on its own poller.
       [Wait.t] holds the timeout (zero or none) and the earliest
-      deadline of the domain. The result tells which fds are ready, if
-      the alarm went off, and if [wake] occurred. *)
+      deadline of the domain. The result gives the ready fds, the
+      completed jobs and the signals. It can be empty: after the alarm,
+      after a [wake], or with no event. The scheduler then reads its
+      queues and its heap again. *)
 
   val wake : t -> domain:int -> unit
   (** Ends the [wait] of domain [domain]. Any domain or thread can call
@@ -542,9 +544,17 @@ Thus each direction has one path.
 - Before a `sync` parks, it tests the cancelled flags of its contexts, up to the nearest shield. Thus a `sync` in a nested scope sees the flag of an outer scope, and the nested scopes need no flag of their own. A chain is short, and its reads have no contention.
 - The cancel writes the flag and then reads the current sync word. The fiber writes its current sync word and then reads the flag. OCaml atomics are sequentially consistent, so at least one of the two sees the other. This is the Dekker pattern again, and `dscheck` must examine it.
 
+**The link of a nested scope.** The walk finds a nested scope in the `children` of its parent. A nested scope links there only at the first `fork` or `fork_daemon` into it, not when `Fiber.scope` makes it (the review of 2026-11-06, P2):
+
+- The fiber that makes a scope is a member of the parent, or the parent is a shield. Thus a walk of the parent finds the syncs of that fiber through its cell in the parent, and the walk needs the link only for the fibers that a fork adds.
+- A fork links its scope, and first each parent that is not linked, from the top down. Thus a linked node always has a linked chain up to the root or a shield. The fork then reads the flags of the chain in `add_member`. A cancel sets its flag and then reads the `children`. This is the Dekker pair again: the fork fails, or the walk finds the scope.
+- The link state of a node is one atomic value: unlinked, linked or removed. The link is a CAS from unlinked to linked under the lock of the parent. The end of a scope is a CAS from unlinked to removed, and it takes the lock of the parent only if the CAS fails. A fork into a scope that ended does not link it, and its `add_member` raises `Scope_closed`.
+- The cost before this rule: each `Fiber.scope` and each `with_timeout` took the lock of the parent and changed its hash table two times. In a server, all handlers share one parent scope. A measurement with 16 fibers in one scope gave 2.9 to 3.4 M `Fiber.scope` calls per second on 8 domains. With no link, the upper bound was 19 to 24 M. `with_timeout` never forks into its own scope, so it never links.
+- `Scope.tla` has the rule: a fork of K into S links S and then reads the flags, in two steps. The planted bug `BugNoLinkAtFork` forks with no link. A `dscheck` test has a fork into a scope that is not linked while a cancel walks the parent.
+
 **The concurrency of scopes.** The fibers of one scope can run on many domains at the same time. Thus:
 
-- Each scope has one atomic state word with two counts and a closed bit: the members that are not daemons, and all members. A `fork` adds a member with a CAS that succeeds only if the closed bit is clear. When the first count is 0 and the body returned, the scope cancels its daemons. The end of the last member sets the closed bit with the same CAS. Thus a `fork` and the end of the last member cannot both win.
+- Each scope has one atomic state word with two counts and a closed bit: the members that are not daemons, and all members. A `fork` adds a member with a CAS that succeeds only if the closed bit is clear. When the first count is 0 and the body returned, the scope cancels its daemons. The end reads the first count again under the lock of the scope, where `fork_daemon` adds its node, and it cancels the daemons only if the count is still 0. Without this read, a daemon could fork a member that is not a daemon between the CAS and the lock, that member could fork a new daemon, and the end cancelled the new daemon while the member was alive (the review of 2026-11-06, a `dscheck` test). The end of the last member sets the closed bit with the same CAS. Thus a `fork` and the end of the last member cannot both win.
 - A member that fails stores its exception before it decreases the counts. Thus the join always sees the exception.
 - If `on_error` of `fork_isolated` raises, its exception goes to the outer scope, as an exception of a normal fiber does.
 - Each scope has a short lock for its list of members and of nested scopes. The members are a doubly linked list, the newest first. A fiber holds its cell, so it leaves the list in O(1), and the walk gets the members in the fork order with no sort (3.12, P5). The lock is a spin lock with test and test-and-set. A new nested scope links itself under this lock, under its parent node. The parent of a scope inside a shield is the shield node. The link has no cancel logic: a cancel that walks the list at the same time can miss the new scope, but each `sync` in it reads the flag of the cancelled scope through its chain. The TLA+ model of section 2.16 examined this.
@@ -610,7 +620,7 @@ TLC checks these properties in each scenario:
 
 All three scenarios pass. Five planted bugs each give a failure: a join that a cancel can end, a scope in a shield that links under the outer scope, a walk with no check of the chain, a member that ends before it stores its exception, and a `sync` that parks with no read of the flags. In **error**, G1 can also raise a `Cancelled`. A scope that ignores each `Cancelled`, also when the chain of S is not cancelled, violates `ExnSeen` (the review of 2026-10-16, C1). Section 2.16 lists all of the TLA+ models. The model makes each commit one atomic step, and `Commit.tla` examines the commit itself. The model does not cover promises, `fork_isolated`, `Fiber.Mutex`, more than one nested scope in each scenario, or the deadline form of `with_timeout`.
 
-**In the simulator.** The scope cancels its members in the fork order, so the seed sets the full result. After a scope ends, the simulator examines its state. It must find no fibers of that scope, and no live offers or heap entries. An offer or an entry is live if its sync word is not `Done`. Stale entries can stay until their owner drops them.
+**In the simulator.** The scope cancels its members in the fork order, so the seed sets the full result. The simulator does not examine the state of a scope when it ends. The review of 2026-11-06 found that this text described such a check, but no code did it. The check at each quiescence (section 2.8) finds a fiber, a timer or an fd waiter that the scheduler did not run, and `Scope.tla` examines the orphan fibers (section 2.16).
 
 ### The id of a fiber (issue 9)
 
@@ -662,7 +672,7 @@ caravan needs only the id. The other use is a request id in logs and traces. In 
 **Code that catches `Cancelled`.** A handler such as `try ... with _ -> ()` also catches `Cancelled`, and the fiber continues. The sticky cancel makes the next `sync` raise again. But a loop that catches all exceptions around each `sync` never ends. Thus:
 
 - Code that catches all exceptions must raise `Cancelled` again, for example with `| Fiber.Cancelled _ as e -> raise e`.
-- The simulator reports a fiber that catches `Cancelled` more than 100 times. The value 100 is a start value.
+- The simulator does not count the caught cancels. The review of 2026-11-06 found that this text described a report after 100 caught cancels, but no code did it.
 
 **Asynchronous exceptions are not permitted.** OCaml can raise an exception from a `Sys.signal` handler, from a finaliser, or as `Sys.Break` after `Sys.catch_break`. These exceptions come at a poll point. OCaml 5 polls at allocations, at function entries and at loop back edges. Thus this point can be inside the scheduler's own code, for example in a push to the local queue. The scheduler state is then half changed, and OCaml has no way to block these exceptions. Thus:
 
@@ -691,6 +701,7 @@ A user can have their own effects, for example a counter or a logger. A handler 
 - `Fiber.scope ~handler f` stores `handler` in the scope. The body `f` runs inside `handler.handle`.
 - Each fiber of the scope runs inside the handler of its scope. A nested scope composes its handler inside the handler of the outer scope. Thus a fiber of a nested scope runs as `outer.handle (fun () -> inner.handle g)`, as in affect.
 - The handler must be safe for parallel use. It can run on many domains at the same time, and a fiber can move to a different domain while it is suspended.
+- The handler must resume or discontinue each continuation that it takes. A dropped continuation skips the end of each scope and shield inside it, so their fibers are not joined. The scope of the handler then finds a node of an inner scope at the head of the contexts of the fiber. It restores the contexts and fails with `Invalid_argument` (the review of 2026-11-06).
 - A user handler cannot match the world effects or the program effects by name, because their constructors are private (section 2.3). These effects go through the user handler to the scheduler and to the world handler. But a user handler with a wildcard case in its `effc` catches all effects, also the private ones. Thus a user handler must give `None` for each effect that it does not know.
 
 ### Compared with affect's asynchronous functions
@@ -721,7 +732,7 @@ The stealing is full, as in affect (decision 7). A thief can take any ready fibe
 | Poller | The epoll set or the kqueue of this domain, with its fd registrations, its alarm and its `wake` fd. On domain 0, also the signal source. | Only the owner. `wake` can come from any thread. |
 | Fd registrations | For each fd in the poller: a read flag, a write flag and the waiters | Only the owner |
 | Deadline heap | The `Mono` deadlines of the fibers that blocked on this domain (section 2.6) | Only the owner adds and pops entries. Other domains change only the sync word of an entry. |
-| Mailbox (M2) | A C queue for the completed `Blocking` operations and the close notices of this domain | Pool threads and other domains push. Only the owner takes. |
+| Mailboxes (M2) | Two: a C queue of the ids of the completed `Blocking` operations, and the atomic list `mailbox` of the close notices of this domain | Pool threads push to the C queue, and other domains push to the list. Only the owner takes. |
 | PRNG | Selects the domain to steal from, and the order of the branches of a `sync` | Only the owner. Its seed comes from `World.random` when the domain starts. |
 | Sync id counter | The ids of section 2.4 | Only the owner |
 
@@ -803,13 +814,13 @@ A lost wake-up is the typical bug here: domain A goes to sleep, and at the same 
 **A domain that finds no work (step 4 of the loop found nothing):**
 
 1. It adds itself to `idle`.
-2. It checks again: its next slot, its local queue, its mailbox, the global injection queue, the queues and next slots of the other domains, and on domain 0, the pinned queue.
+2. It checks again: the end of `main`, the global injection queue, on domain 0 the pinned queue, the local queues and next slots of all domains, and the overflow queue. It does not read the mailboxes (What the second check protects in M1, below).
 3. If it finds work, it removes itself from `idle` and goes to step 1 of the loop. If not, it performs `Wait`.
 
 **A domain or thread that pushes work:**
 
 1. It pushes the fiber.
-2. It reads `idle`. If `idle` is not empty, it takes one domain out of `idle` and wakes it with `wake`.
+2. It reads `idle` and `searching`. If `idle` is not empty and no domain searches, it wakes one idle domain with `wake` and the token (The Go rules, below). In M1, each push woke an idle domain.
 3. A push to the pinned queue wakes domain 0 directly. A different idle domain cannot run a pinned fiber.
 
 OCaml `Atomic` operations are sequentially consistent. Thus one of the two sides always sees the other: the sleeper sees the work in its second check, or the pusher sees the sleeper in `idle`. This is the Dekker pattern. It needs a model check with `dscheck`, because the simulator does not try the other orders of the atomic operations between two switch points.
@@ -818,9 +829,9 @@ OCaml `Atomic` operations are sequentially consistent. Thus one of the two sides
 
 A `wake` that comes before the domain is in `Wait` is not lost. The `eventfd` keeps its count, and the next `Wait` returns at once. The wake pipe of the kqueue world keeps its bytes in the same way.
 
-**The cost: more wakes.** A push wakes an idle domain each time that one exists, also when another domain already looks for work. Thus there can be more wakes than necessary, a small "thundering herd". Go and Tokio prevent this with a count of the domains that search for work ("spinning" threads in Go, "searching" workers in Tokio). Open question 8 asks for a measurement of this cost.
+**The cost of M1: more wakes.** In M1, a push woke an idle domain each time that one existed, also when another domain already looked for work. Thus there can be more wakes than necessary, a small "thundering herd". Go and Tokio prevent this with a count of the domains that search for work ("spinning" threads in Go, "searching" workers in Tokio). Open question 8 asked for a measurement of this cost, and M3 added the Go rules that follow.
 
-**The Go rules (M3, only if a measurement shows that they are necessary).** These rules lower the number of wakes, but the TLA+ model of `Wake.tla` showed that correctness does not need them:
+**The Go rules (M3).** These rules lower the number of wakes, but the TLA+ model of `Wake.tla` showed that correctness does not need them:
 
 - A `searching` count. A domain increases it when it starts step 4, and a push wakes nobody if it is not 0.
 - At most half of the domains search at one time.
@@ -862,11 +873,13 @@ Fiber code must not hold a stdlib `Mutex` across a `sync` or a world effect, for
 - A second fiber on the same domain that locks it gets `Sys_error` (`EDEADLK`), because the domain is one OS thread. In the simulator, all virtual domains are on one OS thread, so this occurs for each lock from another fiber.
 - With full stealing, the holder can resume on a different domain. Its `unlock` then gives `Sys_error` (`EPERM`), and the mutex stays locked forever. Each domain that waits on it then stops. A review verified these two results with a test program (`mutex.mli` agrees).
 
-**A cancel in `Condition.wait` does not poison.** By contract, the protected data is correct at a wait point. Thus a `Cancelled` that comes out of `Condition.wait` does not poison the mutex, and `use_rw` raises it with no poison. Also, inside `use_rw ~protect:true`, `Condition.wait` sees the cancels from outside. If it did not, a consumer that waits for a producer that never comes would make its scope wait forever. Eio poisons in this case (`eio_mutex.ml`, `condition.ml`).
+**A cancel in `Condition.wait` does not poison.** By contract, the protected data is correct at a wait point. Thus a `Cancelled` that comes out of `Condition.wait` does not poison the mutex, and `use_rw` raises it with no poison. The reason of that `Cancelled` also does not poison. For example, a `with_timeout` around the wait raises `Timeout`, the reason of the cancel of the wait (the review of 2026-11-06). Also, inside `use_rw ~protect:true`, `Condition.wait` sees the cancels from outside. If it did not, a consumer that waits for a producer that never comes would make its scope wait forever. Eio poisons in this case (`eio_mutex.ml`, `condition.ml`).
 
 **How the wait sees the cancels (M2).** The shield node of `use_rw ~protect:true` has an open flag. `Condition.wait` opens the node before its `sync` publishes its record, and it shuts the node after the `sync`. While the node is open, the read of the flags and the check of the chain go through it. Thus the wait sees the cancels of the outer scopes and of the scopes inside the shield, for example a `with_timeout` around the wait. The walk of a cancel never goes into a shield node, but it finds the fiber as a member of the outer scope. The mutex holds the node only while a fiber holds the mutex, and `Condition.wait` clears it before the unlock, so a later holder never uses the node of another fiber. The review of M2 found that the first form (the wait used the contexts from outside the shield) missed the cancels from inside, and `Scope.tla` has a scenario for it (section 2.16).
 
 `Fiber.Condition.wait` must lock the mutex again before it returns, also when the fiber is cancelled. That lock is a `sync`, so `Condition.wait` does it in a shield. Without the shield, the lock raises `Cancelled`, and the caller continues without the mutex. This shield has no time limit. It is an exception to the rule of the shield: the lock waits only for the other holders of the mutex, and each of them must unlock it.
+
+**A condition that outlives a run.** A waiter of `Fiber.Condition` keeps the id of its run, and `signal` and `broadcast` skip the waiters of another run. A run that ends while a fiber waits makes the sync of that fiber `Done` (section 3.11, finding 1), but the waiter stays in the queue of the condition. Without the id, a signal of a later run went to that dead waiter, and the real waiter slept forever (the review of 2026-11-06). A `Mutex` has waiters only while a fiber holds it, and a run that ends while a fiber holds a mutex leaves it held. Thus its waiters need no id.
 
 For the same reason as the stdlib `Mutex`, fiber code must not use a spin loop that waits for another domain. In the simulator, no other virtual domain runs between two switch points, so the loop never ends.
 
@@ -1069,7 +1082,7 @@ On Linux, `accept` can also give a pending network error of the new connection. 
 - `wake` writes a pipe of the domain, and not `EVFILT_USER`: a worker of a thread pool must write an fd after it posts a completion, and the pipe serves the two.
 - Signals use a handler of the world, which counts each signal and writes the wake pipe of domain 0 (section Signals, below). Before issue 6, they used `EVFILT_SIGNAL` on domain 0, with the action `SIG_IGN`. A test of macOS and FreeBSD in CI verifies that a `SIGTERM` to the process comes as an event.
 - A child has no pidfd. Its fd is a pipe, and domain 0 watches the child with `EVFILT_PROC` (`NOTE_EXIT`). At the exit, the world writes one byte to the pipe, so the fiber that waits gets a normal read edge. If `EVFILT_PROC` refuses the child because it already exited, the world writes the pipe at once. The kernel can tell of the exit before the child is a zombie. Then a reap with `WNOHANG` finds nothing, and no second edge comes. Thus after the exit, the reap first waits for the zombie with `waitid (WNOWAIT)`, in a blocking section. The reap and a `kill` are under one lock, so a `kill` never goes to a pid that the system gave again. A test spawns 50 children that exit at once, on 2 domains. It does not show which of the two ways occurs.
-- The parts that the two POSIX worlds share are in `src/posix` (`weft.posix`): the sockets, pipes, thread pools, errors and the watchdog, with portable C. The functor `Weft_posix.Make` gives the `World` module and `run` of a world from its poller, its signals and its child processes. Its `submit` takes each operation, and `run` checks the limit of the watchdog before it makes the world. On macOS, a timed wait uses `pthread_cond_timedwait_relative_np`, because macOS has no `pthread_condattr_setclock`.
+- The parts that the three production worlds (Linux, kqueue and Windows) share are in `src/posix` (`weft.posix`): the sockets, pipes, thread pools, errors and the watchdog, with portable C. The functor `Weft_posix.Make` gives the `World` module and `run` of a world from its poller, its signals and its child processes. Its `submit` takes each operation, and `run` checks the limit of the watchdog before it makes the world. On macOS, a timed wait uses `pthread_cond_timedwait_relative_np`, because macOS has no `pthread_condattr_setclock`.
 
 **The world at the call site (decision 33).** The core defines `module type OS`, with the `run` of a world of the OS. `Weft_linux`, `Weft_kqueue` and `Weft_windows` match it. A program gives the world to `Weft.run`, for example `Weft.run (module Weft_linux) main`. A portable program uses `Weft.run (module Weft_os) main`. The library `weft.os` (module `Weft_os`) selects the world with a `select` of dune: `weft.linux` if it is available, then `weft.kqueue`, then `weft.windows`. On another system, `weft.os` builds, and its `run` raises `Failure`. The selection occurs at compile time, because the stubs of epoll compile only on Linux, the stubs of kqueue only on macOS and FreeBSD, and the stubs of IOCP only on Windows. Thus the core keeps no C stubs, and a program that names a world that its OS does not have gives an error at build time. The world gives the defaults: for the worlds of the OS, `min 4 (Domain.recommended_domain_count ())` domains and a watchdog of 10 ms. `Weft.run_world (module W) w main` runs a program with a `WORLD` value, for example a test world. It has 1 domain by default.
 - **Not verified:** a system sleep on macOS, the combination of near timeouts by macOS, and OpenBSD and NetBSD.
@@ -1323,7 +1336,7 @@ The check of step 1 reads the scheduler through `Sched_debug` (section 2.2). The
 
 Without this check, the simulator takes a lost wakeup as quiescence and moves the time. A test then gives an incorrect timeout and not a clear error.
 
-A `Blocking` operation (milestone M2) does not complete at once. The simulator puts its completion in the agenda, with a time cost and a later switch point from the seed. The completion goes through the mailbox of the domain, as in production. Thus the race of a cancel and a completion, and the detach path, run in simulator tests.
+A `Blocking` operation (milestone M2) does not complete at once. The simulator puts its completion in the agenda, with a time cost and a later switch point from the seed. The completion goes to the domain as an `External` edge, as a completion of the pool does in production. Thus the race of a cancel and a completion, and the detach path, run in simulator tests.
 
 **Livelock (M3).** A loop such as `while Time.now Mono < t do Fiber.yield () done` ends in production. In the simulator, the program is never quiescent, so the time never moves, and the loop never ends. Go's `synctest` has the same property. Thus the simulator counts the switch points since the last quiescence in which the only world effects are `Now`, `Switch` and yields. If the count is more than 10^7, the simulator raises `Livelock` with the fibers that run. A test that streams much data with no timer is thus not a livelock. A test can change the limit, and 10^7 is a start value.
 
@@ -1644,9 +1657,9 @@ The sections of this document mark each part that does not come in M0 with its m
 - **Pinned fibers.** `~pinned:true` is on `fork`, `fork_promise` and `fork_isolated`. A push of a pinned fiber goes to the pinned queue, adds one to its count, and wakes domain 0 only if domain 0 is in `idle`: domain 0 reads the count in its second check, so the pair is a Dekker pair. Domain 0 also reads the count before a sleep, because the expire inside `wait` can resume a pinned fiber with no wake. It takes the pinned queue first at most 3 times in sequence, so a pinned fiber that yields does not starve the local queue (the review of M3).
 - **`Ivar.fill_from_outside`** gives `false` if no `run` is active. One `run` at a time takes these fills: `run` keeps its scheduler and the wake of its world in one global slot. A domain applies the requests of the injection queue each 61st take and before a steal.
 - **The deadline form of `with_timeout`** uses a sync word as the state of its heap entry, so the heap drops an ended entry as a stale one. A call that ends at once costs 4.6 times less than with a daemon fiber.
-- **The report of failed promises.** Only a promise that failed gets a finaliser. Its closure holds the id of the run, not the scheduler: the scheduler can hold the promise in an old slot of a ring. A ring clears the slots of the items that left it only when a pop finds it empty, because a clear on each pop is a store in the fast path. Thus a report can come late while a ring is never empty. The simulator clears the slots at its end, and it forces a full GC only if a promise of the run failed and no fiber awaited it.
+- **The report of failed promises.** Only a promise that failed gets a finaliser. Its closure holds the id of the run, not the scheduler: the scheduler can hold the promise in an old slot of a ring. A pop clears its slot. The slots of a steal stay until a pop finds the ring empty. Thus a report can come late only for a stolen promise while its old ring is never empty. The review of M3 removed the clear on each pop, because it is a store in the fast path. The review of 2026-11-06 measured it: it costs about 2 ns for each pop. Without it, the GC promoted each ended fiber that a slot held, and a fork and join took 630 ns in place of 457 ns. The simulator clears the slots at its end, and it forces a full GC only if a promise of the run failed and no fiber awaited it.
 - **The watchdog** reads a beat of each domain in a Bigarray: one more at the start and at the end of each fiber. It is in `weft.posix`, and the worlds of the OS use it (`Weft_linux.run ~watchdog`, `Weft_kqueue.run ~watchdog`, `Weft_windows.run ~watchdog`).
-- **`Livelock`.** A switch point with only `Now`, `Switch`, `Random` or a `Wait` that gives nothing is not progress, unless a commit resumed a fiber on that domain since its last step. Thus a long exchange on a channel is progress.
+- **`Livelock`.** A switch point with only `Now`, `Switch`, `Random`, `Wake`, or a wait that gets no edge of an fd or a job, is not progress, unless a commit resumed a fiber on that domain since its last step. Thus a long exchange on a channel is progress. The scheduler makes a `Wake` and the woken flag itself, for example for the push of a yield. Thus a yield loop on many domains gives `Livelock`, as on one domain (the review of 2026-11-06).
 - **A yield in a read** after 64 KiB with no wait (section 2.7).
 - **A sync on one base event** has a fast path: 60 words instead of 123.
 - **The slack** is 100 µs by default (open question 7, answered after M3).
@@ -1851,7 +1864,7 @@ The package `weft-tls` (library `weft-tls`, module `Weft_tls`) makes a TLS flow 
 - A reader, a writer and a cancel at the same time. The read gives the plaintext also after a cancel, and the peer reads the record of the writer. With the `feed` of caravan, the test fails.
 - A KeyUpdate of the peer that asks for an update, and a write at the same time. The peer reads each record in order. With the response after the data of the writer, the test fails.
 
-**The tests.** `test/tls` runs on the simulator only, and it is in `SUITES` of the Makefile. Its group "The flow" has the 18 flow tests of caravan, with the harness of caravan in `support.ml` and the test certificates in `tls_support.ml` (these files are MPL-2.0). The new groups (ISC) test the deadlines of the handshake, a cancel, a peer that keeps the socket full, and the check of the generator. They also test the read rule (a `Timeout` in a record, records in small TCP segments, the plaintext before a failure, a cancel between the read of the base flow and the session, and a `Reader` that gets each byte under cancels), an upgrade after clear text and after a MySQL SSL request, and the client configurations of each `ssl-mode` of Cistern. With the `feed` of caravan, two tests of the read rule fail. The fingerprint test uses `X509.Authenticator.cert_fingerprint`: x509 1.2.0 has no `server_cert_fingerprint`.
+**The tests.** `test/tls` runs on the simulator only, and it is in `SUITES` of the Makefile. Its group "The flow" has the 18 flow tests of caravan, with the harness of caravan in `support.ml` and the test certificates in `tls_support.ml` (these files are MPL-2.0). The new groups (ISC) test the deadlines of the handshake, a cancel, a peer that keeps the socket full, and the check of the generator. They also test the read rule (a `Timeout` in a record, records in small TCP segments, the plaintext before a failure, a cancel between the read of the base flow and the session, and a `Reader` that gets each byte under cancels), an upgrade after clear text and after a MySQL SSL request, and the client configurations of each `ssl-mode` of Cistern. The group "The shutdown" tests `shutdown_send` in a cancelled fiber: it raises `Cancelled` and the peer sees a truncation, and in a shield with a timeout the peer reads the end of the stream (the review of 2026-11-06). With the `feed` of caravan, two tests of the read rule fail. The fingerprint test uses `X509.Authenticator.cert_fingerprint`: x509 1.2.0 has no `server_cert_fingerprint`.
 
 ---
 

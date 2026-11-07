@@ -76,19 +76,17 @@ let enable nacks i =
     nacks
 
 (* A base event, the most frequent form, needs no flatten (M3). *)
-let sync_with ~nocancel ev =
+let sync ev =
   match ev with
   | Base mk ->
       let p = mk () in
-      let i = sync_req ~nocancel [|p.leaf|] in
+      let i = sync_req ~nocancel:false [|p.leaf|] in
       if i < 0 then raise (Cancelled (reason ())) else p.result ()
   | _ ->
       let leaves, results, nacks = flatten ev in
-      let i = sync_req ~nocancel leaves in
+      let i = sync_req ~nocancel:false leaves in
       enable nacks i ;
       if i < 0 then raise (Cancelled (reason ())) else results.(i) ()
-
-let sync ev = sync_with ~nocancel:false ev
 
 (* [Fiber.yield]: the fiber goes to the tail of its queue. It is a cancellation
    point. *)

@@ -247,6 +247,16 @@ let ring_clears () =
     equal ~msg:"the ring of the thief" int 0 (held into)
   done
 
+(* A pop clears its slot, also when the ring is not empty after it (the review
+   of 2026-11-06). Thus a busy ring keeps no item that left it. *)
+let ring_pop_clears () =
+  let r = Ring.create () in
+  ignore (Ring.push r 1) ;
+  ignore (Ring.push r 2) ;
+  equal (option int) (Some 1) (Ring.pop r) ;
+  is_true (Option.is_none (Atomic.get r.Ring.buf.(0))) ;
+  is_true (Option.is_some (Atomic.get r.Ring.buf.(1)))
+
 (* Random pushes, pops and steals between two rings. At each pop on an empty
    ring with head h, the slots of h and h + 1 hold no item. *)
 let ring_empty_slots () =
@@ -280,6 +290,7 @@ let ring =
     [ test "a full ring refuses a push and keeps the FIFO order" ring_full
     ; test "a steal takes half of a full ring" ring_steal_full
     ; test "an empty ring holds no item" ring_clears
+    ; test "a pop clears its slot in a ring that is not empty" ring_pop_clears
     ; test "the slots at the head of an empty ring hold no item"
         ring_empty_slots ]
 

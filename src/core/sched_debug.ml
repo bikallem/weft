@@ -75,14 +75,25 @@ let lost ?posix t ~now =
     else "the injection queue is not empty" :: queues
   in
   (* The scheduler expires each entry up to now before a sleep, so an entry at
-     now is a bug in expire. *)
+     now is a bug in expire. The check runs at each quiescence. Thus it scans a
+     heap only when its first entry is stale or due: if the first entry is live
+     and not due, the heap order tells that no entry is due. *)
   let expired heap now =
-    List.init heap.size (fun i -> heap.entries.(i))
-    |> List.filter (fun e ->
-        (not (is_done e.esync))
-        && ( Int64.compare e.deadline now
-           <= 0 )
-           [@mutate off "an entry at now is a bug in expire, not in this check"] )
+    let due e =
+      (not (is_done e.esync))
+      && ( Int64.compare e.deadline now
+         <= 0 )
+         [@mutate off "an entry at now is a bug in expire, not in this check"]
+    in
+    if
+      heap.size = 0
+      || (not (is_done heap.entries.(0).esync))
+         && ( Int64.compare heap.entries.(0).deadline now
+            > 0 )
+            [@mutate
+              off "an entry at now is a bug in expire, not in this check"]
+    then []
+    else List.filter due (List.init heap.size (fun i -> heap.entries.(i)))
   in
   let timers =
     Array.to_list t.doms
@@ -92,15 +103,21 @@ let lost ?posix t ~now =
     |> List.map (fun e ->
         Printf.sprintf "%s has an expired timer" (name e.esync.owner) )
   in
+  (* One pass with no allocation for a fiber with no problem. Only the fibers
+     with a problem are sorted. *)
   let done_not_queued =
-    List.filter_map
-      (fun f ->
-        match Atomic.get f.current with
-        | Some s when is_done s && not f.queued ->
-            Some (Printf.sprintf "%s is committed but not in a queue" (name f))
-        | _ ->
-            None )
-      (fibers t)
+    Spin.with_lock t.fibers_lock (fun () ->
+        Hashtbl.fold
+          (fun _ f acc ->
+            match Atomic.get f.current with
+            | Some s when is_done s && not f.queued ->
+                f :: acc
+            | _ ->
+                acc )
+          t.fibers [] )
+    |> List.sort (fun a b -> compare a.fid b.fid)
+    |> List.map (fun f ->
+        Printf.sprintf "%s is committed but not in a queue" (name f) )
   in
   queues @ timers @ done_not_queued
 
@@ -115,17 +132,29 @@ let live_timers t =
       n + !live )
     0 t.doms
 
-(* The live waiters of each registered fd: the fd of the world, and the names of
-   the fibers that wait to read and to write. *)
-let fd_waiters t =
+(* The live waiters of each registered fd that [ready] gives: the fd of the
+   world, and the names of the fibers that wait to read and to write. [ready fd
+   ~write] tells if the fd is ready for that direction. The check runs at each
+   quiescence, so it makes the names only for a ready fd. *)
+let fd_waiters t ~ready =
+  let live w = List.exists (fun (s, _) -> not (is_done s)) w.ws in
   let names w =
     List.filter_map
       (fun (s, _) -> if is_done s then None else Some (name s.owner))
       (Waiters.to_list w)
   in
+  let side w fd ~write = if live w && ready fd ~write then names w else [] in
   Array.to_list t.doms
   |> List.concat_map (fun d ->
       Hashtbl.fold
-        (fun _ reg acc -> (reg.fdr.os, names reg.rwait, names reg.wwait) :: acc)
+        (fun _ reg acc ->
+          let fd = reg.fdr.os in
+          match
+            (side reg.rwait fd ~write:false, side reg.wwait fd ~write:true)
+          with
+          | (([], []) [@mutate off "an fd with no names gives no message"]) ->
+              acc
+          | r, w ->
+              (fd, r, w) :: acc )
         d.regs [] )
   |> List.sort compare

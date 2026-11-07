@@ -120,7 +120,10 @@ module Fiber : sig
 
   (** A handler of the user, for example of a user effect (design section 2.5,
       Effect handlers of a scope). It must be safe for parallel use, and its
-      [effc] must give [None] for each effect that it does not know. *)
+      [effc] must give [None] for each effect that it does not know. It must
+      resume or discontinue each continuation that it takes. A continuation that
+      it drops skips the end of the scopes inside it: their fibers are not
+      joined. Then the scope of the handler raises [Invalid_argument]. *)
   type handler = {handle: 'a. (unit -> 'a) -> 'a}
 
   val scope : ?handler:handler -> (scope -> 'a) -> 'a
@@ -251,9 +254,10 @@ module Fiber : sig
     val use_rw : protect:bool -> t -> (unit -> 'a) -> 'a
     (** [use_rw ~protect m f] locks [m], runs [f] and unlocks [m]. If [f]
         raises, the protected data can be incorrect, so [m] becomes poisoned. A
-        [Cancelled] from [Condition.wait] does not poison. With [~protect:true],
-        [f] runs in a shield, but [Condition.wait] in [f] sees the cancels from
-        outside.
+        [Cancelled] from [Condition.wait] does not poison. Its reason also does
+        not poison, for example the [Timeout] of a [with_timeout] around the
+        wait. With [~protect:true], [f] runs in a shield, but [Condition.wait]
+        in [f] sees the cancels from outside.
 
         @raise Poisoned if [m] is poisoned. *)
 

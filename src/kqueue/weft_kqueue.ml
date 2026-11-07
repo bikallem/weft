@@ -300,7 +300,7 @@ module Poller = struct
              count before it writes the pipe. *)
           drain_all d.wake_r ;
           let acc = if domain = 0 then signals t acc else acc in
-          World.Ready.Woken :: completions t.pool domain acc )
+          completions t.pool domain acc )
         else if token <= -1000 then (exited t token ; acc)
         else World.Ready.Fd {token; read; write} :: acc )
       (kq_wait d.kq (timeout_ns w))

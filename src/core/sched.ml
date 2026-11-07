@@ -81,6 +81,10 @@ and ctx =
   ; members: members  (** Under [lock]. *)
   ; children: (int, ctx) Hashtbl.t
         (** The nested nodes that are not shields, by node id, under [lock]. *)
+  ; link: int Atomic.t
+        (** [unlinked], [linked] or [removed]: the state of this node in the
+            [children] of its parent (design section 2.5, The link of a nested
+            scope). *)
   ; chain: handler
         (** The handlers of the user on the chain of scopes, the outermost
             first. Each fiber of the node runs inside it. *)
@@ -112,8 +116,7 @@ and scope_state =
         *)
   ; failures: (exn * Printexc.raw_backtrace) list Atomic.t
         (** The newest first. *)
-  ; join: unit ivar
-  ; daemons: (int, ctx) Hashtbl.t  (** Under the lock of the scope node. *) }
+  ; join: unit ivar }
 
 and 'a ivar = 'a ivar_state Atomic.t
 
@@ -172,6 +175,7 @@ and _ req =
   | Fork : fiber * (unit -> unit) -> unit req
   | Self : fiber req
   | Dom_index : int req  (** The domain that runs the fiber, for the tests. *)
+  | Run_id : int req  (** The id of the run of the fiber. *)
   | Enqueue : sync list -> unit req
   | Close_notices : fdrec -> unit req
       (** Send a close notice to each domain with a registration. *)
@@ -296,14 +300,15 @@ and sigstate =
 (* A completion that the world gives with [Ready.External]: the end of a job of
    the pool, or of [Sim.settle]. *)
 and ext =
-  { mutable ewait: (sync * int) option  (** The waiter, if one. *)
-  ; mutable arrived: bool  (** The completion came before the waiter. *)
-  ; mutable dropped: bool
-        (** The fiber left before its wait started, for example after a cancel.
-        *)
+  { mutable est: ext_state
   ; on_done: (unit -> unit) option
         (** For a job that holds the user of an fd: the release, at the
             completion, also when the waiter left. *) }
+
+(* [Started]: no waiter and no completion. [Waiting]: the waiter. [Arrived]: the
+   completion came before the waiter. [Dropped]: the fiber does not wait any
+   more, for example after a cancel. *)
+and ext_state = Started | Waiting of sync * int | Arrived | Dropped
 
 (* The heap of deadlines of one domain. Only its owner uses it. *)
 and heap =
@@ -326,6 +331,11 @@ and entry =
 type _ Effect.t += Prog : 'a req -> 'a Effect.t
 
 let prog name r = World.perform name (Prog r)
+
+(* A push to an atomic list with a CAS: no lock. A finaliser can do it. *)
+let rec push_list l x =
+  let old = Atomic.get l in
+  if not (Atomic.compare_and_set l old (x :: old)) then push_list l x
 
 let is_done s = match C.state s.word with C.Done _ -> true | _ -> false
 
@@ -365,6 +375,7 @@ module Heap = struct
       ; lock= Spin.make ()
       ; members= {head= None}
       ; children= Hashtbl.create 1
+      ; link= Atomic.make 1
       ; chain= {handle= (fun f -> f ())}
       ; fids= Atomic.make 0 }
     in
@@ -916,9 +927,7 @@ let remove_reg dom reg =
 (* A close notice on [dom] acts only on a live registration. *)
 let close_notice dom fdr = Option.iter (remove_reg dom) (live_reg dom fdr)
 
-let rec post dom fdr =
-  let l = Atomic.get dom.mailbox in
-  if not (Atomic.compare_and_set dom.mailbox l (fdr :: l)) then post dom fdr
+let post dom fdr = push_list dom.mailbox fdr
 
 (* Take the close notices of [dom], the oldest first. *)
 let take_mail dom =
@@ -943,33 +952,22 @@ let external_leaf id : leaf =
   let t = dom.sched in
   Spin.with_lock t.externals_lock (fun () ->
       match Hashtbl.find_opt t.externals id with
-      | ((Some e)
-         [@mutate
-           off
-             "only the domain of the job takes its completion, and it does not \
-              poll between the start of the job and the wait or the detach"] )
-        when e.arrived ->
+      | Some {est= Arrived; _} ->
           Hashtbl.remove t.externals id ;
           ignore (C.self_commit s.word i)
       | Some e ->
-          e.ewait <- Some (s, i)
+          e.est <- Waiting (s, i)
       | None ->
-          Hashtbl.replace t.externals id
-            {ewait= Some (s, i); arrived= false; dropped= false; on_done= None} )
+          Hashtbl.replace t.externals id {est= Waiting (s, i); on_done= None} )
 
 (* The fiber does not wait for the completion of [id] any more. *)
 let drop_external t id =
   Spin.with_lock t.externals_lock (fun () ->
       match Hashtbl.find_opt t.externals id with
-      | ((Some e)
-         [@mutate
-           off
-             "only the domain of the job takes its completion, and it does not \
-              poll between the start of the job and the wait or the detach"] )
-        when e.arrived ->
+      | Some {est= Arrived; _} ->
           Hashtbl.remove t.externals id
       | Some e ->
-          e.dropped <- true
+          e.est <- Dropped
       | None ->
           () )
 
@@ -982,8 +980,7 @@ let start_job dom job on_done =
       if Option.is_some on_done then dom.held <- dom.held + 1 ;
       let t = dom.sched in
       Spin.with_lock t.externals_lock (fun () ->
-          Hashtbl.replace t.externals id
-            {ewait= None; arrived= false; dropped= false; on_done} )
+          Hashtbl.replace t.externals id {est= Started; on_done} )
   | Error _ ->
       () ) ;
   r
@@ -1132,16 +1129,11 @@ let on_ready dom = function
       let e =
         Spin.with_lock t.externals_lock (fun () ->
             match Hashtbl.find_opt t.externals id with
-            | Some e
-              when ( Option.is_some e.ewait || e.dropped )
-                   [@mutate
-                     off
-                       "the dscheck test of the jobs kills this mutant, and \
-                        dscheck is not in the mutation run"] ->
+            | Some ({est= Waiting _ | Dropped; _} as e) ->
                 Hashtbl.remove t.externals id ;
                 Some e
             | Some e ->
-                e.arrived <- true ;
+                e.est <- Arrived ;
                 Some e
             | None ->
                 None )
@@ -1153,15 +1145,13 @@ let on_ready dom = function
               dom.held <- dom.held - 1 ;
               f () )
             e.on_done ;
-          match e.ewait with
-          | Some (s, i) -> (
+          match e.est with
+          | Waiting (s, i) -> (
             match C.notify s.word i with C.Resume -> resume dom s | _ -> () )
-          | None ->
+          | Started | Arrived | Dropped ->
               () )
       | None ->
           () )
-  | World.Ready.Alarm | World.Ready.Posix_alarm | World.Ready.Woken ->
-      ()
 
 (* The cancel contexts (design section 2.5, How a cancel reaches a fiber, and
    spec/tla/Scope.tla). *)
@@ -1169,6 +1159,16 @@ let on_ready dom = function
 let next_nid = Atomic.make 0
 
 let no_handler = {handle= (fun f -> f ())}
+
+(* The states of the link of a node in the [children] of its parent. A nested
+   scope starts [unlinked]: its first fork links it, and its end removes it. The
+   other nodes start [linked]: the root has no parent, a daemon node links at
+   its fork, and a shield is never in [children]. *)
+let unlinked = 0
+
+let linked = 1
+
+let removed = 2
 
 (* A nested scope composes its handler inside the chain of its parent. *)
 let new_node ?parent ?handler kind =
@@ -1187,6 +1187,13 @@ let new_node ?parent ?handler kind =
   ; lock= Spin.make ()
   ; members= {head= None}
   ; children= Hashtbl.create ~random:false 4
+  ; link=
+      Atomic.make
+        ( match (kind, parent) with
+        | Scope_node _, Some _ ->
+            unlinked
+        | _ ->
+            linked )
   ; chain
   ; fids= (match parent with Some p -> p.fids | None -> Atomic.make 0) }
 
@@ -1326,6 +1333,8 @@ let rec run_fiber : dom -> fiber -> step -> unit =
       run_fiber dom fiber (Effect.Deep.continue k fiber)
   | Suspended (Dom_index, k) ->
       run_fiber dom fiber (Effect.Deep.continue k dom.index)
+  | Suspended (Run_id, k) ->
+      run_fiber dom fiber (Effect.Deep.continue k dom.sched.run_id)
   | Suspended (Fork (f, body), k) ->
       register dom.sched f ;
       push dom f (start_fiber body) ;
@@ -1793,6 +1802,10 @@ let all_count c = c lsr 32
 
 let self () = prog "Fiber.self" Self
 
+(* The id of the run of the fiber. Outside a fiber, it raises [Not_in_fiber], as
+   [self]. *)
+let run_id () = prog "Fiber.self" Run_id
+
 let enqueue = function [] -> () | l -> prog "Fiber" (Enqueue l)
 
 (* Fill an Ivar and resume its waiters. *)
@@ -1820,17 +1833,18 @@ let fail ~ctx node e bt =
   | Cancelled _ when Option.is_some (first_flag ctx) ->
       []
   | _ ->
-      let st = state_of node in
-      let rec store () =
-        let l = Atomic.get st.failures in
-        if not (Atomic.compare_and_set st.failures l ((e, bt) :: l)) then
-          store ()
-      in
-      store () ; cancel_node node e
+      push_list (state_of node).failures (e, bt) ;
+      cancel_node node e
 
 (* The end of a member: one CAS on the counts. The end of the last member sets
    the closed bit and fills the join. When the last member that is not a daemon
-   ends, the scope cancels its daemons. It gives the syncs to resume. *)
+   ends, the scope cancels its daemons. It gives the syncs to resume.
+
+   A daemon can fork a member that is not a daemon between the CAS and the lock,
+   and that member can fork a new daemon. Thus the end reads the count again
+   under the lock, where [fork_daemon] adds its node: if a member that is not a
+   daemon is alive, no daemon is cancelled. Its end does the cancel later (the
+   review of 2026-11-06). *)
 let member_end node ~daemon =
   let st = state_of node in
   let rec dec () =
@@ -1842,9 +1856,48 @@ let member_end node ~daemon =
   let c = dec () in
   if all_count c = 0 then Option.value ~default:[] (Iv.fill st.join ())
   else if (not daemon) && nd_count c = 0 then
-    let ds = by_id (Spin.with_lock node.lock (fun () -> entries st.daemons)) in
-    List.concat_map (fun d -> cancel_node d Daemons_end) ds
+    let ds =
+      Spin.with_lock node.lock (fun () ->
+          if nd_count (Atomic.get st.counts) = 0 then entries node.children
+          else [] )
+    in
+    List.concat_map
+      (fun d ->
+        match d.kind with
+        | Daemon_node ->
+            cancel_node d Daemons_end
+        | Scope_node _ | Shield_node _ ->
+            [] )
+      (by_id ds)
   else []
+
+(* Link [n] in the [children] of its parent, and first each parent that is not
+   linked: from the top down, so that a linked node always has a linked chain up
+   to the root or a shield. A fork links its scope before [add_member] reads the
+   flags of the chain, and a cancel sets its flag before its walk reads the
+   [children]: the Dekker pair (design section 2.5, The link of a nested scope,
+   and spec/tla/Scope.tla). A scope that ended is [removed], and it does not
+   link: its [add_member] then raises [Scope_closed]. *)
+let rec link n =
+  if Atomic.get n.link = unlinked then
+    match n.parent with
+    | None ->
+        ()
+    | Some p ->
+        link p ;
+        Spin.with_lock p.lock (fun () ->
+            if Atomic.compare_and_set n.link unlinked linked then
+              Hashtbl.replace p.children n.nid n )
+
+(* The end of a scope: a scope that no fiber forked into is not linked, and its
+   end takes no lock of its parent. *)
+let unlink n =
+  if not (Atomic.compare_and_set n.link unlinked removed) then
+    match n.parent with
+    | Some p ->
+        Spin.with_lock p.lock (fun () -> Hashtbl.remove p.children n.nid)
+    | None ->
+        ()
 
 (* Add a member with a CAS that succeeds only if the closed bit is clear. A fork
    also reads the flags of the chain (design section 2.5, Fork into a scope that
@@ -1875,6 +1928,7 @@ let run_body ~ctx scope body =
    the scope. *)
 let fork ?name ?pinned scope body =
   ignore (self ()) ;
+  link scope ;
   add_member scope ~daemon:false ;
   let f = new_fiber ?name ?pinned [scope] in
   let m = add_member_to scope f in
@@ -1892,22 +1946,20 @@ let fork ?name ?pinned scope body =
    daemon removes its node when it ends. [Self] first, as in [fork]. *)
 let fork_daemon ?name scope body =
   ignore (self ()) ;
-  let st = state_of scope in
   let d = new_node ~parent:scope Daemon_node in
   let f = new_fiber ?name [d] in
   ignore (add_member_to d f) ;
+  link scope ;
   Spin.with_lock scope.lock (fun () ->
       add_member scope ~daemon:true ;
-      Hashtbl.replace scope.children d.nid d ;
-      Hashtbl.replace st.daemons d.nid d ) ;
+      Hashtbl.replace scope.children d.nid d ) ;
   prog "Fiber.fork_daemon"
     (Fork
        ( f
        , fun () ->
            run_body ~ctx:d scope body ;
            Spin.with_lock scope.lock (fun () ->
-               Hashtbl.remove scope.children d.nid ;
-               Hashtbl.remove st.daemons d.nid ) ;
+               Hashtbl.remove scope.children d.nid ) ;
            enqueue (member_end scope ~daemon:true) ) )
 
 let sync_req ~nocancel leaves = prog "sync" (Sync {leaves; nocancel})
@@ -1915,8 +1967,7 @@ let sync_req ~nocancel leaves = prog "sync" (Sync {leaves; nocancel})
 let new_scope_state () =
   { counts= Atomic.make (all_one + nd_one)
   ; failures= Atomic.make []
-  ; join= Iv.make ()
-  ; daemons= Hashtbl.create ~random:false 4 }
+  ; join= Iv.make () }
 
 let reraise (e, bt) = Printexc.raise_with_backtrace e bt
 
@@ -1934,11 +1985,7 @@ let finish_scope m node result =
   enqueue (member_end node ~daemon:false) ;
   let st = state_of node in
   ignore (sync_req ~nocancel:true [|Iv.leaf st.join|]) ;
-  ( match node.parent with
-  | Some p ->
-      Spin.with_lock p.lock (fun () -> Hashtbl.remove p.children node.nid)
-  | None ->
-      () ) ;
+  unlink node ;
   match List.rev (Atomic.get st.failures) with
   | [] -> (
     match result with Ok v -> v | Error e -> reraise e )
@@ -1948,14 +1995,16 @@ let finish_scope m node result =
       raise (Multiple l)
 
 (* The body runs inside [handler] only: the fiber already runs inside the chain
-   of its outer scopes. *)
+   of its outer scopes. A handler that does not resume a continuation skips the
+   end of each scope and shield inside it: their nodes stay at the head of
+   [ctxs]. Then the scope fails with [Invalid_argument], and [ctxs] gets its old
+   value (the review of 2026-11-06). *)
 let scope ?handler f =
   let fiber = self () in
-  let parent = List.hd fiber.ctxs in
+  let ctxs = fiber.ctxs in
+  let parent = List.hd ctxs in
   let node = new_node ~parent ?handler (Scope_node (new_scope_state ())) in
   let m = add_member_to node fiber in
-  Spin.with_lock parent.lock (fun () ->
-      Hashtbl.replace parent.children node.nid node ) ;
   fiber.ctxs <- node :: fiber.ctxs ;
   let result =
     match
@@ -1970,7 +2019,18 @@ let scope ?handler f =
     | exception e ->
         Error (e, Printexc.get_raw_backtrace ())
   in
-  fiber.ctxs <- List.tl fiber.ctxs ;
+  let result =
+    match fiber.ctxs with
+    | n :: _ when n == node ->
+        result
+    | _ ->
+        Error
+          ( Invalid_argument
+              "Fiber.scope: a handler did not resume or discontinue a \
+               continuation"
+          , Printexc.get_callstack 0 )
+  in
+  fiber.ctxs <- ctxs ;
   finish_scope m node result
 
 (* [f] gets the shield node. *)
@@ -2116,11 +2176,6 @@ let start t main =
   push t.doms.(0) fiber (start_fiber body) ;
   (* The value of [main], or its exception. *)
   fun () -> match !result with Some r -> r () | None -> assert false
-
-(* A push to an atomic list with a CAS: no lock. A finaliser can do it. *)
-let rec push_list l x =
-  let old = Atomic.get l in
-  if not (Atomic.compare_and_set l old (x :: old)) then push_list l x
 
 (* Push a request to the injection queue: no lock, no sync word. *)
 let inject t req = push_list t.inject req

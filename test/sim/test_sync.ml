@@ -33,6 +33,136 @@ let shield_closes_after_wait () =
                   Fiber.cancel s (Failure "stop") ) ) ) ;
       is_true !slept )
 
+(* A [with_timeout] around [Condition.wait] in [use_rw ~protect:true] raises
+   [Timeout], the reason of the cancel of the wait. The data is correct at the
+   wait, so the mutex stays usable (the review of 2026-11-06). *)
+let timeout_of_wait_no_poison () =
+  Helpers.run (fun () ->
+      let m = Fiber.Mutex.create () and c = Fiber.Condition.create () in
+      raises Fiber.Timeout (fun () ->
+          Fiber.Mutex.use_rw ~protect:true m (fun () ->
+              Fiber.with_timeout Mono (Span.ms 5) (fun () ->
+                  Fiber.Condition.wait c m ) ) ) ;
+      equal string "free" (Fiber.Mutex.use_ro m (fun () -> "free")) )
+
+(* A [Timeout] that does not come from a wait poisons the mutex. *)
+let timeout_outside_wait_poisons () =
+  Helpers.run (fun () ->
+      let m = Fiber.Mutex.create () in
+      raises Fiber.Timeout (fun () ->
+          Fiber.Mutex.use_rw ~protect:true m (fun () ->
+              Fiber.with_timeout Mono (Span.ms 5) (fun () ->
+                  Time.sleep Mono (Span.ms 10) ) ) ) ;
+      raises Fiber.Mutex.Poisoned (fun () -> Fiber.Mutex.use_ro m ignore) )
+
+(* A condition and a mutex that two runs share, for example as globals of a test
+   that runs many seeds. The first run ends while a fiber waits on the
+   condition. The signal of the second run goes to the waiter of the second run,
+   not to the dead waiter (the review of 2026-11-06). *)
+let condition_of_two_runs () =
+  let m = Fiber.Mutex.create () and c = Fiber.Condition.create () in
+  let wait () =
+    Fiber.Mutex.lock m ; Fiber.Condition.wait c m ; Fiber.Mutex.unlock m
+  in
+  raises_match
+    (function Weft_sim.Deadlock _ -> true | _ -> false)
+    (fun () -> Weft_sim.run (fun _ -> wait ())) ;
+  Weft_sim.run (fun _ ->
+      Fiber.scope (fun s ->
+          Fiber.fork s wait ;
+          Time.sleep Mono (Span.ms 1) ;
+          Fiber.Mutex.use_ro m (fun () -> Fiber.Condition.signal c) ) )
+
+type _ Effect.t += Drop : unit Effect.t
+
+(* A handler that drops the continuation of [Drop]: it raises with no
+   discontinue. The end of the nested scope never runs. The scope of the handler
+   raises [Invalid_argument], and the contexts of the fiber get their old value
+   (the review of 2026-11-06). *)
+let dropped_continuation () =
+  let drop =
+    { Fiber.handle=
+        (fun f ->
+          Effect.Deep.match_with f ()
+            { retc= Fun.id
+            ; exnc= raise
+            ; effc=
+                (fun (type a) (e : a Effect.t) ->
+                  match e with
+                  | Drop ->
+                      Some
+                        (fun (_ : (a, _) Effect.Deep.continuation) -> raise Exit)
+                  | _ ->
+                      None ) } ) }
+  in
+  Helpers.run (fun () ->
+      raises_match
+        (function Invalid_argument _ -> true | _ -> false)
+        (fun () ->
+          Fiber.scope ~handler:drop (fun _ ->
+              Fiber.scope (fun inner ->
+                  Fiber.fork inner (fun () -> Time.sleep Mono (Span.ms 1)) ;
+                  Effect.perform Drop ) ) ) ;
+      (* The fiber runs in its own scope again: a cancel check works. *)
+      Fiber.check_cancel () ;
+      Time.sleep Mono (Span.ms 5) )
+
+(* The link of a nested scope (the review of 2026-11-06, design section 2.5). A
+   scope links in the children of its parent at its first fork, and its end
+   removes it. *)
+let link_removed_at_end () =
+  Helpers.run (fun () ->
+      Fiber.scope (fun outer ->
+          let children () =
+            Hashtbl.length (Private.scope_ctx outer).Private.Sched.children
+          in
+          Fiber.scope (fun _ -> ()) ;
+          equal int 0 (children ()) ;
+          Fiber.scope (fun inner ->
+              Fiber.fork inner ignore ;
+              equal int 1 (children ()) ) ;
+          equal int 0 (children ()) ) )
+
+(* A fork into a scope S whose parent P is also not linked links P first. Thus a
+   cancel of the scope A above P reaches the fiber that the fork added. *)
+let link_parents_first () =
+  Helpers.run (fun () ->
+      let reached = ref false in
+      ( try
+          Fiber.scope (fun a ->
+              Fiber.fork a (fun () ->
+                  Time.sleep Mono (Span.ms 1) ;
+                  Fiber.cancel a Exit ) ;
+              Fiber.scope (fun _p ->
+                  Fiber.scope (fun s ->
+                      Fiber.fork s (fun () ->
+                          try sync (Ivar.read (Ivar.create ()))
+                          with Fiber.Cancelled _ as e ->
+                            reached := true ;
+                            raise e ) ;
+                      Fiber.shield (fun () -> Time.sleep Mono (Span.ms 5)) ) ) )
+        with Fiber.Cancelled _ -> () ) ;
+      is_true !reached )
+
+(* fork_daemon links its scope. Thus a cancel of the outer scope reaches the
+   daemon at once, before the body of its scope ends. *)
+let daemon_links_scope () =
+  let add, get = Helpers.log () in
+  Helpers.run (fun () ->
+      try
+        Fiber.scope (fun a ->
+            Fiber.fork a (fun () ->
+                Time.sleep Mono (Span.ms 1) ;
+                Fiber.cancel a Exit ) ;
+            Fiber.scope (fun s ->
+                Fiber.fork_daemon s (fun () ->
+                    try sync (Ivar.read (Ivar.create ()))
+                    with Fiber.Cancelled _ as e -> add "daemon" ; raise e ) ;
+                Fiber.shield (fun () -> Time.sleep Mono (Span.ms 5)) ;
+                add "body" ) )
+      with Fiber.Cancelled _ -> () ) ;
+  equal (list string) ["daemon"; "body"] (get ())
+
 (* Outside a fiber, each call raises [Not_in_fiber] before it changes the lock.
    The release and the use of the semaphore do not change its count. *)
 let lock_calls_outside () =
@@ -154,6 +284,18 @@ let tests =
       [ test "use_ro unlocks the mutex when f gives a value" use_ro_unlocks
       ; test "the shield of use_rw closes again after Condition.wait"
           shield_closes_after_wait
+      ; test "a timeout of Condition.wait in use_rw does not poison"
+          timeout_of_wait_no_poison
+      ; test "a timeout outside a wait in use_rw poisons"
+          timeout_outside_wait_poisons
+      ; test "the end of a linked scope removes its link" link_removed_at_end
+      ; test "a fork links the parents that are not linked first"
+          link_parents_first
+      ; test "fork_daemon links its scope" daemon_links_scope
+      ; test "a handler that drops a continuation fails its scope"
+          dropped_continuation
+      ; test "a signal skips the dead waiter of an earlier run"
+          condition_of_two_runs
       ; test "each lock call outside a fiber raises Not_in_fiber"
           lock_calls_outside
       ; test "a cancelled waiter that got the mutex releases it"

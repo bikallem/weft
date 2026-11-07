@@ -141,7 +141,7 @@ let reraise_failed t f =
 (* [feed t] gives the complete records of [carry] to the session, one record at
    a time. After the handshake, a failure only marks the flow: the reader never
    writes, thus no alert goes out. A cancel at the lock raises before the split:
-   [carry] and [unfed] keep the bytes for the next read. *)
+   [carry] keeps the bytes for the next read. *)
 let feed t =
   with_lock t.state_lock
   @@ fun () ->
@@ -286,11 +286,16 @@ let write t buf off len =
   in
   go off len
 
-(* [notify t] sends close_notify, one time. *)
+(* [notify t] sends close_notify, one time. The flag changes under the state
+   lock, when the session makes the record. A cancel at the write lock comes
+   before that, so a later call sends close_notify. After close_notify, [send]
+   raises [Flow.Closed], and [shutdown_send] then ends the TCP stream. *)
 let notify t =
-  if not t.notified then (
-    t.notified <- true ;
-    send t (fun tls -> Some (Tls.Engine.send_close_notify tls)) )
+  send t (fun tls ->
+      if t.notified then None
+      else (
+        t.notified <- true ;
+        Some (Tls.Engine.send_close_notify tls) ) )
 
 (* [shutdown_send t] sends close_notify, then the end of the TCP stream, also
    when the close_notify fails. *)
@@ -323,57 +328,53 @@ let flow_of t =
    flow. *)
 let establish tcp tls =
   let carry = new_carry () in
-  let rec loop tls plain eof total empty =
+  (* [plain] is the plaintext, the newest first, and [total] its bytes. *)
+  let rec loop tls plain total eof read empty =
     if (not (Tls.Engine.handshake_in_progress tls)) || eof then
-      (tls, plain, eof, empty)
+      (tls, plain, total, eof, empty)
     else
       match read_into (Flow.read tcp) carry with
       | 0 ->
           raise (Handshake_error "the peer closed the connection")
       | n ->
-          let total = total + n in
-          if total > max_handshake then
+          let read = read + n in
+          if read > max_handshake then
             raise (Handshake_error "the handshake is too large") ;
           carry.len <- carry.len + n ;
-          let records = take_records carry in
-          let tls, plain, eof, empty =
+          let tls, plain, total, eof, empty =
             List.fold_left
-              (fun (tls, plain, eof, empty) r ->
-                if eof then (tls, plain, eof, empty)
+              (fun ((tls, plain, total, eof, empty) as acc) r ->
+                if eof then acc
                 else
                   (* A record with no plaintext after the end of the handshake
                      counts in the budget of the session. Over the budget, the
                      session does not start. *)
                   let after = not (Tls.Engine.handshake_in_progress tls) in
                   match Tls.Engine.handle_tls tls r with
-                  | Ok (tls, e, `Response resp, `Data d) ->
+                  | Ok (tls, e, `Response resp, `Data d) -> (
                       Option.iter (Flow.write_string tcp) resp ;
-                      let plain, empty =
-                        match d with
-                        | Some d ->
-                            (d :: plain, empty)
-                        | None when after ->
-                            let empty = empty + cost r in
-                            let bytes =
-                              List.fold_left
-                                (fun n d -> n + String.length d)
-                                (0
-                                [@mutate
-                                  off
-                                    "the budget changes only at 16383 bytes, \
-                                     and then the 16896 bytes of one read have \
-                                     no space for 65 records"] )
-                                plain
-                            in
-                            if empty > empty_budget bytes then
-                              raise
-                                (Handshake_error
-                                   "too many records with no plaintext" ) ;
-                            (plain, empty)
-                        | None ->
-                            (plain, empty)
-                      in
-                      (tls, plain, Option.is_some e, empty)
+                      let eof = Option.is_some e in
+                      match d with
+                      | Some d ->
+                          ( tls
+                          , d :: plain
+                          , ( total + String.length d )
+                            [@mutate
+                              off
+                                "the budget changes only at 16383 bytes, and \
+                                 then the 16896 bytes of one read have no \
+                                 space for 65 records"]
+                          , eof
+                          , empty )
+                      | None when after ->
+                          let empty = empty + cost r in
+                          if empty > empty_budget total then
+                            raise
+                              (Handshake_error
+                                 "too many records with no plaintext" ) ;
+                          (tls, plain, total, eof, empty)
+                      | None ->
+                          (tls, plain, total, eof, empty) )
                   | Error (failure, `Response alert) ->
                       ( match Flow.write_string tcp alert with
                       | () ->
@@ -382,11 +383,12 @@ let establish tcp tls =
                           () ) ;
                       raise
                         (Handshake_error (Tls.Engine.string_of_failure failure)) )
-              (tls, plain, eof, empty) records
+              (tls, plain, total, eof, empty)
+              (take_records carry)
           in
-          loop tls plain eof total empty
+          loop tls plain total eof read empty
   in
-  let tls, plain, eof, empty = loop tls [] false 0 0 in
+  let tls, plain, total, eof, empty = loop tls [] 0 false 0 0 in
   let epoch =
     match Tls.Engine.epoch tls with
     | Ok e ->
@@ -394,14 +396,13 @@ let establish tcp tls =
     | Error () ->
         raise (Handshake_error "the peer closed the session")
   in
-  let plain = String.concat "" (List.rev plain) in
   ( { tcp
     ; tls
     ; pending= []
     ; carry
-    ; plain
+    ; plain= String.concat "" (List.rev plain)
     ; pos= 0
-    ; plain_total= String.length plain
+    ; plain_total= total
     ; empty
     ; status= Atomic.make (if eof then `End else `Open)
     ; notified= false

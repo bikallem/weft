@@ -49,12 +49,12 @@ module Manual = struct
       | Some f, _ ->
           t.on_sleep <- None ;
           f () ;
-          [Private.World.Ready.Woken]
+          []
       | None, Some d ->
           let d = Clock.to_ns Mono d in
           t.alarms <- d :: t.alarms ;
           if Int64.compare d t.now > 0 then t.now <- d ;
-          [Private.World.Ready.Alarm]
+          []
       | None, None ->
           failwith "the program sleeps forever" )
 
@@ -415,7 +415,7 @@ module Stop = struct
           while (not (Atomic.get t.woken)) && Sys.time () -. t0 < 2. do
             Domain.cpu_relax ()
           done ;
-          if Atomic.exchange t.woken false then [Private.World.Ready.Woken]
+          if Atomic.exchange t.woken false then []
           else (Atomic.set t.stuck true ; failwith "stuck") )
 
   let wake t ~domain = if domain = 1 then Atomic.set t.woken true
